@@ -51,7 +51,10 @@ type PusherStat struct {
 	LastUpload   string
 	SyncDuration float64
 	LastError    string
+	MirrorBytes  int64
 	DagSync      *dagsync.Stats
+
+	lastPushed time.Time
 }
 
 type pushersScheduler struct {
