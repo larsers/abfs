@@ -49,6 +49,13 @@ func (b *recordingBackend) value(name string, labelValues ...string) float64 {
 	return b.values[name+"{"+strings.Join(labelValues, ",")+"}"]
 }
 
+func (b *recordingBackend) isSet(name string, labelValues ...string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.values[name+"{"+strings.Join(labelValues, ",")+"}"]
+	return ok
+}
+
 func (b *recordingBackend) NewCounter(name, help string, labels []string) metrics.Counter {
 	return &recordingMetric{b: b, name: name}
 }
@@ -107,13 +114,21 @@ func TestPusherMetrics_Sample(t *testing.T) {
 		}}},
 		{State: "fetch", MirrorBytes: -1},
 	}
-	m.sample(stats, now)
+	m.sample(stats, 10, now)
 
-	require.Equal(4.0, b.value("abfs_pusher_projects_total"))
-	require.Equal(2.0, b.value("abfs_pusher_projects", "sleep"))
-	require.Equal(1.0, b.value("abfs_pusher_projects", "push-blobs"))
-	require.Equal(0.0, b.value("abfs_pusher_projects", "diff"))
-	require.Equal(2.0, b.value("abfs_pusher_projects_seeded"))
+	require.Equal(10.0, b.value("abfs_pusher_pool_projects"))
+	for st := PushStateCreated; st <= PushStatePushPacks; st++ {
+		for _, seeded := range []string{"true", "false"} {
+			require.True(b.isSet("abfs_pusher_projects", st.String(), seeded), "state %s seeded %s", st, seeded)
+		}
+	}
+	require.Equal(2.0, b.value("abfs_pusher_projects", "sleep", "true"))
+	require.Equal(0.0, b.value("abfs_pusher_projects", "sleep", "false"))
+	require.Equal(1.0, b.value("abfs_pusher_projects", "push-blobs", "false"))
+	require.Equal(1.0, b.value("abfs_pusher_projects", "fetch", "false"))
+	require.Equal(0.0, b.value("abfs_pusher_projects", "diff", "false"))
+	require.False(b.isSet("abfs_pusher_projects_total"))
+	require.False(b.isSet("abfs_pusher_projects_seeded"))
 	require.Equal(1.0, b.value("abfs_pusher_projects_failing"))
 	require.Equal(3600.0, b.value("abfs_pusher_oldest_success_age_seconds"))
 	require.Equal(1500.0, b.value("abfs_pusher_mirror_bytes", "true"))
@@ -122,9 +137,23 @@ func TestPusherMetrics_Sample(t *testing.T) {
 	require.Equal(7.0, b.value("abfs_pusher_dagsync_requests", "queued", "blob"))
 
 	// A dagsync that finished must not leave its last counts behind.
-	m.sample(stats[:2], now)
+	m.sample(stats[:2], 10, now)
 	require.Equal(0.0, b.value("abfs_pusher_dagsync_requests", "queued", "blob"))
-	require.Equal(0.0, b.value("abfs_pusher_projects", "push-blobs"))
+	require.Equal(0.0, b.value("abfs_pusher_projects", "push-blobs", "false"))
+}
+
+func TestPusherMetrics_SampleOldestSuccess(t *testing.T) {
+	require := require.New(t)
+	b := newRecordingBackend()
+	m := newPusherMetrics(metrics.WrapBackend(b))
+	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+
+	// Zero would read as a push that just finished.
+	m.sample([]PusherStat{{State: "fetch", MirrorBytes: -1}}, 1, now)
+	require.False(b.isSet("abfs_pusher_oldest_success_age_seconds"))
+
+	m.sample([]PusherStat{{State: "sleep", lastPushed: now.Add(-time.Minute)}}, 1, now)
+	require.Equal(60.0, b.value("abfs_pusher_oldest_success_age_seconds"))
 }
 
 func TestPusherMetrics_SampleRepos(t *testing.T) {
@@ -137,9 +166,15 @@ func TestPusherMetrics_SampleRepos(t *testing.T) {
 		{LastError: "fetch failed"},
 		{},
 	})
-	require.Equal(3.0, b.value("abfs_pusher_repos_total"))
-	require.Equal(2.0, b.value("abfs_pusher_repos_without_success"))
+	require.Equal(1.0, b.value("abfs_pusher_repos", "true"))
+	require.Equal(2.0, b.value("abfs_pusher_repos", "false"))
+	require.False(b.isSet("abfs_pusher_repos_total"))
+	require.False(b.isSet("abfs_pusher_repos_without_success"))
 	require.Equal(1.0, b.value("abfs_pusher_repos_failing"))
+
+	m.sampleRepos(nil)
+	require.Equal(0.0, b.value("abfs_pusher_repos", "true"))
+	require.Equal(0.0, b.value("abfs_pusher_repos", "false"))
 }
 
 func TestPusherMetrics_RecordPush(t *testing.T) {

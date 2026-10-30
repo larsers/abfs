@@ -408,6 +408,13 @@ func (s *pushersScheduler) Projects() []string {
 }
 
 func (s *pushersScheduler) ProjectsStats() []PusherStat {
+	stats, _ := s.projectsStats()
+	return stats
+}
+
+// projectsStats returns the stats of this worker's pushers and the number of
+// projects in the whole pool, read under one lock.
+func (s *pushersScheduler) projectsStats() ([]PusherStat, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -415,7 +422,7 @@ func (s *pushersScheduler) ProjectsStats() []PusherStat {
 	for _, s := range s.pushers {
 		stats = append(stats, s.pusher.Stat())
 	}
-	return stats
+	return stats, len(s.projects)
 }
 
 func (s *pushersScheduler) cancelAll() {

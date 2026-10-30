@@ -19,6 +19,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,8 +36,7 @@ type pusherMetrics struct {
 	pushes        metrics.Counter
 	pushDuration  metrics.Histogram
 	projects      metrics.Gauge
-	projectsTotal metrics.Gauge
-	seeded        metrics.Gauge
+	poolProjects  metrics.Gauge
 	failing       metrics.Gauge
 	oldestSuccess metrics.Gauge
 	mirrorBytes   metrics.Gauge
@@ -44,7 +44,6 @@ type pusherMetrics struct {
 	dagRequests   metrics.Gauge
 	transferred   metrics.Counter
 	repos         metrics.Gauge
-	reposPending  metrics.Gauge
 	reposFailing  metrics.Gauge
 
 	// dagKeys are the dagsync state and type pairs reported last time, so
@@ -56,17 +55,15 @@ func newPusherMetrics(provider metrics.Provider) *pusherMetrics {
 	return &pusherMetrics{
 		pushes:        provider.NewCounter("abfs_pusher_pushes_total", "Count of project pushes by result.", []string{"result"}),
 		pushDuration:  provider.NewHistogram("abfs_pusher_push_duration_seconds", "Duration of a project push in seconds, from fetch to the end of upload.", pushDurationBuckets, []string{"result"}),
-		projects:      provider.NewGauge("abfs_pusher_projects", "Count of projects assigned to this pusher by push state.", []string{"state"}),
-		projectsTotal: provider.NewGauge("abfs_pusher_projects_total", "Count of projects assigned to this pusher.", nil),
-		seeded:        provider.NewGauge("abfs_pusher_projects_seeded", "Count of assigned projects pushed successfully at least once.", nil),
+		projects:      provider.NewGauge("abfs_pusher_projects", "Count of projects assigned to this pusher by push state and whether they were pushed successfully at least once.", []string{"state", "seeded"}),
+		poolProjects:  provider.NewGauge("abfs_pusher_pool_projects", "Count of projects in the manifests of the whole pusher pool.", nil),
 		failing:       provider.NewGauge("abfs_pusher_projects_failing", "Count of assigned projects whose last push failed.", nil),
 		oldestSuccess: provider.NewGauge("abfs_pusher_oldest_success_age_seconds", "Seconds since the least recent last successful push among seeded projects.", nil),
 		mirrorBytes:   provider.NewGauge("abfs_pusher_mirror_bytes", "Size of the git packs in the local mirrors, split by whether the project is seeded.", []string{"seeded"}),
 		noMirror:      provider.NewGauge("abfs_pusher_projects_without_mirror", "Count of assigned projects not fetched yet, whose size is unknown.", nil),
 		dagRequests:   provider.NewGauge("abfs_pusher_dagsync_requests", "Count of dagsync upload requests by state and type, over running pushes.", []string{"state", "type"}),
 		transferred:   provider.NewCounter("abfs_pusher_transferred_bytes_total", "Bytes sent to and received from the ABFS server.", []string{"direction"}),
-		repos:         provider.NewGauge("abfs_pusher_repos_total", "Count of manifest repositories this pusher watches.", nil),
-		reposPending:  provider.NewGauge("abfs_pusher_repos_without_success", "Count of watched manifest repositories not listed successfully yet.", nil),
+		repos:         provider.NewGauge("abfs_pusher_repos", "Count of watched manifest repositories by whether they were listed successfully at least once.", []string{"listed"}),
 		reposFailing:  provider.NewGauge("abfs_pusher_repos_failing", "Count of watched manifest repositories whose last listing failed.", nil),
 		dagKeys:       make(map[[2]string]bool),
 	}
@@ -89,23 +86,23 @@ func (m *pusherMetrics) recordPush(d time.Duration, err error) {
 	m.pushDuration.Observe(d.Seconds(), result)
 }
 
-func (m *pusherMetrics) sample(stats []PusherStat, now time.Time) {
-	states := make(map[string]int)
+func (m *pusherMetrics) sample(stats []PusherStat, poolProjects int, now time.Time) {
+	states := make(map[[2]string]int)
 	for st := PushStateCreated; st <= PushStatePushPacks; st++ {
-		states[st.String()] = 0
+		states[[2]string{st.String(), "true"}] = 0
+		states[[2]string{st.String(), "false"}] = 0
 	}
 	dag := make(map[[2]string]int64)
-	var seeded, failing, noMirror int
+	var failing, noMirror int
 	var mirrorSeeded, mirrorPending int64
 	var oldest time.Time
 	for _, st := range stats {
-		states[st.State]++
+		isSeeded := !st.lastPushed.IsZero()
+		states[[2]string{st.State, strconv.FormatBool(isSeeded)}]++
 		if st.LastError != "" {
 			failing++
 		}
-		isSeeded := !st.lastPushed.IsZero()
 		if isSeeded {
-			seeded++
 			if oldest.IsZero() || st.lastPushed.Before(oldest) {
 				oldest = st.lastPushed
 			}
@@ -127,17 +124,16 @@ func (m *pusherMetrics) sample(stats []PusherStat, now time.Time) {
 		}
 	}
 
-	for state, count := range states {
-		m.projects.Set(float64(count), state)
+	for key, count := range states {
+		m.projects.Set(float64(count), key[0], key[1])
 	}
-	m.projectsTotal.Set(float64(len(stats)))
-	m.seeded.Set(float64(seeded))
+	m.poolProjects.Set(float64(poolProjects))
 	m.failing.Set(float64(failing))
-	var age float64
+	// Zero would read as a push that just finished, so leave the age unset
+	// until a project is seeded.
 	if !oldest.IsZero() {
-		age = now.Sub(oldest).Seconds()
+		m.oldestSuccess.Set(now.Sub(oldest).Seconds())
 	}
-	m.oldestSuccess.Set(age)
 	m.mirrorBytes.Set(float64(mirrorSeeded), "true")
 	m.mirrorBytes.Set(float64(mirrorPending), "false")
 	m.noMirror.Set(float64(noMirror))
@@ -155,17 +151,17 @@ func (m *pusherMetrics) sample(stats []PusherStat, now time.Time) {
 }
 
 func (m *pusherMetrics) sampleRepos(stats []RepoStat) {
-	var pending, failing int
+	var listed, failing int
 	for _, st := range stats {
-		if st.lastSuccess.IsZero() {
-			pending++
+		if !st.lastSuccess.IsZero() {
+			listed++
 		}
 		if st.LastError != "" {
 			failing++
 		}
 	}
-	m.repos.Set(float64(len(stats)))
-	m.reposPending.Set(float64(pending))
+	m.repos.Set(float64(listed), "true")
+	m.repos.Set(float64(len(stats)-listed), "false")
 	m.reposFailing.Set(float64(failing))
 }
 
@@ -175,7 +171,8 @@ func (g *GitPusher) recordMetrics(ctx context.Context, sched *pushersScheduler, 
 	defer ticker.Stop()
 	var sent, received int64
 	for {
-		g.metrics.sample(sched.ProjectsStats(), time.Now())
+		stats, poolProjects := sched.projectsStats()
+		g.metrics.sample(stats, poolProjects, time.Now())
 		g.metrics.sampleRepos(repoSched.ReposStats())
 		stat := g.abfsClient.Stat()
 		g.metrics.transferred.Add(float64(stat.BytesSent-sent), "sent")
