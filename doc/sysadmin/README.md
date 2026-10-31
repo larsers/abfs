@@ -291,6 +291,42 @@ To enable faster source control operations, ABFS requires a slightly patched ver
 
 To update `repo` later, repeat these steps.
 
+### Metrics
+
+Commands of the `abfs` binary, such as the server, git-pusher and cacheman, export the metrics they record with OpenTelemetry. Export is off by default. Two config keys turn it on:
+
+* `metrics-provider: otel` selects the OpenTelemetry backend.
+* `record-client-metrics: true` turns recording on for every command, the server and git-pusher included. Without it nothing is exported.
+
+Set them for one command with `--kv`, a global flag that goes before the subcommand, or write them to the instance config file with `abfs config -w`:
+
+```sh
+abfs --kv metrics-provider=otel --kv record-client-metrics=true cacheman run
+abfs --kv metrics-provider=otel --kv record-client-metrics=true config -w
+```
+
+`OTEL_METRICS_EXPORTER` chooses the exporter:
+
+* `otlp` (the default) sends OTLP to a collector. `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` or `OTEL_EXPORTER_OTLP_PROTOCOL` sets the protocol, `http/protobuf` (the default) or `grpc`.
+* `prometheus` serves `/metrics` for scraping on `OTEL_EXPORTER_PROMETHEUS_HOST` (default `localhost`) and `OTEL_EXPORTER_PROMETHEUS_PORT` (default `9464`). It serves values only while the process runs.
+* `console` writes JSON to standard output, which is useful to check the setup.
+* `none` exports nothing.
+
+The other standard `OTEL_*` variables apply as well, for example `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_METRIC_EXPORT_INTERVAL` (in milliseconds, 60000 by default), `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`:
+
+```sh
+OTEL_METRICS_EXPORTER=console OTEL_METRIC_EXPORT_INTERVAL=5000 \
+  abfs --kv metrics-provider=otel --kv record-client-metrics=true cacheman run
+```
+
+Each process describes itself with the resource attributes `service.name` (`abfs`), `service.version`, `service.instance.id` (the host name), `abfs.instance` (the ABFS instance name), `abfs.runID` (new for each process) and `abfs.username` (a hash of the user name). `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override any of these and add others, such as `cloud.region`. A collector can also add the attributes of the platform it runs on.
+
+Things to know:
+
+* Each command waits up to 15 seconds at exit for its final export. With `otlp`, that export comes at least 5 seconds after the previous export, since some backends reject a point less than 5 seconds after the previous point of the same series. A command can take up to 5 seconds longer to exit. If an export still in flight leaves too little time, the final export is skipped with a warning.
+* `OTEL_METRICS_PRODUCERS` does not apply to `otlp`.
+* Each process reports as the instance named by its host name. Two processes on one host that write the same metric with the same labels share a series in a backend that identifies a series by `service.name`, `service.instance.id` and the metric labels. `abfs.runID` is not part of that key.
+
 ## First Mount
 
 Unfortunately git-pusher does not yet have a great way to tell when it is complete and ready for clients to start mounting the source code. This is an area we need to improve. It could take a few days for the push to complete depending on the size of your git history and the number and size of your git-pusher servers.
