@@ -105,6 +105,9 @@ func (c *CacheMan) handlePushBuildMetrics(w http.ResponseWriter, r *http.Request
 		c.buildCacheHitRatioHist.Observe(req.CacheHitRatio, req.BuildGoal, req.Status, req.AndroidTarget)
 		c.buildCacheHitsTotal.Add(float64(req.CacheHitCount), req.BuildGoal, req.Status, req.AndroidTarget)
 		c.buildCacheMissesTotal.Add(float64(req.CacheMissCount), req.BuildGoal, req.Status, req.AndroidTarget)
+		if req.Steps != nil {
+			c.recordBuildSteps(&req)
+		}
 	}
 
 	for phase, durationSecs := range req.Phases {

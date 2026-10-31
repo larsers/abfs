@@ -243,6 +243,13 @@ type CacheMan struct {
 	buildPhaseDurationHist metrics.Histogram
 	buildCacheHitsTotal    metrics.Counter
 	buildCacheMissesTotal  metrics.Counter
+
+	buildStepsTotal                metrics.Counter
+	buildMissReasonsTotal          metrics.Counter
+	buildRejectedResponsesTotal    metrics.Counter
+	buildStepRunSecondsTotal       metrics.Counter
+	buildCacheSavedCPUSecondsTotal metrics.Counter
+	buildCacheTimeHitRatioHist     metrics.Histogram
 }
 
 func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
@@ -326,6 +333,37 @@ func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
 		buildCacheMissesTotal: provider.NewCounter(
 			"abfs_build_cache_misses_total",
 			"Total number of cache misses in builds.",
+			[]string{"build_goal", "status", "android_target"},
+		),
+		buildStepsTotal: provider.NewCounter(
+			"abfs_build_steps_total",
+			"Total number of build steps that completed, by run type.",
+			[]string{"build_goal", "status", "android_target", "run_type"},
+		),
+		buildMissReasonsTotal: provider.NewCounter(
+			"abfs_build_cache_miss_reasons_total",
+			"Total number of build steps executed because the cache had no usable response, by reason.",
+			[]string{"build_goal", "status", "android_target", "reason"},
+		),
+		buildRejectedResponsesTotal: provider.NewCounter(
+			"abfs_build_cache_rejected_responses_total",
+			"Total number of cached responses that builds did not use, by reason.",
+			[]string{"build_goal", "status", "android_target", "reason"},
+		),
+		buildStepRunSecondsTotal: provider.NewCounter(
+			"abfs_build_step_run_seconds_total",
+			"Total run time of build steps: source=cache is the time measured by the builds that produced the cached steps, source=executed is the time of the steps executed.",
+			[]string{"build_goal", "status", "android_target", "source"},
+		),
+		buildCacheSavedCPUSecondsTotal: provider.NewCounter(
+			"abfs_build_cache_saved_cpu_seconds_total",
+			"Total user and system CPU time of the build steps taken from the cache, as measured by the builds that produced them.",
+			[]string{"build_goal", "status", "android_target"},
+		),
+		buildCacheTimeHitRatioHist: provider.NewHistogram(
+			"abfs_build_cache_time_hit_ratio",
+			"Ratio (0.0 to 1.0) of step run time taken from the cache in the build, each step weighted by its run time.",
+			[]float64{0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0},
 			[]string{"build_goal", "status", "android_target"},
 		),
 	}
