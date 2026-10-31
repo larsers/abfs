@@ -327,6 +327,19 @@ Things to know:
 * `OTEL_METRICS_PRODUCERS` does not apply to `otlp`.
 * Each process reports as the instance named by its host name. Two processes on one host that write the same metric with the same labels share a series in a backend that identifies a series by `service.name`, `service.instance.id` and the metric labels. `abfs.runID` is not part of that key.
 
+The cacheman service that `abfs init` or `cacheman init` sets up runs under `systemd` and does not see `OTEL_*` variables set in a shell. Without them it exports with the defaults: OTLP over HTTP to `localhost:4318`. Set them for the service in a drop-in, then restart it (replace `default` with the instance name). The drop-in survives a later `abfs init`, which rewrites only the unit file:
+
+```sh
+systemctl --user edit cacheman@default
+abfs cacheman restart
+```
+
+```ini
+[Service]
+Environment=OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
 ## First Mount
 
 Unfortunately git-pusher does not yet have a great way to tell when it is complete and ready for clients to start mounting the source code. This is an area we need to improve. It could take a few days for the push to complete depending on the size of your git history and the number and size of your git-pusher servers.
