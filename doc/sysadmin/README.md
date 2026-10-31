@@ -293,7 +293,7 @@ To update `repo` later, repeat these steps.
 
 ### Metrics
 
-Commands of the `abfs` binary, such as the server, git-pusher and cacheman, export the metrics they record with OpenTelemetry. Export is off by default. Two config keys turn it on:
+Commands of the `abfs` binary, such as the server, git-pusher and cacheman, export the metrics they record with OpenTelemetry. So does the standalone `cacheman` binary that `make cacheman` and `make cacheman-static` build. Export is off by default. Two config keys turn it on:
 
 * `metrics-provider: otel` selects the OpenTelemetry backend.
 * `record-client-metrics: true` turns recording on for every command, the server and git-pusher included. Without it nothing is exported.
