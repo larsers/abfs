@@ -43,4 +43,7 @@ func TestNewResource(t *testing.T) {
 	require.Equal("pod-1", got["service.instance.id"], "the environment must override our defaults")
 	require.Equal("region-1", got["cloud.region"])
 	require.Equal("inst-1", got["abfs.instance"])
+	require.Equal("opentelemetry", got["telemetry.sdk.name"])
+	require.Equal("go", got["telemetry.sdk.language"])
+	require.NotEmpty(got["telemetry.sdk.version"])
 }

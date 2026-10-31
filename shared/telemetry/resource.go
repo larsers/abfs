@@ -47,6 +47,7 @@ func NewResource(ctx context.Context) (*resource.Resource, error) {
 	res, err := resource.New(ctx,
 		resource.WithAttributes(attrs...),
 		resource.WithFromEnv(),
+		resource.WithTelemetrySDK(),
 	)
 	if errors.Is(err, resource.ErrPartialResource) {
 		log.Printf("Warning: telemetry: %v", err)

@@ -319,7 +319,7 @@ OTEL_METRICS_EXPORTER=console OTEL_METRIC_EXPORT_INTERVAL=5000 \
   abfs --kv metrics-provider=otel --kv record-client-metrics=true cacheman run
 ```
 
-Each process describes itself with the resource attributes `service.name` (`abfs`), `service.version`, `service.instance.id` (the host name), `abfs.instance` (the ABFS instance name), `abfs.runID` (new for each process) and `abfs.username` (a hash of the user name). `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override any of these and add others, such as `cloud.region`. A collector can also add the attributes of the platform it runs on.
+Each process describes itself with the resource attributes `service.name` (`abfs`), `service.version`, `service.instance.id` (the host name), `abfs.instance` (the ABFS instance name), `abfs.runID` (new for each process) and `abfs.username` (a hash of the user name), plus the SDK's `telemetry.sdk.name`, `telemetry.sdk.language` and `telemetry.sdk.version`. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override any of ours and add others, such as `cloud.region`. A collector can also add the attributes of the platform it runs on.
 
 Things to know:
 
