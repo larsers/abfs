@@ -88,6 +88,8 @@ The other flags (`--port`, TLS, `--auth-enabled`, `--acl-enabled`, logging) are 
 
 In builds that export metrics with OpenTelemetry, `OTEL_METRICS_EXPORTER` chooses where the server's metrics go, as described under Metrics in the [System Admin doc](README.md). Builds whose System Admin doc has no such section serve Prometheus metrics on `/metrics` of the HTTP server.
 
+In builds that have `--health-probe-interval` (Health checks while serving in the [System Admin doc](README.md)), the server probes its three backends in each round: one query each on the Spanner tables `Projects` and `Refs`, one read of an absent row in each of the Bigtable tables `objects`, `maps` and `chunks`, and one listing of the bucket with a prefix that matches nothing (a Class A operation). A failure of any of the three counts, and `abfs_server_backend_up` names the backend (`spanner`, `bigtable` or `storage`). The probe only reads: a lost write permission, an exhausted write quota or failing Spanner commits fail every upload while the probe passes. Servers that share a backend fail their probes together when it is down, so all of them report `NOT_SERVING` and a load balancer in front of them fails every request. A Google Cloud regional internal Application Load Balancer, for example, answers HTTP 503 to every call. A Cloud Storage outage alone does this too, although refs and objects up to 1 MiB would still work.
+
 Several servers can share the same database, tables and bucket. Put them behind one address, for example a load balancer, and give clients that address in `--remote-servers`.
 
 ## Try it locally with emulators
