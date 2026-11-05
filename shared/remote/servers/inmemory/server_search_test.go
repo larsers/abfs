@@ -107,3 +107,21 @@ func TestInMemoryServer_SearchRefs(t *testing.T) {
 		}
 	})
 }
+
+func TestInMemoryServer_SearchRefsSkipsDeleted(t *testing.T) {
+	ctx := context.Background()
+	server := New()
+
+	require.NoError(t, server.PutRefs(ctx, "default-server", "test-project", []remote.RefHash{
+		{Ref: "refs/heads/main", Hash: entities.EmptyFileHash},
+		{Ref: "refs/heads/old", Hash: entities.EmptyFileHash},
+	}))
+	require.NoError(t, server.PutRefs(ctx, "default-server", "test-project", []remote.RefHash{
+		{Ref: "refs/heads/old", Hash: entities.ZeroHash},
+	}))
+
+	res, err := server.SearchRefs(ctx, "default-server", "test-project", "refs/heads/", 0)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	assert.Equal(t, "refs/heads/main", res[0].Ref)
+}
