@@ -65,8 +65,9 @@ type Config struct {
 	GitPrefetchIndices  bool `yaml:"git.prefetch-indices,omitempty" json:",omitempty" desc:"Prefetch Git index files"`
 	GitPrefetchSymlinks bool `yaml:"git.prefetch-symlinks,omitempty" json:",omitempty" desc:"Prefetch Git symlinks"`
 
-	GCKeepAliveRefInterval   time.Duration `yaml:"gc-keepalive-ref-interval,omitempty" json:",omitempty" desc:"Interval between rewrites of a live mount's ref for the server GC; zero disables"`
-	GCKeepAliveTouchInterval time.Duration `yaml:"gc-keepalive-touch-interval,omitempty" json:",omitempty" desc:"Interval between Headers touches of a live mount's objects for the server GC; zero disables"`
+	GCKeepAlive              bool          `yaml:"gc-keepalive,omitempty" json:",omitempty" desc:"Keep live mounts visible to the server GC: refresh the mount ref and touch the mount's objects"`
+	GCKeepAliveRefInterval   time.Duration `yaml:"gc-keepalive-ref-interval,omitempty" json:",omitempty" desc:"With gc-keepalive, interval between rewrites of a live mount's ref for the server GC; zero disables"`
+	GCKeepAliveTouchInterval time.Duration `yaml:"gc-keepalive-touch-interval,omitempty" json:",omitempty" desc:"With gc-keepalive, interval between Headers touches of a live mount's objects for the server GC; zero disables"`
 
 	SetupIgnoreEvalCacheRegex string  `yaml:"setup.ignore-eval-cache-regex,omitempty" json:",omitempty" desc:"Regex of targets to exclude from eval cache"`
 	SetupLogMismatches        bool    `yaml:"setup.log-mismatches,omitempty" json:",omitempty" desc:"Log eval cache mismatches"`
@@ -138,6 +139,7 @@ type ConfigOptional struct {
 	GitPrefetchIndices  *bool `yaml:"git.prefetch-indices,omitempty" json:",omitempty"`
 	GitPrefetchSymlinks *bool `yaml:"git.prefetch-symlinks,omitempty" json:",omitempty"`
 
+	GCKeepAlive              *bool          `yaml:"gc-keepalive,omitempty" json:",omitempty"`
 	GCKeepAliveRefInterval   *time.Duration `yaml:"gc-keepalive-ref-interval,omitempty" json:",omitempty"`
 	GCKeepAliveTouchInterval *time.Duration `yaml:"gc-keepalive-touch-interval,omitempty" json:",omitempty"`
 

@@ -245,6 +245,7 @@ func TestGCKeepAlive_Touch(t *testing.T) {
 
 func TestNewGCKeepAlive(t *testing.T) {
 	config := instance.DefaultConfig(t.TempDir())
+	config.GCKeepAlive = true
 	details := &binding.MountDetails{
 		StartTimestamp: 42,
 		MetaRefPrefix:  "user/u",
@@ -257,6 +258,10 @@ func TestNewGCKeepAlive(t *testing.T) {
 	zeroConfig.GCKeepAliveTouchInterval = 0
 	zeroDetails := *details
 	zeroDetails.Config = zeroConfig
+
+	// The default config has the intervals set and the keep-alive off.
+	offDetails := *details
+	offDetails.Config = instance.DefaultConfig(t.TempDir())
 
 	tests := []struct {
 		name      string
@@ -271,6 +276,7 @@ func TestNewGCKeepAlive(t *testing.T) {
 		{name: "remote read-only", info: filesystem.MountInfo{RemoteReadOnly: true}, details: details, wantTick: 15 * time.Minute, wantTouch: 18 * time.Hour},
 		{name: "local only", info: filesystem.MountInfo{LocalOnly: true}, details: details, wantNil: true},
 		{name: "disabled", details: &zeroDetails, wantNil: true},
+		{name: "off by default", details: &offDetails, wantNil: true},
 		{name: "no config", details: &binding.MountDetails{}, wantNil: true},
 	}
 	for _, tt := range tests {

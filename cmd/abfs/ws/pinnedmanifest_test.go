@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
@@ -48,27 +49,40 @@ func TestSetPinnedManifest(t *testing.T) {
 	givenHash := objects.HashBlobBytes([]byte("given"))
 
 	tests := []struct {
-		name string
-		opts MountRepoOpts
-		want entities.Hash
+		name      string
+		opts      MountRepoOpts
+		keepAlive bool
+		want      entities.Hash
 	}{
-		{name: "manifest hash", opts: MountRepoOpts{ManifestHash: givenHash}, want: givenHash},
-		{name: "manifest file", opts: MountRepoOpts{ManifestFile: manFile}, want: fileHash},
-		{name: "branch", opts: MountRepoOpts{Branch: "main"}},
-		{name: "snapshot", opts: MountRepoOpts{ManifestHash: givenHash, IsSnapshot: true}},
+		{name: "manifest hash", opts: MountRepoOpts{ManifestHash: givenHash}, keepAlive: true, want: givenHash},
+		{name: "manifest file", opts: MountRepoOpts{ManifestFile: manFile}, keepAlive: true, want: fileHash},
+		{name: "branch", opts: MountRepoOpts{Branch: "main"}, keepAlive: true},
+		{name: "snapshot", opts: MountRepoOpts{ManifestHash: givenHash, IsSnapshot: true}, keepAlive: true},
+		{name: "keep-alive off", opts: MountRepoOpts{ManifestFile: manFile}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			casStore := remote.NewRemoteStore(inmemory.New())
+			ctx := context.Background()
+			srv := inmemory.New()
+			casStore := remote.NewRemoteStore(srv)
+			config := instance.DefaultConfig(t.TempDir())
+			config.GCKeepAlive = tt.keepAlive
 			c := &mountRepoCmd{
-				wsCmd:         &wsCmd{StoreProvider: &cmd.StoreProvider{Store: casStore}},
+				wsCmd: &wsCmd{
+					StoreProvider:  &cmd.StoreProvider{Store: casStore},
+					ConfigProvider: &cmd.ConfigProvider{Config: config},
+				},
 				MountRepoOpts: tt.opts,
 			}
 			var got fakeManifestHashes
-			require.NoError(c.setPinnedManifest(context.Background(), &got))
+			require.NoError(c.setPinnedManifest(ctx, &got))
 			if tt.want.IsZero() {
 				require.False(got.called)
+				// Nothing is stored either.
+				hdrs, err := srv.Headers(ctx, []entities.Hash{fileHash})
+				require.NoError(err)
+				require.True(hdrs[0].IsEmpty())
 				return
 			}
 			require.Equal(tt.want, got.manifest)

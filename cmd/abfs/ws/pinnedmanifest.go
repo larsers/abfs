@@ -28,12 +28,12 @@ type manifestHashesSetter interface {
 }
 
 // setPinnedManifest gives the mount the hash of the pinned manifest that this
-// command writes to .repo/pinned.xml, so the mount details link it. A manifest
-// file is stored first, because the mount details are pushed before the file
-// is written into the mount. A mount from a branch or a workspace snapshot has
-// no pinned manifest.
+// command writes to .repo/pinned.xml, so the mount details link it, when
+// gc-keepalive is on. A manifest file is stored first, because the mount
+// details are pushed before the file is written into the mount. A mount from a
+// branch or a workspace snapshot has no pinned manifest.
 func (c *mountRepoCmd) setPinnedManifest(ctx context.Context, m manifestHashesSetter) error {
-	if c.IsSnapshot || c.Store == nil {
+	if c.IsSnapshot || c.Store == nil || c.ConfigProvider == nil || c.Config == nil || !c.Config.GCKeepAlive {
 		return nil
 	}
 	h := c.ManifestHash

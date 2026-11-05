@@ -77,10 +77,10 @@ func MountRef(d *binding.MountDetails) string {
 }
 
 // NewGCKeepAlive returns the GC keep-alive of the mount at mountPoint, or nil
-// if the mount does not use a server or both intervals are zero. Call it after
-// the mount details and the mount ref are written.
+// if gc-keepalive is off, the mount does not use a server or both intervals
+// are zero. Call it after the mount details and the mount ref are written.
 func NewGCKeepAlive(info filesystem.MountInfo, details *binding.MountDetails, server string, remote GCKeepAliveRemote, mountPoint string) *GCKeepAlive {
-	if info.LocalOnly || details == nil || details.Config == nil {
+	if info.LocalOnly || details == nil || details.Config == nil || !details.Config.GCKeepAlive {
 		return nil
 	}
 	k := &GCKeepAlive{

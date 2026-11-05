@@ -31,8 +31,10 @@ func TestConfigFromFlags_GCKeepAlive(t *testing.T) {
 	var overrides instance.ConfigOptional
 	registerConfigFlags(fl, &overrides)
 
-	require.NoError(fl.Parse([]string{"--gc-keepalive-ref-interval", "30m", "--gc-keepalive-touch-interval", "0"}))
+	require.NoError(fl.Parse([]string{"--gc-keepalive", "--gc-keepalive-ref-interval", "30m", "--gc-keepalive-touch-interval", "0"}))
 
+	require.NotNil(overrides.GCKeepAlive)
+	require.True(*overrides.GCKeepAlive)
 	require.NotNil(overrides.GCKeepAliveRefInterval)
 	require.Equal(30*time.Minute, *overrides.GCKeepAliveRefInterval)
 	require.NotNil(overrides.GCKeepAliveTouchInterval)
