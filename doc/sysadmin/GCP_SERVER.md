@@ -121,6 +121,13 @@ Garbage collection is off unless it is turned on, on the servers and on the clie
 
 Off means the state before step 1. A server without `--gc` reads and writes only what a server without garbage collection does and starts on a deployment that plain `init` created; a client without `gc-keepalive` sends nothing extra. The garbage collector resources can stay in place.
 
+These changes that come with garbage collection apply even when it is off. Each makes a missing object a recoverable case instead of a failure:
+
+* `GetObject` over gRPC reports an object that disappears while it is read as not found (`NotFound`) instead of an unknown error. This applies to every server type.
+* A cached map result whose object is missing is skipped as a miss: `maps.MapExisting` tries the next result and stores its input again when none is left, and ninjago treats a missing eval response as a cache miss.
+* The git-pusher forgets the LFS objects it pushed for a project after a push of that project fails, so the next push checks them against the server again.
+* Cacheman serves a `/remote-headers` request, used only by the client keep-alive.
+
 To turn garbage collection off, restart the servers without `--gc` and turn `gc-keepalive` off. Objects added while it is off get no `gc` row, so turning it on again needs steps 2, 3 and 4 again; until the backfill ran, the consistency pass of the dry run reports the objects without a row, and a condemn mode will refuse to run while any are missing.
 
 ### Limits of the garbage collector
