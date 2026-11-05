@@ -541,6 +541,9 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 			}
 			resp, err := binding.FetchObject[binding.EvalResponse](ctx, c.abfs.Store(), hash)
 			if err != nil {
+				if c.skipMissingResp(eval, hash, err) {
+					continue
+				}
 				return false, err
 			}
 
