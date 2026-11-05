@@ -129,6 +129,8 @@ type Report struct {
 	// RefsToTombstone counts the refs that retention would tombstone.
 	RefsToTombstone int64       `json:"refs_to_tombstone"`
 	LiveMounts      MountCounts `json:"live_mounts"`
+	// Replicas reports the server replicas and their settings.
+	Replicas ReplicaReport `json:"replicas"`
 	// Roots counts the roots per class; a root without a gc row is dangling.
 	Roots       map[string]*RootCounts  `json:"roots"`
 	Objects     ObjectCounts            `json:"objects"`
@@ -294,6 +296,14 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.report = r
 	if err := d.lease.RecordSnapshot(ctx, snapshot); err != nil {
 		return nil, err
+	}
+	replicas, err := ReadReplicas(ctx, d.sp)
+	if err != nil {
+		return nil, err
+	}
+	r.Replicas = checkReplicas(replicas, snapshot, o)
+	for _, w := range r.Replicas.Warnings {
+		log.Printf("Warning: %s", w)
 	}
 
 	step := time.Now()

@@ -151,7 +151,12 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	}
 	g.metrics = reg
 	if opts.GCHeartbeatInterval > 0 {
-		s.startHeartbeat(opts.GCHeartbeatInterval, gc.ExtractorVersion)
+		s.startHeartbeat(opts.GCHeartbeatInterval, gc.Replica{
+			Version:       gc.ExtractorVersion,
+			GC:            true,
+			TouchInterval: time.Duration(g.touchInterval) * time.Second,
+			CacheTTL:      time.Duration(g.cacheTTL) * time.Second,
+		})
 	}
 	return nil
 }
@@ -443,11 +448,11 @@ func (s *GCPServer) chunkMissing(ctx context.Context, key entities.Hash, content
 	}
 }
 
-// startHeartbeat writes the heartbeat of this replica now and then every
+// startHeartbeat writes the heartbeat r of this replica now and then every
 // interval until stopGCHooks.
-func (s *GCPServer) startHeartbeat(interval time.Duration, version int64) {
-	id := gc.NewReplicaID()
-	log.Printf("GC replica ID %s, heartbeat every %s", id, interval)
+func (s *GCPServer) startHeartbeat(interval time.Duration, r gc.Replica) {
+	r.ID = gc.NewReplicaID()
+	log.Printf("GC replica ID %s, heartbeat every %s", r.ID, interval)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -455,7 +460,7 @@ func (s *GCPServer) startHeartbeat(interval time.Duration, version int64) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			s.heartbeat(ctx, id, version)
+			s.heartbeat(ctx, &r)
 			select {
 			case <-ctx.Done():
 				return
@@ -469,10 +474,10 @@ func (s *GCPServer) startHeartbeat(interval time.Duration, version int64) {
 	}
 }
 
-func (s *GCPServer) heartbeat(ctx context.Context, id string, version int64) {
+func (s *GCPServer) heartbeat(ctx context.Context, r *gc.Replica) {
 	hctx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
 	defer cancel()
-	if err := gc.WriteHeartbeat(hctx, s.casdb.SpannerClient(), id, version); err != nil && ctx.Err() == nil {
+	if err := gc.WriteHeartbeat(hctx, s.casdb.SpannerClient(), r); err != nil && ctx.Err() == nil {
 		s.gcHooks.heartbeatFailures.Add(1)
 		log.Printf("Warning: %v", err)
 	}

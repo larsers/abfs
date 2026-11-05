@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"time"
 
 	"cloud.google.com/go/spanner"
 )
@@ -38,14 +39,52 @@ func NewReplicaID() string {
 	return host + "-" + hex.EncodeToString(b)
 }
 
+// Replica is the heartbeat row of a server replica in GcReplicas.
+type Replica struct {
+	ID string
+	// Version is the GC edge extractor version the replica writes into the
+	// table gc, 0 when it writes none.
+	Version int64
+	// GC reports whether the replica runs the garbage collector hooks.
+	GC bool
+	// TouchInterval and CacheTTL are the replica's touch period and cache TTL;
+	// zero means it writes no touches or keeps cache entries without a TTL.
+	TouchInterval time.Duration
+	CacheTTL      time.Duration
+	// LastSeen is the commit time of its last heartbeat; WriteHeartbeat
+	// ignores it.
+	LastSeen time.Time
+}
+
+var replicaColumns = []string{"ReplicaId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "LastSeen"}
+
 // WriteHeartbeat records in the Spanner table GcReplicas that the server
-// replica replicaID is running and writes gc rows of the given edge extractor
-// version, 0 when it writes none.
-func WriteHeartbeat(ctx context.Context, client *spanner.Client, replicaID string, version int64) error {
-	m := spanner.InsertOrUpdate(replicasTable, []string{"ReplicaId", "Version", "LastSeen"},
-		[]any{replicaID, version, spanner.CommitTimestamp})
+// replica r is running, with its settings.
+func WriteHeartbeat(ctx context.Context, client *spanner.Client, r *Replica) error {
+	m := spanner.InsertOrUpdate(replicasTable, replicaColumns,
+		[]any{r.ID, r.Version, r.GC, int64(r.TouchInterval / time.Second), int64(r.CacheTTL / time.Second), spanner.CommitTimestamp})
 	if _, err := client.Apply(ctx, []*spanner.Mutation{m}); err != nil {
-		return fmt.Errorf("failed to write the heartbeat of replica %s: %w", replicaID, err)
+		return fmt.Errorf("failed to write the heartbeat of replica %s: %w", r.ID, err)
 	}
 	return nil
+}
+
+// ReadReplicas returns the rows of GcReplicas.
+func ReadReplicas(ctx context.Context, client *spanner.Client) ([]Replica, error) {
+	var replicas []Replica
+	err := client.Single().Read(ctx, replicasTable, spanner.AllKeys(), replicaColumns).Do(func(row *spanner.Row) error {
+		var r Replica
+		var touch, ttl int64
+		if err := row.Columns(&r.ID, &r.Version, &r.GC, &touch, &ttl, &r.LastSeen); err != nil {
+			return err
+		}
+		r.TouchInterval = time.Duration(touch) * time.Second
+		r.CacheTTL = time.Duration(ttl) * time.Second
+		replicas = append(replicas, r)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the GC replicas: %w", err)
+	}
+	return replicas, nil
 }

@@ -78,12 +78,13 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 A cycle:
 
 1. Takes the lease in `GcState`, increments the cycle number and records the start and snapshot times. While another process holds a valid lease the command fails. The lease (`--lease`, default 5 minutes) is renewed while the cycle runs, and the cycle stops itself if the lease is lost or cannot be renewed in time.
-2. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
-3. For each live mount, reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. Other revisions, such as branch names, are counted and ignored.
-4. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
-5. Marks in memory everything the roots reach. Edges to objects without a `gc` row are skipped and counted. A `gc` row with an object type the binary does not know stops the run, so run the same or a newer version than the servers.
-6. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once.
-7. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
+2. Reads the heartbeats in `GcReplicas` and warns about each server seen within the last 30 minutes whose settings break the timing rules: a `--gc-touch-interval` of 0 or longer than half of `--grace`, a `--cache-ttl` of 0, not shorter than `--cycle` or longer than the command's `--cache-ttl`, or GC edge rules older than the command's. The warnings are in the report and the log. A later condemn mode will refuse to run with any of them.
+3. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
+4. For each live mount, reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. Other revisions, such as branch names, are counted and ignored.
+5. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
+6. Marks in memory everything the roots reach. Edges to objects without a `gc` row are skipped and counted. A `gc` row with an object type the binary does not know stops the run, so run the same or a newer version than the servers.
+7. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once.
+8. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
 
 | Class | Roots | Retention |
 | --- | --- | --- |
@@ -157,7 +158,7 @@ The garbage collector runs as a separate job. With `--gc`, the server records fo
 * **Cache TTL.** The header and content caches keep an entry for `--cache-ttl` and then read it again from Bigtable, so that every server sees a marker long before the collector deletes the object. The collector needs its cycle to be longer than the TTL. A shorter TTL costs more Bigtable reads on directory listings.
 * **Missing map results.** `MapResults` leaves out results whose object does not exist, with one header lookup for all results, from the cache where it can.
 * **Missing chunks.** When a chunk of an object is missing while the server streams it, the server drops the object from its caches and reads the object row again. If the row is gone, the read fails as a missing object; if the row still lists the chunk, the content is lost and the read fails with an error that is not "missing".
-* **Heartbeat.** Each server writes its row in the Spanner table `GcReplicas` at start and every `--gc-heartbeat-interval`: an ID made of the host name and a random suffix, logged at start, the version of the GC edge rules it writes into the table `gc`, and the commit time. The collector uses it to see which server versions are running. A failed write is logged and counted; the server keeps running.
+* **Heartbeat.** Each server writes its row in the Spanner table `GcReplicas` at start and every `--gc-heartbeat-interval`: an ID made of the host name and a random suffix, logged at start, the version of the GC edge rules it writes into the table `gc`, its `--gc-touch-interval` and `--cache-ttl`, and the commit time. The collector uses it to see which server versions and settings are running. A failed write is logged and counted; the server keeps running.
 
 Cost: one Bigtable write per object and map row used, per server and touch period, batched; one conditional write and one touch per rescue.
 

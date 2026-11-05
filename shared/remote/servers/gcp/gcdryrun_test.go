@@ -379,3 +379,29 @@ func TestDryRunGC_LeaseRefusesSecondRun(t *testing.T) {
 	require.Equal(int64(2), res.Report.Cycle)
 	require.Equal("second", res.Report.Holder)
 }
+
+// The dry run warns about live replicas whose settings break the timing
+// rules, and ignores replicas that stopped.
+func TestDryRunGC_ChecksReplicaSettings(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newGCFixture(t)
+	sp := f.s.casdb.SpannerClient()
+	good := gc.Replica{ID: "good", Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}
+	require.NoError(gc.WriteHeartbeat(ctx, sp, &good))
+	bad := good
+	bad.ID, bad.TouchInterval, bad.CacheTTL = "bad", 72*time.Hour, 30*time.Hour
+	require.NoError(gc.WriteHeartbeat(ctx, sp, &bad))
+	_, err := sp.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcReplicas",
+		[]string{"ReplicaId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "LastSeen"},
+		[]any{"stopped", int64(0), true, int64(0), int64(0), f.now.Add(-2 * time.Hour)})})
+	require.NoError(err)
+
+	r := f.run(nil).Report
+	require.Equal(int64(2), r.Replicas.Live)
+	require.Equal(int64(1), r.Replicas.Stale)
+	require.Len(r.Replicas.Warnings, 2)
+	for _, w := range r.Replicas.Warnings {
+		require.Contains(w, "replica bad: ")
+	}
+}

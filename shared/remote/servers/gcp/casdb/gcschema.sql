@@ -36,9 +36,13 @@ CREATE TABLE IF NOT EXISTS GcState (
 ) PRIMARY KEY (Name);
 
 -- One heartbeat row per server replica. Version is the GC edge extractor
--- version the replica writes into the Bigtable table gc.
+-- version the replica writes into the Bigtable table gc; GcEnabled, the touch
+-- period and the cache TTL are its settings, zero meaning off.
 CREATE TABLE IF NOT EXISTS GcReplicas (
     ReplicaId STRING(MAX) NOT NULL,
     Version INT64 NOT NULL,
+    GcEnabled BOOL NOT NULL,
+    TouchIntervalSeconds INT64 NOT NULL,
+    CacheTTLSeconds INT64 NOT NULL,
     LastSeen TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
 ) PRIMARY KEY (ReplicaId);

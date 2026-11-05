@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigtable"
-	"cloud.google.com/go/spanner"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -481,22 +480,22 @@ func TestGCHooks_Heartbeat(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	s := newEmulatorCASDBServer(t)
-	require.NoError(s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Hour}))
+	require.NoError(s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Hour, GCTouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 
-	var version int64
-	var lastSeen time.Time
+	var replicas []gc.Replica
 	require.Eventually(func() bool {
-		rows := 0
-		err := s.casdb.SpannerClient().Single().Query(ctx, spanner.Statement{SQL: "SELECT Version, LastSeen FROM GcReplicas"}).Do(func(r *spanner.Row) error {
-			rows++
-			return r.Columns(&version, &lastSeen)
-		})
+		var err error
+		replicas, err = gc.ReadReplicas(ctx, s.casdb.SpannerClient())
 		require.NoError(err)
-		return rows == 1
+		return len(replicas) == 1
 	}, 10*time.Second, 50*time.Millisecond)
-	require.Equal(int64(gc.ExtractorVersion), version)
-	require.WithinDuration(time.Now(), lastSeen, time.Minute)
+	r := replicas[0]
+	require.Equal(int64(gc.ExtractorVersion), r.Version)
+	require.True(r.GC)
+	require.Equal(36*time.Hour, r.TouchInterval)
+	require.Equal(6*time.Hour, r.CacheTTL)
+	require.WithinDuration(time.Now(), r.LastSeen, time.Minute)
 	require.Zero(s.gcHooks.heartbeatFailures.Load())
 }
 
