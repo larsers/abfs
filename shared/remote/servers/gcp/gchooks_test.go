@@ -16,9 +16,11 @@ package gcp
 
 import (
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
@@ -240,6 +242,33 @@ func TestGCHooks_TouchThrottle(t *testing.T) {
 	_, err = s.Headers(ctx, []entities.Hash{key})
 	require.NoError(err)
 	require.Equal(int64(1), written(), "no touch in the next period")
+}
+
+// The keep-alive of a large mount sends batches of 50,000 cached keys back to
+// back. Every hit gets its touch.
+func TestGCHooks_HeadersBurstDropsNoTouches(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
+	const n = 200000
+	var err error
+	s.headers, err = newShardedCache[CachedHeader](2 * n)
+	require.NoError(err)
+	keys := make([]entities.Hash, n)
+	for i := range keys {
+		keys[i] = entities.Hash(sha1.Sum(fmt.Appendf(nil, "burst %d", i)))
+		s.headers[keys[i][0]].Add(keys[i], newCachedHeader(&ObjectHeader{Id: keys[i], Type: "blob", Size: 1}))
+	}
+
+	for batch := range slices.Chunk(keys, 50000) {
+		hdrs, err := s.Headers(ctx, batch)
+		require.NoError(err)
+		for _, h := range hdrs {
+			require.False(h.IsEmpty())
+		}
+	}
+	s.gcHooks.toucher.Close()
+	require.Equal(gc.TouchStats{Written: n}, s.gcHooks.toucher.Stats())
 }
 
 func TestGCHooks_GetObjectTouches(t *testing.T) {

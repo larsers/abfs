@@ -34,6 +34,13 @@ const (
 	touchBatchSize     = 1000
 	touchFlushInterval = time.Second
 	touchWriteTimeout  = 10 * time.Second
+	// touchWorkers write batches in parallel, so that a burst of hits, such as
+	// the keep-alive of a large mount, drains at the rate of several writers.
+	touchWorkers = 4
+	// touchEnqueueWait is how long a touch waits for room in a full buffer
+	// before it is dropped. The wait slows the call that found the objects to
+	// the rate the workers write.
+	touchEnqueueWait = 500 * time.Millisecond
 	// The rows of the table maps, as casdb.AddMapResult writes them.
 	mapsTableName = "maps"
 	mapsFamily    = "cf"
@@ -43,7 +50,7 @@ const (
 type TouchStats struct {
 	// Written counts the touches written.
 	Written int64
-	// Dropped counts the touches dropped because the buffer was full.
+	// Dropped counts the touches dropped because the buffer stayed full.
 	Dropped int64
 	// Failed counts the touches that could not be written.
 	Failed int64
@@ -56,20 +63,25 @@ type touch struct {
 
 // Toucher writes touches in the background: the touch cell of an object's gc
 // row, and the cell of a map row, whose timestamp then records the last use.
-// Touches wait in a bounded buffer and are written in batches; when the buffer
-// is full, a touch is dropped. The cells get server timestamps, so all
-// replicas write on one clock.
+// Touches wait in a bounded buffer and are written in batches by several
+// workers. When the buffer is full, a touch waits up to touchEnqueueWait for
+// room and is then dropped; after such a timeout, touches are dropped without
+// waiting until the buffer has room again, so that writes that stall delay
+// the calls only once. The cells get server timestamps, so all replicas write
+// on one clock.
 type Toucher struct {
-	gcTable   *bigtable.Table
-	mapsTable *bigtable.Table
-	queue     chan touch
-	retryWait time.Duration
-	stop      chan struct{}
-	stopOnce  sync.Once
-	done      chan struct{}
-	written   atomic.Int64
-	dropped   atomic.Int64
-	failed    atomic.Int64
+	gcTable     *bigtable.Table
+	mapsTable   *bigtable.Table
+	queue       chan touch
+	retryWait   time.Duration
+	enqueueWait time.Duration
+	stalled     atomic.Bool
+	stop        chan struct{}
+	stopOnce    sync.Once
+	done        chan struct{}
+	written     atomic.Int64
+	dropped     atomic.Int64
+	failed      atomic.Int64
 }
 
 // NewToucher returns a running Toucher for the tables of client's instance that
@@ -82,23 +94,24 @@ func NewToucher(client *bigtable.Client, size int) *Toucher {
 
 func newToucher(client *bigtable.Client, size int) *Toucher {
 	return &Toucher{
-		gcTable:   client.Open(TableName),
-		mapsTable: client.Open(mapsTableName),
-		queue:     make(chan touch, size),
-		retryWait: firstRetryWait,
-		stop:      make(chan struct{}),
-		done:      make(chan struct{}),
+		gcTable:     client.Open(TableName),
+		mapsTable:   client.Open(mapsTableName),
+		queue:       make(chan touch, size),
+		retryWait:   firstRetryWait,
+		enqueueWait: touchEnqueueWait,
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 }
 
 // TouchObject queues a touch of the object key. It returns false when the
-// buffer is full and the touch was dropped.
+// buffer stayed full and the touch was dropped.
 func (t *Toucher) TouchObject(key Hash) bool {
 	return t.add(touch{row: key.String()})
 }
 
 // TouchMapRow queues a rewrite of the cell of the map row with the given key. It
-// returns false when the buffer is full and the touch was dropped.
+// returns false when the buffer stayed full and the touch was dropped.
 func (t *Toucher) TouchMapRow(row string) bool {
 	return t.add(touch{mapRow: true, row: row})
 }
@@ -106,11 +119,25 @@ func (t *Toucher) TouchMapRow(row string) bool {
 func (t *Toucher) add(tc touch) bool {
 	select {
 	case t.queue <- tc:
+		if t.stalled.Load() {
+			t.stalled.Store(false)
+		}
 		return true
 	default:
-		t.dropped.Add(1)
-		return false
 	}
+	if !t.stalled.Load() {
+		timer := time.NewTimer(t.enqueueWait)
+		defer timer.Stop()
+		select {
+		case t.queue <- tc:
+			return true
+		case <-timer.C:
+			t.stalled.Store(true)
+		case <-t.stop:
+		}
+	}
+	t.dropped.Add(1)
+	return false
 }
 
 // Stats returns the counts of the touches so far.
@@ -131,6 +158,14 @@ func (t *Toucher) Close() {
 
 func (t *Toucher) run() {
 	defer close(t.done)
+	var wg sync.WaitGroup
+	for range touchWorkers {
+		wg.Go(t.work)
+	}
+	wg.Wait()
+}
+
+func (t *Toucher) work() {
 	ticker := time.NewTicker(touchFlushInterval)
 	defer ticker.Stop()
 	batch := make([]touch, 0, touchBatchSize)

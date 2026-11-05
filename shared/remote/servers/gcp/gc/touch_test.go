@@ -16,6 +16,8 @@ package gc
 
 import (
 	"context"
+	"crypto/sha1"
+	"fmt"
 	"testing"
 	"time"
 
@@ -73,6 +75,14 @@ func cellTime(t *testing.T, client *bigtable.Client, table, row, family, column 
 	return 0, false
 }
 
+func testHashes(n int) []Hash {
+	hashes := make([]Hash, n)
+	for i := range hashes {
+		hashes[i] = Hash(sha1.Sum(fmt.Appendf(nil, "%d", i)))
+	}
+	return hashes
+}
+
 func TestToucher_WritesObjectAndMapRowTouches(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -103,23 +113,61 @@ func TestToucher_DropsWhenTheBufferIsFull(t *testing.T) {
 	require := require.New(t)
 	client := newHooksTestBigtable(t)
 	toucher := newToucher(client, 2)
+	toucher.enqueueWait = 50 * time.Millisecond
 	keys := []Hash{
 		entities.NewHash("1111111111111111111111111111111111111111"),
 		entities.NewHash("2222222222222222222222222222222222222222"),
 		entities.NewHash("3333333333333333333333333333333333333333"),
+		entities.NewHash("5555555555555555555555555555555555555555"),
 	}
 	require.True(toucher.TouchObject(keys[0]))
 	require.True(toucher.TouchObject(keys[1]))
+	start := time.Now()
 	require.False(toucher.TouchObject(keys[2]))
-	require.Equal(TouchStats{Dropped: 1}, toucher.Stats())
+	require.GreaterOrEqual(time.Since(start), toucher.enqueueWait, "dropped without waiting for room")
+	// After a timeout, touches are dropped at once until there is room again.
+	start = time.Now()
+	require.False(toucher.TouchObject(keys[3]))
+	require.Less(time.Since(start), toucher.enqueueWait)
+	require.Equal(TouchStats{Dropped: 2}, toucher.Stats())
 
 	go toucher.run()
 	toucher.Close()
-	require.Equal(TouchStats{Written: 2, Dropped: 1}, toucher.Stats())
+	require.Equal(TouchStats{Written: 2, Dropped: 2}, toucher.Stats())
 	for i, key := range keys {
 		_, ok := cellTime(t, client, TableName, key.String(), TouchFamily, TouchColumn)
 		require.Equal(i < 2, ok, key)
 	}
+}
+
+func TestToucher_WaitsForRoom(t *testing.T) {
+	require := require.New(t)
+	client := newHooksTestBigtable(t)
+	toucher := newToucher(client, 1)
+	keys := testHashes(3)
+	require.True(toucher.TouchObject(keys[0]))
+	toucher.stalled.Store(true)
+	require.False(toucher.TouchObject(keys[1]))
+
+	// A touch that waits gets the room that a starting worker makes.
+	toucher.stalled.Store(false)
+	time.AfterFunc(50*time.Millisecond, func() { go toucher.run() })
+	require.True(toucher.TouchObject(keys[1]))
+	require.Eventually(func() bool { return toucher.TouchObject(keys[2]) }, 5*time.Second, 10*time.Millisecond)
+	toucher.Close()
+	require.Equal(TouchStats{Written: 3, Dropped: 1}, toucher.Stats())
+}
+
+func TestToucher_DrainsABurst(t *testing.T) {
+	require := require.New(t)
+	client := newHooksTestBigtable(t)
+	toucher := NewToucher(client, 1000)
+	keys := testHashes(50000)
+	for _, key := range keys {
+		require.True(toucher.TouchObject(key))
+	}
+	toucher.Close()
+	require.Equal(TouchStats{Written: int64(len(keys))}, toucher.Stats())
 }
 
 func TestToucher_FlushesWhileRunning(t *testing.T) {
