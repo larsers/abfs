@@ -53,7 +53,7 @@ type gcpCmd struct {
 	clientMetrics         bool
 	linksContent          bool
 	linksContentThreshold int64
-	gcEdges               bool
+	gc                    bool
 	cacheTTL              time.Duration
 	gcTouchInterval       time.Duration
 	gcHeartbeatInterval   time.Duration
@@ -85,10 +85,10 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.clientMetrics, "gcp-client-metrics", false, "Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring")
 	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
 	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
-	fl.BoolVar(&c.gcEdges, "gc-edges", true, "Write the GC edges of each new object to the Bigtable table gc, which the garbage collector reads. Objects added with this off need 'abfs server gcp gc backfill' before a garbage collection")
-	fl.DurationVar(&c.cacheTTL, "cache-ttl", gcp.DefaultCacheTTL, "How long cached object headers and content are used before they are read again from Bigtable (0 keeps them until they are evicted). The garbage collector needs it shorter than its cycle")
-	fl.DurationVar(&c.gcTouchInterval, "gc-touch-interval", gcp.DefaultGCTouchInterval, "Length of the period in which the server records at most one use of each object and map row for the garbage collector (0 disables these writes)")
-	fl.DurationVar(&c.gcHeartbeatInterval, "gc-heartbeat-interval", gcp.DefaultGCHeartbeatInterval, "Time between two heartbeats of this server in the Spanner table GcReplicas, which the garbage collector reads (0 disables them)")
+	fl.BoolVar(&c.gc, "gc", false, "Run the server side of the garbage collector: write the GC edges of new objects to the Bigtable table gc, rescue condemned objects that are used, and apply --cache-ttl, --gc-touch-interval and --gc-heartbeat-interval. Needs the resources of 'abfs server gcp init --gc'")
+	fl.DurationVar(&c.cacheTTL, "cache-ttl", gcp.DefaultCacheTTL, "With --gc, how long cached object headers and content are used before they are read again from Bigtable (0 keeps them until they are evicted). The garbage collector needs it shorter than its cycle")
+	fl.DurationVar(&c.gcTouchInterval, "gc-touch-interval", gcp.DefaultGCTouchInterval, "With --gc, length of the period in which the server records at most one use of each object and map row for the garbage collector (0 disables these writes)")
+	fl.DurationVar(&c.gcHeartbeatInterval, "gc-heartbeat-interval", gcp.DefaultGCHeartbeatInterval, "With --gc, time between two heartbeats of this server in the Spanner table GcReplicas, which the garbage collector reads (0 disables them)")
 }
 
 func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -119,7 +119,7 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		ClientMetrics:         c.clientMetrics,
 		LinksContent:          c.linksContent,
 		LinksContentThreshold: c.linksContentThreshold,
-		NoGCEdges:             !c.gcEdges,
+		GC:                    c.gc,
 		CacheTTL:              c.cacheTTL,
 		GCTouchInterval:       c.gcTouchInterval,
 		GCHeartbeatInterval:   c.gcHeartbeatInterval,
@@ -143,11 +143,12 @@ type gcpInitCmd struct {
 func (c *gcpInitCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "init",
-		Usage: "--project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
+		Usage: "--project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--gc]",
 		Desc: `Prepare the Spanner and Bigtable instances and the bucket of a GCP-backed ABFS server.
 Creates the Spanner database, its schema and the Bigtable tables when they are missing and
 checks that the bucket exists. The instances and the bucket must exist. Existing data is
-kept, so it is safe to run again, for example after an upgrade.`,
+kept, so it is safe to run again, for example after an upgrade. With --gc it also creates
+the tables of the garbage collector.`,
 	}
 }
 
@@ -157,6 +158,7 @@ func (c *gcpInitCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.opts.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.opts.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.opts.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table gc, the column family g of the table objects and the Spanner tables GcState and GcReplicas")
 }
 
 func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {

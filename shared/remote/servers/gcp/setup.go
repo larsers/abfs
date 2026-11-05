@@ -29,16 +29,14 @@ import (
 )
 
 // bigtableTables lists the Bigtable tables of the server and their column
-// families. The family g of objects and the table gc belong to the garbage
-// collector.
+// families.
 var bigtableTables = []struct {
 	name     string
 	families []string
 }{
-	{"objects", []string{"meta", "data", "g"}},
+	{"objects", []string{"meta", "data"}},
 	{"maps", []string{"cf"}},
 	{"chunks", []string{"data"}},
-	{"gc", []string{"e", "t"}},
 }
 
 type SetupOpts struct {
@@ -47,6 +45,8 @@ type SetupOpts struct {
 	DatabaseID string
 	BtInstance string
 	BucketName string
+	// GC also creates the tables and column families of the garbage collector.
+	GC bool
 }
 
 // Setup prepares existing Spanner and Bigtable instances and a bucket for the
@@ -55,16 +55,16 @@ type SetupOpts struct {
 // data, so it can run again after an upgrade.
 func Setup(ctx context.Context, opts *SetupOpts) error {
 	spannerDB := fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID)
-	if err := casdb.SetupSchema(ctx, spannerDB); err != nil {
+	if err := casdb.SetupSchema(ctx, spannerDB, opts.GC); err != nil {
 		return err
 	}
-	if err := setupBigtable(ctx, opts.ProjectID, opts.BtInstance); err != nil {
+	if err := setupBigtable(ctx, opts.ProjectID, opts.BtInstance, opts.GC); err != nil {
 		return err
 	}
 	return checkBucket(ctx, opts.BucketName)
 }
 
-func setupBigtable(ctx context.Context, project, instance string) error {
+func setupBigtable(ctx context.Context, project, instance string, gc bool) error {
 	admin, err := bigtable.NewAdminClient(ctx, project, instance)
 	if err != nil {
 		return fmt.Errorf("failed to create the Bigtable admin client: %w", err)
@@ -75,7 +75,7 @@ func setupBigtable(ctx context.Context, project, instance string) error {
 	if err != nil {
 		return fmt.Errorf("failed to list the tables of Bigtable instance %s: %w", instance, err)
 	}
-	for _, table := range bigtableTables {
+	for _, table := range serverTables(gc) {
 		if !slices.Contains(existing, table.name) {
 			if err := admin.CreateTable(ctx, table.name); err != nil {
 				return fmt.Errorf("failed to create Bigtable table %s: %w", table.name, err)

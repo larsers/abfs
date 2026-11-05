@@ -72,8 +72,9 @@ func (c *gcpGCBackfillCmd) Spec() cmd.CmdSpec {
 		Desc: `Write the GC edges of existing objects to the Bigtable table gc.
 Scans the objects table and writes the gc row of every object whose row is missing or
 was written by an older edge extractor, reading and decoding every such object that is
-not a blob. Objects that a server with --gc-edges added have their rows already. The scan
-can stop at any time; run it again with --start set to the printed resume key.`,
+not a blob. Objects that a server with --gc added have their rows already. The scan can
+stop at any time; run it again with --start set to the printed resume key. Needs the
+resources of 'abfs server gcp init --gc'.`,
 	}
 }
 
@@ -98,6 +99,7 @@ func (c *gcpGCBackfillCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return err
 	}
 	// The scan reads each object once, so caching them only costs memory.
+	c.server.GC = true
 	c.server.MaxCachedHeaders = 1
 	c.server.MaxCachedContents = 1
 	server, err := gcp.New(ctx, &c.server)
@@ -154,7 +156,8 @@ func (c *gcpGCRunCmd) Spec() cmd.CmdSpec {
 reads the refs at one snapshot, scans the gc and maps tables, marks what the roots, the
 retention rules and the grace keep, and reports what a collection would remove as JSON. It
 writes nothing but the garbage collector state in Spanner. With --consistency it also scans
-the meta family of the objects table to check that every object has a gc row.`,
+the meta family of the objects table to check that every object has a gc row. Needs the
+resources of 'abfs server gcp init --gc'.`,
 	}
 }
 
@@ -193,6 +196,7 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	}
 	// The run reads only the mount details and pinned manifests of live
 	// mounts, once each.
+	c.server.GC = true
 	c.server.MaxCachedHeaders = 1
 	c.server.MaxCachedContents = 1
 	server, err := gcp.New(ctx, &c.server)

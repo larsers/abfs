@@ -62,9 +62,16 @@ func randomID(t *testing.T, prefix string) string {
 	return prefix + hex.EncodeToString(b)
 }
 
-// newEmulatorDatabase creates a database with the server schema on the Spanner
-// emulator and returns its ID.
+// newEmulatorDatabase creates a database with the server schema and the
+// garbage collector tables on the Spanner emulator and returns its ID.
 func newEmulatorDatabase(t *testing.T) string {
+	t.Helper()
+	return newEmulatorDatabaseWith(t, append(casdb.SchemaStatements(), casdb.GCSchemaStatements()...))
+}
+
+// newEmulatorDatabaseWith creates a database with the given DDL on the Spanner
+// emulator and returns its ID.
+func newEmulatorDatabaseWith(t *testing.T, ddl []string) string {
 	t.Helper()
 	requireSpannerEmulator(t)
 	ctx := context.Background()
@@ -95,7 +102,7 @@ func newEmulatorDatabase(t *testing.T) string {
 	dop, err := dc.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          fmt.Sprintf("projects/%s/instances/%s", emulatorProject, emulatorInstance),
 		CreateStatement: "CREATE DATABASE `" + dbID + "`",
-		ExtraStatements: casdb.SchemaStatements(),
+		ExtraStatements: ddl,
 	})
 	require.NoError(t, err)
 	_, err = dop.Wait(ctx)
@@ -103,14 +110,21 @@ func newEmulatorDatabase(t *testing.T) string {
 	return dbID
 }
 
-// newEmulatorBigtable starts an in-process Bigtable with the server tables.
+// newEmulatorBigtable starts an in-process Bigtable with the server tables and
+// those of the garbage collector.
 func newEmulatorBigtable(t *testing.T) {
+	t.Helper()
+	newEmulatorBigtableWith(t, serverTables(true))
+}
+
+// newEmulatorBigtableWith starts an in-process Bigtable with the given tables.
+func newEmulatorBigtableWith(t *testing.T, tables []tableFamilies) {
 	t.Helper()
 	newEmptyEmulatorBigtable(t)
 	adm, err := bigtable.NewAdminClient(context.Background(), emulatorProject, emulatorBigtable)
 	require.NoError(t, err)
 	defer adm.Close()
-	for _, table := range bigtableTables {
+	for _, table := range tables {
 		require.NoError(t, adm.CreateTable(context.Background(), table.name))
 		for _, f := range table.families {
 			require.NoError(t, adm.CreateColumnFamily(context.Background(), table.name, f))

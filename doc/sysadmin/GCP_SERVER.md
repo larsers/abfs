@@ -11,12 +11,12 @@ The GCP server is a CAS server that keeps its data in Google Cloud instead of a 
 | Map results | Bigtable table `maps` |
 | The first 1 MiB of larger objects | Bigtable table `chunks` |
 | The rest of larger objects | Cloud Storage bucket, in objects of 10 MiB and then 1000 MiB |
-| The GC edges of each object: the objects it references | Bigtable table `gc` |
-| Garbage collector state | Spanner tables `GcState` and `GcReplicas`, Bigtable family `objects:g` |
+| With `--gc`: the GC edges of each object, the objects it references | Bigtable table `gc` |
+| With `--gc`: garbage collector state | Spanner tables `GcState` and `GcReplicas`, Bigtable family `objects:g` |
 
 ## Limits
 
-* Nothing is ever deleted: there is no garbage collection yet. The `gc` table and the other garbage collector resources prepare for it. Plan storage for growth.
+* Nothing is ever deleted: there is no garbage collection yet. The server flag `--gc` and the resources of `abfs server gcp init --gc` prepare for it; without them the server behaves as one without garbage collection. Plan storage for growth.
 * Some content is stored but never referenced. When an upload fails after the server tried to write the object row, the server cannot tell whether the row was written, so it keeps the content. Concurrent uploads of the same object keep the content of every upload, though only one is referenced. This content is left for a later orphan sweep, which ABFS does not have yet.
 * Bigtable must be read and written through single-cluster routing: an instance with one cluster, or an app profile with single-cluster routing (`--bt-app-profile`). With multi-cluster routing a server can report objects another server has just written as missing: uploads that link them fail until the client retries, objects can be stored again, and map results can be missed. Refs are in Spanner and are not affected.
 * Map results come back oldest first by the time each server added them, so with several servers the order of results added close together follows the servers' clock skew.
@@ -50,14 +50,16 @@ Create these with your usual tooling, in one region:
 `abfs server gcp init` creates the Spanner database and its schema and the Bigtable tables and column families when they are missing, and checks that the bucket exists. It keeps existing data, so run it again after each upgrade:
 
 ```sh
-abfs server gcp init --project <project> --instance <spanner-instance> --bucket <bucket> [--db cas] [--bt-instance objects]
+abfs server gcp init --project <project> --instance <spanner-instance> --bucket <bucket> [--db cas] [--bt-instance objects] [--gc]
 ```
 
-The server checks the same resources at startup and stops with an error that names the missing one.
+With `--gc`, init also creates the garbage collector resources: the Bigtable table `gc`, the column family `g` of `objects` and the Spanner tables `GcState` and `GcReplicas`. Without it, init creates only the server's own resources. Running it again with `--gc` adds the garbage collector resources to an existing deployment.
+
+The server checks the same resources at startup and stops with an error that names the missing one; with `--gc` it also checks the garbage collector resources. The `abfs server gcp gc` commands need them and refuse to run without them.
 
 ### Fill the gc table
 
-With `--gc-edges` on, the default, the server writes the `gc` row of each object it adds. Objects added before that, or while it was off, have none. `abfs server gcp gc backfill` scans the `objects` table and writes the missing rows, and the rows written by an older version of the edge rules; it reads every such object that is not a blob:
+With `--gc` on, the server writes the `gc` row of each object it adds. Objects added before that, or while it was off, have none. `abfs server gcp gc backfill` scans the `objects` table and writes the missing rows, and the rows written by an older version of the edge rules; it reads every such object that is not a blob:
 
 ```sh
 abfs server gcp gc backfill --project <project> --instance <spanner-instance> --bucket <bucket> [--dry-run] [--rate 2000] [--shards 16]
@@ -131,10 +133,10 @@ abfs-server --port 50051 --project <project> --instance <spanner-instance> --buc
 | `--links-content` | off | Return signed Cloud Storage URLs, valid for 10 minutes, for objects larger than `--links-content-threshold`, so that clients download them from Cloud Storage directly. Clients then need access to `storage.googleapis.com`, and the server signs one URL per Cloud Storage object on every read. Without it, the server streams every object. |
 | `--links-content-threshold` | `1048576` | Size in bytes above which `--links-content` returns URLs |
 | `--gcp-client-metrics` | off | Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring |
-| `--gc-edges` | on | Write the GC edges of each new object to the Bigtable table `gc` before its object row. This adds one Bigtable write to each upload. |
-| `--cache-ttl` | `6h` | How long cached object headers and content are used before the server reads them again from Bigtable; `0` keeps them until they are evicted. See [What the server does for the garbage collector](#what-the-server-does-for-the-garbage-collector). |
-| `--gc-touch-interval` | `36h` | Length of the period in which the server writes at most one touch per object and map row; `0` writes none |
-| `--gc-heartbeat-interval` | `5m` | Time between two heartbeats of the server in the Spanner table `GcReplicas`; `0` writes none |
+| `--gc` | off | Run the server side of the garbage collector, described in [What the server does for the garbage collector](#what-the-server-does-for-the-garbage-collector). It needs the resources of `abfs server gcp init --gc`. Off, the server reads and writes only what a server without garbage collection does, and the three flags below have no effect. |
+| `--cache-ttl` | `6h` | With `--gc`, how long cached object headers and content are used before the server reads them again from Bigtable; `0` keeps them until they are evicted |
+| `--gc-touch-interval` | `36h` | With `--gc`, length of the period in which the server writes at most one touch per object and map row; `0` writes none |
+| `--gc-heartbeat-interval` | `5m` | With `--gc`, time between two heartbeats of the server in the Spanner table `GcReplicas`; `0` writes none |
 | `--no-link-validation`, `--no-hash-validation` | off | As for the file-based server |
 | `--http-host` | `localhost` | Address of the HTTP server (`--http-port`). Its endpoints, such as `/debug` and `/server/status`, have no authentication. |
 
@@ -146,14 +148,16 @@ Several servers can share the same database, tables and bucket. Put them behind 
 
 ## What the server does for the garbage collector
 
-The garbage collector runs as a separate job. The server records for it which objects are used, and keeps objects that the collector marked for deletion when they are used again. Nothing in the server deletes data.
+The garbage collector runs as a separate job. With `--gc`, the server records for it which objects are used, and keeps objects that the collector marked for deletion when they are used again. Nothing in the server deletes data. Without `--gc` none of the following happens.
+
+* **GC edges.** `PutObject` writes the `gc` row of each new object, with the GC edges, before its object row. This adds one Bigtable write to each upload. A failed `gc` row write fails the upload.
 
 * **Rescue.** The collector marks an object it plans to delete with the cell `g:condemned` of its `objects` row. The server reads that cell with every object row it reads: in `Headers`, the existence check of `PutObject`, the link checks of `PutObject`, `PutRefs`, `XchgRefs` and `AddMapResult`, `GetObject` and `MapResults`. On a marked row it clears the marker, but only while the marker still holds the value it read, writes a touch, and answers as for any other object. When the collector deleted the row first, the object is missing, and a client that writes it stores it again.
 * **Touches.** When a call finds an object (`Headers`, the existence check of `PutObject`, the link checks, the results of `MapResults`), the server writes the cell `t:touch` of the object's row in the table `gc`, with a Bigtable server timestamp. Each server writes at most one touch per object in each period of `--gc-touch-interval`, counted from the server start, so an object in use has a touch younger than the interval. `MapResults` also writes the cell of each map row it returns again, with the same limit, so the timestamp of a map row is the time it was last used. Map results therefore come back in the order of their last use, oldest first, instead of the order they were added. ninjago tries the newest result first, so builds are not affected. Touches wait in a buffer of 100,000 and are written in batches about once a second. When the buffer is full, touches are dropped and counted; the next use writes them.
 * **Cache TTL.** The header and content caches keep an entry for `--cache-ttl` and then read it again from Bigtable, so that every server sees a marker long before the collector deletes the object. The collector needs its cycle to be longer than the TTL. A shorter TTL costs more Bigtable reads on directory listings.
 * **Missing map results.** `MapResults` leaves out results whose object does not exist, with one header lookup for all results, from the cache where it can.
 * **Missing chunks.** When a chunk of an object is missing while the server streams it, the server drops the object from its caches and reads the object row again. If the row is gone, the read fails as a missing object; if the row still lists the chunk, the content is lost and the read fails with an error that is not "missing".
-* **Heartbeat.** Each server writes its row in the Spanner table `GcReplicas` at start and every `--gc-heartbeat-interval`: an ID made of the host name and a random suffix, logged at start, the version of the GC edge rules it writes into the table `gc` (0 with `--gc-edges=false`), and the commit time. The collector uses it to see which server versions are running. A failed write is logged and counted; the server keeps running.
+* **Heartbeat.** Each server writes its row in the Spanner table `GcReplicas` at start and every `--gc-heartbeat-interval`: an ID made of the host name and a random suffix, logged at start, the version of the GC edge rules it writes into the table `gc`, and the commit time. The collector uses it to see which server versions are running. A failed write is logged and counted; the server keeps running.
 
 Cost: one Bigtable write per object and map row used, per server and touch period, batched; one conditional write and one touch per rescue.
 

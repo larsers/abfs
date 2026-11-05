@@ -28,18 +28,33 @@ import (
 func TestGCPFlags_GCHooks(t *testing.T) {
 	tests := []struct {
 		args           []string
+		gc             bool
 		ttl, touch, hb time.Duration
 	}{
-		{nil, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval, gcp.DefaultGCHeartbeatInterval},
-		{[]string{"--cache-ttl=0", "--gc-touch-interval=0", "--gc-heartbeat-interval=1m"}, 0, 0, time.Minute},
+		{nil, false, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval, gcp.DefaultGCHeartbeatInterval},
+		{[]string{"--gc", "--cache-ttl=0", "--gc-touch-interval=0", "--gc-heartbeat-interval=1m"}, true, 0, 0, time.Minute},
 	}
 	for _, tt := range tests {
 		cmd := NewStandaloneGCPServerCmd(root.NewRootCommand())
 		fl := pflag.NewFlagSet("abfs-server", pflag.ContinueOnError)
 		cmd.RegisterFlags(fl)
 		require.NoError(t, fl.Parse(tt.args))
+		require.Equal(t, tt.gc, cmd.gcpCmd.gc)
 		require.Equal(t, tt.ttl, cmd.gcpCmd.cacheTTL)
 		require.Equal(t, tt.touch, cmd.gcpCmd.gcTouchInterval)
 		require.Equal(t, tt.hb, cmd.gcpCmd.gcHeartbeatInterval)
+	}
+}
+
+func TestGCPInitFlags_GC(t *testing.T) {
+	for _, tt := range []struct {
+		args []string
+		gc   bool
+	}{{nil, false}, {[]string{"--gc"}, true}} {
+		cmd := &gcpInitCmd{RootCmd: root.NewRootCommand()}
+		fl := pflag.NewFlagSet("init", pflag.ContinueOnError)
+		cmd.RegisterFlags(fl)
+		require.NoError(t, fl.Parse(tt.args))
+		require.Equal(t, tt.gc, cmd.opts.GC)
 	}
 }

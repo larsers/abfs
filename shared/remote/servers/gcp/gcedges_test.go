@@ -145,7 +145,7 @@ func TestPutObject_FailedGCRowFailsPut(t *testing.T) {
 	require.Eventually(func() bool { return rec.removedCount() == 1 }, 2*time.Second, 10*time.Millisecond)
 }
 
-func TestPutObject_NoGCEdges(t *testing.T) {
+func TestPutObject_GCOffWritesNoGCRow(t *testing.T) {
 	require := require.New(t)
 	s, _ := createTestServerWithCASDB(t)
 	createGCTable(t)
@@ -155,9 +155,9 @@ func TestPutObject_NoGCEdges(t *testing.T) {
 	require.Nil(readGCRow(t, s, key))
 }
 
-func TestNew_GCEdgesOption(t *testing.T) {
+func TestNew_GCOption(t *testing.T) {
 	require := require.New(t)
-	s := newEmulatorServer(t, nil)
+	s := newEmulatorServer(t, &NewServerOpts{GC: true})
 	require.NotNil(s.gcEdges)
 	// New adds the empty file and directory through PutObject.
 	for _, key := range []entities.Hash{entities.EmptyFileHash, entities.EmptyDirHash} {
@@ -166,5 +166,10 @@ func TestNew_GCEdgesOption(t *testing.T) {
 		require.Empty(r.Edges)
 	}
 
-	require.Nil(newEmulatorServer(t, &NewServerOpts{NoGCEdges: true}).gcEdges)
+	s = newEmulatorServer(t, nil)
+	require.Nil(s.gcEdges)
+	require.False(s.gcHooks.on)
+	for _, key := range []entities.Hash{entities.EmptyFileHash, entities.EmptyDirHash} {
+		require.Nil(readGCRow(t, s, key))
+	}
 }

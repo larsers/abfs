@@ -17,8 +17,6 @@ package gcp
 import (
 	"context"
 	"fmt"
-	"slices"
-	"strings"
 	"testing"
 
 	"cloud.google.com/go/bigtable"
@@ -129,37 +127,41 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	newEmptyEmulatorBigtable(t)
 	opts := setupOpts(t, randomID(t, "t"))
 
-	// The resources as init created them before the garbage collector.
-	preGCSchema := slices.DeleteFunc(casdb.SchemaStatements(), func(s string) bool { return strings.Contains(s, "EXISTS Gc") })
-	require.Len(preGCSchema, len(casdb.SchemaStatements())-2)
-	createDatabase(t, opts, preGCSchema)
-	adm, err := bigtable.NewAdminClient(ctx, emulatorProject, emulatorBigtable)
-	require.NoError(err)
-	defer adm.Close()
-	for _, table := range []struct {
-		name     string
-		families []string
-	}{{"objects", []string{"meta", "data"}}, {"maps", []string{"cf"}}, {"chunks", []string{"data"}}} {
-		require.NoError(adm.CreateTable(ctx, table.name))
-		for _, f := range table.families {
-			require.NoError(adm.CreateColumnFamily(ctx, table.name, f))
-		}
-	}
+	// The resources as plain init creates them.
+	require.NoError(Setup(ctx, opts))
 	btClient, err := bigtable.NewClient(ctx, emulatorProject, emulatorBigtable)
 	require.NoError(err)
 	defer btClient.Close()
 	mut := bigtable.NewMutation()
 	mut.Set("meta", "type", bigtable.Now(), []byte("blob"))
 	require.NoError(btClient.Open("objects").Apply(ctx, "kept", mut))
+	adm, err := bigtable.NewAdminClient(ctx, emulatorProject, emulatorBigtable)
+	require.NoError(err)
+	defer adm.Close()
+	tables, err := adm.Tables(ctx)
+	require.NoError(err)
+	require.NotContains(tables, "gc")
+	info, err := adm.TableInfo(ctx, "objects")
+	require.NoError(err)
+	require.ElementsMatch([]string{"meta", "data"}, info.Families)
+	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
+	require.NoError(err)
+	defer client.Close()
+	for _, table := range []string{"GcState", "GcReplicas"} {
+		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
+		require.Error(err, table)
+	}
 
+	opts.GC = true
+	require.NoError(Setup(ctx, opts))
 	require.NoError(Setup(ctx, opts))
 
-	for _, table := range bigtableTables {
+	for _, table := range serverTables(true) {
 		info, err := adm.TableInfo(ctx, table.name)
 		require.NoError(err)
 		require.ElementsMatch(table.families, info.Families, table.name)
 	}
-	info, err := adm.TableInfo(ctx, "gc")
+	info, err = adm.TableInfo(ctx, "gc")
 	require.NoError(err)
 	for _, f := range info.FamilyInfos {
 		require.Equal("versions() > 1", f.GCPolicy, f.Name)
@@ -167,14 +169,16 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	row, err := btClient.Open("objects").ReadRow(ctx, "kept")
 	require.NoError(err)
 	require.NotEmpty(row)
-
-	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
-	require.NoError(err)
-	defer client.Close()
 	for _, table := range []string{"GcState", "GcReplicas"} {
 		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
 		require.NoError(err, table)
 	}
+	s, err := New(ctx, &NewServerOpts{
+		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true,
+	})
+	require.NoError(err)
+	require.NoError(s.Close())
 }
 
 func TestSetup_MissingBucket(t *testing.T) {
@@ -190,7 +194,7 @@ func TestNew_ChecksResources(t *testing.T) {
 	newOpts := func(o *SetupOpts) *NewServerOpts {
 		return &NewServerOpts{
 			ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID,
-			BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024,
+			BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: o.GC,
 		}
 	}
 	tests := []struct {
@@ -198,6 +202,38 @@ func TestNew_ChecksResources(t *testing.T) {
 		prepare func(t *testing.T) *SetupOpts
 		wantErr string
 	}{
+		{
+			name: "GC without GC Spanner tables",
+			prepare: func(t *testing.T) *SetupOpts {
+				newEmulatorBigtable(t)
+				o := setupOpts(t, newEmulatorDatabaseWith(t, casdb.SchemaStatements()))
+				o.GC = true
+				return o
+			},
+			wantErr: "init --gc",
+		},
+		{
+			name: "GC without table gc",
+			prepare: func(t *testing.T) *SetupOpts {
+				newEmulatorBigtableWith(t, serverTables(false))
+				o := setupOpts(t, newEmulatorDatabase(t))
+				o.GC = true
+				return o
+			},
+			wantErr: "Bigtable table gc",
+		},
+		{
+			name: "GC without family g",
+			prepare: func(t *testing.T) *SetupOpts {
+				tables := serverTables(true)
+				tables[0].families = []string{"meta", "data"}
+				newEmulatorBigtableWith(t, tables)
+				o := setupOpts(t, newEmulatorDatabase(t))
+				o.GC = true
+				return o
+			},
+			wantErr: "column family g",
+		},
 		{
 			name: "missing bucket",
 			prepare: func(t *testing.T) *SetupOpts {

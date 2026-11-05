@@ -27,8 +27,12 @@ var sqlCommentRe = regexp.MustCompile(`(?m)^\s*--.*$`)
 
 // SchemaStatements returns the DDL statements of the Spanner schema in schema.sql.
 func SchemaStatements() []string {
+	return splitStatements(schemaSQL)
+}
+
+func splitStatements(sql string) []string {
 	var stmts []string
-	for _, s := range strings.Split(sqlCommentRe.ReplaceAllString(schemaSQL, ""), ";") {
+	for _, s := range strings.Split(sqlCommentRe.ReplaceAllString(sql, ""), ";") {
 		if s = strings.TrimSpace(s); s != "" {
 			stmts = append(stmts, s)
 		}

@@ -35,9 +35,9 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// The server side of the garbage collector: reads rescue condemned objects,
-// hits touch objects and map rows, cache entries expire, and each replica
-// writes a heartbeat.
+// The server side of the garbage collector, on with NewServerOpts.GC: reads
+// rescue condemned objects, hits touch objects and map rows, cache entries
+// expire, and each replica writes a heartbeat.
 const (
 	DefaultCacheTTL            = 6 * time.Hour
 	DefaultGCTouchInterval     = 36 * time.Hour
@@ -80,6 +80,8 @@ type mapRowKey struct {
 }
 
 type gcHooks struct {
+	// on is NewServerOpts.GC. Off, none of the hooks below run.
+	on bool
 	// Zero disables the TTL and the touches.
 	cacheTTL      uint32
 	touchInterval uint32
@@ -106,12 +108,27 @@ func seconds(d time.Duration) uint32 {
 	return uint32(max(1, (d+time.Second-1)/time.Second))
 }
 
-// startGCHooks starts the garbage collector hooks configured in opts.
-func (s *GCPServer) startGCHooks(opts *NewServerOpts) error {
+// startGCHooks starts the garbage collector hooks configured in opts. It does
+// nothing unless opts.GC is set.
+func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error {
+	if !opts.GC {
+		return nil
+	}
 	if opts.CacheTTL < 0 || opts.GCTouchInterval < 0 || opts.GCHeartbeatInterval < 0 {
 		return fmt.Errorf("invalid negative cache TTL %s, touch interval %s or heartbeat interval %s", opts.CacheTTL, opts.GCTouchInterval, opts.GCHeartbeatInterval)
 	}
+	if err := s.checkGCResources(ctx); err != nil {
+		return fmt.Errorf("garbage collector resources missing, run 'abfs server gcp init --gc' to create them: %w", err)
+	}
+	return s.enableGCHooks(opts)
+}
+
+// enableGCHooks turns the hooks on and starts the toucher and the heartbeat.
+func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
+	s.casdb.EnableGC()
+	s.gcEdges = gc.NewEdgeWriter(s.casdb.BTClient())
 	g := &s.gcHooks
+	g.on = true
 	g.cacheTTL = seconds(opts.CacheTTL)
 	g.rescue = gc.NewRescuer(s.casdb.BTClient()).Rescue
 	if opts.GCTouchInterval > 0 {
@@ -132,11 +149,7 @@ func (s *GCPServer) startGCHooks(opts *NewServerOpts) error {
 	}
 	g.metrics = reg
 	if opts.GCHeartbeatInterval > 0 {
-		var version int64
-		if !opts.NoGCEdges {
-			version = gc.ExtractorVersion
-		}
-		s.startHeartbeat(opts.GCHeartbeatInterval, version)
+		s.startHeartbeat(opts.GCHeartbeatInterval, gc.ExtractorVersion)
 	}
 	return nil
 }
@@ -171,11 +184,16 @@ func (s *GCPServer) lookupHeader(key entities.Hash) (CachedHeader, bool) {
 	return h, ok
 }
 
-// storeHeader caches hdr, read from Bigtable, keeping the touch mark of the
-// entry it replaces when that touch is of the current period.
+// storeHeader caches hdr, read from Bigtable. With GC it replaces an expired
+// entry and keeps the touch mark of the entry it replaces when that touch is
+// of the current period; without GC it keeps an existing entry.
 func (s *GCPServer) storeHeader(hdr *ObjectHeader) CachedHeader {
 	h := newCachedHeader(hdr)
 	shard := s.headers[hdr.Id[0]]
+	if !s.gcHooks.on {
+		shard.PeekOrAdd(hdr.Id, h)
+		return h
+	}
 	if old, ok := shard.Peek(hdr.Id); ok && s.gcHooks.touchInterval > 0 && s.gcHooks.touchedThisPeriod(old, h.Loaded) {
 		h.Touched = old.Touched
 	}
@@ -193,14 +211,52 @@ func (s *GCPServer) lookupContent(key entities.Hash) (*ObjectContent, bool) {
 	return c.content, ok
 }
 
+// storeContent caches content; see storeHeader.
 func (s *GCPServer) storeContent(key entities.Hash, content *ObjectContent) {
-	s.content[key[0]].Add(key, contentEntry{content: content, loaded: cacheNow()})
+	entry := contentEntry{content: content, loaded: cacheNow()}
+	if !s.gcHooks.on {
+		s.content[key[0]].PeekOrAdd(key, entry)
+		return
+	}
+	s.content[key[0]].Add(key, entry)
 }
 
 // forget removes key from the caches.
 func (s *GCPServer) forget(key entities.Hash) {
 	s.headers[key[0]].Remove(key)
 	s.content[key[0]].Remove(key)
+}
+
+// forgetMissing removes key, which a read found missing, from the caches, so
+// that an expired entry is not kept. Without GC entries do not expire.
+func (s *GCPServer) forgetMissing(key entities.Hash) {
+	if s.gcHooks.on {
+		s.forget(key)
+	}
+}
+
+// getObjectDataGC is getObjectData with GC on.
+func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (CachedHeader, *ObjectContent, error) {
+	cachedHdr, hdrOk := s.lookupHeader(key)
+	content, contentOk := s.lookupContent(key)
+	if hdrOk && contentOk {
+		return cachedHdr, content, nil
+	}
+	// A read of the whole row sees the condemn marker with the content.
+	header, content, err := s.casdb.GetObjectData(ctx, key)
+	if err == nil && header != nil {
+		err = s.rescueCondemned(ctx, pathGetObject, header)
+	}
+	if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
+		s.forget(key)
+		return CachedHeader{}, nil, entities.ErrNotExist
+	}
+	if err != nil {
+		return CachedHeader{}, nil, err
+	}
+	cachedHdr = s.storeHeader(header)
+	s.storeContent(key, content)
+	return cachedHdr, content, nil
 }
 
 // rescueCondemned rescues hdr if the collector condemned it. It returns

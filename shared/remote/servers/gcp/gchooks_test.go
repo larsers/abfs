@@ -49,7 +49,7 @@ func newGCHooksServer(t *testing.T, opts *NewServerOpts) *GCPServer {
 	require.NoError(t, adm.CreateColumnFamily(ctx, "objects", gc.ObjectsFamily))
 	require.NoError(t, adm.CreateTable(ctx, "maps"))
 	require.NoError(t, adm.CreateColumnFamily(ctx, "maps", "cf"))
-	require.NoError(t, s.startGCHooks(opts))
+	require.NoError(t, s.enableGCHooks(opts))
 	t.Cleanup(s.stopGCHooks)
 	return s
 }
@@ -354,7 +354,7 @@ func TestGCHooks_ChunkMissingDuringRead(t *testing.T) {
 func TestGCHooks_ChunkMissingInBucket(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
-	s := newEmulatorServer(t, &NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour})
+	s := newEmulatorServer(t, &NewServerOpts{GC: true, CacheTTL: time.Hour, GCTouchInterval: time.Hour})
 	content := make([]byte, 1500*1024)
 	for i := range content {
 		content[i] = byte(i * 7)
@@ -380,43 +380,31 @@ func TestGCHooks_ChunkMissingInBucket(t *testing.T) {
 }
 
 func TestGCHooks_Heartbeat(t *testing.T) {
-	tests := []struct {
-		name        string
-		noGCEdges   bool
-		wantVersion int64
-	}{
-		{"with gc edges", false, gc.ExtractorVersion},
-		{"without gc edges", true, 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require := require.New(t)
-			ctx := context.Background()
-			s := newEmulatorCASDBServer(t)
-			require.NoError(s.startGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Hour, NoGCEdges: tt.noGCEdges}))
-			t.Cleanup(s.stopGCHooks)
+	require := require.New(t)
+	ctx := context.Background()
+	s := newEmulatorCASDBServer(t)
+	require.NoError(s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Hour}))
+	t.Cleanup(s.stopGCHooks)
 
-			var version int64
-			var lastSeen time.Time
-			require.Eventually(func() bool {
-				rows := 0
-				err := s.casdb.SpannerClient().Single().Query(ctx, spanner.Statement{SQL: "SELECT Version, LastSeen FROM GcReplicas"}).Do(func(r *spanner.Row) error {
-					rows++
-					return r.Columns(&version, &lastSeen)
-				})
-				require.NoError(err)
-				return rows == 1
-			}, 10*time.Second, 50*time.Millisecond)
-			require.Equal(tt.wantVersion, version)
-			require.WithinDuration(time.Now(), lastSeen, time.Minute)
-			require.Zero(s.gcHooks.heartbeatFailures.Load())
+	var version int64
+	var lastSeen time.Time
+	require.Eventually(func() bool {
+		rows := 0
+		err := s.casdb.SpannerClient().Single().Query(ctx, spanner.Statement{SQL: "SELECT Version, LastSeen FROM GcReplicas"}).Do(func(r *spanner.Row) error {
+			rows++
+			return r.Columns(&version, &lastSeen)
 		})
-	}
+		require.NoError(err)
+		return rows == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	require.Equal(int64(gc.ExtractorVersion), version)
+	require.WithinDuration(time.Now(), lastSeen, time.Minute)
+	require.Zero(s.gcHooks.heartbeatFailures.Load())
 }
 
 func TestGCHooks_RejectsNegativeDurations(t *testing.T) {
 	s, _ := createTestServerWithCASDB(t)
-	require.Error(t, s.startGCHooks(&NewServerOpts{CacheTTL: -time.Second}))
+	require.Error(t, s.startGCHooks(context.Background(), &NewServerOpts{GC: true, CacheTTL: -time.Second}))
 }
 
 func TestGCHooks_Metrics(t *testing.T) {

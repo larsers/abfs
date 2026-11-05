@@ -250,9 +250,11 @@ type NewServerOpts struct {
 	// content for objects larger than LinksContentThreshold bytes.
 	LinksContent          bool
 	LinksContentThreshold int64
-	// NoGCEdges stops PutObject from writing the GC edges of new objects to the
-	// table gc. The garbage collector then needs a backfill first.
-	NoGCEdges bool
+	// GC turns on the server side of the garbage collector: PutObject writes
+	// the GC edges of new objects, reads rescue condemned objects, and the
+	// options below apply. Off, the server reads and writes only what a server
+	// without garbage collection does.
+	GC bool
 	// CacheTTL is how long cached headers and content are used before they are
 	// read again; zero keeps them until they are evicted.
 	CacheTTL time.Duration
@@ -308,9 +310,6 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		casdb:                 cas,
 		addObject:             cas.AddObject,
 	}
-	if !opts.NoGCEdges {
-		s.gcEdges = gc.NewEdgeWriter(cas.BTClient())
-	}
 	if err := s.setMasterDepot(ctx, opts.BucketName, opts.ClientMetrics); err != nil {
 		_ = cas.Close()
 		return nil, err
@@ -319,7 +318,7 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		_ = s.Close()
 		return nil, fmt.Errorf("resources missing, run 'abfs server gcp init' to create them: %w", err)
 	}
-	if err := s.startGCHooks(opts); err != nil {
+	if err := s.startGCHooks(ctx, opts); err != nil {
 		_ = s.Close()
 		return nil, err
 	}
@@ -434,26 +433,54 @@ func (s *GCPServer) supportsLinksContent(ctx context.Context) bool {
 }
 
 func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedHeader, *ObjectContent, error) {
-	cachedHdr, hdrOk := s.lookupHeader(key)
+	if s.gcHooks.on {
+		return s.getObjectDataGC(ctx, key)
+	}
+	shard := key[0]
+	cachedHdr, hdrOk := s.headers[shard].Get(key)
 	content, contentOk := s.lookupContent(key)
-	if hdrOk && contentOk {
+
+	switch {
+	case hdrOk && contentOk:
+		return cachedHdr, content, nil
+	case hdrOk && !contentOk:
+		var err error
+		content, err = s.casdb.GetContent(ctx, key)
+		if errors.Is(err, casdb.ErrNotFound) || (err == nil && content == nil) {
+			s.headers[shard].Remove(key)
+			return CachedHeader{}, nil, entities.ErrNotExist
+		}
+		if err != nil {
+			return CachedHeader{}, nil, err
+		}
+		s.storeContent(key, content)
+		return cachedHdr, content, nil
+	case !hdrOk && contentOk:
+		header, err := s.casdb.GetHeader(ctx, key)
+		if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
+			s.content[shard].Remove(key)
+			return CachedHeader{}, nil, entities.ErrNotExist
+		}
+		if err != nil {
+			return CachedHeader{}, nil, err
+		}
+		cachedHdr = newCachedHeader(header)
+		s.headers[shard].PeekOrAdd(key, cachedHdr)
+		return cachedHdr, content, nil
+	default:
+		header, objContent, err := s.casdb.GetObjectData(ctx, key)
+		if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
+			return CachedHeader{}, nil, entities.ErrNotExist
+		}
+		if err != nil {
+			return CachedHeader{}, nil, err
+		}
+		cachedHdr = newCachedHeader(header)
+		content = objContent
+		s.headers[shard].PeekOrAdd(key, cachedHdr)
+		s.storeContent(key, content)
 		return cachedHdr, content, nil
 	}
-	// A read of the whole row sees the condemn marker with the content.
-	header, content, err := s.casdb.GetObjectData(ctx, key)
-	if err == nil && header != nil {
-		err = s.rescueCondemned(ctx, pathGetObject, header)
-	}
-	if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
-		s.forget(key)
-		return CachedHeader{}, nil, entities.ErrNotExist
-	}
-	if err != nil {
-		return CachedHeader{}, nil, err
-	}
-	cachedHdr = s.storeHeader(header)
-	s.storeContent(key, content)
-	return cachedHdr, content, nil
 }
 
 // GetObject implements remote.RemoteProvider.
@@ -481,7 +508,9 @@ func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.Cont
 	if err != nil {
 		return nil, err
 	}
-	r = &missingChunkReader{ReadCloser: r, ctx: ctx, s: s, key: key, content: content.Content}
+	if s.gcHooks.on {
+		r = &missingChunkReader{ReadCloser: r, ctx: ctx, s: s, key: key, content: content.Content}
+	}
 
 	return remote.NewContentReader(r, content.Encoding), nil
 }
@@ -575,8 +604,8 @@ func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
 // MapResults implements remote.RemoteProvider.
 func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.Hash, error) {
 	results, err := s.casdb.MapResults(ctx, from)
-	if err != nil {
-		return nil, err
+	if err != nil || !s.gcHooks.on {
+		return results, err
 	}
 	return s.liveMapResults(ctx, from, results)
 }
@@ -844,7 +873,7 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 		err = s.rescueCondemned(ctx, pathPutObject, obj)
 	}
 	if err == casdb.ErrNotFound {
-		s.forget(hash)
+		s.forgetMissing(hash)
 		return CachedHeader{}, nil
 	}
 	if err != nil || obj == nil {
@@ -883,7 +912,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 	s.headersCacheMissCount.Add(int64(missCount))
 
 	objs, err := s.casdb.GetHeaders(ctx, misses)
-	if err == nil {
+	if err == nil && s.gcHooks.on {
 		objs, err = s.rescueHeaders(ctx, path, objs)
 	}
 	if err != nil {
@@ -903,7 +932,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 	}
 	// The keys left do not exist; drop their expired entries.
 	for h := range missesIdx {
-		s.forget(h)
+		s.forgetMissing(h)
 	}
 
 	s.headersRespCount.Add(int64(foundCount))
