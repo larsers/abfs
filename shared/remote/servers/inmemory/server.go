@@ -169,6 +169,9 @@ func (s *InMemoryServer) PutObject(ctx context.Context, key remote.Hash, reader 
 	if err != nil {
 		return err
 	}
+	if got := objects.HashBytes(decoded); got != key {
+		return fmt.Errorf("expected hash %q, but got %q", key, got)
+	}
 
 	t, rest, err := entities.DecodeObject(decoded)
 	if err != nil {
