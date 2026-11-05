@@ -44,6 +44,7 @@ import (
 
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 	"github.com/google/abfs/shared/remote/servers/gcp/depot"
+	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
 type (
@@ -199,6 +200,7 @@ type GCPServer struct {
 	casdb                 *casdb.CASDB
 	addObject             func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error
 	depot                 *depot.MasterDepot
+	gcEdges               *gc.EdgeWriter
 	storage               *storage.Client
 	storeLinks            bool
 	validateHash          bool
@@ -240,6 +242,9 @@ type NewServerOpts struct {
 	// content for objects larger than LinksContentThreshold bytes.
 	LinksContent          bool
 	LinksContentThreshold int64
+	// NoGCEdges stops PutObject from writing the GC edges of new objects to the
+	// table gc. The garbage collector then needs a backfill first.
+	NoGCEdges bool
 }
 
 func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
@@ -285,6 +290,9 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		linksContentThreshold: opts.LinksContentThreshold,
 		casdb:                 cas,
 		addObject:             cas.AddObject,
+	}
+	if !opts.NoGCEdges {
+		s.gcEdges = gc.NewEdgeWriter(cas.BTClient())
 	}
 	if err := s.setMasterDepot(ctx, opts.BucketName, opts.ClientMetrics); err != nil {
 		_ = cas.Close()
@@ -526,6 +534,12 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	links := validator.Links()
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
+	}
+	// The edges go first, so that no object row exists without them.
+	if s.gcEdges != nil {
+		if err := s.gcEdges.Put(ctx, key, validator.Type(), validator.Object()); err != nil {
+			return err
+		}
 	}
 
 	header := &casdb.ObjectHeader{

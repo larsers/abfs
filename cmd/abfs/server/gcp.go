@@ -52,6 +52,7 @@ type gcpCmd struct {
 	clientMetrics         bool
 	linksContent          bool
 	linksContentThreshold int64
+	gcEdges               bool
 }
 
 func (c *gcpCmd) Spec() cmd.CmdSpec {
@@ -79,6 +80,7 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.clientMetrics, "gcp-client-metrics", false, "Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring")
 	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
 	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
+	fl.BoolVar(&c.gcEdges, "gc-edges", true, "Write the GC edges of each new object to the Bigtable table gc, which the garbage collector reads. Objects added with this off need 'abfs server gcp gc backfill' before a garbage collection")
 }
 
 func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -109,6 +111,7 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		ClientMetrics:         c.clientMetrics,
 		LinksContent:          c.linksContent,
 		LinksContentThreshold: c.linksContentThreshold,
+		NoGCEdges:             !c.gcEdges,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)

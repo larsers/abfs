@@ -37,6 +37,7 @@ type Validator struct {
 	objSize      int64
 	objType      string
 	links        []Hash
+	obj          objects.Object
 	readSize     int64
 	content      []byte
 	wg           sync.WaitGroup
@@ -206,6 +207,12 @@ func (v *Validator) Links() []Hash {
 	return v.links
 }
 
+// Object returns the decoded object, or nil for a blob or when links are not
+// extracted.
+func (v *Validator) Object() objects.Object {
+	return v.obj
+}
+
 func (v *Validator) extractLinks() error {
 	_, obj, err := objects.Factory.Decode(v.hash, v.content)
 	if err != nil {
@@ -225,6 +232,7 @@ func (v *Validator) extractLinks() error {
 	}
 
 	v.links = links
+	v.obj = obj
 
 	return nil
 }
