@@ -16,9 +16,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"math/rand/v2"
 	"path/filepath"
 	"slices"
@@ -39,12 +41,26 @@ const (
 	gcKeepAliveSpread = 0.1
 	// Same as the per-call key limit of the gRPC client, so each request is one server call.
 	gcTouchBatchSize = 50000
+	// Keys a touch sends per second at most, so that the server's touch
+	// writers keep up with the touch of a large mount.
+	gcTouchRate = 10000
 )
 
 // GCKeepAliveRemote is the part of the cacheman client that GCKeepAlive uses.
 type GCKeepAliveRemote interface {
 	PutRefs(server string, project string, refs []entities.RefHash, blocking bool) error
-	RemoteHeaders(keys []entities.Hash) (int, error)
+	// RemoteHeaders returns for each key whether the server has it.
+	RemoteHeaders(keys []entities.Hash) ([]bool, error)
+}
+
+// MountScan is what a scan of a mount found.
+type MountScan struct {
+	// Hashes are those of loaded files and of unloaded entries.
+	Hashes []entities.Hash
+	// Dirs maps the hash of each clean loaded directory to its paths. The
+	// hash covers what the directory holds, except excluded entries, which
+	// the scan lists on their own.
+	Dirs map[entities.Hash][]string
 }
 
 // GCKeepAlive keeps a live mount visible to the server GC. It re-writes the
@@ -58,7 +74,11 @@ type GCKeepAlive struct {
 	Target        entities.Hash
 	RefInterval   time.Duration
 	TouchInterval time.Duration
-	Scan          func(ctx context.Context) ([]entities.Hash, error)
+	// TouchRate is the most keys a touch sends per second; zero means no limit.
+	TouchRate float64
+	// Scan scans the mount below each of roots, or the whole mount when roots
+	// is empty. The roots themselves are not reported as clean directories.
+	Scan func(ctx context.Context, roots []string) (MountScan, error)
 	// Rand returns a number in [0, 1) that spreads the waits, so that mounts
 	// started at the same time do not refresh and touch at the same time. Nil
 	// means every wait is exactly the interval.
@@ -88,9 +108,13 @@ func NewGCKeepAlive(info filesystem.MountInfo, details *binding.MountDetails, se
 		Server:        server,
 		RefInterval:   details.Config.GCKeepAliveRefInterval,
 		TouchInterval: details.Config.GCKeepAliveTouchInterval,
+		TouchRate:     gcTouchRate,
 		Rand:          rand.Float64,
-		Scan: func(ctx context.Context) ([]entities.Hash, error) {
-			return scanMountHashes(ctx, mountPoint, bindcasAttrs{})
+		Scan: func(ctx context.Context, roots []string) (MountScan, error) {
+			if len(roots) == 0 {
+				roots = []string{mountPoint}
+			}
+			return scanMountHashes(ctx, roots, bindcasAttrs{})
 		},
 	}
 	// Cacheman does not write refs in remote read-only mode, so such a mount has no ref to refresh.
@@ -213,96 +237,260 @@ func (k *GCKeepAlive) refreshRef() error {
 	return k.Remote.PutRefs(k.Server, entities.ABFSMetaProject, refs, true)
 }
 
-// touch sends the scanned hashes to the server and returns how many the server
-// has and how many were sent. A scan error does not stop the hashes found so far.
+// touch sends the hashes of the mount to the server and returns how many the
+// server has and how many were sent. For a clean loaded directory it sends the
+// directory's hash, and scans the directory only when the server lacks it,
+// which happens when the directory was changed and hashed locally. A scan
+// error does not stop the hashes found so far.
 func (k *GCKeepAlive) touch(ctx context.Context) (int, int, error) {
-	hashes, scanErr := k.Scan(ctx)
+	p := &touchPacer{rate: k.TouchRate, start: time.Now()}
+	sent := make(map[entities.Hash]struct{})
+	// The directory hashes asked so far, and whether the server has them.
+	dirPresent := make(map[entities.Hash]bool)
 	found := 0
-	for batch := range slices.Chunk(hashes, gcTouchBatchSize) {
-		if err := ctx.Err(); err != nil {
-			return found, len(hashes), err
+	var roots []string
+	var scanErr error
+	for {
+		scan, err := k.Scan(ctx, roots)
+		if err != nil && scanErr == nil {
+			scanErr = err
 		}
-		n, err := k.Remote.RemoteHeaders(batch)
+		hashes := newHashes(sent, scan.Hashes)
+		present, err := k.remoteHeaders(ctx, p, hashes)
+		found += count(present)
 		if err != nil {
-			return found, len(hashes), fmt.Errorf("failed to read remote headers: %w", err)
+			return found, len(sent), err
 		}
-		found += n
+
+		roots = nil
+		var dirs []entities.Hash
+		for h, paths := range scan.Dirs {
+			ok, asked := dirPresent[h]
+			switch {
+			case !asked:
+				dirs = append(dirs, h)
+			case !ok:
+				roots = append(roots, paths...)
+			}
+		}
+		dirs = newHashes(sent, dirs)
+		present, err = k.remoteHeaders(ctx, p, dirs)
+		found += count(present)
+		if err != nil {
+			return found, len(sent), err
+		}
+		for i, ok := range present {
+			dirPresent[dirs[i]] = ok
+			if !ok {
+				roots = append(roots, scan.Dirs[dirs[i]]...)
+			}
+		}
+		if len(roots) == 0 {
+			break
+		}
 	}
 	if scanErr != nil {
-		return found, len(hashes), fmt.Errorf("failed to scan the mount: %w", scanErr)
+		return found, len(sent), fmt.Errorf("failed to scan the mount: %w", scanErr)
 	}
-	return found, len(hashes), nil
+	return found, len(sent), nil
+}
+
+// newHashes returns the hashes not in sent and adds them to it.
+func newHashes(sent map[entities.Hash]struct{}, hashes []entities.Hash) []entities.Hash {
+	var out []entities.Hash
+	for _, h := range hashes {
+		if _, ok := sent[h]; !ok {
+			sent[h] = struct{}{}
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func count(present []bool) int {
+	n := 0
+	for _, ok := range present {
+		if ok {
+			n++
+		}
+	}
+	return n
+}
+
+// remoteHeaders asks the server for keys in batches, paced by p, and returns
+// for each key whether the server has it.
+func (k *GCKeepAlive) remoteHeaders(ctx context.Context, p *touchPacer, keys []entities.Hash) ([]bool, error) {
+	present := make([]bool, 0, len(keys))
+	for batch := range slices.Chunk(keys, gcTouchBatchSize) {
+		if err := p.wait(ctx); err != nil {
+			return present, err
+		}
+		found, err := k.Remote.RemoteHeaders(batch)
+		if err != nil {
+			return present, fmt.Errorf("failed to read remote headers: %w", err)
+		}
+		present = append(present, found...)
+		p.sent += len(batch)
+	}
+	return present, nil
+}
+
+// touchPacer spaces the batches of a touch so that the keys sent since start
+// stay below rate per second.
+type touchPacer struct {
+	rate  float64
+	start time.Time
+	sent  int
+}
+
+func (p *touchPacer) wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.rate <= 0 || p.sent == 0 {
+		return nil
+	}
+	d := time.Until(p.start.Add(time.Duration(float64(p.sent) / p.rate * float64(time.Second))))
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type mountAttrs interface {
 	Loaded(path string) (bool, error)
+	Dirty(path string) (bool, error)
+	Excluded(path string) (bool, error)
 	Hash(path string) (entities.Hash, error)
 }
 
 type bindcasAttrs struct{}
 
 func (bindcasAttrs) Loaded(path string) (bool, error)        { return bindcas.Loaded(path) }
+func (bindcasAttrs) Dirty(path string) (bool, error)         { return bindcas.Dirty(path) }
+func (bindcasAttrs) Excluded(path string) (bool, error)      { return bindcas.Excluded(path) }
 func (bindcasAttrs) Hash(path string) (entities.Hash, error) { return bindcas.Hash(path) }
 
-// scanMountHashes returns the hashes the server must keep for the mount at
-// root: those of loaded files, and those of unloaded files and directories,
-// which the mount fetches from the server when they are read. It does not read
-// the hash of a loaded directory, which may be dirty and costly to hash; its
-// entries are scanned instead.
-func scanMountHashes(ctx context.Context, root string, attrs mountAttrs) ([]entities.Hash, error) {
+// scanMountHashes scans the mount below each of roots for what the server
+// must keep: the hashes of loaded files and of unloaded files and
+// directories, which the mount fetches from the server when they are read,
+// and the hashes of clean loaded directories. casfs keeps the hash of a clean
+// directory, so reading it costs nothing, while a dirty directory would be
+// hashed; dirty directories are scanned entry by entry. The entries below a
+// clean directory are covered by its hash, except excluded ones, which casfs
+// leaves out of the hash of their parent, such as projects and the files of
+// linkfile; the scan still walks loaded directories below a clean one to find
+// them, but reads no hash there.
+func scanMountHashes(ctx context.Context, roots []string, attrs mountAttrs) (MountScan, error) {
 	var mu sync.Mutex
 	seen := make(map[entities.Hash]struct{})
-	err := cwalk.Walk(root, func(rel string, info fs.FileInfo, err error) error {
-		if err != nil {
-			if entities.IsNotExist(err) {
+	dirs := make(map[entities.Hash][]string)
+	var errs []error
+	for _, root := range roots {
+		// The relative paths of the directories whose entries a clean
+		// directory's hash covers.
+		var covered sync.Map
+		err := cwalk.Walk(root, func(rel string, info fs.FileInfo, err error) error {
+			if err != nil {
+				if entities.IsNotExist(err) {
+					return filepath.SkipDir
+				}
+				return err
+			}
+			if ctx.Err() != nil {
 				return filepath.SkipDir
 			}
-			return err
-		}
-		if ctx.Err() != nil {
-			return filepath.SkipDir
-		}
-		if base := filepath.Base(rel); base == bindcas.GitDirName || base == bindcas.ControlDirName {
-			return filepath.SkipDir
-		}
+			if base := filepath.Base(rel); base == bindcas.GitDirName || base == bindcas.ControlDirName {
+				return filepath.SkipDir
+			}
+			p := filepath.Join(root, rel)
+			skip := func(err error) error {
+				if entities.IsNotExist(err) {
+					return filepath.SkipDir
+				}
+				return err
+			}
 
-		p := filepath.Join(root, rel)
-		loaded, err := attrs.Loaded(p)
-		if err != nil {
-			if entities.IsNotExist(err) {
+			if _, ok := covered.Load(filepath.Dir(rel)); ok && rel != "." {
+				excluded, err := attrs.Excluded(p)
+				if err != nil {
+					return skip(err)
+				}
+				if !excluded {
+					if !info.IsDir() {
+						return nil
+					}
+					// An unloaded directory holds no excluded entries.
+					loaded, err := attrs.Loaded(p)
+					if err != nil {
+						return skip(err)
+					}
+					if !loaded {
+						return filepath.SkipDir
+					}
+					covered.Store(rel, struct{}{})
+					return nil
+				}
+			}
+
+			loaded, err := attrs.Loaded(p)
+			if err != nil {
+				return skip(err)
+			}
+			if loaded && info.IsDir() {
+				if rel == "." {
+					return nil
+				}
+				dirty, err := attrs.Dirty(p)
+				if err != nil {
+					return skip(err)
+				}
+				if dirty {
+					return nil
+				}
+				h, err := attrs.Hash(p)
+				if err != nil {
+					return skip(err)
+				}
+				if !h.IsZero() {
+					mu.Lock()
+					dirs[h] = append(dirs[h], p)
+					mu.Unlock()
+				}
+				covered.Store(rel, struct{}{})
+				return nil
+			}
+
+			h, err := attrs.Hash(p)
+			if err != nil {
+				return skip(err)
+			}
+			if !h.IsZero() {
+				mu.Lock()
+				seen[h] = struct{}{}
+				mu.Unlock()
+			}
+			if info.IsDir() {
 				return filepath.SkipDir
 			}
-			return err
-		}
-		if loaded && info.IsDir() {
 			return nil
-		}
-
-		h, err := attrs.Hash(p)
+		})
 		if err != nil {
-			if entities.IsNotExist(err) {
-				return filepath.SkipDir
-			}
-			return err
+			errs = append(errs, err)
 		}
-		if !h.IsZero() {
-			mu.Lock()
-			seen[h] = struct{}{}
-			mu.Unlock()
-		}
-		if info.IsDir() {
-			return filepath.SkipDir
-		}
-		return nil
-	})
+	}
+	err := errors.Join(errs...)
 	if err == nil {
 		err = ctx.Err()
 	}
-	hashes := make([]entities.Hash, 0, len(seen))
-	for h := range seen {
-		hashes = append(hashes, h)
-	}
-	return hashes, err
+	return MountScan{Hashes: slices.Collect(maps.Keys(seen)), Dirs: dirs}, err
 }
 
 func (c *casfs) startGCKeepAlive(ctx context.Context) {

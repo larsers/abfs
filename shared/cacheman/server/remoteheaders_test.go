@@ -60,14 +60,14 @@ func TestHandleRemoteHeaders(t *testing.T) {
 	}()
 	handler := c.httpHandler()
 
-	post := func(keys []entities.Hash) (int, int) {
+	post := func(keys []entities.Hash) (int, []bool) {
 		b, err := json.Marshal(keys)
 		require.NoError(err)
 		req := httptest.NewRequest("POST", "http://localhost/remote-headers", bytes.NewReader(b))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
-		var found int
+		var found []bool
 		if w.Code == http.StatusOK {
 			require.NoError(json.NewDecoder(w.Body).Decode(&found))
 		}
@@ -87,9 +87,9 @@ func TestHandleRemoteHeaders(t *testing.T) {
 
 	code, found := post([]entities.Hash{entities.EmptyDirHash, missing})
 	require.Equal(http.StatusOK, code)
-	require.Equal(1, found)
+	require.Equal([]bool{true, false}, found)
 
 	code, found = post(nil)
 	require.Equal(http.StatusOK, code)
-	require.Zero(found)
+	require.Empty(found)
 }

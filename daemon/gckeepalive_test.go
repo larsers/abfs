@@ -20,6 +20,8 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +40,7 @@ type fakeGCRemote struct {
 	batches    [][]entities.Hash
 	known      map[entities.Hash]bool
 	headersErr error
+	onHeaders  func()
 }
 
 func (f *fakeGCRemote) PutRefs(server string, project string, refs []entities.RefHash, blocking bool) error {
@@ -48,18 +51,29 @@ func (f *fakeGCRemote) PutRefs(server string, project string, refs []entities.Re
 	return f.refErr
 }
 
-func (f *fakeGCRemote) RemoteHeaders(keys []entities.Hash) (int, error) {
+func (f *fakeGCRemote) RemoteHeaders(keys []entities.Hash) ([]bool, error) {
 	if f.headersErr != nil {
-		return 0, f.headersErr
+		return nil, f.headersErr
 	}
 	f.batches = append(f.batches, keys)
-	found := 0
-	for _, k := range keys {
-		if f.known[k] {
-			found++
-		}
+	if f.onHeaders != nil {
+		f.onHeaders()
+	}
+	found := make([]bool, len(keys))
+	for i, k := range keys {
+		found[i] = f.known[k]
 	}
 	return found, nil
+}
+
+// hashesScan returns a Scan that reports hashes and no clean directory.
+func hashesScan(hashes []entities.Hash, err error, scans *int) func(context.Context, []string) (MountScan, error) {
+	return func(ctx context.Context, roots []string) (MountScan, error) {
+		if scans != nil {
+			*scans++
+		}
+		return MountScan{Hashes: hashes}, err
+	}
 }
 
 func testHashes(n int) []entities.Hash {
@@ -84,10 +98,7 @@ func TestGCKeepAlive_Step(t *testing.T) {
 		Target:        target,
 		RefInterval:   15 * time.Minute,
 		TouchInterval: 18 * time.Hour,
-		Scan: func(ctx context.Context) ([]entities.Hash, error) {
-			scans++
-			return hashes, nil
-		},
+		Scan:          hashesScan(hashes, nil, &scans),
 	}
 	require.Equal(15*time.Minute, k.tick())
 
@@ -128,12 +139,7 @@ func jitterKeepAlive(remote *fakeGCRemote, r func() float64, scans *int) *GCKeep
 		RefInterval:   15 * time.Minute,
 		TouchInterval: 18 * time.Hour,
 		Rand:          r,
-		Scan: func(ctx context.Context) ([]entities.Hash, error) {
-			if scans != nil {
-				*scans++
-			}
-			return nil, nil
-		},
+		Scan:          hashesScan(nil, nil, scans),
 	}
 }
 
@@ -232,9 +238,7 @@ func TestGCKeepAlive_Touch(t *testing.T) {
 	scanErr := errors.New("permission denied")
 	k := &GCKeepAlive{
 		Remote: remote,
-		Scan: func(ctx context.Context) ([]entities.Hash, error) {
-			return hashes, scanErr
-		},
+		Scan:   hashesScan(hashes, scanErr, nil),
 	}
 	found, total, err := k.touch(context.Background())
 	require.ErrorIs(err, scanErr)
@@ -300,14 +304,30 @@ func TestNewGCKeepAlive(t *testing.T) {
 
 type fakeMountAttrs struct {
 	unloaded map[string]bool
+	dirty    map[string]bool
+	excluded map[string]bool
 	hashes   map[string]entities.Hash
+	// read records the paths whose hash was read.
+	mu   sync.Mutex
+	read []string
 }
 
 func (f *fakeMountAttrs) Loaded(path string) (bool, error) {
 	return !f.unloaded[path], nil
 }
 
+func (f *fakeMountAttrs) Dirty(path string) (bool, error) {
+	return f.dirty[path], nil
+}
+
+func (f *fakeMountAttrs) Excluded(path string) (bool, error) {
+	return f.excluded[path], nil
+}
+
 func (f *fakeMountAttrs) Hash(path string) (entities.Hash, error) {
+	f.mu.Lock()
+	f.read = append(f.read, path)
+	f.mu.Unlock()
 	h, ok := f.hashes[path]
 	if !ok {
 		return entities.Hash{}, os.ErrNotExist
@@ -315,21 +335,29 @@ func (f *fakeMountAttrs) Hash(path string) (entities.Hash, error) {
 	return h, nil
 }
 
+func makeTree(t *testing.T, root string, dirs, files []string) {
+	t.Helper()
+	for _, d := range dirs {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, d), 0755))
+	}
+	for _, f := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(root, f), nil, 0644))
+	}
+}
+
 func TestScanMountHashes(t *testing.T) {
 	require := require.New(t)
 
 	root := t.TempDir()
-	for _, d := range []string{"loaded/inner", "unloaded/inner", ".git/objects", "dup"} {
-		require.NoError(os.MkdirAll(filepath.Join(root, d), 0755))
-	}
-	for _, f := range []string{"file", "loaded/inner/file", "loaded/cold", "unloaded/inner/file", ".git/objects/x", "dup/a", "dup/b", "gone"} {
-		require.NoError(os.WriteFile(filepath.Join(root, f), nil, 0644))
-	}
+	makeTree(t, root,
+		[]string{"loaded/inner", "unloaded/inner", ".git/objects", "dup"},
+		[]string{"file", "loaded/inner/file", "loaded/cold", "unloaded/inner/file", ".git/objects/x", "dup/a", "dup/b", "gone"})
 
 	h := testHashes(6)
 	p := func(rel string) string { return filepath.Join(root, rel) }
 	attrs := &fakeMountAttrs{
 		unloaded: map[string]bool{p("unloaded"): true, p("loaded/cold"): true},
+		dirty:    map[string]bool{root: true, p("loaded"): true, p("loaded/inner"): true, p("dup"): true},
 		hashes: map[string]entities.Hash{
 			root:                     h[0],
 			p("loaded"):              h[0],
@@ -346,7 +374,131 @@ func TestScanMountHashes(t *testing.T) {
 		},
 	}
 
-	got, err := scanMountHashes(context.Background(), root, attrs)
+	got, err := scanMountHashes(context.Background(), []string{root}, attrs)
 	require.NoError(err)
-	require.ElementsMatch(h[1:], got)
+	require.ElementsMatch(h[1:], got.Hashes)
+	require.Empty(got.Dirs)
+}
+
+func TestScanMountHashes_CleanDirectories(t *testing.T) {
+	require := require.New(t)
+
+	root := t.TempDir()
+	makeTree(t, root,
+		[]string{"clean/sub", "clean/project/src", "clean/cold", "dirty/clean", "dirty/edited"},
+		[]string{"clean/a", "clean/sub/b", "clean/project/src/c", "clean/link", "clean/cold/d", "dirty/clean/e", "dirty/edited/f"})
+
+	h := testHashes(8)
+	p := func(rel string) string { return filepath.Join(root, rel) }
+	attrs := &fakeMountAttrs{
+		unloaded: map[string]bool{p("clean/cold"): true},
+		dirty:    map[string]bool{root: true, p("dirty"): true, p("dirty/edited"): true},
+		excluded: map[string]bool{p("clean/project"): true, p("clean/link"): true},
+		hashes: map[string]entities.Hash{
+			p("clean"):          h[0],
+			p("clean/project"):  h[1],
+			p("clean/link"):     h[2],
+			p("dirty/clean"):    h[3],
+			p("dirty/edited/f"): h[4],
+		},
+	}
+
+	got, err := scanMountHashes(context.Background(), []string{root}, attrs)
+	require.NoError(err)
+	// The excluded file below a clean directory is not in its hash.
+	require.ElementsMatch([]entities.Hash{h[2], h[4]}, got.Hashes)
+	// The excluded project below a clean directory is a clean directory of its own.
+	require.Equal(map[entities.Hash][]string{h[0]: {p("clean")}, h[1]: {p("clean/project")}, h[3]: {p("dirty/clean")}}, got.Dirs)
+	// No hash is read below a clean directory, except of excluded entries.
+	require.ElementsMatch([]string{p("clean"), p("clean/project"), p("clean/link"), p("dirty/clean"), p("dirty/edited/f")}, attrs.read)
+
+	// A scan of a clean directory reports its entries.
+	attrs.hashes[p("clean/a")] = h[5]
+	attrs.hashes[p("clean/sub")] = h[6]
+	attrs.hashes[p("clean/cold")] = h[7]
+	got, err = scanMountHashes(context.Background(), []string{p("clean")}, attrs)
+	require.NoError(err)
+	require.ElementsMatch([]entities.Hash{h[5], h[7], h[2]}, got.Hashes)
+	require.Equal(map[entities.Hash][]string{h[6]: {p("clean/sub")}, h[1]: {p("clean/project")}}, got.Dirs)
+}
+
+// treeScan is a Scan over a fixed tree: dirs maps a root to the scan found
+// below it; the mount root is "".
+type treeScan map[string]MountScan
+
+func (s treeScan) scan(ctx context.Context, roots []string) (MountScan, error) {
+	if len(roots) == 0 {
+		roots = []string{""}
+	}
+	var out MountScan
+	out.Dirs = make(map[entities.Hash][]string)
+	for _, r := range roots {
+		out.Hashes = append(out.Hashes, s[r].Hashes...)
+		for h, paths := range s[r].Dirs {
+			out.Dirs[h] = append(out.Dirs[h], paths...)
+		}
+	}
+	return out, nil
+}
+
+func TestGCKeepAlive_TouchScansDirectoriesTheServerLacks(t *testing.T) {
+	require := require.New(t)
+
+	h := testHashes(8)
+	scans := treeScan{
+		// /a is on the server; /b and /c were changed and hashed locally and
+		// hold the same content; /b/x is on the server.
+		"":   {Hashes: []entities.Hash{h[0]}, Dirs: map[entities.Hash][]string{h[1]: {"/a"}, h[2]: {"/b", "/c"}}},
+		"/b": {Hashes: []entities.Hash{h[3]}, Dirs: map[entities.Hash][]string{h[4]: {"/b/x"}, h[2]: {"/b/same"}}},
+		"/c": {Hashes: []entities.Hash{h[3]}, Dirs: map[entities.Hash][]string{h[4]: {"/c/x"}}},
+		// /b/same has the hash of /b, which the server lacks, so it is
+		// scanned without asking again.
+		"/b/same": {Hashes: []entities.Hash{h[5]}},
+	}
+	var scanned [][]string
+	remote := &fakeGCRemote{known: map[entities.Hash]bool{h[0]: true, h[1]: true, h[3]: true, h[4]: true, h[5]: true}}
+	k := &GCKeepAlive{
+		Remote: remote,
+		Scan: func(ctx context.Context, roots []string) (MountScan, error) {
+			scanned = append(scanned, slices.Clone(roots))
+			return scans.scan(ctx, roots)
+		},
+	}
+	found, total, err := k.touch(context.Background())
+	require.NoError(err)
+	require.Equal(5, found)
+	require.Equal(6, total)
+	require.Len(scanned, 3)
+	require.Empty(scanned[0])
+	require.ElementsMatch([]string{"/b", "/c"}, scanned[1])
+	require.Equal([]string{"/b/same"}, scanned[2])
+	var asked []entities.Hash
+	for _, b := range remote.batches {
+		asked = append(asked, b...)
+	}
+	require.ElementsMatch(h[:6], asked, "a hash is asked once")
+}
+
+func TestGCKeepAlive_TouchPaces(t *testing.T) {
+	require := require.New(t)
+
+	hashes := testHashes(2*gcTouchBatchSize + 1)
+	remote := &fakeGCRemote{}
+	k := &GCKeepAlive{Remote: remote, TouchRate: 1000000, Scan: hashesScan(hashes, nil, nil)}
+	start := time.Now()
+	_, total, err := k.touch(context.Background())
+	require.NoError(err)
+	require.Equal(len(hashes), total)
+	require.Len(remote.batches, 3)
+	// The third batch waits until two batches' worth of time at the rate.
+	require.GreaterOrEqual(time.Since(start), time.Duration(2*gcTouchBatchSize)*time.Second/1000000)
+
+	// A cancel stops the touch before the next batch.
+	ctx, cancel := context.WithCancel(context.Background())
+	k.TouchRate = 1
+	remote.batches = nil
+	remote.onHeaders = cancel
+	_, _, err = k.touch(ctx)
+	require.ErrorIs(err, context.Canceled)
+	require.Len(remote.batches, 1)
 }

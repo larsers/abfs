@@ -15,25 +15,30 @@
 package client
 
 import (
+	"fmt"
+
 	"github.com/google/abfs/cas/cas/providers/cacheman"
 	"github.com/google/abfs/shared/entities"
 )
 
 // RemoteHeaders asks the remote server, through cacheman, for the headers of
-// keys and returns how many of them the server has.
-func (c *HttpClient) RemoteHeaders(keys []entities.Hash) (int, error) {
-	var found int
+// keys and returns for each key whether the server has it.
+func (c *HttpClient) RemoteHeaders(keys []entities.Hash) ([]bool, error) {
+	var found []bool
 	if err := c.postJSON("/remote-headers", keys, &found); err != nil {
-		return 0, err
+		return nil, err
+	}
+	if len(found) != len(keys) {
+		return nil, fmt.Errorf("cacheman answered %d remote headers for %d keys", len(found), len(keys))
 	}
 	return found, nil
 }
 
 // RemoteHeaders asks the remote server, through cacheman, for the headers of
-// keys and returns how many of them the server has.
-func (c *Client) RemoteHeaders(keys []entities.Hash) (int, error) {
+// keys and returns for each key whether the server has it.
+func (c *Client) RemoteHeaders(keys []entities.Hash) ([]bool, error) {
 	if c.client.IsClosing() {
-		return 0, cacheman.ErrClosedClient
+		return nil, cacheman.ErrClosedClient
 	}
 	return c.httpClient.RemoteHeaders(keys)
 }

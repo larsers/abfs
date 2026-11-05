@@ -22,8 +22,8 @@ import (
 )
 
 // handleRemoteHeaders asks the remote server for the headers of the given keys
-// and returns how many of them the server has. Mounts use it to touch the
-// objects they hold, so the server GC sees them as in use.
+// and returns for each key whether the server has it. Mounts use it to touch
+// the objects they hold, so the server GC sees them as in use.
 func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 	var keys []entities.Hash
 	if !c.ReadJSON(w, r, &keys) {
@@ -43,11 +43,9 @@ func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 		c.ErrorJSON(w, r, err, http.StatusInternalServerError)
 		return
 	}
-	found := 0
-	for _, hdr := range hdrs {
-		if !hdr.IsEmpty() {
-			found++
-		}
+	found := make([]bool, len(hdrs))
+	for i, hdr := range hdrs {
+		found[i] = !hdr.IsEmpty()
 	}
 	c.WriteJSON(w, r, found)
 }
