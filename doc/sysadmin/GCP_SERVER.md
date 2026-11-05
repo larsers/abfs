@@ -11,10 +11,12 @@ The GCP server is a CAS server that keeps its data in Google Cloud instead of a 
 | Map results | Bigtable table `maps` |
 | The first 1 MiB of larger objects | Bigtable table `chunks` |
 | The rest of larger objects | Cloud Storage bucket, in objects of 10 MiB and then 1000 MiB |
+| The GC edges of each object: the objects it references | Bigtable table `gc` |
+| Garbage collector state | Spanner tables `GcState` and `GcReplicas`, Bigtable family `objects:g` |
 
 ## Limits
 
-* Nothing is ever deleted: there is no garbage collection. Plan storage for growth.
+* Nothing is ever deleted: there is no garbage collection yet. The `gc` table and the other garbage collector resources prepare for it. Plan storage for growth.
 * Some content is stored but never referenced. When an upload fails after the server tried to write the object row, the server cannot tell whether the row was written, so it keeps the content. Concurrent uploads of the same object keep the content of every upload, though only one is referenced. This content is left for a later orphan sweep, which ABFS does not have yet.
 * Bigtable must be read and written through single-cluster routing: an instance with one cluster, or an app profile with single-cluster routing (`--bt-app-profile`). With multi-cluster routing a server can report objects another server has just written as missing: uploads that link them fail until the client retries, objects can be stored again, and map results can be missed. Refs are in Spanner and are not affected.
 * Map results come back oldest first by the time each server added them, so with several servers the order of results added close together follows the servers' clock skew.
@@ -53,6 +55,16 @@ abfs server gcp init --project <project> --instance <spanner-instance> --bucket 
 
 The server checks the same resources at startup and stops with an error that names the missing one.
 
+### Fill the gc table
+
+With `--gc-edges` on, the default, the server writes the `gc` row of each object it adds. Objects added before that, or while it was off, have none. `abfs server gcp gc backfill` scans the `objects` table and writes the missing rows, and the rows written by an older version of the edge rules; it reads every such object that is not a blob:
+
+```sh
+abfs server gcp gc backfill --project <project> --instance <spanner-instance> --bucket <bucket> [--dry-run] [--rate 2000] [--shards 16]
+```
+
+`--dry-run` only counts the rows to write. `--rate` limits the object rows scanned per second (0 means no limit). The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
+
 ## Run the server
 
 Both commands take the same flags. `abfs server gcp` is a subcommand of the `abfs` binary; flags of `abfs server` go before `gcp`:
@@ -81,6 +93,7 @@ abfs-server --port 50051 --project <project> --instance <spanner-instance> --buc
 | `--links-content` | off | Return signed Cloud Storage URLs, valid for 10 minutes, for objects larger than `--links-content-threshold`, so that clients download them from Cloud Storage directly. Clients then need access to `storage.googleapis.com`, and the server signs one URL per Cloud Storage object on every read. Without it, the server streams every object. |
 | `--links-content-threshold` | `1048576` | Size in bytes above which `--links-content` returns URLs |
 | `--gcp-client-metrics` | off | Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring |
+| `--gc-edges` | on | Write the GC edges of each new object to the Bigtable table `gc` before its object row. This adds one Bigtable write to each upload. |
 | `--no-link-validation`, `--no-hash-validation` | off | As for the file-based server |
 | `--http-host` | `localhost` | Address of the HTTP server (`--http-port`). Its endpoints, such as `/debug` and `/server/status`, have no authentication. |
 
