@@ -22,11 +22,27 @@ import (
 )
 
 const (
+	// A client pings only while a call is open and nothing has been read for this long, so
+	// a healthy server sees few pings even though this is below the one minute the gRPC
+	// keepalive guide suggests.
+	clientKeepaliveTime = 30 * time.Second
+	// On Linux this is also the socket's TCP_USER_TIMEOUT: data the server has not
+	// acknowledged for this long closes the connection.
+	clientKeepaliveTimeout = 20 * time.Second
 	// grpc-go clients cannot ping more often than every 10 s, so this lets any of them ping
 	// on an open call. grpc-go's default, 5 minutes, closes the connection with
 	// too_many_pings after a few pings on a call the server writes nothing to.
 	serverKeepaliveMinTime = 10 * time.Second
 )
+
+// clientKeepalive makes a client close a connection to a server that stops answering, so
+// that calls fail instead of waiting for the operating system or the call deadline. Tests
+// shorten it.
+var clientKeepalive = keepalive.ClientParameters{
+	Time:                clientKeepaliveTime,
+	Timeout:             clientKeepaliveTimeout,
+	PermitWithoutStream: false,
+}
 
 // ServerKeepalivePolicy returns the keepalive enforcement policy of the ABFS gRPC servers.
 func ServerKeepalivePolicy() grpc.ServerOption {
