@@ -25,3 +25,8 @@ import (
 func (s *GCPServer) BackfillGC(ctx context.Context, opts *gc.BackfillOpts) (*gc.BackfillStats, error) {
 	return gc.Backfill(ctx, s.casdb.BTClient(), s, opts)
 }
+
+// DryRunGC runs a garbage collection cycle that only reports; see gc.DryRun.
+func (s *GCPServer) DryRunGC(ctx context.Context, opts *gc.DryRunOpts) (*gc.Result, error) {
+	return gc.DryRun(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s, opts)
+}
