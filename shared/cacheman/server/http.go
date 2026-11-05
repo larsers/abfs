@@ -72,6 +72,7 @@ func (c *CacheMan) httpHandler() http.Handler {
 	r.HandleFunc("/remote-config", c.handleRemoteConfig).Methods("GET")
 	r.HandleFunc("/keep-alive", c.handleKeepAlive).Methods("POST")
 	r.HandleFunc("/is-object-remote", c.handleIsObjectRemote).Methods("POST")
+	r.HandleFunc("/remote-headers", c.handleRemoteHeaders).Methods("POST")
 	r.HandleFunc("/local-gc", c.handleLocalGC).Methods("POST")
 	r.HandleFunc("/prefetch", c.handlePrefetch).Methods("POST")
 	r.HandleFunc("/push-build-metrics", c.handlePushBuildMetrics).Methods("POST")
