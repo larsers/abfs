@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,6 +205,52 @@ func TestGCHooks_RescueLosesToDelete(t *testing.T) {
 	_, err = s.casdb.GetHeader(ctx, key3)
 	require.NoError(err)
 	require.False(objectTouched(t, s, key), "a lost rescue wrote a touch")
+}
+
+// A keep-alive batch right after a condemn cycle can hold many condemned
+// objects; their rescues run in parallel, and one the collector deleted first
+// is reported missing.
+func TestGCHooks_RescuesABatchInParallel(t *testing.T) {
+	require := require.New(t)
+	s := newGCHooksServer(t, &NewServerOpts{})
+	keys := make([]entities.Hash, 100)
+	for i := range keys {
+		keys[i] = putBlob(t, s, fmt.Sprintf("condemned %d", i))
+		condemnObject(t, s, keys[i], 3)
+	}
+	gone := keys[7]
+	rescue := s.gcHooks.rescue
+	var mu sync.Mutex
+	var running, most int
+	s.gcHooks.rescue = func(ctx context.Context, key entities.Hash, condemned []byte) (bool, error) {
+		mu.Lock()
+		running++
+		most = max(most, running)
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		mu.Lock()
+		running--
+		mu.Unlock()
+		if key == gone {
+			deleteObjectRow(t, s, key)
+		}
+		return rescue(ctx, key, condemned)
+	}
+
+	hdrs, err := s.Headers(context.Background(), keys)
+	require.NoError(err)
+	for i, h := range hdrs {
+		require.Equal(keys[i] == gone, h.IsEmpty(), i)
+	}
+	for _, key := range keys {
+		if key != gone {
+			require.False(isCondemned(t, s, key))
+		}
+	}
+	require.Equal(int64(99), s.gcHooks.rescues[pathHeaders].Load())
+	require.Equal(int64(1), s.gcHooks.rescuesLost[pathHeaders].Load())
+	require.Greater(most, 1)
+	require.LessOrEqual(most, rescueWorkers)
 }
 
 func TestGCHooks_TouchThrottle(t *testing.T) {
