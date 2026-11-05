@@ -35,6 +35,7 @@ var defaultConfig = &Config{
 	ServerWaitTimeout:   DefaultServerWaitTimeout,
 	ManifestProjectName: "platform/manifest",
 	EnableIndex:         true,
+	IdleLocalGC:         true,
 	EvictThreshold:      uint64(1024 * 1024 * 1024 * 1024), // 1 TB
 	FsyncObjects:        true,
 	GitPrefetching:      true,
