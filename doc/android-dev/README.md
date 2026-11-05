@@ -89,6 +89,10 @@ one machine. Hosts that share a cache should mount the workspace at the same
 absolute path. See
 [Mount at the same path on every host](WORKSPACES.md#mount-at-the-same-path-on-every-host).
 
+If your tree comes from a layered manifest (supplier lists, `remove-project`,
+`extend-project`, include groups) or you add local manifests, see
+[Manifests and tree layouts](../sysadmin/MANIFESTS.md).
+
 ### Build
 
 Replace the below commands with your desired `lunch` target and build goal.

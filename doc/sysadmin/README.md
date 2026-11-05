@@ -294,6 +294,10 @@ EOF
 
 This can always be changed later interactively with `abfs edit config:clients/configs`.
 
+If your manifest layers lists with `remove-project`, `extend-project` or include groups, or
+your builds mount another entry file than `default.xml`, see
+[Manifests and tree layouts](MANIFESTS.md) for the client and git-pusher setup.
+
 ### When the server is unavailable
 
 Clients wait for a server that is stopped or restarting, or whose address does not answer, so a server restart does not fail the builds, mounted workspaces and git-pushers that use it:
@@ -342,6 +346,9 @@ To enable faster source control operations, ABFS requires a slightly patched ver
     ```
 
 To update `repo` later, repeat these steps.
+
+[Manifests and tree layouts](MANIFESTS.md) lists the manifest elements ABFS applies and the
+known limits of `repo sync` and `repo-hooks` inside a mount.
 
 ## First Mount
 

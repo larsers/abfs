@@ -65,6 +65,7 @@ type Repo struct {
 	manifestServer      string
 	manifestScheme      string
 	localManifestDir    string
+	manifestFile        string
 
 	remoteCache           map[string]remoteData
 	defaultSchemeURL      string
@@ -186,6 +187,7 @@ func (r *Repo) WorkspaceManifest(root string) (*manifest.Manifest, error) {
 }
 
 func (r *Repo) ManifestFromFile(fileName string) error {
+	r.manifestFile = fileName
 	manifest, err := manifest.ParseFile(fileName)
 	if err != nil {
 		return err
@@ -202,6 +204,7 @@ func (r *Repo) ManifestFromBytes(content []byte) error {
 }
 
 func (r *Repo) ManifestFromBranch(ctx context.Context, branch, manifestProjectName, manifestBranchFile string) (returnErr error) {
+	r.manifestFile = manifestBranchFile
 	if err := r.ResolveManifestBranch(manifestProjectName, branch); err != nil {
 		return err
 	}
@@ -448,6 +451,20 @@ func (r *Repo) pin(ctx context.Context, man *manifest.Manifest) (*manifest.Manif
 				}
 			}
 		}
+	}
+
+	if err := pinned.Effective(); err != nil {
+		return nil, nil, err
+	}
+	top := ""
+	if r.manifestFile != "" {
+		top = r.manifestFile + ": "
+	}
+	for _, w := range man.Warnings() {
+		log.Printf("Warning: manifest %s%s", top, w)
+	}
+	for _, w := range pinned.Warnings() {
+		log.Printf("Warning: manifest %s", w)
 	}
 
 	// Create fast lookup of remote properties.
