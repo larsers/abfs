@@ -124,6 +124,12 @@ func (t *Toucher) TouchMapRow(row string) bool {
 
 func (t *Toucher) add(tc touch, wait bool) bool {
 	select {
+	case <-t.stop:
+		t.dropped.Add(1)
+		return false
+	default:
+	}
+	select {
 	case t.queue <- tc:
 		if t.stalled.Load() {
 			t.stalled.Store(false)
@@ -156,7 +162,7 @@ func (t *Toucher) Stats() TouchStats {
 }
 
 // Close writes the buffered touches and stops the Toucher. Touches queued
-// after Close are not written.
+// after Close are dropped.
 func (t *Toucher) Close() {
 	t.stopOnce.Do(func() { close(t.stop) })
 	<-t.done

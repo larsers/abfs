@@ -160,6 +160,19 @@ func TestToucher_TryTouchObjectDoesNotWait(t *testing.T) {
 	require.Equal(TouchStats{Written: 2, Dropped: 1}, toucher.Stats())
 }
 
+func TestToucher_DropsTouchesAfterClose(t *testing.T) {
+	require := require.New(t)
+	client := newHooksTestBigtable(t)
+	toucher := NewToucher(client, 10)
+	keys := testHashes(3)
+	require.True(toucher.TouchObject(keys[0]))
+	toucher.Close()
+	require.False(toucher.TouchObject(keys[1]))
+	require.False(toucher.TryTouchObject(keys[2]))
+	require.False(toucher.TouchMapRow(keys[2].String() + "#" + keys[2].String()))
+	require.Equal(TouchStats{Written: 1, Dropped: 3}, toucher.Stats())
+}
+
 func TestToucher_WaitsForRoom(t *testing.T) {
 	require := require.New(t)
 	client := newHooksTestBigtable(t)
