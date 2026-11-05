@@ -390,7 +390,7 @@ Some things to know:
 
 - `abfs ready` writes `pinned.xml` only when the branch is ready, and removes it when not, so a later step cannot mount an old file.
 - Pass the same `-b` and `-g` to both commands, and do not pass `--local-manifest-dir` with a pinned file.
-- If the branch uses a manifest file other than `default.xml`, pass it to `abfs ready` with `--branch-file` and mount the pinned file. `abfs mount --tmp-ws` and `--ws` read the default file of the branch otherwise.
+- If the branch uses a manifest file other than `default.xml`, pass it to `abfs ready` with `--branch-file` and mount the pinned file. Without `-f` or `-h`, `abfs mount` reads the file that `--branch-file` names (default `default.xml`), with or without `--tmp-ws` and `--ws`; with `-f` or `-h` it reads the pinned manifest and ignores `--branch-file`.
 - A ref can resolve before git-pusher has written its deep tree helper objects. The mount then builds them itself, which is slower.
 
 `abfs ready` can report a branch as not ready while a mount would still work in a few cases:
