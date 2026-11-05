@@ -354,6 +354,59 @@ To update `repo` later, repeat these steps.
 [Manifests and tree layouts](MANIFESTS.md) lists the manifest elements ABFS applies and the
 known limits of `repo sync` and `repo-hooks` inside a mount.
 
+### Metrics
+
+Commands of the `abfs` binary, such as the server, git-pusher and cacheman, export the metrics they record with OpenTelemetry. So does the standalone `cacheman` binary that `make cacheman` and `make cacheman-static` build. Export is off by default. Two config keys turn it on:
+
+* `metrics-provider: otel` selects the OpenTelemetry backend.
+* `record-client-metrics: true` turns recording on for every command, the server and git-pusher included. Without it nothing is exported.
+
+Set them for one command with `--kv`, a global flag that goes before the subcommand, or write them to the instance config file with `abfs config -w`:
+
+```sh
+abfs --kv metrics-provider=otel --kv record-client-metrics=true cacheman run
+abfs --kv metrics-provider=otel --kv record-client-metrics=true config -w
+```
+
+`OTEL_METRICS_EXPORTER` chooses the exporter:
+
+* `otlp` (the default) sends OTLP to a collector. `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` or `OTEL_EXPORTER_OTLP_PROTOCOL` sets the protocol, `http/protobuf` (the default) or `grpc`.
+* `prometheus` serves `/metrics` for scraping on `OTEL_EXPORTER_PROMETHEUS_HOST` (default `localhost`) and `OTEL_EXPORTER_PROMETHEUS_PORT` (default `9464`). It serves values only while the process runs.
+* `console` writes JSON to standard output, which is useful to check the setup.
+* `none` exports nothing.
+
+A comma-separated list combines them, for example `OTEL_METRICS_EXPORTER=otlp,prometheus` to push to a collector and serve `/metrics` at once. In a list, `OTEL_METRICS_PRODUCERS` does not apply, and a name listed twice or a name other than these four turns export off with a warning.
+
+The other standard `OTEL_*` variables apply as well, for example `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_METRIC_EXPORT_INTERVAL` (in milliseconds, 60000 by default), `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`:
+
+```sh
+OTEL_METRICS_EXPORTER=console OTEL_METRIC_EXPORT_INTERVAL=5000 \
+  abfs --kv metrics-provider=otel --kv record-client-metrics=true cacheman run
+```
+
+Each process describes itself with the resource attributes `service.name` (`abfs`), `service.version`, `service.instance.id` (the host name), `abfs.instance` (the ABFS instance name), `abfs.runID` (new for each process) and `abfs.username` (a hash of the user name), plus the SDK's `telemetry.sdk.name`, `telemetry.sdk.language` and `telemetry.sdk.version`. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override any of ours and add others, such as `cloud.region`. A collector can also add the attributes of the platform it runs on.
+
+Things to know:
+
+* Each command waits up to 15 seconds at exit for its final export. With `otlp`, that export comes at least 5 seconds after the previous export, since some backends reject a point less than 5 seconds after the previous point of the same series. A command can take up to 5 seconds longer to exit. If an export still in flight leaves too little time, the final export is skipped with a warning.
+* `OTEL_METRICS_PRODUCERS` does not apply to `otlp`.
+* Each process reports as the instance named by its host name. Two processes on one host that write the same metric with the same labels share a series in a backend that identifies a series by `service.name`, `service.instance.id` and the metric labels. `abfs.runID` is not part of that key.
+
+The cacheman service that `abfs init` or `cacheman init` sets up runs under `systemd` and does not see `OTEL_*` variables set in a shell. Without them it exports with the defaults: OTLP over HTTP with TLS to `https://localhost:4318`. Set them for the service in a drop-in, then restart it (replace `default` with the instance name). The drop-in survives a later `abfs init`, which rewrites only the unit file:
+
+```sh
+systemctl --user edit cacheman@default
+abfs cacheman restart
+```
+
+```ini
+[Service]
+Environment=OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+`systemctl --user edit` needs a terminal. A script writes the same lines to `~/.config/systemd/user/cacheman@default.service.d/override.conf`; `abfs cacheman restart` reloads the unit files itself.
+
 ## First Mount
 
 It could take a few days for the push to complete depending on the size of your git history and the number and size of your git-pusher servers. `abfs ready` tells you when a manifest branch can be mounted. It reads the manifest from the ABFS server, resolves every project the same way `abfs mount` does, and lists the projects that are still missing:
