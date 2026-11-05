@@ -19,10 +19,12 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -272,6 +274,46 @@ func TestGCHooks_RescuesABatchInParallel(t *testing.T) {
 	require.Equal(int64(1), s.gcHooks.rescuesLost[pathHeaders].Load())
 	require.Greater(most, 1)
 	require.LessOrEqual(most, rescueWorkers)
+}
+
+// A failed rescue does not stop the other rescues of the batch, so that a
+// retry of the call finds only that object still condemned.
+func TestGCHooks_FailedRescueDoesNotStopTheBatch(t *testing.T) {
+	require := require.New(t)
+	s := newGCHooksServer(t, &NewServerOpts{})
+	keys := make([]entities.Hash, 100)
+	for i := range keys {
+		keys[i] = putBlob(t, s, fmt.Sprintf("condemned %d", i))
+		condemnObject(t, s, keys[i], 3)
+	}
+	failing := keys[7]
+	rescueErr := errors.New("unavailable")
+	rescue := s.gcHooks.rescue
+	var calls atomic.Int64
+	s.gcHooks.rescue = func(ctx context.Context, key entities.Hash, condemned []byte) (bool, error) {
+		calls.Add(1)
+		if key == failing {
+			return false, rescueErr
+		}
+		return rescue(ctx, key, condemned)
+	}
+
+	_, err := s.Headers(context.Background(), keys)
+	require.ErrorIs(err, rescueErr)
+	require.Equal(int64(len(keys)), calls.Load())
+	for _, key := range keys {
+		require.Equal(key == failing, isCondemned(t, s, key), key)
+	}
+	require.Equal(int64(99), s.gcHooks.rescues[pathHeaders].Load())
+
+	// The retry rescues the one left.
+	s.gcHooks.rescue = rescue
+	hdrs, err := s.Headers(context.Background(), keys)
+	require.NoError(err)
+	for _, h := range hdrs {
+		require.False(h.IsEmpty())
+	}
+	require.False(isCondemned(t, s, failing))
 }
 
 // fakeToucher records the touches of objects by whether the call waited for

@@ -304,20 +304,22 @@ func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *O
 // rescueHeaders rescues the condemned objects of hdrs and returns hdrs without
 // the ones the collector deleted first. A batch can hold many condemned
 // objects, for example a keep-alive touch right after a cycle condemned what
-// the mount holds, so the rescues run in parallel.
+// the mount holds, so the rescues run in parallel. A failed rescue does not
+// stop the others: the call fails with the first error once all have run, so
+// a retry finds only the objects whose rescue failed still condemned.
 func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*ObjectHeader) ([]*ObjectHeader, error) {
 	if s.gcHooks.rescue == nil {
 		return hdrs, nil
 	}
 	gone := make([]bool, len(hdrs))
-	g, gctx := errgroup.WithContext(ctx)
+	var g errgroup.Group
 	g.SetLimit(rescueWorkers)
 	for i, h := range hdrs {
 		if h.Condemned == nil {
 			continue
 		}
 		g.Go(func() error {
-			err := s.rescueCondemned(gctx, path, h)
+			err := s.rescueCondemned(ctx, path, h)
 			if errors.Is(err, casdb.ErrNotFound) {
 				gone[i] = true
 				return nil
