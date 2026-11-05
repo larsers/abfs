@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -113,8 +114,9 @@ func TestSync_RefKey(t *testing.T) {
 			require.NoError(os.MkdirAll(wsDir, 0755))
 
 			// The manifest and the repo tool come from local paths through the git
-			// fallback, so only the project clone looks refs up. Its own git fallback
-			// must not reach the network.
+			// fallback, so only the project clone and the manifest revision lookup of
+			// the sync look refs up. The project's own git fallback must not reach the
+			// network.
 			t.Setenv("GIT_ALLOW_PROTOCOL", "file")
 			store := &refKeyStore{}
 			casfs := &stubCASFS{}
@@ -133,7 +135,10 @@ func TestSync_RefKey(t *testing.T) {
 			}))
 
 			require.Error(repo.Sync(ctx, nil, abfsrepo.SyncOpts{Jobs: 1, FallbackToGit: true}))
-			require.Equal(tt.want, store.recorded())
+			// A local path has no host, so the manifest lookup finds nothing and the
+			// name is taken as a branch.
+			want := append([]refKey{{"", strings.Trim(manifestRemote, "/")}}, tt.want...)
+			require.Equal(want, store.recorded())
 		})
 	}
 }
