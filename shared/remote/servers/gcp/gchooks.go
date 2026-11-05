@@ -40,7 +40,7 @@ import (
 // rescue condemned objects, hits touch objects and map rows, cache entries
 // expire, and each replica writes a heartbeat.
 const (
-	DefaultCacheTTL            = 6 * time.Hour
+	DefaultCacheTTL            = gc.DefaultCacheTTL
 	DefaultGCTouchInterval     = 36 * time.Hour
 	DefaultGCHeartbeatInterval = 5 * time.Minute
 	touchBufferSize            = 100 * 1000

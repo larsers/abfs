@@ -104,6 +104,49 @@ func TestAcquireLease_TakesExpiredLease(t *testing.T) {
 	}, 10*time.Second, 500*time.Millisecond)
 }
 
+// A lease taken over from a holder that did not release it records that
+// holder's expiry, which a later delete step waits for; a released lease
+// leaves no expiry and no phase.
+func TestAcquireLease_RecordsPreviousLeaseExpiry(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	sp := newEmulatorCASDBServer(t).casdb.SpannerClient()
+	state := func() (phase spanner.NullString, prev spanner.NullTime) {
+		row, err := sp.Single().ReadRow(ctx, "GcState", spanner.Key{gc.DefaultStateName}, []string{"Phase", "PreviousLeaseExpiry"})
+		require.NoError(err)
+		require.NoError(row.Columns(&phase, &prev))
+		return phase, prev
+	}
+
+	first, err := gc.AcquireLease(ctx, sp, gc.DefaultStateName, "stalled", gc.PhaseDryRun, 3*time.Second, testGrace)
+	require.NoError(err)
+	require.True(first.PreviousExpiry.IsZero())
+	_, prev := state()
+	require.False(prev.Valid)
+
+	var next *gc.Lease
+	require.Eventually(func() bool {
+		next, err = gc.AcquireLease(ctx, sp, gc.DefaultStateName, "next", gc.PhaseDryRun, time.Minute, testGrace)
+		return err == nil
+	}, 10*time.Second, 500*time.Millisecond)
+	require.False(next.PreviousExpiry.IsZero())
+	require.True(next.PreviousExpiry.Before(next.Start))
+	require.True(next.PreviousExpiry.After(first.Start))
+	phase, prev := state()
+	require.Equal(gc.PhaseDryRun, phase.StringVal)
+	require.True(prev.Valid)
+	require.Equal(next.PreviousExpiry, prev.Time)
+
+	next.Release()
+	phase, _ = state()
+	require.False(phase.Valid, "the phase of a released lease")
+	third, err := gc.AcquireLease(ctx, sp, gc.DefaultStateName, "third", gc.PhaseDryRun, time.Minute, testGrace)
+	require.NoError(err)
+	require.True(third.PreviousExpiry.IsZero())
+	_, prev = state()
+	require.False(prev.Valid)
+}
+
 func TestLease_WatchdogStopsWhenLeaseIsTaken(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()

@@ -68,6 +68,10 @@ type Lease struct {
 	Epoch int64
 	// Start is the commit time of the transaction that took the lease.
 	Start time.Time
+	// PreviousExpiry is the expiry of the lease this one took over, zero when
+	// that lease had been released. A holder that stalled may still act until
+	// then.
+	PreviousExpiry time.Time
 	// taken is the local time just before the lease was taken, the base of the
 	// watchdog.
 	taken time.Time
@@ -84,8 +88,9 @@ func DefaultHolder() string {
 
 // AcquireLease takes the lease of the garbage collector name for duration and
 // starts a new cycle in the given phase: it increments the cycle number and
-// the lease epoch and records the start time and grace. It fails with
-// *ErrLeaseHeld while another holder's lease is valid.
+// the lease epoch and records the start time, the grace and the expiry of the
+// lease it takes over. It fails with *ErrLeaseHeld while another holder's
+// lease is valid.
 func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, phase string, duration, grace time.Duration) (*Lease, error) {
 	if duration < minLeaseDuration {
 		return nil, fmt.Errorf("lease duration %s is shorter than %s", duration, minLeaseDuration)
@@ -97,7 +102,7 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 			return err
 		}
 		var cycle, epoch int64
-		var prevStart spanner.NullTime
+		var prevStart, expiry spanner.NullTime
 		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime"})
 		switch {
 		case spanner.ErrCode(err) == codes.NotFound:
@@ -105,7 +110,6 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 			return err
 		default:
 			var current spanner.NullString
-			var expiry spanner.NullTime
 			if err := row.Columns(&cycle, &current, &epoch, &expiry, &prevStart); err != nil {
 				return err
 			}
@@ -114,6 +118,10 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 			}
 		}
 		l.Cycle, l.Epoch = cycle+1, epoch+1
+		l.PreviousExpiry = time.Time{}
+		if expiry.Valid {
+			l.PreviousExpiry = expiry.Time
+		}
 		return txn.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(stateTable, map[string]any{
 			"Name":                   name,
 			"Cycle":                  l.Cycle,
@@ -121,6 +129,7 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 			"LeaseHolder":            holder,
 			"LeaseEpoch":             l.Epoch,
 			"LeaseExpiry":            now.Add(duration),
+			"PreviousLeaseExpiry":    expiry,
 			"CycleStartTime":         now,
 			"PreviousCycleStartTime": prevStart,
 			"GraceSeconds":           int64(grace / time.Second),
@@ -149,12 +158,12 @@ func (l *Lease) RecordSnapshot(ctx context.Context, snapshot time.Time) error {
 }
 
 // Release gives the lease up, so that the next run need not wait for it to
-// expire.
+// expire, and records that no cycle runs.
 func (l *Lease) Release() {
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer cancel()
 	err := l.update(ctx, func(time.Time) map[string]any {
-		return map[string]any{"LeaseHolder": spanner.NullString{}, "LeaseExpiry": spanner.NullTime{}}
+		return map[string]any{"LeaseHolder": spanner.NullString{}, "LeaseExpiry": spanner.NullTime{}, "Phase": spanner.NullString{}}
 	})
 	if err != nil {
 		log.Printf("Warning: failed to release the GC lease: %v", err)

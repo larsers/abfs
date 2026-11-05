@@ -16,14 +16,17 @@
 -- can be applied again to an existing database.
 
 -- One row per garbage collector instance. The process that holds the lease
--- (LeaseHolder until LeaseExpiry, fenced by LeaseEpoch) runs the cycles.
+-- (LeaseHolder until LeaseExpiry, fenced by LeaseEpoch) runs the cycles, and
+-- Phase is the mode of its cycle. PreviousLeaseExpiry is the expiry of the
+-- lease that the current holder took over, NULL when it had been released.
 CREATE TABLE IF NOT EXISTS GcState (
     Name STRING(64) NOT NULL,
     Cycle INT64 NOT NULL,
-    Phase STRING(64) NOT NULL,
+    Phase STRING(64),
     LeaseHolder STRING(MAX),
     LeaseEpoch INT64 NOT NULL,
     LeaseExpiry TIMESTAMP,
+    PreviousLeaseExpiry TIMESTAMP,
     CycleStartTime TIMESTAMP,
     PreviousCycleStartTime TIMESTAMP,
     SnapshotTime TIMESTAMP,
