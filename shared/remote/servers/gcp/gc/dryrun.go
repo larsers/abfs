@@ -338,6 +338,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	bounds = prefixBounds(bounds)
 	scanStart := time.Now()
 	gcTable := d.bt.Open(TableName)
 	g, nodes, err := scanNodes(ctx, gcTable, bounds, snapshot.Add(-o.Grace))
@@ -345,7 +346,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		return nil, err
 	}
 	d.sampleMemory()
-	var mapRows []mapRow
+	var mapRows [][]mapRow
 	var malformedMaps int64
 	eg, ectx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
@@ -365,7 +366,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
-	m := newMarker(g, len(g.keys))
+	m := newMarker(g, g.size())
 	for _, root := range refs.roots {
 		d.addRoot(m, g, string(root.class), root.target)
 	}
@@ -376,7 +377,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		d.addRoot(m, g, RootPermanent, h)
 	}
 	recent := d.root(RootRecent)
-	for id := range uint32(len(g.keys)) {
+	for id := range uint32(g.size()) {
 		if g.recent.has(id) {
 			m.add(id)
 			recent.Roots++
@@ -394,7 +395,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	r.Objects = ObjectCounts{
-		Rows:         int64(len(g.keys)),
+		Rows:         int64(g.size()),
 		Reachable:    m.live.count(),
 		Recent:       recent.Roots,
 		TouchOnly:    nodes.TouchOnly,
@@ -416,11 +417,13 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		r.Seconds.Consistency = time.Since(step).Seconds()
 	}
 	d.sampleMemory()
-	r.Memory.KeysBytes = int64(len(g.keys)) * entities.HashSize
+	r.Memory.KeysBytes = g.keysBytes()
 	for _, s := range g.segs {
-		r.Memory.EdgesBytes += int64(len(s.edges))*4 + int64(len(s.offsets))*8
+		r.Memory.EdgesBytes += s.bytes()
 	}
-	r.Memory.MapRowsBytes = int64(len(mapRows)) * 16
+	for _, rows := range mapRows {
+		r.Memory.MapRowsBytes += int64(cap(rows)) * 16
+	}
 	r.Seconds.Total = time.Since(d.start).Seconds()
 	logSummary(r)
 	return &Result{Report: r, graph: g, live: m.live}, nil

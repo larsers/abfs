@@ -97,11 +97,11 @@ func testGraph(types []string, edges map[uint32][]uint32) *graph {
 	}
 	half := uint32(len(types) / 2)
 	for _, r := range [][2]uint32{{0, half}, {half, uint32(len(types))}} {
-		seg := segment{lo: r[0], offsets: []uint64{0}}
+		seg := segment{lo: r[0]}
 		for id := r[0]; id < r[1]; id++ {
-			seg.edges = append(seg.edges, edges[id]...)
-			seg.offsets = append(seg.offsets, uint64(len(seg.edges)))
+			seg.add(edges[id])
 		}
+		seg.finish()
 		g.segs = append(g.segs, seg)
 	}
 	return g
@@ -130,7 +130,7 @@ func TestMarker_MapsAndDanglingTargets(t *testing.T) {
 		{from: 11, to: 12},
 		{from: noNode, to: noNode},
 	}
-	counts := m.markMaps(g, rows, 50)
+	counts := m.markMaps(g, [][]mapRow{rows[:2], rows[2:]}, 50)
 	require.Equal(&MapCounts{Rows: 2, Live: 1, Expired: 1}, counts[MapPusher])
 	require.Equal(&MapCounts{Rows: 1, Live: 1}, counts[MapEval])
 	require.Equal(&MapCounts{Rows: 1, Live: 1}, counts[MapLFS])
@@ -145,7 +145,51 @@ func TestMarker_MapsAndDanglingTargets(t *testing.T) {
 
 	// The eval row past the map retention keeps nothing.
 	m = newMarker(g, 14)
-	counts = m.markMaps(g, rows[2:3], 200)
+	counts = m.markMaps(g, [][]mapRow{rows[2:3]}, 200)
 	require.Equal(&MapCounts{Rows: 1, Expired: 1}, counts[MapEval])
 	require.Zero(m.live.count())
+}
+
+// Nodes with many, few and no edges round-trip through the blocks of a
+// segment, also when a node's edges do not fit the current block.
+func TestSegment_Blocks(t *testing.T) {
+	require := require.New(t)
+	sizes := []int{0, 3, minEdgeBlock - 3, 0, 4, maxEdgeBlock + 5, 0, 1, minEdgeBlock, 2}
+	var want [][]uint32
+	seg := segment{lo: 7}
+	next := uint32(0)
+	for _, n := range sizes {
+		ids := make([]uint32, n)
+		for i := range ids {
+			ids[i] = next
+			next++
+		}
+		want = append(want, ids)
+		seg.add(ids)
+	}
+	seg.finish()
+	require.Equal(len(sizes), seg.nodes())
+	for k := range want {
+		got := seg.nodeEdges(uint32(k))
+		require.Len(got, len(want[k]), k)
+		if len(want[k]) > 0 {
+			require.Equal(want[k], got, k)
+		}
+	}
+	for _, b := range seg.blocks {
+		require.LessOrEqual(len(b), cap(b))
+	}
+	g := &graph{segs: []segment{seg}}
+	require.Equal(want[1], g.edges(8))
+	require.Nil(g.edges(6))
+	require.Nil(g.edges(7 + uint32(len(sizes))))
+}
+
+func TestPrefixBounds(t *testing.T) {
+	bounds, err := splitRange("", "", 3)
+	require.NoError(t, err)
+	require.Equal(t, []string{"", "55555555", "aaaaaaaa", ""}, bounds)
+	require.Equal(t, []string{"", "5555", "aaaa", ""}, prefixBounds(bounds))
+	require.Equal(t, []string{"", "0000", "0001", ""}, prefixBounds([]string{"", "00000000", "00000001", "00010000", ""}))
+	require.Equal(t, []string{"", ""}, prefixBounds([]string{"", ""}))
 }

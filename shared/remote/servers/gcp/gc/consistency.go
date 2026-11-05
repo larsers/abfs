@@ -65,7 +65,7 @@ type objectBytes struct {
 // of the reachable and unreachable objects.
 func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []string, g *graph, live bitmap, checkBefore time.Time) (*ConsistencyReport, objectBytes, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.LatestNFilter(1))
-	seen := newBitmap(len(g.keys))
+	seen := newBitmap(g.size())
 	var mu sync.Mutex
 	report := &ConsistencyReport{Ran: true}
 	var sizes objectBytes
@@ -127,6 +127,6 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 	}
 	slices.Sort(report.FirstMissing)
 	report.FirstMissing = report.FirstMissing[:min(len(report.FirstMissing), maxMissingKept)]
-	report.GCRowsWithoutObject = int64(len(g.keys)) - seen.count()
+	report.GCRowsWithoutObject = int64(g.size()) - seen.count()
 	return report, sizes, nil
 }

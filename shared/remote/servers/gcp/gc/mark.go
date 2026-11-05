@@ -153,7 +153,7 @@ type MapCounts struct {
 // become live when the tree of their request is live, which the walk can only
 // tell after it ran, so they are checked again after each walk until none
 // changes.
-func (m *marker) markMaps(g *graph, rows []mapRow, evalAfter int64) map[MapClass]*MapCounts {
+func (m *marker) markMaps(g *graph, shards [][]mapRow, evalAfter int64) map[MapClass]*MapCounts {
 	counts := make(map[MapClass]*MapCounts)
 	count := func(c MapClass) *MapCounts {
 		mc := counts[c]
@@ -163,41 +163,42 @@ func (m *marker) markMaps(g *graph, rows []mapRow, evalAfter int64) map[MapClass
 		}
 		return mc
 	}
-	var pusher []int
-	for i := range rows {
-		r := &rows[i]
-		c := g.mapClass(r)
-		mc := count(c)
-		mc.Rows++
-		if r.to == noNode {
-			mc.MissingTo++
-		}
-		switch c {
-		case MapEval:
-			if r.time < evalAfter {
+	var pusher []*mapRow
+	for _, rows := range shards {
+		for i := range rows {
+			r := &rows[i]
+			c := g.mapClass(r)
+			mc := count(c)
+			mc.Rows++
+			if r.to == noNode {
+				mc.MissingTo++
+			}
+			switch c {
+			case MapEval:
+				if r.time < evalAfter {
+					continue
+				}
+			case MapPusher:
+				pusher = append(pusher, r)
+				continue
+			case MapNoRequest:
+				m.add(r.to)
+				mc.Live++
 				continue
 			}
-		case MapPusher:
-			pusher = append(pusher, i)
-			continue
-		case MapNoRequest:
+			m.add(r.from)
 			m.add(r.to)
 			mc.Live++
-			continue
 		}
-		m.add(r.from)
-		m.add(r.to)
-		mc.Live++
 	}
 	m.walk()
 
 	for changed := true; changed; {
 		changed = false
 		kept := pusher[:0]
-		for _, i := range pusher {
-			r := &rows[i]
+		for _, r := range pusher {
 			if !m.treeLive(r.from) {
-				kept = append(kept, i)
+				kept = append(kept, r)
 				continue
 			}
 			m.add(r.from)

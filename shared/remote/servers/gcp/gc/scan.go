@@ -57,39 +57,119 @@ func knownTypes() ([]string, map[string]uint8) {
 }
 
 // graph is the object graph of one scan of the table gc. Nodes are the row
-// keys, numbered in key order; the edges of each node are in compressed
-// sparse rows, one segment per scan shard.
+// keys, numbered in key order across the scan shards; the edges of each node
+// are in compressed sparse rows, one segment per scan shard. The keys stay in
+// the arrays their shards filled, so the scan never copies them.
 type graph struct {
-	keys []Hash
-	// prefix[p] is the first node whose key starts with the 16 bits p.
-	prefix []uint32
-	types  []uint8
-	recent bitmap
-	segs   []segment
-	// shardSizes holds the number of nodes of each scan shard.
-	shardSizes []int
+	shards []keyShard
+	n      int
+	// prefix[p] is the first node whose key starts with the 16 bits p, and
+	// prefixShard[p] the shard that holds those keys.
+	prefix      []uint32
+	prefixShard []uint16
+	types       []uint8
+	recent      bitmap
+	segs        []segment
 }
 
+// keyShard holds the sorted keys of the nodes lo to lo+len(keys)-1.
+type keyShard struct {
+	lo   uint32
+	keys []Hash
+}
+
+const (
+	minEdgeBlock = 1 << 10
+	maxEdgeBlock = 1 << 20
+)
+
+// segment holds the edges of the nodes from lo on, in blocks that never
+// grow, so that the scan copies no edges and leaves at most one partly used
+// block. starts[i] is where the edges of node lo+i start: the block index in
+// the high 32 bits, the position in the block in the low 32 bits. They end
+// where the edges of the next node start, or at the end of the block when the
+// next node starts in a later one.
 type segment struct {
-	lo uint32
-	// offsets[i] is the start of the edges of node lo+i, offsets[i+1] its end.
-	offsets []uint64
-	edges   []uint32
+	lo     uint32
+	starts []uint64
+	blocks [][]uint32
+}
+
+// add appends the edges of the next node.
+func (s *segment) add(ids []uint32) {
+	b := len(s.blocks) - 1
+	if b < 0 || cap(s.blocks[b])-len(s.blocks[b]) < len(ids) {
+		size := minEdgeBlock
+		if b >= 0 {
+			size = min(2*cap(s.blocks[b]), maxEdgeBlock)
+		}
+		s.blocks = append(s.blocks, make([]uint32, 0, max(size, len(ids))))
+		b++
+	}
+	s.starts = append(s.starts, uint64(b)<<32|uint64(len(s.blocks[b])))
+	s.blocks[b] = append(s.blocks[b], ids...)
+}
+
+// finish ends the edges of the last node.
+func (s *segment) finish() {
+	b := max(len(s.blocks)-1, 0)
+	var used int
+	if len(s.blocks) > 0 {
+		used = len(s.blocks[b])
+	}
+	s.starts = append(s.starts, uint64(b)<<32|uint64(used))
+}
+
+func (s *segment) nodes() int {
+	return len(s.starts) - 1
+}
+
+// nodeEdges returns the edges of node lo+k.
+func (s *segment) nodeEdges(k uint32) []uint32 {
+	start, next := s.starts[k], s.starts[k+1]
+	block := s.blocks[start>>32]
+	end := uint32(len(block))
+	if next>>32 == start>>32 {
+		end = uint32(next)
+	}
+	return block[uint32(start):end]
+}
+
+// bytes returns the memory the segment holds.
+func (s *segment) bytes() int64 {
+	n := int64(cap(s.starts)) * 8
+	for _, b := range s.blocks {
+		n += int64(cap(b)) * 4
+	}
+	return n
 }
 
 func compareHash(a, b Hash) int {
 	return bytes.Compare(a[:], b[:])
 }
 
+func keyPrefix16(h Hash) int {
+	return int(h[0])<<8 | int(h[1])
+}
+
+// size returns the number of nodes.
+func (g *graph) size() int {
+	return g.n
+}
+
 // find returns the node of h, or noNode.
 func (g *graph) find(h Hash) uint32 {
-	p := int(h[0])<<8 | int(h[1])
-	lo, hi := int(g.prefix[p]), int(g.prefix[p+1])
-	i, ok := slices.BinarySearchFunc(g.keys[lo:hi], h, compareHash)
+	p := keyPrefix16(h)
+	lo, hi := g.prefix[p], g.prefix[p+1]
+	if lo == hi {
+		return noNode
+	}
+	s := &g.shards[g.prefixShard[p]]
+	i, ok := slices.BinarySearchFunc(s.keys[lo-s.lo:hi-s.lo], h, compareHash)
 	if !ok {
 		return noNode
 	}
-	return uint32(lo + i)
+	return lo + uint32(i)
 }
 
 // edges returns the edges of node id.
@@ -98,7 +178,7 @@ func (g *graph) edges(id uint32) []uint32 {
 		switch {
 		case s.lo > id:
 			return 1
-		case s.lo+uint32(len(s.offsets)-1) <= id:
+		case s.lo+uint32(s.nodes()) <= id:
 			return -1
 		}
 		return 0
@@ -107,8 +187,30 @@ func (g *graph) edges(id uint32) []uint32 {
 		return nil
 	}
 	s := &g.segs[i]
-	k := id - s.lo
-	return s.edges[s.offsets[k]:s.offsets[k+1]]
+	return s.nodeEdges(id - s.lo)
+}
+
+// keysBytes returns the memory the keys and their indexes hold.
+func (g *graph) keysBytes() int64 {
+	n := int64(cap(g.types)) + int64(len(g.prefix))*4 + int64(len(g.prefixShard))*2
+	for _, s := range g.shards {
+		n += int64(cap(s.keys)) * entities.HashSize
+	}
+	return n
+}
+
+// prefixBounds cuts the inner bounds of a key range split to 16-bit key
+// prefixes, so that the keys of each prefix fall in one shard, as the graph
+// needs.
+func prefixBounds(bounds []string) []string {
+	out := []string{bounds[0]}
+	for _, b := range bounds[1 : len(bounds)-1] {
+		b = b[:min(len(b), 4)]
+		if b > out[len(out)-1] {
+			out = append(out, b)
+		}
+	}
+	return append(out, bounds[len(bounds)-1])
 }
 
 // nodeStats counts the rows of the first scan.
@@ -197,24 +299,42 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 	if uint64(n) >= uint64(noNode) {
 		return nil, stats, fmt.Errorf("the table gc has %d rows, more than one mark can hold", n)
 	}
-	gr := &graph{keys: make([]Hash, 0, n), types: make([]uint8, 0, n), recent: newBitmap(n), shardSizes: make([]int, len(shards))}
+	if len(shards) > 1<<16 {
+		return nil, stats, fmt.Errorf("too many scan shards: %d", len(shards))
+	}
+	gr := &graph{
+		shards:      make([]keyShard, len(shards)),
+		n:           n,
+		prefix:      make([]uint32, 1<<16+1),
+		prefixShard: make([]uint16, 1<<16),
+		types:       make([]uint8, 0, n),
+		recent:      newBitmap(n),
+	}
+	var lo uint32
+	var last *Hash
 	for i := range shards {
 		s := &shards[i]
-		gr.shardSizes[i] = len(s.keys)
-		base := uint32(len(gr.keys))
-		gr.keys = append(gr.keys, s.keys...)
+		if !slices.IsSortedFunc(s.keys, compareHash) || (last != nil && len(s.keys) > 0 && compareHash(*last, s.keys[0]) >= 0) {
+			return nil, stats, fmt.Errorf("the scan of the table gc returned keys out of order")
+		}
+		if len(s.keys) > 0 {
+			last = &s.keys[len(s.keys)-1]
+		}
+		gr.shards[i] = keyShard{lo: lo, keys: s.keys}
 		gr.types = append(gr.types, s.types...)
 		for _, r := range s.recent {
-			gr.recent.set(base + r)
+			gr.recent.set(lo + r)
 		}
+		for _, k := range s.keys {
+			p := keyPrefix16(k)
+			if gr.prefix[p+1] > 0 && gr.prefixShard[p] != uint16(i) {
+				return nil, stats, fmt.Errorf("the keys with the prefix %04x are in two scan shards", p)
+			}
+			gr.prefix[p+1]++
+			gr.prefixShard[p] = uint16(i)
+		}
+		lo += uint32(len(s.keys))
 		shards[i] = nodeShard{}
-	}
-	if !slices.IsSortedFunc(gr.keys, compareHash) {
-		return nil, stats, fmt.Errorf("the scan of the table gc returned keys out of order")
-	}
-	gr.prefix = make([]uint32, 1<<16+1)
-	for _, k := range gr.keys {
-		gr.prefix[(int(k[0])<<8|int(k[1]))+1]++
 	}
 	for p := 1; p < len(gr.prefix); p++ {
 		gr.prefix[p] += gr.prefix[p-1]
@@ -259,16 +379,14 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(EdgesFamily), bigtable.ColumnFilter(LinksColumn), bigtable.LatestNFilter(1))
 	shards := make([]edgeShard, len(bounds)-1)
 	g, gctx := errgroup.WithContext(ctx)
-	var lo uint32
 	for i := range shards {
-		shardLo := lo
-		shardHi := lo + uint32(gr.shardSizes[i])
-		lo = shardHi
+		ks := gr.shards[i]
 		g.Go(func() error {
 			s := &shards[i]
 			s.perType = make([]int64, len(typeNames))
-			s.seg = segment{lo: shardLo, offsets: make([]uint64, 1, shardHi-shardLo+1)}
-			next := shardLo
+			s.seg = segment{lo: ks.lo, starts: make([]uint64, 0, len(ks.keys)+1)}
+			next := 0
+			var ids []uint32
 			var rowErr error
 			err := table.ReadRows(gctx, bigtable.NewRange(bounds[i], bounds[i+1]), func(row bigtable.Row) bool {
 				if !entities.IsHash(row.Key()) {
@@ -276,14 +394,16 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 					return false
 				}
 				key := entities.NewHash(row.Key())
-				for next < shardHi && compareHash(gr.keys[next], key) < 0 {
-					s.seg.offsets = append(s.seg.offsets, uint64(len(s.seg.edges)))
+				for next < len(ks.keys) && compareHash(ks.keys[next], key) < 0 {
+					s.seg.add(nil)
 					next++
 				}
-				if next == shardHi || gr.keys[next] != key {
+				if next == len(ks.keys) || ks.keys[next] != key {
 					s.counts.NewRows++
 					return true
 				}
+				id := ks.lo + uint32(next)
+				ids = ids[:0]
 				for _, item := range row[EdgesFamily] {
 					targets, err := UnpackEdges(item.Value)
 					if err != nil {
@@ -291,10 +411,10 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 						return false
 					}
 					for _, t := range targets {
-						id := gr.find(t)
-						if id == noNode {
+						to := gr.find(t)
+						if to == noNode {
 							s.counts.Dangling++
-							if gr.recent.has(next) {
+							if gr.recent.has(id) {
 								s.counts.DanglingFromRecent++
 							}
 							if len(s.counts.DanglingSample) < maxDanglingKept {
@@ -302,12 +422,12 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 							}
 							continue
 						}
-						s.seg.edges = append(s.seg.edges, id)
+						ids = append(ids, to)
 					}
 					s.counts.Total += int64(len(targets))
-					s.perType[gr.types[next]] += int64(len(targets))
+					s.perType[gr.types[id]] += int64(len(targets))
 				}
-				s.seg.offsets = append(s.seg.offsets, uint64(len(s.seg.edges)))
+				s.seg.add(ids)
 				next++
 				return true
 			}, bigtable.RowFilter(filter))
@@ -317,10 +437,10 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 			if err != nil {
 				return fmt.Errorf("failed to scan the edges of the table gc from %q: %w", bounds[i], err)
 			}
-			for ; next < shardHi; next++ {
-				s.seg.offsets = append(s.seg.offsets, uint64(len(s.seg.edges)))
+			for ; next < len(ks.keys); next++ {
+				s.seg.add(nil)
 			}
-			s.seg.edges = slices.Clip(s.seg.edges)
+			s.seg.finish()
 			return nil
 		})
 	}
@@ -341,7 +461,7 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 		for t, n := range s.perType {
 			perType[t] += n
 		}
-		if len(s.seg.offsets) > 1 {
+		if s.seg.nodes() > 0 {
 			gr.segs = append(gr.segs, s.seg)
 		}
 	}
@@ -357,8 +477,10 @@ type mapRow struct {
 	time     int64
 }
 
-// scanMaps reads the keys and cell times of the table maps.
-func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *graph) ([]mapRow, int64, error) {
+// scanMaps reads the keys and cell times of the table maps. It returns the
+// rows of each scan shard, which are not copied into one array, so that they
+// do not take twice their memory while the edges are scanned.
+func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *graph) ([][]mapRow, int64, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(mapsFamily), bigtable.LatestNFilter(1), bigtable.StripValueFilter())
 	rows := make([][]mapRow, len(bounds)-1)
 	malformed := make([]int64, len(bounds)-1)
@@ -388,12 +510,9 @@ func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *g
 	if err := g.Wait(); err != nil {
 		return nil, 0, err
 	}
-	var all []mapRow
 	var bad int64
-	for i := range rows {
-		all = append(all, rows[i]...)
-		rows[i] = nil
-		bad += malformed[i]
+	for _, m := range malformed {
+		bad += m
 	}
-	return all, bad, nil
+	return rows, bad, nil
 }
