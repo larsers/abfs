@@ -135,3 +135,15 @@ func TestCliExec_ExitCode(t *testing.T) {
 		})
 	}
 }
+
+func TestStartTracing_Off(t *testing.T) {
+	require := require.New(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "")
+	// No command is set, so resolving the config would panic.
+	c := &CliExec{cliCommand: &cliCommand{}}
+
+	stop, err := c.startTracing(context.Background())
+	require.NoError(err)
+	require.Nil(c.configProvider, "the config is not resolved early with traces off")
+	require.Nil(stop)
+}

@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/stats"
+
 	"github.com/google/abfs/shared/cacheman/protocol"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
@@ -52,6 +54,7 @@ type ABFSClientOpts struct {
 	SkipHealthCheck bool
 	// ServerWaitTimeout is how long calls wait for an unreachable server before they fail. Zero means no wait.
 	ServerWaitTimeout time.Duration
+	StatsHandler      stats.Handler
 }
 
 func NewABFSClient(o *ABFSClientOpts) (*ABFSClient, error) {
@@ -62,7 +65,7 @@ func NewABFSClient(o *ABFSClientOpts) (*ABFSClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	cm, err := newConnectionManager(o.Servers, tokenSource, o.AuthInfo.RootCAFile, o.AuthInfo.DisableTLS, o.SkipHealthCheck, o.ServerWaitTimeout)
+	cm, err := newConnectionManager(o.Servers, tokenSource, o.AuthInfo.RootCAFile, o.AuthInfo.DisableTLS, o.SkipHealthCheck, o.ServerWaitTimeout, o.StatsHandler)
 	if err != nil {
 		return nil, err
 	}

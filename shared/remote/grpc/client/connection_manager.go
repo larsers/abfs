@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/stats"
 
 	"github.com/google/abfs/third_party/rendezvous"
 
@@ -76,6 +77,7 @@ type connectionManager struct {
 	disableTLS        bool
 	skipHealthCheck   bool
 	serverWaitTimeout time.Duration
+	statsHandler      stats.Handler
 }
 
 var _ abfsgrpc.BytesStatHandler = (*connectionManager)(nil)
@@ -90,7 +92,7 @@ func (cm *connectionManager) AddBytesReceived(n int64) {
 	cm.lastReceived.Store(time.Now().UnixNano())
 }
 
-func newConnectionManager(servers []string, tokenSource auth.TokenSource, rootCAFile string, disableTLS bool, skipHealthCheck bool, serverWaitTimeout time.Duration) (*connectionManager, error) {
+func newConnectionManager(servers []string, tokenSource auth.TokenSource, rootCAFile string, disableTLS bool, skipHealthCheck bool, serverWaitTimeout time.Duration, statsHandler stats.Handler) (*connectionManager, error) {
 	cm := &connectionManager{
 		clients:           make(map[string]remote.RemoteProvider, len(servers)),
 		conns:             make(map[string]*grpc.ClientConn, len(servers)),
@@ -101,6 +103,7 @@ func newConnectionManager(servers []string, tokenSource auth.TokenSource, rootCA
 		disableTLS:        disableTLS,
 		skipHealthCheck:   skipHealthCheck,
 		serverWaitTimeout: serverWaitTimeout,
+		statsHandler:      statsHandler,
 	}
 
 	if err := cm.dial(servers); err != nil {
@@ -132,6 +135,7 @@ func (cm *connectionManager) dial(servers []string) error {
 				DisableTLS:       cm.disableTLS,
 				SkipHealthCheck:  cm.skipHealthCheck,
 				OutageClock:      clock,
+				StatsHandler:     cm.statsHandler,
 			})
 			if err != nil {
 				helpText := ""

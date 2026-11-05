@@ -29,6 +29,7 @@ import (
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/telemetry"
 	"github.com/google/abfs/store"
 )
 
@@ -241,6 +242,7 @@ func newABFSClientProvider(c *CliExec) (*ABFSClientProvider, error) {
 		Servers:           servers,
 		AuthInfo:          config.GetAuthInfo(),
 		ServerWaitTimeout: config.EffectiveServerWaitTimeout(),
+		StatsHandler:      telemetry.ClientHandler(),
 	})
 	if err != nil {
 		return nil, err

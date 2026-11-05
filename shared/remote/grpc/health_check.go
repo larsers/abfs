@@ -134,7 +134,8 @@ type GrpcDialOpts struct {
 	DisableTLS       bool
 	SkipHealthCheck  bool
 	// OutageClock, if set, makes calls to the ABFS service wait for an unreachable server.
-	OutageClock *OutageClock
+	OutageClock  *OutageClock
+	StatsHandler stats.Handler
 }
 
 type tokenSourceCreds struct {
@@ -167,6 +168,9 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 		grpc.WithStreamInterceptor(clientMetaStreamInterceptor(o.ServiceName, o.ClientVersion, o.ServerMinVersion)),
 		grpc.WithStatsHandler(byteCounter),
 		grpc.WithKeepaliveParams(clientKeepalive),
+	}
+	if o.StatsHandler != nil {
+		opts = append(opts, grpc.WithStatsHandler(o.StatsHandler))
 	}
 
 	if o.RetryPolicy != "" {

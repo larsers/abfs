@@ -66,6 +66,7 @@ import (
 	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/grpc/client"
 	"github.com/google/abfs/shared/store/localcache"
+	"github.com/google/abfs/shared/telemetry"
 	"github.com/google/abfs/shared/version"
 )
 
@@ -1072,6 +1073,7 @@ func (c *CacheMan) setupABFSClient(config *instance.Config, force bool) error {
 		AuthInfo:          config.GetAuthInfo(),
 		SkipHealthCheck:   true,
 		ServerWaitTimeout: config.EffectiveServerWaitTimeout(),
+		StatsHandler:      telemetry.ClientHandler(),
 	})
 	if err != nil {
 		return err

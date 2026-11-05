@@ -46,6 +46,7 @@ import (
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/telemetry"
 	"github.com/google/abfs/shared/user"
 	"github.com/google/abfs/workspaces"
 )
@@ -524,6 +525,7 @@ func (c *unmountCmd) saveUnmountDetails(ctx context.Context) error {
 		Servers:           servers,
 		AuthInfo:          conf.GetAuthInfo(),
 		ServerWaitTimeout: conf.EffectiveServerWaitTimeout(),
+		StatsHandler:      telemetry.ClientHandler(),
 	})
 	if err != nil {
 		return fmt.Errorf("error building ABFS client for servers %s: %w", servers, err)

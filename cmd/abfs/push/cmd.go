@@ -37,6 +37,7 @@ import (
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
 	abfsclient "github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/telemetry"
 )
 
 type handleFn func(obj *shellgit.ObjectTypeName) error
@@ -181,6 +182,7 @@ func (c *pushCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 			Servers:           servers,
 			AuthInfo:          c.Config.GetAuthInfo(),
 			ServerWaitTimeout: c.Config.EffectiveServerWaitTimeout(),
+			StatsHandler:      telemetry.ClientHandler(),
 		})
 		if err != nil {
 			log.Fatalf("Error: unable to start abfsclient: %v", err)
