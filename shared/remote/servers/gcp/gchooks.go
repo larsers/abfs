@@ -50,7 +50,7 @@ const (
 	metricsScope               = "github.com/google/abfs/shared/remote/servers/gcp"
 )
 
-// rescuePath is the server call that found an object condemned.
+// rescuePath is the server call that found an object, condemned or not.
 type rescuePath int
 
 const (
@@ -81,6 +81,15 @@ type mapRowKey struct {
 	from, to entities.Hash
 }
 
+// toucher is the part of gc.Toucher that the hooks use.
+type toucher interface {
+	TouchObject(key gc.Hash) bool
+	TryTouchObject(key gc.Hash) bool
+	TouchMapRow(row string) bool
+	Stats() gc.TouchStats
+	Close()
+}
+
 type gcHooks struct {
 	// on is NewServerOpts.GC. Off, none of the hooks below run.
 	on bool
@@ -88,7 +97,7 @@ type gcHooks struct {
 	cacheTTL      uint32
 	touchInterval uint32
 	rescue        func(ctx context.Context, key entities.Hash, condemned []byte) (bool, error)
-	toucher       *gc.Toucher
+	toucher       toucher
 	// touchedMapRows holds the last touch of map rows, sharded by the first
 	// byte of from.
 	touchedMapRows []*lru.Cache[mapRowKey, uint32]
@@ -250,7 +259,7 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	cachedHdr, hdrOk := s.lookupHeader(key)
 	content, contentOk := s.lookupContent(key)
 	if hdrOk && contentOk {
-		s.touchHit(key, cachedHdr)
+		s.touchHit(pathGetObject, key, cachedHdr)
 		return cachedHdr, content, nil
 	}
 	// A read of the whole row sees the condemn marker with the content.
@@ -267,7 +276,7 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	}
 	cachedHdr = s.storeHeader(header)
 	s.storeContent(key, content)
-	s.touchHit(key, cachedHdr)
+	s.touchHit(pathGetObject, key, cachedHdr)
 	return cachedHdr, content, nil
 }
 
@@ -343,11 +352,11 @@ func (g *gcHooks) touchedThisPeriod(h CachedHeader, now uint32) bool {
 	return h.Touched != 0 && period-h.Loaded/g.touchInterval < 255 && h.Touched == touchMark(period)
 }
 
-// touchHit touches the object key, which a call found, unless this server
-// touched it in the current touch period. So an object that is used keeps a
-// touch younger than the touch interval, and each server writes at most one
-// touch per object and period.
-func (s *GCPServer) touchHit(key entities.Hash, h CachedHeader) {
+// touchHit touches the object key, which the call path found, unless this
+// server touched it in the current touch period. So an object that is used
+// keeps a touch younger than the touch interval, and each server writes at
+// most one touch per object and period.
+func (s *GCPServer) touchHit(path rescuePath, key entities.Hash, h CachedHeader) {
 	g := &s.gcHooks
 	if g.toucher == nil {
 		return
@@ -356,7 +365,7 @@ func (s *GCPServer) touchHit(key entities.Hash, h CachedHeader) {
 	if g.touchedThisPeriod(h, now) {
 		return
 	}
-	if !g.toucher.TouchObject(key) {
+	if !g.touch(path, key) {
 		return
 	}
 	// A concurrent forget can be undone here; the entry keeps its load time,
@@ -371,6 +380,17 @@ func (s *GCPServer) touchHit(key entities.Hash, h CachedHeader) {
 		}
 		shard.Add(key, cur)
 	}
+}
+
+// touch queues a touch of key. Headers and MapResults, the calls of the client
+// keep-alive and of builds, wait for room in a full buffer, so that a burst of
+// them slows down instead of losing touches. The other calls do not wait, so
+// that reads and uploads do not slow down when the gc table does.
+func (g *gcHooks) touch(path rescuePath, key entities.Hash) bool {
+	if path == pathHeaders || path == pathMapResults {
+		return g.toucher.TouchObject(key)
+	}
+	return g.toucher.TryTouchObject(key)
 }
 
 // touchMapRow rewrites the cell of the map row from#to, so that its timestamp

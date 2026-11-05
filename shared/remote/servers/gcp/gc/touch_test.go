@@ -140,6 +140,26 @@ func TestToucher_DropsWhenTheBufferIsFull(t *testing.T) {
 	}
 }
 
+func TestToucher_TryTouchObjectDoesNotWait(t *testing.T) {
+	require := require.New(t)
+	client := newHooksTestBigtable(t)
+	toucher := newToucher(client, 1)
+	toucher.enqueueWait = time.Hour
+	keys := testHashes(3)
+	require.True(toucher.TryTouchObject(keys[0]))
+	start := time.Now()
+	require.False(toucher.TryTouchObject(keys[1]))
+	require.Less(time.Since(start), time.Second)
+	require.False(toucher.stalled.Load(), "a touch that did not wait stalled the waiting ones")
+	require.Equal(TouchStats{Dropped: 1}, toucher.Stats())
+
+	// A waiting touch still gets the room that a starting worker makes.
+	time.AfterFunc(50*time.Millisecond, func() { go toucher.run() })
+	require.True(toucher.TouchObject(keys[2]))
+	toucher.Close()
+	require.Equal(TouchStats{Written: 2, Dropped: 1}, toucher.Stats())
+}
+
 func TestToucher_WaitsForRoom(t *testing.T) {
 	require := require.New(t)
 	client := newHooksTestBigtable(t)

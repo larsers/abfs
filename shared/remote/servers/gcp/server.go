@@ -870,7 +870,7 @@ func (s *GCPServer) setMasterDepot(ctx context.Context, bucketName string, clien
 
 func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHeader, error) {
 	if cached, ok := s.lookupHeader(hash); ok {
-		s.touchHit(hash, cached)
+		s.touchHit(pathPutObject, hash, cached)
 		return cached, nil
 	}
 	obj, err := s.casdb.GetHeader(ctx, hash)
@@ -885,7 +885,7 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 		return CachedHeader{}, err
 	}
 	cached := s.storeHeader(obj)
-	s.touchHit(hash, cached)
+	s.touchHit(pathPutObject, hash, cached)
 	return cached, nil
 }
 
@@ -899,7 +899,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 		if cached, ok := s.lookupHeader(h); ok {
 			result[i] = cached
 			s.headersRespCount.Add(1)
-			s.touchHit(h, cached)
+			s.touchHit(path, h, cached)
 		} else if m, ok := missesIdx[h]; ok {
 			missesIdx[h] = append(m, i)
 			missCount++
@@ -928,7 +928,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 	foundCount := 0
 	for _, o := range objs {
 		cached := s.storeHeader(o)
-		s.touchHit(o.Id, cached)
+		s.touchHit(path, o.Id, cached)
 		for _, i := range missesIdx[o.Id] {
 			foundCount++
 			result[i] = cached

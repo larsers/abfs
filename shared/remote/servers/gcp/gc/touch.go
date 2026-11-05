@@ -64,11 +64,11 @@ type touch struct {
 // Toucher writes touches in the background: the touch cell of an object's gc
 // row, and the cell of a map row, whose timestamp then records the last use.
 // Touches wait in a bounded buffer and are written in batches by several
-// workers. When the buffer is full, a touch waits up to touchEnqueueWait for
-// room and is then dropped; after such a timeout, touches are dropped without
-// waiting until the buffer has room again, so that writes that stall delay
-// the calls only once. The cells get server timestamps, so all replicas write
-// on one clock.
+// workers. When the buffer is full, TouchObject and TouchMapRow wait up to
+// touchEnqueueWait for room and then drop the touch; after such a timeout,
+// touches are dropped without waiting until the buffer has room again, so that
+// writes that stall delay the calls only once. TryTouchObject never waits. The
+// cells get server timestamps, so all replicas write on one clock.
 type Toucher struct {
 	gcTable     *bigtable.Table
 	mapsTable   *bigtable.Table
@@ -107,16 +107,22 @@ func newToucher(client *bigtable.Client, size int) *Toucher {
 // TouchObject queues a touch of the object key. It returns false when the
 // buffer stayed full and the touch was dropped.
 func (t *Toucher) TouchObject(key Hash) bool {
-	return t.add(touch{row: key.String()})
+	return t.add(touch{row: key.String()}, true)
+}
+
+// TryTouchObject queues a touch of the object key without waiting. It returns
+// false when the buffer was full and the touch was dropped.
+func (t *Toucher) TryTouchObject(key Hash) bool {
+	return t.add(touch{row: key.String()}, false)
 }
 
 // TouchMapRow queues a rewrite of the cell of the map row with the given key. It
 // returns false when the buffer stayed full and the touch was dropped.
 func (t *Toucher) TouchMapRow(row string) bool {
-	return t.add(touch{mapRow: true, row: row})
+	return t.add(touch{mapRow: true, row: row}, true)
 }
 
-func (t *Toucher) add(tc touch) bool {
+func (t *Toucher) add(tc touch, wait bool) bool {
 	select {
 	case t.queue <- tc:
 		if t.stalled.Load() {
@@ -125,7 +131,7 @@ func (t *Toucher) add(tc touch) bool {
 		return true
 	default:
 	}
-	if !t.stalled.Load() {
+	if wait && !t.stalled.Load() {
 		timer := time.NewTimer(t.enqueueWait)
 		defer timer.Stop()
 		select {

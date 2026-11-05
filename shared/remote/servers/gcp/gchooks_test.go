@@ -274,6 +274,76 @@ func TestGCHooks_RescuesABatchInParallel(t *testing.T) {
 	require.LessOrEqual(most, rescueWorkers)
 }
 
+// fakeToucher records the touches of objects by whether the call waited for
+// room in a full buffer.
+type fakeToucher struct {
+	mu      sync.Mutex
+	waited  []entities.Hash
+	tried   []entities.Hash
+	mapRows []string
+}
+
+func (f *fakeToucher) TouchObject(key gc.Hash) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.waited = append(f.waited, key)
+	return true
+}
+
+func (f *fakeToucher) TryTouchObject(key gc.Hash) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tried = append(f.tried, key)
+	return true
+}
+
+func (f *fakeToucher) TouchMapRow(row string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mapRows = append(f.mapRows, row)
+	return true
+}
+
+func (f *fakeToucher) Stats() gc.TouchStats { return gc.TouchStats{} }
+
+func (f *fakeToucher) Close() {}
+
+// Headers and MapResults, the calls of the client keep-alive and of builds,
+// wait for room in a full touch buffer; reads, uploads and link checks do not.
+func TestGCHooks_OnlyKeepAliveCallsWaitForTouches(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	now := uint32(1)
+	setCacheNow(t, &now)
+	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
+	headersKey := putBlob(t, s, "headers")
+	readKey := putBlob(t, s, "read")
+	putKey := putBlob(t, s, "put")
+	linkKey := putBlob(t, s, "link")
+	from := putBlob(t, s, "request")
+	result := putBlob(t, s, "result")
+	require.NoError(s.AddMapResult(ctx, from, result))
+	s.gcHooks.toucher.Close()
+	fake := &fakeToucher{}
+	s.gcHooks.toucher = fake
+	// A new touch period, so that every object is touched again.
+	now += 3600
+
+	_, err := s.Headers(ctx, []entities.Hash{headersKey})
+	require.NoError(err)
+	require.NoError(readObject(s, readKey))
+	require.NoError(putRaw(s, putKey, []byte("blob 3\x00put")))
+	tree, data := treeOf(linkKey)
+	require.NoError(putRaw(s, tree, data))
+	results, err := s.MapResults(ctx, from)
+	require.NoError(err)
+	require.Equal([]entities.Hash{result}, results)
+
+	require.ElementsMatch([]entities.Hash{headersKey, result}, fake.waited)
+	require.ElementsMatch([]entities.Hash{readKey, putKey, linkKey}, fake.tried)
+	require.Equal([]string{casdb.MapRowKey(from, result)}, fake.mapRows)
+}
+
 // The collector's own server reads condemned objects as live and leaves the
 // marker and the touches as they are.
 func TestGCHooks_ReadOnly(t *testing.T) {
