@@ -242,6 +242,28 @@ func TestGCHooks_TouchThrottle(t *testing.T) {
 	require.Equal(int64(1), written(), "no touch in the next period")
 }
 
+func TestGCHooks_GetObjectTouches(t *testing.T) {
+	require := require.New(t)
+	now := uint32(1)
+	setCacheNow(t, &now)
+	s := newGCHooksServer(t, &NewServerOpts{CacheTTL: 10 * time.Minute, GCTouchInterval: time.Hour})
+	cached := putBlob(t, s, "cached")
+	uncached := putBlob(t, s, "uncached")
+	s.forget(uncached)
+	_, hdrOk := s.headers[cached[0]].Peek(cached)
+	_, contentOk := s.content[cached[0]].Peek(cached)
+	require.True(hdrOk && contentOk)
+
+	for range 2 {
+		require.NoError(readObject(s, cached))
+		require.NoError(readObject(s, uncached))
+	}
+	s.gcHooks.toucher.Close()
+	require.Equal(int64(2), s.gcHooks.toucher.Stats().Written, "one touch per object and period")
+	require.True(objectTouched(t, s, cached))
+	require.True(objectTouched(t, s, uncached))
+}
+
 func TestGCHooks_TouchesOff(t *testing.T) {
 	require := require.New(t)
 	s := newGCHooksServer(t, &NewServerOpts{})

@@ -235,11 +235,13 @@ func (s *GCPServer) forgetMissing(key entities.Hash) {
 	}
 }
 
-// getObjectDataGC is getObjectData with GC on.
+// getObjectDataGC is getObjectData with GC on. A read touches the object, from
+// the cache or not, as any other call that finds it.
 func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (CachedHeader, *ObjectContent, error) {
 	cachedHdr, hdrOk := s.lookupHeader(key)
 	content, contentOk := s.lookupContent(key)
 	if hdrOk && contentOk {
+		s.touchHit(key, cachedHdr)
 		return cachedHdr, content, nil
 	}
 	// A read of the whole row sees the condemn marker with the content.
@@ -256,6 +258,7 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	}
 	cachedHdr = s.storeHeader(header)
 	s.storeContent(key, content)
+	s.touchHit(key, cachedHdr)
 	return cachedHdr, content, nil
 }
 
