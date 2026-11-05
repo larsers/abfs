@@ -24,11 +24,12 @@ import (
 )
 
 func TestGCPSubcommandsRunInTheCLI(t *testing.T) {
-	c := NewCmd(root.NewRootCommand())
-	for _, sub := range c.subcommands() {
-		require.Implements(t, (*cmd.InstanceResolver)(nil), sub, sub.Spec().Name)
-		for _, subsub := range sub.Spec().Subcommands {
-			require.Implements(t, (*cmd.InstanceResolver)(nil), subsub, subsub.Spec().Name)
+	var check func(cmds []cmd.ABFSCmd)
+	check = func(cmds []cmd.ABFSCmd) {
+		for _, sub := range cmds {
+			require.Implements(t, (*cmd.InstanceResolver)(nil), sub, sub.Spec().Name)
+			check(sub.Spec().Subcommands)
 		}
 	}
+	check(NewCmd(root.NewRootCommand()).subcommands())
 }

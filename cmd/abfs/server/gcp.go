@@ -63,6 +63,7 @@ func (c *gcpCmd) Spec() cmd.CmdSpec {
 		Desc:    `Run a GCP-backed ABFS server.`,
 		Subcommands: []cmd.ABFSCmd{
 			&gcpInitCmd{RootCmd: c.RootCmd},
+			&gcpGCCmd{RootCmd: c.RootCmd},
 		},
 	}
 }
