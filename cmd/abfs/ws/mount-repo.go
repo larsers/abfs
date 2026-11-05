@@ -378,6 +378,9 @@ func (c *mountRepoCmd) mount(ctx context.Context) error {
 	casfsMountCmd.ConfigProvider = c.ConfigProvider
 	casfsMountCmd.StoreProvider = c.StoreProvider
 	casfsMountCmd.CachemanProvider = c.CachemanProvider
+	if err := c.setPinnedManifest(ctx, casfsMountCmd); err != nil {
+		return err
+	}
 
 	serving := make(chan struct{})
 	if !c.foreground {
