@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -92,4 +93,22 @@ func TestHandleRemoteHeaders(t *testing.T) {
 	code, found = post(nil)
 	require.Equal(http.StatusOK, code)
 	require.Empty(found)
+
+	// A server that does not answer fails the request after the timeout.
+	defer func(d time.Duration) { remoteHeadersTimeout = d }(remoteHeadersTimeout)
+	remoteHeadersTimeout = 50 * time.Millisecond
+	c.abfsClient = &stuckHeaders{ABFSClient: mockRemote}
+	code, _ = post([]entities.Hash{entities.EmptyDirHash})
+	require.Equal(http.StatusInternalServerError, code)
+}
+
+// stuckHeaders is a server whose Headers calls wait until they are canceled.
+type stuckHeaders struct {
+	ABFSClient
+}
+
+// Headers implements remote.RemoteProvider.
+func (s *stuckHeaders) Headers(ctx context.Context, keys []remote.Hash) ([]entities.ObjectHeader, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
 }

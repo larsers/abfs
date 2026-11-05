@@ -15,11 +15,18 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/google/abfs/shared/entities"
 )
+
+// remoteHeadersTimeout bounds one request. A batch of condemned objects takes
+// the server a while to rescue, so it is generous; it only keeps a server that
+// does not answer from holding the keep-alive forever.
+var remoteHeadersTimeout = 10 * time.Minute
 
 // handleRemoteHeaders asks the remote server for the headers of the given keys
 // and returns for each key whether the server has it. Mounts use it to touch
@@ -38,7 +45,9 @@ func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hdrs, err := c.abfsClient.Headers(r.Context(), keys)
+	ctx, cancel := context.WithTimeout(r.Context(), remoteHeadersTimeout)
+	defer cancel()
+	hdrs, err := c.abfsClient.Headers(ctx, keys)
 	if err != nil {
 		c.ErrorJSON(w, r, err, http.StatusInternalServerError)
 		return
