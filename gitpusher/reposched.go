@@ -46,6 +46,8 @@ type RepoStat struct {
 	// ManifestFiles lists the branch:file pairs the last listing read, Skipped what it could not use.
 	ManifestFiles []string
 	Skipped       []string
+
+	lastSuccess time.Time
 }
 
 type repoScheduler struct {

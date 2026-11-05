@@ -121,8 +121,11 @@ func (m *RepoWatcher) Stat() RepoStat {
 		State:         m.state.String(),
 		FetchStart:    m.listStart.Format(time.RFC3339),
 		FetchDuration: m.listDuration.Seconds(),
-		LastSuccess:   m.lastSuccess.Format(time.RFC3339),
 		LastError:     lastErr,
+		lastSuccess:   m.lastSuccess,
+	}
+	if !m.lastSuccess.IsZero() {
+		stat.LastSuccess = m.lastSuccess.Format(time.RFC3339)
 	}
 	if r := m.lastReport.Load(); r != nil {
 		stat.ManifestFiles, stat.Skipped = r.read, r.skipped
