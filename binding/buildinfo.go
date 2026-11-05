@@ -119,6 +119,8 @@ type NinjaStats struct {
 	CacheForceCount uint32
 	CacheErrorCount uint32
 	CacheHitPercent float64
+	// Steps is nil in stats written by versions that did not count steps.
+	Steps *StepStats `json:",omitempty"`
 
 	NinjaEntryFile string
 	BuildFiles     []string       `json:",omitempty"`
