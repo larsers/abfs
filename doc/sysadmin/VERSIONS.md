@@ -105,6 +105,9 @@ Two changes between releases do not cause errors, but you will notice them:
 
 ## Upgrade the server and the git-pushers
 
+* **Order.** Upgrade the CAS server before the clients. Clients send gRPC keepalive pings more
+  often than older servers accept, and such a server can close their connections with
+  `too_many_pings`, see [When the server is unavailable](README.md#when-the-server-is-unavailable).
 * **CAS server.** Stop the old server and start the new one. The old server lets running
   requests finish, up to `--shutdown-timeout`, before it exits, and clients wait for the new one
   for up to `server-wait-timeout` (1 minute by default). See

@@ -166,6 +166,7 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 		),
 		grpc.WithStreamInterceptor(clientMetaStreamInterceptor(o.ServiceName, o.ClientVersion, o.ServerMinVersion)),
 		grpc.WithStatsHandler(byteCounter),
+		grpc.WithKeepaliveParams(clientKeepalive),
 	}
 
 	if o.RetryPolicy != "" {
