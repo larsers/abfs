@@ -20,6 +20,7 @@ import (
 	"log"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/spf13/pflag"
 
@@ -53,6 +54,9 @@ type gcpCmd struct {
 	linksContent          bool
 	linksContentThreshold int64
 	gcEdges               bool
+	cacheTTL              time.Duration
+	gcTouchInterval       time.Duration
+	gcHeartbeatInterval   time.Duration
 }
 
 func (c *gcpCmd) Spec() cmd.CmdSpec {
@@ -82,6 +86,9 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
 	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
 	fl.BoolVar(&c.gcEdges, "gc-edges", true, "Write the GC edges of each new object to the Bigtable table gc, which the garbage collector reads. Objects added with this off need 'abfs server gcp gc backfill' before a garbage collection")
+	fl.DurationVar(&c.cacheTTL, "cache-ttl", gcp.DefaultCacheTTL, "How long cached object headers and content are used before they are read again from Bigtable (0 keeps them until they are evicted). The garbage collector needs it shorter than its cycle")
+	fl.DurationVar(&c.gcTouchInterval, "gc-touch-interval", gcp.DefaultGCTouchInterval, "Length of the period in which the server records at most one use of each object and map row for the garbage collector (0 disables these writes)")
+	fl.DurationVar(&c.gcHeartbeatInterval, "gc-heartbeat-interval", gcp.DefaultGCHeartbeatInterval, "Time between two heartbeats of this server in the Spanner table GcReplicas, which the garbage collector reads (0 disables them)")
 }
 
 func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -113,6 +120,9 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		LinksContent:          c.linksContent,
 		LinksContentThreshold: c.linksContentThreshold,
 		NoGCEdges:             !c.gcEdges,
+		CacheTTL:              c.cacheTTL,
+		GCTouchInterval:       c.gcTouchInterval,
+		GCHeartbeatInterval:   c.gcHeartbeatInterval,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)

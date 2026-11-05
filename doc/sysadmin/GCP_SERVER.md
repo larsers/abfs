@@ -94,6 +94,9 @@ abfs-server --port 50051 --project <project> --instance <spanner-instance> --buc
 | `--links-content-threshold` | `1048576` | Size in bytes above which `--links-content` returns URLs |
 | `--gcp-client-metrics` | off | Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring |
 | `--gc-edges` | on | Write the GC edges of each new object to the Bigtable table `gc` before its object row. This adds one Bigtable write to each upload. |
+| `--cache-ttl` | `6h` | How long cached object headers and content are used before the server reads them again from Bigtable; `0` keeps them until they are evicted. See [What the server does for the garbage collector](#what-the-server-does-for-the-garbage-collector). |
+| `--gc-touch-interval` | `36h` | Length of the period in which the server writes at most one touch per object and map row; `0` writes none |
+| `--gc-heartbeat-interval` | `5m` | Time between two heartbeats of the server in the Spanner table `GcReplicas`; `0` writes none |
 | `--no-link-validation`, `--no-hash-validation` | off | As for the file-based server |
 | `--http-host` | `localhost` | Address of the HTTP server (`--http-port`). Its endpoints, such as `/debug` and `/server/status`, have no authentication. |
 
@@ -102,6 +105,30 @@ The other flags (`--port`, TLS, `--auth-enabled`, `--acl-enabled`, logging) are 
 In builds that export metrics with OpenTelemetry, `OTEL_METRICS_EXPORTER` chooses where the server's metrics go, as described under Metrics in the [System Admin doc](README.md). Builds whose System Admin doc has no such section serve Prometheus metrics on `/metrics` of the HTTP server.
 
 Several servers can share the same database, tables and bucket. Put them behind one address, for example a load balancer, and give clients that address in `--remote-servers`.
+
+## What the server does for the garbage collector
+
+The garbage collector runs as a separate job. The server records for it which objects are used, and keeps objects that the collector marked for deletion when they are used again. Nothing in the server deletes data.
+
+* **Rescue.** The collector marks an object it plans to delete with the cell `g:condemned` of its `objects` row. The server reads that cell with every object row it reads: in `Headers`, the existence check of `PutObject`, the link checks of `PutObject`, `PutRefs`, `XchgRefs` and `AddMapResult`, `GetObject` and `MapResults`. On a marked row it clears the marker, but only while the marker still holds the value it read, writes a touch, and answers as for any other object. When the collector deleted the row first, the object is missing, and a client that writes it stores it again.
+* **Touches.** When a call finds an object (`Headers`, the existence check of `PutObject`, the link checks, the results of `MapResults`), the server writes the cell `t:touch` of the object's row in the table `gc`, with a Bigtable server timestamp. Each server writes at most one touch per object in each period of `--gc-touch-interval`, counted from the server start, so an object in use has a touch younger than the interval. `MapResults` also writes the cell of each map row it returns again, with the same limit, so the timestamp of a map row is the time it was last used. Map results therefore come back in the order of their last use, oldest first, instead of the order they were added. ninjago tries the newest result first, so builds are not affected. Touches wait in a buffer of 100,000 and are written in batches about once a second. When the buffer is full, touches are dropped and counted; the next use writes them.
+* **Cache TTL.** The header and content caches keep an entry for `--cache-ttl` and then read it again from Bigtable, so that every server sees a marker long before the collector deletes the object. The collector needs its cycle to be longer than the TTL. A shorter TTL costs more Bigtable reads on directory listings.
+* **Missing map results.** `MapResults` leaves out results whose object does not exist, with one header lookup for all results, from the cache where it can.
+* **Missing chunks.** When a chunk of an object is missing while the server streams it, the server drops the object from its caches and reads the object row again. If the row is gone, the read fails as a missing object; if the row still lists the chunk, the content is lost and the read fails with an error that is not "missing".
+* **Heartbeat.** Each server writes its row in the Spanner table `GcReplicas` at start and every `--gc-heartbeat-interval`: an ID made of the host name and a random suffix, logged at start, the version of the GC edge rules it writes into the table `gc` (0 with `--gc-edges=false`), and the commit time. The collector uses it to see which server versions are running. A failed write is logged and counted; the server keeps running.
+
+Cost: one Bigtable write per object and map row used, per server and touch period, batched; one conditional write and one touch per rescue.
+
+Metrics, as OpenTelemetry counters (Prometheus replaces the dots with underscores and adds `_total`):
+
+| Metric | Labels | Counts |
+| --- | --- | --- |
+| `abfs.gcp.gc.rescues` | `call` | Marked objects rescued, by call: `headers`, `validation`, `put_object`, `get_object`, `map_results` |
+| `abfs.gcp.gc.rescues_lost` | `call` | Marked objects that the collector deleted before the call could rescue them |
+| `abfs.gcp.gc.touches` | `result` | Touches `written`, `dropped` because the buffer was full, or `failed` |
+| `abfs.gcp.cache.ttl_expiries` | `cache` | Cache lookups of `headers` or `content` that found an entry older than `--cache-ttl` |
+| `abfs.gcp.gc.map_results_dropped` | | Map results left out because their object is missing |
+| `abfs.gcp.gc.heartbeat_failures` | | Failed heartbeat writes |
 
 ## Try it locally with emulators
 
