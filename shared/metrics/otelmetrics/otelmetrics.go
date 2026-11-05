@@ -80,10 +80,12 @@ func newProvider(enabled bool) metrics.Provider {
 		log.Printf("Warning: metrics: failed to create the metric exporter, falling back to Noop: %v", err)
 		return metrics.NewNoopProvider()
 	}
-	return metrics.WrapBackend(newBackend(sdkmetric.NewMeterProvider(
+	provider := sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(reader),
-	), spaced))
+	)
+	telemetry.SetMeterProvider(provider)
+	return metrics.WrapBackend(newBackend(provider, spaced))
 }
 
 // backend implements metrics.Backend on an OpenTelemetry MeterProvider.
