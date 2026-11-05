@@ -69,7 +69,7 @@ Each row it writes carries the time of the object row, so the garbage collector'
 
 ### Garbage collection dry run
 
-`abfs server gcp gc run --dry-run` runs one garbage collection cycle that only reports. It deletes and marks nothing; the only writes are to the `GcState` row in Spanner. Without `--dry-run` the command refuses to run, because condemn and delete modes do not exist yet.
+`abfs server gcp gc run --dry-run` runs one garbage collection cycle that only reports. It deletes and marks no data; its only writes are to the `GcState` row and the removal of `GcReplicas` rows, both in Spanner. Without `--dry-run` the command refuses to run, because condemn and delete modes do not exist yet.
 
 ```sh
 abfs server gcp gc run --dry-run --project <project> --instance <spanner-instance> --bucket <bucket> [--report gc-report.json]
@@ -78,7 +78,7 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 A cycle:
 
 1. Takes the lease in `GcState`, increments the cycle number and records the start and snapshot times. While another process holds a valid lease the command fails. The lease (`--lease`, default 5 minutes) is renewed while the cycle runs, and the cycle stops itself if the lease is lost or cannot be renewed in time.
-2. Reads the heartbeats in `GcReplicas` and warns about each server seen within the last 30 minutes whose settings break the timing rules: a `--gc-touch-interval` of 0 or longer than half of `--grace`, a `--cache-ttl` of 0, not shorter than `--cycle` or longer than the command's `--cache-ttl`, or GC edge rules older than the command's. The warnings are in the report and the log. A later condemn mode will refuse to run with any of them.
+2. Reads the heartbeats in `GcReplicas` and warns about each server seen within the last 30 minutes whose settings break the timing rules: a `--gc-touch-interval` of 0 or longer than half of `--grace`, a `--cache-ttl` of 0, not shorter than `--cycle` or longer than the command's `--cache-ttl`, or GC edge rules older than the command's. The warnings are in the report and the log. A later condemn mode will refuse to run with any of them. Rows not written for a day, one per stopped server process, are deleted.
 3. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
 4. For each live mount, reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. Other revisions, such as branch names, are counted and ignored.
 5. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.

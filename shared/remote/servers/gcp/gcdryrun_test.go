@@ -381,7 +381,8 @@ func TestDryRunGC_LeaseRefusesSecondRun(t *testing.T) {
 }
 
 // The dry run warns about live replicas whose settings break the timing
-// rules, and ignores replicas that stopped.
+// rules, ignores replicas that stopped, and deletes the rows of replicas not
+// seen for a day.
 func TestDryRunGC_ChecksReplicaSettings(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -394,14 +395,28 @@ func TestDryRunGC_ChecksReplicaSettings(t *testing.T) {
 	require.NoError(gc.WriteHeartbeat(ctx, sp, &bad))
 	_, err := sp.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcReplicas",
 		[]string{"ReplicaId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "LastSeen"},
-		[]any{"stopped", int64(0), true, int64(0), int64(0), f.now.Add(-2 * time.Hour)})})
+		[]any{"stopped", int64(0), true, int64(0), int64(0), f.now.Add(-2 * time.Hour)}),
+		spanner.InsertOrUpdate("GcReplicas",
+			[]string{"ReplicaId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "LastSeen"},
+			[]any{"gone", int64(0), true, int64(0), int64(0), f.now.Add(-25 * time.Hour)}),
+	})
 	require.NoError(err)
 
 	r := f.run(nil).Report
 	require.Equal(int64(2), r.Replicas.Live)
-	require.Equal(int64(1), r.Replicas.Stale)
+	require.Equal(int64(2), r.Replicas.Stale)
+	require.Equal(int64(1), r.Replicas.Removed)
 	require.Len(r.Replicas.Warnings, 2)
 	for _, w := range r.Replicas.Warnings {
 		require.Contains(w, "replica bad: ")
 	}
+
+	// The row not seen for a day is gone.
+	replicas, err := gc.ReadReplicas(ctx, sp)
+	require.NoError(err)
+	var ids []string
+	for _, rep := range replicas {
+		ids = append(ids, rep.ID)
+	}
+	require.ElementsMatch([]string{"good", "bad", "stopped"}, ids)
 }

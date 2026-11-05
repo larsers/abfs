@@ -88,3 +88,21 @@ func ReadReplicas(ctx context.Context, client *spanner.Client) ([]Replica, error
 	}
 	return replicas, nil
 }
+
+// DeleteStaleReplicas deletes the rows of GcReplicas last seen before before,
+// one per stopped server process, and returns how many it deleted.
+func DeleteStaleReplicas(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {
+	var n int64
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		var err error
+		n, err = txn.Update(ctx, spanner.Statement{
+			SQL:    "DELETE FROM " + replicasTable + " WHERE LastSeen < @before",
+			Params: map[string]any{"before": before},
+		})
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete the stale GC replicas: %w", err)
+	}
+	return n, nil
+}

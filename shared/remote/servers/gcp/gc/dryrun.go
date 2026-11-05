@@ -229,7 +229,7 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 // DryRun runs one garbage collection cycle that only reports: it takes the
 // lease, reads the roots at one snapshot, marks the objects of the table gc
 // and counts what a collection would remove. It writes nothing but the
-// GcState row. objs reads the mount details and pinned manifests of live
+// GcState row and deletes the GcReplicas rows not seen for a day. objs reads the mount details and pinned manifests of live
 // mounts.
 func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
@@ -304,6 +304,9 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	r.Replicas = checkReplicas(replicas, snapshot, o)
 	for _, w := range r.Replicas.Warnings {
 		log.Printf("Warning: %s", w)
+	}
+	if r.Replicas.Removed, err = DeleteStaleReplicas(ctx, d.sp, snapshot.Add(-staleReplicaAge)); err != nil {
+		return nil, err
 	}
 
 	step := time.Now()

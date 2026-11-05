@@ -19,8 +19,12 @@ import (
 	"time"
 )
 
-// liveReplicaAge is how recent the heartbeat of a live replica is.
-const liveReplicaAge = 30 * time.Minute
+const (
+	// liveReplicaAge is how recent the heartbeat of a live replica is.
+	liveReplicaAge = 30 * time.Minute
+	// staleReplicaAge is the age after which the collector deletes a row.
+	staleReplicaAge = 24 * time.Hour
+)
 
 // ReplicaReport reports the server replicas seen in GcReplicas.
 type ReplicaReport struct {
@@ -28,6 +32,8 @@ type ReplicaReport struct {
 	Live int64 `json:"live"`
 	// Stale counts the other rows.
 	Stale int64 `json:"stale"`
+	// Removed counts the rows not seen for a day, which the run deleted.
+	Removed int64 `json:"removed"`
 	// Warnings lists the live replicas whose settings break the timing rules
 	// of the collector. A condemn mode would refuse to run with any of them.
 	Warnings []string `json:"warnings,omitempty"`
