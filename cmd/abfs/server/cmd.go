@@ -16,26 +16,20 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
-	"os"
-	"os/signal"
 	"strconv"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/prometheus"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
 
 	aresgrpc "github.com/google/abfs/ares/grpc"
 	arespb "github.com/google/abfs/ares/grpc/proto"
@@ -43,10 +37,12 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/remote"
 	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/grpc/server"
 	"github.com/google/abfs/shared/remote/servers"
+	"github.com/google/abfs/shared/telemetry"
 )
 
 type serverCmd struct {
@@ -58,6 +54,8 @@ type serverCmd struct {
 	noHashValidation bool
 	noLogging        bool
 	maxConnectionAge time.Duration
+	shutdownTimeout  time.Duration
+	drainDelay       time.Duration
 	aresEnabled      bool
 	tlsCertFile      string
 	tlsKeyFile       string
@@ -74,7 +72,7 @@ func NewCmd(rootCmd *root.RootCmd) *serverCmd {
 func (c *serverCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:        "server",
-		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--tls-cert-file <path>] [--tls-key-file <path>]",
+		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--drain-delay <duration>] [--shutdown-timeout <duration>] [--tls-cert-file <path>] [--tls-key-file <path>]",
 		Aliases:     []string{},
 		Desc:        `Start ABFS server for blobs, objects and map results.`,
 		Subcommands: c.subcommands(),
@@ -89,6 +87,8 @@ func (c *serverCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.httpHost, "http-host", "localhost", "The host or address the http (v1) server listens on. Its endpoints, such as /debug and /server/status, have no authentication; use an address other than localhost only on a trusted network")
 	fl.IntVar(&c.httpPort, "http-port", 0, "The http (v1) server port")
 	fl.DurationVar(&c.maxConnectionAge, "max-connection-age", 0, "A duration for the maximum amount of time a connection may exist before it will be closed by sending a GoAway. Supports units like '1h', '30m', '1s'. Default is 0 (no limit).")
+	fl.DurationVar(&c.drainDelay, "drain-delay", 0, "How long to keep serving after a shutdown signal, while health checks already report NOT_SERVING, so that load balancers and health checkers stop sending new requests before the server stops accepting them. Size it from the health check interval times the unhealthy threshold. 0 means the drain starts at once.")
+	fl.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 25*time.Second, "How long to wait for pending RPCs on shutdown before closing their connections, so that a stalled or vanished client cannot keep the server from exiting. Keep it below the time your process manager waits before killing the server. 0 means no limit.")
 	// TODO: override hashpath or some other solution for local testing?
 	fl.BoolVar(&c.aresEnabled, "ares-enabled", false, fmt.Sprintf("Polls the hashpath %q for the list of ARES servers to proxy to", aresgrpc.ConfigARESServersHashPath))
 	fl.StringVar(&c.tlsCertFile, "tls-cert-file", "", "Path to the TLS certificate file")
@@ -112,13 +112,6 @@ func (c *serverCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 }
 
 func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) error {
-	exporter, err := prometheus.New()
-	if err != nil {
-		return fmt.Errorf("failed to initialize prometheus exporter: %w", err)
-	}
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
-	otel.SetMeterProvider(provider)
-
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", c.port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
@@ -150,6 +143,15 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	if !c.noLogging {
 		composedServer = servers.NewLoggingServer(composedServer, log.Default(), 3, c.logSampleRate)
 	}
+	composedServer = servers.NewMetricsServer(composedServer, metrics.GetProvider())
+	hs := health.NewServer()
+	// The gRPC handler records into the metrics backend, so build it first.
+	metrics.Init()
+	var extraOpts []grpc.ServerOption
+	if h := telemetry.ServerHandler(); h != nil {
+		extraOpts = append(extraOpts, grpc.StatsHandler(h))
+	}
+	telemetry.SetGlobals()
 	s, err := server.NewGRPCServer(&server.GRPCServerOpts{
 		Server:                   composedServer,
 		ProxyPrefixToConnManager: proxyMap,
@@ -157,41 +159,12 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		CertFile:                 c.tlsCertFile,
 		KeyFile:                  c.tlsKeyFile,
 		AuthEnabled:              c.authEnabled,
-		ExtraServerOpts: []grpc.ServerOption{
-			grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		},
+		Health:                   hs,
+		ExtraServerOpts:          extraOpts,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create grpc server: %w", err)
 	}
-
-	var wg sync.WaitGroup
-	serverCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		select {
-		case <-sigChan:
-			log.Printf("received interrupt signal")
-		case <-serverCtx.Done():
-		}
-		cancel()
-		s.GracefulStop()
-		metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer metricsCancel()
-		if err := provider.Shutdown(metricsCtx); err != nil {
-			log.Printf("WARNING: error shutting down metrics provider: %v", err)
-		}
-		if aresProxy != nil {
-			if err := aresProxy.Close(); err != nil {
-				log.Printf("WARNING: error stopping ares proxy: %v", err)
-			}
-		}
-	}()
 
 	go func() {
 		// This goroutine will be terminated when the main process exits.
@@ -218,16 +191,61 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		if r, ok := abfsServer.(interface{ RegisterHTTPRoutes(*mux.Router) }); ok {
 			r.RegisterHTTPRoutes(router)
 		}
-		router.PathPrefix("/metrics").Handler(promhttp.Handler())
 		if err := http.Serve(httpLis, router); err != nil {
 			log.Fatalf("Error when starting or running http server: %v", err)
 		}
 	}()
 
-	log.Printf("server listening at %v serving", lis.Addr())
-	if err := s.Serve(lis); err != nil && err != grpc.ErrServerStopped {
-		return fmt.Errorf("failed to serve: %w", err)
+	serveErr := serveGRPC(ctx, s, hs, lis, c.drainDelay, c.shutdownTimeout)
+	if aresProxy != nil {
+		if err := aresProxy.Close(); err != nil {
+			log.Printf("WARNING: error stopping ares proxy: %v", err)
+		}
 	}
-	wg.Wait()
-	return nil
+	return serveErr
+}
+
+// serveGRPC serves s on lis until ctx is canceled or s fails. It then reports
+// NOT_SERVING on hs, keeps serving for drainDelay and stops s gracefully,
+// closing the remaining connections after timeout.
+func serveGRPC(ctx context.Context, s *grpc.Server, hs *health.Server, lis net.Listener, drainDelay, timeout time.Duration) error {
+	stopCtx := ctx
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		<-ctx.Done()
+		if hs != nil {
+			// Health checkers see the shutdown before the listener closes.
+			hs.Shutdown()
+		}
+		// Only a requested stop waits; when Serve failed there is nothing to drain.
+		if drainDelay > 0 && stopCtx.Err() != nil {
+			log.Printf("Reporting NOT_SERVING and serving for %s before shutting down...", drainDelay)
+			time.Sleep(drainDelay)
+		}
+		log.Printf("Shutting down gRPC server gracefully so pending RPCs can finish...")
+		// GracefulStop waits for every handler to return, also for clients
+		// that stopped reading or vanished. Stop cancels their contexts, so the
+		// timeout bounds the shutdown for handlers that honour them. Waiting
+		// for GracefulStop keeps the backend Close after every handler.
+		if timeout > 0 {
+			timer := time.AfterFunc(timeout, func() {
+				log.Printf("Pending RPCs did not finish within %s, closing their connections", timeout)
+				s.Stop()
+			})
+			defer timer.Stop()
+		}
+		s.GracefulStop()
+		return nil
+	})
+
+	g.Go(func() error {
+		log.Printf("server listening at %v serving", lis.Addr())
+		if err := s.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			return fmt.Errorf("failed to serve: %w", err)
+		}
+		return nil
+	})
+
+	return g.Wait()
 }
