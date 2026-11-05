@@ -97,7 +97,15 @@ func (s *PBServer) GetObject(req *pb.GetObjectRequest, stream pb.ABFS_GetObjectS
 	}
 	defer entities.CloseErrCheck(reader, &retErr)
 
-	return copyToStream(reader, stream, nil)
+	// An object can also disappear while it is read, after some content was
+	// sent; the status still reaches the client.
+	if err := copyToStream(reader, stream, nil); err != nil {
+		if entities.IsNotExist(err) {
+			return status.Error(codes.NotFound, "object not found on the server")
+		}
+		return err
+	}
+	return nil
 }
 
 // PutObject implements ABFSServer.
