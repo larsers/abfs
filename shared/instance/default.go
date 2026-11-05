@@ -53,6 +53,9 @@ var defaultConfig = &Config{
 	GitPrefetchIndices:  true,
 	GitPrefetchSymlinks: true,
 
+	GCKeepAliveRefInterval:   15 * time.Minute,
+	GCKeepAliveTouchInterval: 18 * time.Hour,
+
 	SetupOrderOnlyAsRegular: true,
 	SetupRemoteCC:           true,
 	SetupRemoteJava:         true,
