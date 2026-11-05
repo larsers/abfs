@@ -65,6 +65,44 @@ abfs server gcp gc backfill --project <project> --instance <spanner-instance> --
 
 `--dry-run` only counts the rows to write. `--rate` limits the object rows scanned per second (0 means no limit). The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
 
+### Garbage collection dry run
+
+`abfs server gcp gc run --dry-run` runs one garbage collection cycle that only reports. It deletes and marks nothing; the only writes are to the `GcState` row in Spanner. Without `--dry-run` the command refuses to run, because condemn and delete modes do not exist yet.
+
+```sh
+abfs server gcp gc run --dry-run --project <project> --instance <spanner-instance> --bucket <bucket> [--report gc-report.json]
+```
+
+A cycle:
+
+1. Takes the lease in `GcState`, increments the cycle number and records the start and snapshot times. While another process holds a valid lease the command fails. The lease (`--lease`, default 5 minutes) is renewed while the cycle runs, and the cycle stops itself if the lease is lost or cannot be renewed in time.
+2. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
+3. For each live mount, reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. Other revisions, such as branch names, are counted and ignored.
+4. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
+5. Marks in memory everything the roots reach. Edges to objects without a `gc` row are skipped and counted. A `gc` row with an object type the binary does not know stops the run, so run the same or a newer version than the servers.
+6. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once.
+7. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
+
+| Class | Roots | Retention |
+| --- | --- | --- |
+| Source | every ref outside the classes below, such as branches, tags and `HEAD`; `abfs/project-status`, `abfs/pushed-packs`, `config` and `acl` are counted separately | while the ref exists |
+| Workspaces | `refs/abfs/ws/...` of the project `abfs-meta` | while the ref exists |
+| Mounts | `refs/abfs/mount/...` of `abfs-meta`, and the revisions of their pinned manifests | while the client rewrote the ref within `--mount-idle` (default `336h`) |
+| Unmount records | none | the ref would be tombstoned after `--build-retention` |
+| Builds | `refs/abfs/build/...` and `refs/abfs/build-start/...` of `abfs-meta` | `--build-retention` (default `720h`) since the ref was written |
+| Eval map rows | the request and the result | `--map-retention` (default `720h`) since the row was written or used |
+| Deep tree and digest map rows | the request and the result | while the tree of the request is reachable |
+| LFS map rows | the request and the result | always |
+| Recent objects | objects whose `gc` row was written or touched within `--grace` (default `72h`) before the snapshot | `--grace` |
+
+Map rows with request types not listed are kept. `--grace` must be at least `2 x --cycle + --cache-ttl + --longest-push` (defaults `24h`, `6h` and `3h`); the command refuses to run otherwise.
+
+The report counts, per class, the refs, tombstones, roots and refs that retention would tombstone; roots whose object has no `gc` row (dangling roots); objects and edges per type, reachable and unreachable; dangling edges with a few examples; map rows live and expired per class; the consistency result with the first objects missing a `gc` row; the time of each step; and the peak heap. Objects written within a minute of the scan are not checked for a `gc` row, and `gc` rows without an object row (uploads in flight) are counted.
+
+Memory grows with the `gc` table: about 29 bytes per object (key, type and edge offset) and 4 bytes per edge. A table of 10^8 objects and 2x10^9 edges needs about 11 GB.
+
+The scans read the whole `gc` table, the `maps` keys and, with `--consistency`, the `meta` family of `objects`. Give the command a Bigtable app profile with low priority and single-cluster routing (`--bt-app-profile`).
+
 ## Run the server
 
 Both commands take the same flags. `abfs server gcp` is a subcommand of the `abfs` binary; flags of `abfs server` go before `gcp`:
