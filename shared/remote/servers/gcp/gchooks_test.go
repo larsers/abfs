@@ -252,6 +252,33 @@ func TestGCHooks_RescuesABatchInParallel(t *testing.T) {
 	require.LessOrEqual(most, rescueWorkers)
 }
 
+// The collector's own server reads condemned objects as live and leaves the
+// marker and the touches as they are.
+func TestGCHooks_ReadOnly(t *testing.T) {
+	require := require.New(t)
+	s := newGCHooksServer(t, &NewServerOpts{GCReadOnly: true, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Hour})
+	require.Nil(s.gcHooks.toucher)
+	require.Nil(s.gcHooks.stopHeartbeat)
+	key := putBlob(t, s, "hello")
+	condemnObject(t, s, key, 3)
+
+	hdrs, err := s.Headers(context.Background(), []entities.Hash{key})
+	require.NoError(err)
+	require.False(hdrs[0].IsEmpty())
+	s.forget(key)
+	require.NoError(readObject(s, key))
+	s.forget(key)
+	require.NoError(putRaw(s, key, []byte("blob 5\x00hello")))
+	tree, data := treeOf(key)
+	require.NoError(putRaw(s, tree, data))
+
+	require.True(isCondemned(t, s, key))
+	require.False(objectTouched(t, s, key))
+	for p := range numRescuePaths {
+		require.Zero(s.gcHooks.rescues[p].Load())
+	}
+}
+
 func TestGCHooks_TouchThrottle(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()

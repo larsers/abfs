@@ -55,7 +55,7 @@ abfs server gcp init --project <project> --instance <spanner-instance> --bucket 
 
 With `--gc`, init also creates the garbage collector resources: the Bigtable table `gc`, the column family `g` of `objects` and the Spanner tables `GcState` and `GcReplicas`. Without it, init creates only the server's own resources. Running it again with `--gc` adds the garbage collector resources to an existing deployment.
 
-The server checks the same resources at startup and stops with an error that names the missing one; with `--gc` it also checks the garbage collector resources. The `abfs server gcp gc` commands need them and refuse to run without them.
+The server checks the same resources at startup and stops with an error that names the missing one; with `--gc` it also checks the garbage collector resources. The `abfs server gcp gc` commands need them and refuse to run without them. Their own reads of objects leave the garbage collector state as it is: they rescue and touch nothing, so what the collector reads is not kept because it read it.
 
 ### Fill the gc table
 

@@ -217,3 +217,23 @@ func TestBackfillGC_CountsUnreadableObjects(t *testing.T) {
 	require.Nil(readGCRow(t, f.s, lost))
 	require.NotNil(readGCRow(t, f.s, f.bigTree))
 }
+
+// The backfill reads objects through a server that leaves condemn markers in
+// place.
+func TestBackfillGC_ReadsLeaveCondemnMarkers(t *testing.T) {
+	require := require.New(t)
+	f := newBackfillFixture(t)
+	adm, err := bigtable.NewAdminClient(context.Background(), "test-proj", "test-bt")
+	require.NoError(err)
+	defer adm.Close()
+	require.NoError(adm.CreateColumnFamily(context.Background(), "objects", gc.ObjectsFamily))
+	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCReadOnly: true, GCTouchInterval: time.Hour}))
+	t.Cleanup(f.s.stopGCHooks)
+	condemnObject(t, f.s, f.bigTree, 3)
+
+	_, err = f.s.BackfillGC(context.Background(), &gc.BackfillOpts{})
+	require.NoError(err)
+	require.NotNil(readGCRow(t, f.s, f.bigTree))
+	require.True(isCondemned(t, f.s, f.bigTree))
+	require.False(objectTouched(t, f.s, f.bigTree))
+}

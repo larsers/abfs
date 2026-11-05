@@ -132,8 +132,10 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	g := &s.gcHooks
 	g.on = true
 	g.cacheTTL = seconds(opts.CacheTTL)
-	g.rescue = gc.NewRescuer(s.casdb.BTClient()).Rescue
-	if opts.GCTouchInterval > 0 {
+	if !opts.GCReadOnly {
+		g.rescue = gc.NewRescuer(s.casdb.BTClient()).Rescue
+	}
+	if opts.GCTouchInterval > 0 && !opts.GCReadOnly {
 		g.touchInterval = seconds(opts.GCTouchInterval)
 		g.touchedMapRows = make([]*lru.Cache[mapRowKey, uint32], cacheShards)
 		for i := range g.touchedMapRows {
@@ -150,7 +152,7 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 		return fmt.Errorf("failed to register the GC metrics: %w", err)
 	}
 	g.metrics = reg
-	if opts.GCHeartbeatInterval > 0 {
+	if opts.GCHeartbeatInterval > 0 && !opts.GCReadOnly {
 		s.startHeartbeat(opts.GCHeartbeatInterval, gc.Replica{
 			Version:       gc.ExtractorVersion,
 			GC:            true,
@@ -295,6 +297,9 @@ func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *O
 // objects, for example a keep-alive touch right after a cycle condemned what
 // the mount holds, so the rescues run in parallel.
 func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*ObjectHeader) ([]*ObjectHeader, error) {
+	if s.gcHooks.rescue == nil {
+		return hdrs, nil
+	}
 	gone := make([]bool, len(hdrs))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(rescueWorkers)

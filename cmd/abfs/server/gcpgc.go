@@ -99,7 +99,9 @@ func (c *gcpGCBackfillCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return err
 	}
 	// The scan reads each object once, so caching them only costs memory.
+	// Its reads must not rescue condemned objects or count as a use.
 	c.server.GC = true
+	c.server.GCReadOnly = true
 	c.server.MaxCachedHeaders = 1
 	c.server.MaxCachedContents = 1
 	server, err := gcp.New(ctx, &c.server)
@@ -195,8 +197,9 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return err
 	}
 	// The run reads only the mount details and pinned manifests of live
-	// mounts, once each.
+	// mounts, once each, and must not rescue them.
 	c.server.GC = true
+	c.server.GCReadOnly = true
 	c.server.MaxCachedHeaders = 1
 	c.server.MaxCachedContents = 1
 	server, err := gcp.New(ctx, &c.server)

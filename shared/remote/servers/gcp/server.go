@@ -264,6 +264,11 @@ type NewServerOpts struct {
 	// GCHeartbeatInterval is the time between two heartbeats of this server in
 	// the table GcReplicas; zero disables the heartbeat.
 	GCHeartbeatInterval time.Duration
+	// GCReadOnly, with GC, leaves the state of the garbage collector as it is:
+	// reads answer for condemned objects without rescuing them, and the server
+	// writes no touches and no heartbeat. The collector's own commands use it,
+	// so that what they read does not count as a use.
+	GCReadOnly bool
 }
 
 func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
