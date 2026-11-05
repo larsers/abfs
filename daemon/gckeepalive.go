@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -34,6 +35,8 @@ import (
 
 const (
 	gcKeepAliveMaxTick = 15 * time.Minute
+	// Fraction of the interval by which each later wait varies.
+	gcKeepAliveSpread = 0.1
 	// Same as the per-call key limit of the gRPC client, so each request is one server call.
 	gcTouchBatchSize = 50000
 )
@@ -56,9 +59,16 @@ type GCKeepAlive struct {
 	RefInterval   time.Duration
 	TouchInterval time.Duration
 	Scan          func(ctx context.Context) ([]entities.Hash, error)
+	// Rand returns a number in [0, 1) that spreads the waits, so that mounts
+	// started at the same time do not refresh and touch at the same time. Nil
+	// means every wait is exactly the interval.
+	Rand func() float64
 
 	lastRef   time.Time
 	lastTouch time.Time
+	// Zero means the interval.
+	refWait   time.Duration
+	touchWait time.Duration
 }
 
 // MountRef returns the ref in the ABFS meta project that points to a mount's details.
@@ -78,6 +88,7 @@ func NewGCKeepAlive(info filesystem.MountInfo, details *binding.MountDetails, se
 		Server:        server,
 		RefInterval:   details.Config.GCKeepAliveRefInterval,
 		TouchInterval: details.Config.GCKeepAliveTouchInterval,
+		Rand:          rand.Float64,
 		Scan: func(ctx context.Context) ([]entities.Hash, error) {
 			return scanMountHashes(ctx, mountPoint, bindcasAttrs{})
 		},
@@ -113,35 +124,81 @@ func (k *GCKeepAlive) refInterval() time.Duration {
 // Run refreshes the ref and touches the objects until ctx is done. Errors are
 // logged and never stop it.
 func (k *GCKeepAlive) Run(ctx context.Context) {
-	tick := k.tick()
-	if tick <= 0 {
+	if k.tick() <= 0 {
 		return
 	}
-	now := time.Now()
-	k.lastRef, k.lastTouch = now, now
-	ticker := time.NewTicker(tick)
-	defer ticker.Stop()
+	k.start(time.Now())
+	timer := time.NewTimer(k.untilNext(time.Now()))
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case now := <-timer.C:
 			k.step(ctx, now)
+			timer.Reset(k.untilNext(time.Now()))
 		}
 	}
 }
 
+// start sets the first waits to a random part of each interval, so that the
+// first refreshes and touches of mounts started together are spread over a
+// whole interval.
+func (k *GCKeepAlive) start(now time.Time) {
+	k.lastRef, k.lastTouch = now, now
+	k.refWait = k.firstWait(k.refInterval())
+	k.touchWait = k.firstWait(k.TouchInterval)
+}
+
+// firstWait returns a wait in (0, d].
+func (k *GCKeepAlive) firstWait(d time.Duration) time.Duration {
+	if k.Rand == nil || d <= 0 {
+		return d
+	}
+	return max(time.Duration((1-k.Rand())*float64(d)), 1)
+}
+
+// nextWait returns d plus or minus gcKeepAliveSpread of d.
+func (k *GCKeepAlive) nextWait(d time.Duration) time.Duration {
+	if k.Rand == nil || d <= 0 {
+		return d
+	}
+	return d + time.Duration((2*k.Rand()-1)*gcKeepAliveSpread*float64(d))
+}
+
+func waitOr(wait, d time.Duration) time.Duration {
+	if wait > 0 {
+		return wait
+	}
+	return d
+}
+
+// untilNext returns the time from now to the next refresh or touch, at most
+// gcKeepAliveMaxTick.
+func (k *GCKeepAlive) untilNext(now time.Time) time.Duration {
+	wait := gcKeepAliveMaxTick
+	if d := k.refInterval(); d > 0 {
+		wait = min(wait, k.lastRef.Add(waitOr(k.refWait, d)).Sub(now))
+	}
+	if k.TouchInterval > 0 {
+		wait = min(wait, k.lastTouch.Add(waitOr(k.touchWait, k.TouchInterval)).Sub(now))
+	}
+	return max(wait, 0)
+}
+
 func (k *GCKeepAlive) step(ctx context.Context, now time.Time) {
-	if d := k.refInterval(); d > 0 && now.Sub(k.lastRef) >= d {
+	if d := k.refInterval(); d > 0 && now.Sub(k.lastRef) >= waitOr(k.refWait, d) {
 		k.lastRef = now
+		k.refWait = k.nextWait(d)
 		if err := k.refreshRef(); err != nil {
 			log.Printf("Failed to refresh mount ref %s: %v", k.Ref, err)
 		}
 	}
-	if k.TouchInterval > 0 && now.Sub(k.lastTouch) >= k.TouchInterval {
+	if k.TouchInterval > 0 && now.Sub(k.lastTouch) >= waitOr(k.touchWait, k.TouchInterval) {
 		// A failed touch waits for the next interval too, so a server or cacheman
 		// that cannot answer does not cause a mount scan on every tick.
 		k.lastTouch = now
+		k.touchWait = k.nextWait(k.TouchInterval)
 		found, total, err := k.touch(ctx)
 		if err != nil {
 			log.Printf("GC keep-alive touch failed after %d of %d objects: %v", found, total, err)

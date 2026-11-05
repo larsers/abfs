@@ -17,6 +17,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -116,6 +117,111 @@ func TestGCKeepAlive_Step(t *testing.T) {
 	k.step(context.Background(), start.Add(36*time.Hour))
 	require.Equal(2, scans)
 	require.Len(remote.batches, 2)
+}
+
+func jitterKeepAlive(remote *fakeGCRemote, r func() float64, scans *int) *GCKeepAlive {
+	return &GCKeepAlive{
+		Remote:        remote,
+		Server:        "host",
+		Ref:           "refs/abfs/mount/user/u/1",
+		Target:        objects.HashBlobBytes([]byte("details")),
+		RefInterval:   15 * time.Minute,
+		TouchInterval: 18 * time.Hour,
+		Rand:          r,
+		Scan: func(ctx context.Context) ([]entities.Hash, error) {
+			if scans != nil {
+				*scans++
+			}
+			return nil, nil
+		},
+	}
+}
+
+func TestGCKeepAlive_FirstWait(t *testing.T) {
+	require := require.New(t)
+
+	for _, r := range []float64{0, 0.25, 0.5, 0.999999999999} {
+		k := jitterKeepAlive(&fakeGCRemote{}, func() float64 { return r }, nil)
+		start := time.Now()
+		k.start(start)
+		for _, w := range []struct{ wait, d time.Duration }{{k.refWait, k.RefInterval}, {k.touchWait, k.TouchInterval}} {
+			require.Positive(w.wait, "r=%v", r)
+			require.LessOrEqual(w.wait, w.d, "r=%v", r)
+		}
+		require.Equal(min(k.refWait, gcKeepAliveMaxTick), k.untilNext(start))
+	}
+
+	rng := rand.New(rand.NewPCG(1, 2))
+	var lo, hi time.Duration
+	for i := range 1000 {
+		k := jitterKeepAlive(&fakeGCRemote{}, rng.Float64, nil)
+		k.start(time.Now())
+		require.Positive(k.refWait)
+		require.LessOrEqual(k.refWait, k.RefInterval)
+		require.Positive(k.touchWait)
+		require.LessOrEqual(k.touchWait, k.TouchInterval)
+		if i == 0 || k.touchWait < lo {
+			lo = k.touchWait
+		}
+		hi = max(hi, k.touchWait)
+	}
+	// The first touches spread over the whole interval.
+	require.Less(lo, 2*time.Hour)
+	require.Greater(hi, 16*time.Hour)
+}
+
+func TestGCKeepAlive_LaterWaits(t *testing.T) {
+	require := require.New(t)
+
+	remote := &fakeGCRemote{}
+	scans := 0
+	k := jitterKeepAlive(remote, rand.New(rand.NewPCG(3, 4)).Float64, &scans)
+	now := time.Now()
+	k.start(now)
+	within := func(wait, d time.Duration) {
+		spread := time.Duration(gcKeepAliveSpread * float64(d))
+		require.GreaterOrEqual(wait, d-spread)
+		require.LessOrEqual(wait, d+spread)
+	}
+
+	refs, touches := 0, 0
+	for range 2000 {
+		wait := k.untilNext(now)
+		require.Positive(wait)
+		require.LessOrEqual(wait, gcKeepAliveMaxTick)
+
+		// Nothing is due just before the next wait ends.
+		k.step(context.Background(), now.Add(wait-time.Nanosecond))
+		require.Len(remote.refs, refs)
+		require.Equal(touches, scans)
+
+		now = now.Add(wait)
+		lastRef, lastTouch := k.lastRef, k.lastTouch
+		k.step(context.Background(), now)
+		if k.lastRef != lastRef {
+			refs++
+			within(k.refWait, k.RefInterval)
+		}
+		if k.lastTouch != lastTouch {
+			touches++
+			within(k.touchWait, k.TouchInterval)
+		}
+		require.Len(remote.refs, refs)
+		require.Equal(touches, scans)
+	}
+	require.Greater(refs, 1000)
+	require.Greater(touches, 10)
+}
+
+func TestGCKeepAlive_NoRand(t *testing.T) {
+	require := require.New(t)
+
+	k := jitterKeepAlive(&fakeGCRemote{}, nil, nil)
+	start := time.Now()
+	k.start(start)
+	require.Equal(15*time.Minute, k.refWait)
+	require.Equal(18*time.Hour, k.touchWait)
+	require.Equal(15*time.Minute, k.nextWait(k.RefInterval))
 }
 
 func TestGCKeepAlive_Touch(t *testing.T) {
