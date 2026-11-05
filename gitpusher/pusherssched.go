@@ -475,7 +475,7 @@ func (p *projPushWrap) push(ctx context.Context) error {
 	default:
 	}
 	log.Printf("Pushing project %s", p.config.URL)
-	return p.pusher.Push(ctx)
+	return forgetLFSOnError(p.pusher, p.pusher.Push(ctx))
 }
 
 func (p *projPushWrap) String() string {

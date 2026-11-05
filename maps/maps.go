@@ -40,6 +40,7 @@ type MapRequest struct {
 	OutputDecode func(hash Hash, content []byte) (MapObject, error)
 	Store        entities.CASStore
 	InvalidCount int
+	MissingCount int
 	CacheHit     bool
 	StartTime    time.Time
 	Duration     time.Duration
@@ -70,6 +71,7 @@ func MapExisting(ctx context.Context, inHash Hash, req *MapRequest) (MapObject, 
 	}()
 	tried := make(map[entities.Hash]bool)
 	hasMapEntry := false
+	missing := 0
 	for try := 0; try < 2; try++ {
 		hashes, err := req.Store.MapResults(ctx, inHash)
 		if err != nil {
@@ -84,6 +86,13 @@ func MapExisting(ctx context.Context, inHash Hash, req *MapRequest) (MapObject, 
 			tried[outHash] = true
 
 			outBytes, err := req.Store.GetObject(ctx, outHash)
+			if entities.IsNotExist(err) {
+				// The server GC removes results nobody used for a while, and a map list
+				// fetched earlier can still name them. Try the next one.
+				missing++
+				req.MissingCount++
+				continue
+			}
 			if err != nil {
 				return nil, fmt.Errorf("failed to fetch object %s which is map result of %s: %w", outHash, inHash, err)
 			}
@@ -110,7 +119,8 @@ func MapExisting(ctx context.Context, inHash Hash, req *MapRequest) (MapObject, 
 			}
 		}
 	}
-	if !hasMapEntry {
+	// The input may be gone with its results, so store it again.
+	if !hasMapEntry || missing == len(tried) {
 		req.storeInput = true
 	}
 	return nil, nil

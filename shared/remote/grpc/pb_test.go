@@ -277,6 +277,40 @@ func TestGetObjectReaderError(t *testing.T) {
 	require.ErrorContains(t, err, "reader error")
 }
 
+// An object that disappears after part of it was sent reaches the client as
+// a missing object; other read errors do not.
+func TestGetObjectRemovedWhileReading(t *testing.T) {
+	var myKey = entities.NewHash("a0423896973644771497bdc03eb99d5281615b51")
+	content := bytes.Repeat([]byte("x"), 3*MaxMessageSize)
+	tests := []struct {
+		name     string
+		err      error
+		notExist bool
+	}{
+		{"removed", fmt.Errorf("object was removed while it was read: %w", entities.ErrNotExist), true},
+		{"other error", errors.New("chunk is lost"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &ServerImpl{
+				GetObjectImpl: func(ctx context.Context, key remote.Hash) (remote.ContentReadCloser, error) {
+					reader := objects.PrependHeaderReader(bytes.NewReader(content), "blob", int64(2*len(content)))
+					reader = io.MultiReader(reader, iotest.ErrReader(tt.err))
+					return remote.NewContentReader(io.NopCloser(reader), remote.EncodingRaw), nil
+				},
+			}
+			client, stop := grpcPipe(t, server)
+			defer stop()
+
+			reader, err := client.GetObject(context.Background(), myKey)
+			require.NoError(t, err)
+			_, err = objects.ReadBlob(reader)
+			require.Error(t, err)
+			require.Equal(t, tt.notExist, entities.IsNotExist(err), err)
+		})
+	}
+}
+
 func TestGetObjectReaderError2(t *testing.T) {
 	var myKey = entities.NewHash("a0423896973644771497bdc03eb99d5281615b51")
 	var myContent = "hello world!\n"

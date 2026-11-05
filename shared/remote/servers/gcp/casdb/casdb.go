@@ -55,6 +55,7 @@ type CASDB struct {
 	mapsTable    *bigtable.Table
 	objectsTable *bigtable.Table
 	headersSem   chan struct{}
+	gc           bool
 }
 
 // New connects to the Spanner database and the Bigtable instance. The client
@@ -188,7 +189,7 @@ func (c *CASDB) GetObjectData(ctx context.Context, hash entities.Hash) (*ObjectH
 	}
 
 	if row != nil && len(row["meta"]) > 0 && len(row["data"]) > 0 {
-		hdr := &ObjectHeader{Id: hash}
+		hdr := &ObjectHeader{Id: hash, Condemned: c.condemnedValue(row)}
 		for _, item := range row["meta"] {
 			switch item.Column {
 			case "meta:type":
@@ -213,14 +214,14 @@ func (c *CASDB) GetObjectData(ctx context.Context, hash entities.Hash) (*ObjectH
 }
 
 func (c *CASDB) GetHeader(ctx context.Context, hash entities.Hash) (*ObjectHeader, error) {
-	row, err := c.objectsTable.ReadRow(ctx, hash.String(), bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter("meta"), bigtable.LatestNFilter(1))))
+	row, err := c.objectsTable.ReadRow(ctx, hash.String(), bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter(c.headerFamilies()), bigtable.LatestNFilter(1))))
 	if err != nil {
 		return nil, err
 	}
 	if row == nil || len(row["meta"]) == 0 {
 		return nil, ErrNotFound
 	}
-	obj := &ObjectHeader{Id: hash}
+	obj := &ObjectHeader{Id: hash, Condemned: c.condemnedValue(row)}
 	for _, item := range row["meta"] {
 		switch item.Column {
 		case "meta:type":
@@ -233,7 +234,7 @@ func (c *CASDB) GetHeader(ctx context.Context, hash entities.Hash) (*ObjectHeade
 }
 
 func (c *CASDB) GetHeaders(ctx context.Context, hashes []entities.Hash) ([]*ObjectHeader, error) {
-	filter := bigtable.ChainFilters(bigtable.FamilyFilter("meta"), bigtable.LatestNFilter(1))
+	filter := bigtable.ChainFilters(bigtable.FamilyFilter(c.headerFamilies()), bigtable.LatestNFilter(1))
 	var outMu sync.Mutex
 
 	rowKeys := make(bigtable.RowList, len(hashes))
@@ -261,7 +262,7 @@ func (c *CASDB) GetHeaders(ctx context.Context, hashes []entities.Hash) ([]*Obje
 
 			batch := make([]*ObjectHeader, 0, len(rowList))
 			err := c.objectsTable.ReadRows(gctx, rowList, func(row bigtable.Row) bool {
-				obj := &ObjectHeader{Id: entities.NewHash(row.Key())}
+				obj := &ObjectHeader{Id: entities.NewHash(row.Key()), Condemned: c.condemnedValue(row)}
 				for _, item := range row["meta"] {
 					switch item.Column {
 					case "meta:type":
@@ -320,8 +321,7 @@ func (c *CASDB) AddMapResult(ctx context.Context, from, to entities.Hash) error 
 	// The value is don't care and only signals existence.
 	mut := bigtable.NewMutation()
 	mut.Set("cf", "", bigtable.Now(), []byte("1"))
-	rowKey := fmt.Sprintf("%s#%s", from, to)
-	return c.mapsTable.Apply(ctx, rowKey, mut)
+	return c.mapsTable.Apply(ctx, MapRowKey(from, to), mut)
 }
 
 // MapResults returns the results added for from, oldest first, as file-based

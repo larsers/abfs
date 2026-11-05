@@ -1,0 +1,81 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package gc
+
+import (
+	"fmt"
+	"time"
+)
+
+const (
+	// liveReplicaAge is how recent the heartbeat of a live replica is.
+	liveReplicaAge = 30 * time.Minute
+	// staleReplicaAge is the age after which the collector deletes a row.
+	staleReplicaAge = 24 * time.Hour
+)
+
+// ReplicaReport reports the server replicas seen in GcReplicas.
+type ReplicaReport struct {
+	// Live counts the replicas whose heartbeat is younger than liveReplicaAge.
+	Live int64 `json:"live"`
+	// Stale counts the other rows.
+	Stale int64 `json:"stale"`
+	// Removed counts the rows not seen for a day, which the run deleted.
+	Removed int64 `json:"removed"`
+	// Warnings lists the live replicas whose settings break the timing rules
+	// of the collector. A condemn mode would refuse to run with any of them.
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// checkReplicas checks the settings of the replicas seen within
+// liveReplicaAge before now against the timing rules: a used object must be
+// touched at least once per half grace, and a replica must read a cached
+// entry again within one cycle and within the TTL the grace allows for.
+func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaReport {
+	var rep ReplicaReport
+	warn := func(r *Replica, format string, args ...any) {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("replica %s: ", r.ID)+fmt.Sprintf(format, args...))
+	}
+	for i := range replicas {
+		r := &replicas[i]
+		if now.Sub(r.LastSeen) > liveReplicaAge {
+			rep.Stale++
+			continue
+		}
+		rep.Live++
+		if !r.GC {
+			warn(r, "runs without the garbage collector hooks")
+			continue
+		}
+		if r.Version < ExtractorVersion {
+			warn(r, "writes gc rows of edge rules version %d, older than version %d of this collector", r.Version, ExtractorVersion)
+		}
+		switch {
+		case r.TouchInterval <= 0:
+			warn(r, "writes no touches, so objects that mounts and builds use are not recorded")
+		case r.TouchInterval > o.Grace/2:
+			warn(r, "touch interval %s is longer than half the grace (%s)", r.TouchInterval, o.Grace/2)
+		}
+		switch {
+		case r.CacheTTL <= 0:
+			warn(r, "keeps cache entries without a TTL, so it can answer for an object long after a condemn")
+		case r.CacheTTL >= o.Cycle:
+			warn(r, "cache TTL %s is not shorter than the cycle (%s)", r.CacheTTL, o.Cycle)
+		case r.CacheTTL > o.CacheTTL:
+			warn(r, "cache TTL %s is longer than the cache TTL of the grace check (%s)", r.CacheTTL, o.CacheTTL)
+		}
+	}
+	return rep
+}

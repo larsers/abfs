@@ -22,6 +22,9 @@ type ObjectHeader struct {
 	Id   entities.Hash
 	Type string
 	Size int64
+	// Condemned is the value of the garbage collector's condemn marker, nil
+	// when the object is not condemned.
+	Condemned []byte
 }
 
 type ObjectContent struct {

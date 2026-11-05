@@ -62,6 +62,9 @@ type casfsMountCmd struct {
 	metaRefPrefix string
 	daemon        *daemon.Daemon
 	callbacks     []func() error
+
+	manifestHash       entities.Hash
+	pinnedManifestHash entities.Hash
 }
 
 func (c *casfsMountCmd) AddCallback(f func() error) {
@@ -225,16 +228,18 @@ func (c *casfsMountCmd) newMountDetails() (*binding.MountDetails, error) {
 
 	now := time.Now()
 	return &binding.MountDetails{
-		Version:        binding.CurrentMountDetailsVersion,
-		PID:            os.Getpid(),
-		StartTime:      now,
-		StartTimestamp: now.UnixNano(),
-		MetaRefPrefix:  refPrefix,
-		CmdArgs:        os.Args,
-		UserName:       currUser.Username,
-		HostName:       hostname,
-		ABFSVersion:    version.Version(),
-		Config:         c.Config.Clone(),
+		Version:            binding.CurrentMountDetailsVersion,
+		PID:                os.Getpid(),
+		StartTime:          now,
+		StartTimestamp:     now.UnixNano(),
+		MetaRefPrefix:      refPrefix,
+		CmdArgs:            os.Args,
+		UserName:           currUser.Username,
+		HostName:           hostname,
+		ABFSVersion:        version.Version(),
+		ManifestHash:       c.manifestHash,
+		PinnedManifestHash: c.pinnedManifestHash,
+		Config:             c.Config.Clone(),
 	}, nil
 }
 

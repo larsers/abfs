@@ -158,6 +158,7 @@ func (c *casfs) Serve(ctx context.Context) error {
 	if err := c.putMountDetails(ctx); err != nil {
 		log.Printf("Failed to put mount-details: %s", err)
 	}
+	c.startGCKeepAlive(ctx)
 	if err := c.store.PutObject(ctx, binding.EmptyIndexSnapObject.Hash, binding.EmptyIndexSnapObject.Encoded); err != nil {
 		log.Printf("Failed to put empty index snap: %s", err)
 	}

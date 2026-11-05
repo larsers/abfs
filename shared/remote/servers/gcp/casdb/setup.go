@@ -33,9 +33,10 @@ import (
 const refsTargetForeignKey = "FK_Refs_TargetId"
 
 // SetupSchema creates the Spanner database if it is missing and applies the
-// schema to it. It drops the ref target foreign key of earlier schemas and
-// leaves every other table and its data in place.
-func SetupSchema(ctx context.Context, spannerDB string) error {
+// schema to it, with the garbage collector tables when gc is set. It drops the
+// ref target foreign key of earlier schemas and leaves every other table and
+// its data in place.
+func SetupSchema(ctx context.Context, spannerDB string, gc bool) error {
 	client, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create the Spanner database admin client: %w", err)
@@ -44,7 +45,7 @@ func SetupSchema(ctx context.Context, spannerDB string) error {
 
 	ddl, err := client.GetDatabaseDdl(ctx, &databasepb.GetDatabaseDdlRequest{Database: spannerDB})
 	if status.Code(err) == codes.NotFound {
-		return createDatabase(ctx, client, spannerDB)
+		return createDatabase(ctx, client, spannerDB, gc)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to read the schema of %s: %w", spannerDB, err)
@@ -57,7 +58,7 @@ func SetupSchema(ctx context.Context, spannerDB string) error {
 			break
 		}
 	}
-	stmts = append(stmts, SchemaStatements()...)
+	stmts = append(stmts, schemaStatements(gc)...)
 	op, err := client.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{Database: spannerDB, Statements: stmts})
 	if err != nil {
 		return fmt.Errorf("failed to update the schema of %s: %w", spannerDB, err)
@@ -69,7 +70,7 @@ func SetupSchema(ctx context.Context, spannerDB string) error {
 	return nil
 }
 
-func createDatabase(ctx context.Context, client *database.DatabaseAdminClient, spannerDB string) error {
+func createDatabase(ctx context.Context, client *database.DatabaseAdminClient, spannerDB string, gc bool) error {
 	i := strings.LastIndex(spannerDB, "/databases/")
 	if i < 0 {
 		return fmt.Errorf("invalid Spanner database path %q", spannerDB)
@@ -77,7 +78,7 @@ func createDatabase(ctx context.Context, client *database.DatabaseAdminClient, s
 	op, err := client.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          spannerDB[:i],
 		CreateStatement: "CREATE DATABASE `" + spannerDB[i+len("/databases/"):] + "`",
-		ExtraStatements: SchemaStatements(),
+		ExtraStatements: schemaStatements(gc),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create %s: %w", spannerDB, err)

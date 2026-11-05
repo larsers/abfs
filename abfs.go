@@ -348,6 +348,7 @@ func (a *ABFS) Serve(ctx context.Context) (err error) {
 	if a.RemoteReadOnly {
 		go a.startKeepAliveScanAndNotify(ctx)
 	}
+	a.startGCKeepAlive(ctx)
 	err = <-mntChan
 	<-cleanCh
 	return err
