@@ -97,6 +97,7 @@ A cycle:
 | Deep tree and digest map rows | the request and the result | while the tree of the request is reachable |
 | LFS map rows | the request and the result | always |
 | Recent objects | objects whose `gc` row was written or touched within `--grace` (default `72h`) before the snapshot | `--grace` |
+| Empty objects | the empty file and the empty directory, which every server writes at start | always |
 
 Map rows with request types not listed are kept. `--grace` must be at least `2 x --cycle + --cache-ttl + --longest-push` (defaults `24h`, `6h` and `3h`); the command refuses to run otherwise.
 

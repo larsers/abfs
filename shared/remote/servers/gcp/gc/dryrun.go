@@ -165,6 +165,10 @@ const (
 	RootPinnedRevisions = "pinned-revisions"
 	RootRecent          = "recent"
 	rootMapPrefix       = "map-"
+	// RootPermanent holds the empty file and the empty directory. Every server
+	// writes them at start and link validation needs them, but clients do not
+	// push them, so nothing may remove them.
+	RootPermanent = "permanent"
 )
 
 // ObjectCounts counts the objects of the table gc.
@@ -367,6 +371,9 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	}
 	for _, h := range revisions {
 		d.addRoot(m, g, RootPinnedRevisions, h)
+	}
+	for _, h := range []Hash{entities.EmptyFileHash, entities.EmptyDirHash} {
+		d.addRoot(m, g, RootPermanent, h)
 	}
 	recent := d.root(RootRecent)
 	for id := range uint32(len(g.keys)) {

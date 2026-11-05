@@ -420,3 +420,17 @@ func TestDryRunGC_ChecksReplicaSettings(t *testing.T) {
 	}
 	require.ElementsMatch([]string{"good", "bad", "stopped"}, ids)
 }
+
+// The empty file and directory that servers write at start are kept even
+// when no tree links them.
+func TestDryRunGC_KeepsEmptyObjects(t *testing.T) {
+	f := newGCFixture(t)
+	f.put(entities.EmptyFileHash, []byte("blob 0\x00"), f.old)
+	f.put(entities.EmptyDirHash, []byte("tree 0\x00"), f.old)
+	unused := f.blob("unused", f.old)
+
+	res := f.run(nil)
+	requireReachable(t, res, true, entities.EmptyFileHash, entities.EmptyDirHash)
+	requireReachable(t, res, false, unused)
+	require.Equal(t, &gc.RootCounts{Roots: 2}, res.Report.Roots[gc.RootPermanent])
+}
