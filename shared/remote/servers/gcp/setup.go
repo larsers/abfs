@@ -29,14 +29,16 @@ import (
 )
 
 // bigtableTables lists the Bigtable tables of the server and their column
-// families.
+// families. The family g of objects and the table gc belong to the garbage
+// collector.
 var bigtableTables = []struct {
 	name     string
 	families []string
 }{
-	{"objects", []string{"meta", "data"}},
+	{"objects", []string{"meta", "data", "g"}},
 	{"maps", []string{"cf"}},
 	{"chunks", []string{"data"}},
+	{"gc", []string{"e", "t"}},
 }
 
 type SetupOpts struct {

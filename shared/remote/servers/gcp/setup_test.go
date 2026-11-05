@@ -17,6 +17,8 @@ package gcp
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
 	"cloud.google.com/go/bigtable"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/remote"
+	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 )
 
 func setupOpts(t *testing.T, dbID string) *SetupOpts {
@@ -117,6 +120,61 @@ func TestSetup_DropsRefsTargetForeignKeyAndKeepsData(t *testing.T) {
 	refs, err := s.SearchRefs(ctx, "example.com", "", "", 0)
 	require.NoError(err)
 	require.Equal([]remote.ProjectRefHash{{Project: "kept", Ref: "refs/heads/main", Hash: entities.EmptyDirHash}}, refs)
+}
+
+func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	newEmulatorDatabase(t)
+	newEmptyEmulatorBigtable(t)
+	opts := setupOpts(t, randomID(t, "t"))
+
+	// The resources as init created them before the garbage collector.
+	preGCSchema := slices.DeleteFunc(casdb.SchemaStatements(), func(s string) bool { return strings.Contains(s, "EXISTS Gc") })
+	require.Len(preGCSchema, len(casdb.SchemaStatements())-2)
+	createDatabase(t, opts, preGCSchema)
+	adm, err := bigtable.NewAdminClient(ctx, emulatorProject, emulatorBigtable)
+	require.NoError(err)
+	defer adm.Close()
+	for _, table := range []struct {
+		name     string
+		families []string
+	}{{"objects", []string{"meta", "data"}}, {"maps", []string{"cf"}}, {"chunks", []string{"data"}}} {
+		require.NoError(adm.CreateTable(ctx, table.name))
+		for _, f := range table.families {
+			require.NoError(adm.CreateColumnFamily(ctx, table.name, f))
+		}
+	}
+	btClient, err := bigtable.NewClient(ctx, emulatorProject, emulatorBigtable)
+	require.NoError(err)
+	defer btClient.Close()
+	mut := bigtable.NewMutation()
+	mut.Set("meta", "type", bigtable.Now(), []byte("blob"))
+	require.NoError(btClient.Open("objects").Apply(ctx, "kept", mut))
+
+	require.NoError(Setup(ctx, opts))
+
+	for _, table := range bigtableTables {
+		info, err := adm.TableInfo(ctx, table.name)
+		require.NoError(err)
+		require.ElementsMatch(table.families, info.Families, table.name)
+	}
+	info, err := adm.TableInfo(ctx, "gc")
+	require.NoError(err)
+	for _, f := range info.FamilyInfos {
+		require.Equal("versions() > 1", f.GCPolicy, f.Name)
+	}
+	row, err := btClient.Open("objects").ReadRow(ctx, "kept")
+	require.NoError(err)
+	require.NotEmpty(row)
+
+	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
+	require.NoError(err)
+	defer client.Close()
+	for _, table := range []string{"GcState", "GcReplicas"} {
+		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
+		require.NoError(err, table)
+	}
 }
 
 func TestSetup_MissingBucket(t *testing.T) {
