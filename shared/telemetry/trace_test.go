@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -205,4 +206,26 @@ func TestServerHandler_Metrics(t *testing.T) {
 		}
 	}
 	require.Equal([]string{"abfs.ABFS/Headers"}, methods, "health checks are not recorded")
+}
+
+func TestSetGlobals(t *testing.T) {
+	require := require.New(t)
+	resetTracing(t)
+	t.Cleanup(func() { SetMeterProvider(nil) })
+	globalMeter, globalTracer := otel.GetMeterProvider(), otel.GetTracerProvider()
+	t.Cleanup(func() {
+		otel.SetMeterProvider(globalMeter)
+		otel.SetTracerProvider(globalTracer)
+	})
+
+	SetGlobals()
+	require.Equal(globalMeter, otel.GetMeterProvider(), "telemetry off sets no global meter provider")
+	require.Equal(globalTracer, otel.GetTracerProvider(), "telemetry off sets no global tracer provider")
+
+	mp := sdkmetric.NewMeterProvider()
+	SetMeterProvider(mp)
+	tracerProvider = sdktrace.NewTracerProvider()
+	SetGlobals()
+	require.Equal(mp, otel.GetMeterProvider())
+	require.Equal(tracerProvider, otel.GetTracerProvider())
 }

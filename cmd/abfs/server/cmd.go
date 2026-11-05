@@ -138,6 +138,7 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	if h := telemetry.ServerHandler(); h != nil {
 		extraOpts = append(extraOpts, grpc.StatsHandler(h))
 	}
+	telemetry.SetGlobals()
 	s, err := server.NewGRPCServer(&server.GRPCServerOpts{
 		Server:                   composedServer,
 		ProxyPrefixToConnManager: proxyMap,

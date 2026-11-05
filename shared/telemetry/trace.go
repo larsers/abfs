@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc/filters"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
@@ -64,8 +65,8 @@ var (
 	errResource error
 
 	// tracerProvider is nil unless StartTracing built one. It is passed to the
-	// gRPC handlers explicitly and never set as the global provider, so client
-	// libraries that use the global one stay untraced.
+	// gRPC handlers explicitly. Only SetGlobals makes it the global provider,
+	// so client libraries that use the global one stay untraced elsewhere.
 	tracerProvider *sdktrace.TracerProvider
 )
 
@@ -144,6 +145,20 @@ func ServerHandler() stats.Handler {
 		mp = metricnoop.NewMeterProvider()
 	}
 	return otelgrpc.NewServerHandler(grpcOptions(tp, mp)...)
+}
+
+// SetGlobals makes the metrics backend's meter provider, and the tracer
+// provider when tracing is on, the global OpenTelemetry providers, so client
+// libraries that record through the global ones, such as those of a storage
+// backend, export into the same pipeline. It sets nothing when telemetry is
+// off. Only the server calls it.
+func SetGlobals() {
+	if mp := MeterProvider(); mp != nil {
+		otel.SetMeterProvider(mp)
+	}
+	if tracerProvider != nil {
+		otel.SetTracerProvider(tracerProvider)
+	}
 }
 
 // ClientHandler returns the gRPC client stats handler for traces, or nil when
