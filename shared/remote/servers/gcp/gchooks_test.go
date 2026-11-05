@@ -15,6 +15,7 @@
 package gcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/json"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
+	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 	"github.com/google/abfs/shared/remote/servers/gcp/depot"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
@@ -204,6 +206,26 @@ func TestGCHooks_RescueLosesToDelete(t *testing.T) {
 	_, err = s.casdb.GetHeader(ctx, key3)
 	require.NoError(err)
 	require.False(objectTouched(t, s, key), "a lost rescue wrote a touch")
+
+	// A tree that links an object the collector deleted fails validation.
+	key4 := putBlob(t, s, "linked")
+	condemnObject(t, s, key4, 3)
+	tree, data := treeOf(key4)
+	var linkErr *remote.ErrObjectLinkValidation
+	require.ErrorAs(putRaw(s, tree, data), &linkErr)
+	require.Equal([]entities.Hash{key4}, linkErr.MissingLinks)
+	require.Equal(int64(1), s.gcHooks.rescuesLost[pathValidation].Load())
+
+	// MapResults leaves out a result the collector deleted.
+	from := putBlob(t, s, "request")
+	key5 := putBlob(t, s, "result")
+	require.NoError(s.AddMapResult(ctx, from, key5))
+	condemnObject(t, s, key5, 3)
+	results, err := s.MapResults(ctx, from)
+	require.NoError(err)
+	require.Empty(results)
+	require.Equal(int64(1), s.gcHooks.rescuesLost[pathMapResults].Load())
+	require.Equal(int64(1), s.gcHooks.mapResultsDropped.Load())
 }
 
 // A keep-alive batch right after a condemn cycle can hold many condemned
@@ -473,6 +495,43 @@ func TestGCHooks_ChunkMissingDuringRead(t *testing.T) {
 	require.False(ok, "header of a missing object stays cached")
 	_, ok = s.content[key[0]].Peek(key)
 	require.False(ok, "content of a missing object stays cached")
+}
+
+// An object stored again with new content while a server read the old one
+// is not missing: the read fails and tells to read again.
+func TestGCHooks_ChunkMissingObjectStoredAgain(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s := newGCHooksServer(t, &NewServerOpts{})
+	key := putBlob(t, s, "hello")
+	require.NoError(readObject(s, key))
+	old, err := s.casdb.GetContent(ctx, key)
+	require.NoError(err)
+
+	content, err := s.depot.Store(ctx, key.String()+"-again", bytes.NewReader([]byte("blob 5\x00hello")))
+	require.NoError(err)
+	require.NoError(s.casdb.AddObject(ctx, &casdb.ObjectHeader{Id: key, Type: "blob", Size: 5}, &casdb.ObjectContent{Encoding: old.Encoding, Content: content}))
+	require.NoError(s.depot.Remove(ctx, old.Content))
+
+	err = readObject(s, key)
+	require.ErrorContains(err, "stored again while it was read")
+	require.False(entities.IsNotExist(err), err)
+	require.NoError(readObject(s, key))
+}
+
+// The touch mark of a period repeats every 255 periods; an entry loaded 255
+// or more periods ago is touched again even when its mark matches.
+func TestGCHooks_TouchMarkWraps(t *testing.T) {
+	require := require.New(t)
+	g := &gcHooks{touchInterval: 10}
+	h := CachedHeader{Loaded: 5, Touched: touchMark(0)}
+	require.True(g.touchedThisPeriod(h, 9))
+	require.False(g.touchedThisPeriod(h, 10))
+	require.Equal(touchMark(0), touchMark(255))
+	require.False(g.touchedThisPeriod(h, 2555), "a mark 255 periods old counts as this period")
+	h = CachedHeader{Loaded: 2545, Touched: touchMark(255)}
+	require.True(g.touchedThisPeriod(h, 2555))
+	require.False(g.touchedThisPeriod(CachedHeader{Loaded: 5}, 5), "an entry without a touch")
 }
 
 func TestGCHooks_ChunkMissingInBucket(t *testing.T) {

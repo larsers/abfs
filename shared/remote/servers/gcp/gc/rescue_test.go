@@ -16,7 +16,12 @@ package gc
 
 import (
 	"context"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/bigtable"
 	"github.com/stretchr/testify/require"
@@ -84,4 +89,78 @@ func TestRescuer_Rescue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Two servers rescue the same object while the collector keeps rewriting
+// its marker. Each rescue either clears the marker it read or reports that
+// the marker keeps changing; none reports the object deleted.
+func TestRescuer_ConcurrentRescuesAndChangingMarker(t *testing.T) {
+	require := require.New(t)
+	client := newHooksTestBigtable(t)
+	key := entities.NewHash("6666666666666666666666666666666666666666")
+	putObjectRow(t, client, key, versionBytes(1))
+	r := NewRescuer(client)
+
+	stop := make(chan struct{})
+	errs := make(chan error, 3)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		objects := client.Open(objectsTableName)
+		for cycle := int64(2); ; cycle++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			mut := bigtable.NewMutation()
+			mut.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), versionBytes(cycle))
+			if err := objects.Apply(context.Background(), key.String(), mut); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	var rescues, changing atomic.Int64
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				live, err := r.Rescue(context.Background(), key, versionBytes(1))
+				switch {
+				case err != nil && strings.Contains(err.Error(), "keeps changing"):
+					changing.Add(1)
+				case err != nil:
+					errs <- err
+					return
+				case !live:
+					errs <- errors.New("rescue reported the object deleted")
+					return
+				default:
+					rescues.Add(1)
+				}
+			}
+		}()
+	}
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(err)
+	}
+	require.Positive(rescues.Load() + changing.Load())
+
+	// Once the marker stays, a rescue clears it.
+	live, err := r.Rescue(context.Background(), key, condemnedOf(t, client, key))
+	require.NoError(err)
+	require.True(live)
+	require.Nil(condemnedOf(t, client, key))
 }

@@ -502,3 +502,64 @@ func TestGCKeepAlive_TouchPaces(t *testing.T) {
 	require.ErrorIs(err, context.Canceled)
 	require.Len(remote.batches, 1)
 }
+
+// runRemote reports each ref write and touch batch on a channel.
+type runRemote struct {
+	refs    chan struct{}
+	touches chan int
+}
+
+func (r *runRemote) PutRefs(server string, project string, refs []entities.RefHash, blocking bool) error {
+	r.refs <- struct{}{}
+	return nil
+}
+
+func (r *runRemote) RemoteHeaders(keys []entities.Hash) ([]bool, error) {
+	r.touches <- len(keys)
+	return make([]bool, len(keys)), nil
+}
+
+// Run refreshes the ref and touches on their intervals and returns when its
+// context ends.
+func TestGCKeepAlive_Run(t *testing.T) {
+	require := require.New(t)
+	remote := &runRemote{refs: make(chan struct{}, 100), touches: make(chan int, 100)}
+	k := &GCKeepAlive{
+		Remote:        remote,
+		Server:        "s",
+		Ref:           "refs/abfs/mount/user/u/1",
+		Target:        entities.EmptyDirHash,
+		RefInterval:   20 * time.Millisecond,
+		TouchInterval: 50 * time.Millisecond,
+		Scan:          hashesScan(testHashes(3), nil, nil),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		k.Run(ctx)
+	}()
+
+	for range 3 {
+		select {
+		case <-remote.refs:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no ref refresh")
+		}
+	}
+	select {
+	case n := <-remote.touches:
+		require.Equal(3, n)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no touch")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context ended")
+	}
+
+	// Without intervals Run returns at once.
+	(&GCKeepAlive{Remote: remote}).Run(context.Background())
+}

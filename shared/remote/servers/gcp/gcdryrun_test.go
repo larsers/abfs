@@ -454,3 +454,34 @@ func TestDryRunGC_ReadsLeaveCondemnMarkers(t *testing.T) {
 	require.True(isCondemned(t, f.s, pinned))
 	require.False(objectTouched(t, f.s, details))
 }
+
+// Mount details or pinned manifests that cannot be read, touches of objects
+// without a gc row and map rows with malformed keys are counted and do not
+// stop the run.
+func TestDryRunGC_CountsBrokenInputs(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newGCFixture(t)
+	recent := f.now.Add(-time.Hour)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/mount/user/u/1", objects.HashBlobBytes([]byte("no such mount details")), recent)
+	// Link validation would refuse mount details whose manifest is missing.
+	f.s.validateLinks = false
+	details := f.object(&binding.MountDetails{
+		Version:            binding.CurrentMountDetailsVersion,
+		MetaRefPrefix:      "user/u",
+		PinnedManifestHash: objects.HashBlobBytes([]byte("no such manifest")),
+	}, f.old)
+	f.s.validateLinks = true
+	f.ref(entities.ABFSMetaProject, "refs/abfs/mount/user/u/2", details, recent)
+	f.touch(objects.HashBlobBytes([]byte("touched before its gc row")), f.now)
+	mut := bigtable.NewMutation()
+	mut.Set("cf", "", bigtable.Now(), []byte("1"))
+	require.NoError(f.s.casdb.BTClient().Open("maps").Apply(ctx, "not-a-hash#0000", mut))
+
+	res := f.run(nil)
+	r := res.Report
+	require.Equal(gc.MountCounts{Live: 2, Errors: 2}, r.LiveMounts)
+	require.Equal(int64(1), r.Objects.TouchOnly)
+	require.Equal(&gc.MapCounts{Rows: 1}, r.Maps[gc.MapMalformed])
+	requireReachable(t, res, true, details)
+}
