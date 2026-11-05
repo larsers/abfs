@@ -125,7 +125,7 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 
 	var cloneBranch, cloneRef string
 	var cloneCommit entities.Hash
-	if res, ok := r.resolved[project.Name]; ok {
+	if res, ok := r.resolved[project.GetPath()]; ok {
 		cloneCommit, cloneRef = res.Hash, res.Ref
 	} else if entities.IsHash(revision) {
 		cloneCommit = entities.NewHash(revision)
@@ -352,7 +352,7 @@ func (r *Repo) manifestTarget(ctx context.Context, name string) (target, gitTarg
 
 func (r *Repo) updateProject(ctx context.Context, project *manifest.Project, workDir, gitDir, objDir, remoteName, revision, refServer string, opts SyncOpts) error {
 	target := revision
-	if res, ok := r.resolved[project.Name]; ok {
+	if res, ok := r.resolved[project.GetPath()]; ok {
 		target = res.Hash.String()
 	}
 	gitRepo := casgit.NewGitRepo(r.Git, workDir, gitDir, objDir)

@@ -24,6 +24,7 @@ import (
 	"path"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -86,25 +87,36 @@ func (r *Repo) sync(ctx context.Context, projectsToSync []string, opts SyncOpts)
 		projectsToSync = slices.Collect(maps.Keys(r.projectsByPath))
 	}
 
+	// Projects are synced by path: a name listed at several paths is checked out at each of them.
 	toSync := make(map[string]struct{}, len(projectsToSync))
 	for _, t := range projectsToSync {
-		if p, ok := r.projectsByPath[t]; ok {
-			toSync[p.Name] = struct{}{}
+		if _, ok := r.projectsByPath[t]; ok {
+			toSync[t] = struct{}{}
 			continue
 		}
-		if p, ok := r.projectsByName[t]; ok {
-			toSync[p.Name] = struct{}{}
+		if projects, ok := r.projectsByName[t]; ok {
+			for _, p := range projects {
+				toSync[p.GetPath()] = struct{}{}
+			}
 			continue
 		}
 
 		if relPath, err := r.RelativeToRoot(t); err == nil {
-			if p, ok := r.projectsByPath[relPath]; ok {
-				toSync[p.Name] = struct{}{}
+			if _, ok := r.projectsByPath[relPath]; ok {
+				toSync[relPath] = struct{}{}
 				continue
 			}
 		}
 
 		return fmt.Errorf("project %s not found", t)
+	}
+
+	// The paths of one name share the objects directory .repo/project-objects/<name>.git, so they
+	// are synced one after another, as repo does.
+	byName := make(map[string][]*manifest.Project)
+	for p := range toSync {
+		project := r.projectsByPath[p]
+		byName[project.Name] = append(byName[project.Name], project)
 	}
 
 	if err := r.syncRemoves(); err != nil {
@@ -125,32 +137,22 @@ func (r *Repo) sync(ctx context.Context, projectsToSync []string, opts SyncOpts)
 		limit = runtime.NumCPU()
 	}
 	grp.SetLimit(limit)
-	for p := range toSync {
+	for _, projects := range byName {
+		slices.SortFunc(projects, func(a, b *manifest.Project) int { return strings.Compare(a.GetPath(), b.GetPath()) })
 		grp.Go(func() error {
-			project := r.projectsByName[p]
-			if project == nil {
+			for _, project := range projects {
+				progress.StartTask(project.GetPath())
+				err := r.syncProject(ctx, project, opts)
+				progress.EndTask(project.GetPath(), err == nil)
 				lock.Lock()
-				errWithPath := fmt.Errorf("project %s not found", p)
-				failedErrors = append(failedErrors, errWithPath)
-				failedProjects = append(failedProjects, p)
+				if err != nil {
+					failedErrors = append(failedErrors, fmt.Errorf("project %s: %w", project.GetPath(), err))
+					failedProjects = append(failedProjects, project.GetPath())
+				} else {
+					r.curProjects[project.GetPath()] = struct{}{}
+				}
 				lock.Unlock()
-				return nil
 			}
-			progress.StartTask(project.GetPath())
-			err := r.syncProject(ctx, project, opts)
-			progress.EndTask(project.GetPath(), err == nil)
-			if err != nil {
-				lock.Lock()
-				errWithName := fmt.Errorf("project %s: %w", p, err)
-				failedErrors = append(failedErrors, errWithName)
-				failedProjects = append(failedProjects, p)
-				lock.Unlock()
-				return nil
-			}
-
-			lock.Lock()
-			r.curProjects[project.GetPath()] = struct{}{}
-			lock.Unlock()
 			return nil
 		})
 	}
@@ -175,12 +177,13 @@ func (r *Repo) sync(ctx context.Context, projectsToSync []string, opts SyncOpts)
 }
 
 // resolveRevisions leaves out projects that do not resolve, so their clones can still fall back to git.
-func (r *Repo) resolveRevisions(names map[string]struct{}) {
+// Results are keyed by path: the paths of one name may sit at different revisions.
+func (r *Repo) resolveRevisions(projectPaths map[string]struct{}) {
 	r.resolved = nil
 	var projects []*manifest.Project
 	var reqs []resolve.Request
-	for name := range names {
-		p := r.projectsByName[name]
+	for projectPath := range projectPaths {
+		p := r.projectsByPath[projectPath]
 		if p == nil {
 			continue
 		}
@@ -209,7 +212,7 @@ func (r *Repo) resolveRevisions(names map[string]struct{}) {
 	r.resolved = make(map[string]resolve.Result, len(results))
 	for i, res := range results {
 		if !res.Hash.IsZero() {
-			r.resolved[projects[i].Name] = res
+			r.resolved[projects[i].GetPath()] = res
 		}
 	}
 }
@@ -247,7 +250,7 @@ func (r *Repo) syncProjectRemoves() error {
 func (r *Repo) syncCopyFileRemoves() error {
 	oldCopyFiles := maps.Clone(r.curCopyFiles)
 
-	for _, p := range r.projectsByName {
+	for _, p := range r.projectsByPath {
 		for _, c := range p.Copyfile {
 			delete(oldCopyFiles, c.Dest)
 		}
@@ -268,7 +271,7 @@ func (r *Repo) syncCopyFileRemoves() error {
 func (r *Repo) syncLinkFileRemoves() error {
 	oldLinkFiles := maps.Clone(r.curLinkFiles)
 
-	for _, p := range r.projectsByName {
+	for _, p := range r.projectsByPath {
 		for _, c := range p.Linkfile {
 			delete(oldLinkFiles, c.Dest)
 		}

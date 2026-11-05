@@ -64,7 +64,7 @@ type Repo struct {
 	flatMan        *manifest.Manifest
 	groupsInclude  map[string]struct{}
 	groupsExclude  map[string]struct{}
-	projectsByName map[string]*manifest.Project
+	projectsByName map[string][]*manifest.Project
 	projectsByPath map[string]*manifest.Project
 	resolved       map[string]resolve.Result
 
@@ -149,13 +149,13 @@ func (r *Repo) Load(ctx context.Context) error {
 }
 
 func (r *Repo) filterProjectsByGroups() {
-	byName := make(map[string]*manifest.Project, len(r.flatMan.Project))
+	byName := make(map[string][]*manifest.Project, len(r.flatMan.Project))
 	byPath := make(map[string]*manifest.Project, len(r.flatMan.Project))
 	for _, p := range r.flatMan.Project {
 		if !GroupsMatch(p.Groups, r.groupsInclude, r.groupsExclude) {
 			continue
 		}
-		byName[p.Name] = p
+		byName[p.Name] = append(byName[p.Name], p)
 		byPath[p.GetPath()] = p
 	}
 	r.projectsByName = byName
