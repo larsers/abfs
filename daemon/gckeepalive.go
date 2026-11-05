@@ -44,6 +44,9 @@ const (
 	// Keys a touch sends per second at most, so that the server's touch
 	// writers keep up with the touch of a large mount.
 	gcTouchRate = 10000
+	// The wait before the first retry of a failed touch. It doubles with each
+	// failure in a row, up to half the touch interval.
+	gcTouchRetryWait = 5 * time.Minute
 )
 
 // GCKeepAliveRemote is the part of the cacheman client that GCKeepAlive uses.
@@ -89,6 +92,8 @@ type GCKeepAlive struct {
 	// Zero means the interval.
 	refWait   time.Duration
 	touchWait time.Duration
+	// The touches that failed in a row.
+	touchFailures int
 }
 
 // MountRef returns the ref in the ABFS meta project that points to a mount's details.
@@ -219,17 +224,32 @@ func (k *GCKeepAlive) step(ctx context.Context, now time.Time) {
 		}
 	}
 	if k.TouchInterval > 0 && now.Sub(k.lastTouch) >= waitOr(k.touchWait, k.TouchInterval) {
-		// A failed touch waits for the next interval too, so a server or cacheman
-		// that cannot answer does not cause a mount scan on every tick.
 		k.lastTouch = now
-		k.touchWait = k.nextWait(k.TouchInterval)
 		found, total, err := k.touch(ctx)
 		if err != nil {
-			log.Printf("GC keep-alive touch failed after %d of %d objects: %v", found, total, err)
+			k.touchFailures++
+			k.touchWait = k.retryWait()
+			log.Printf("GC keep-alive touch failed after %d of %d objects, retrying in %s: %v", found, total, k.touchWait.Round(time.Second), err)
 		} else {
+			k.touchFailures = 0
+			k.touchWait = k.nextWait(k.TouchInterval)
 			log.Printf("GC keep-alive touched %d of %d objects on the server", found, total)
 		}
 	}
+}
+
+// retryWait returns the wait before the next attempt after k.touchFailures
+// failed touches in a row. A failed touch is retried long before the next
+// interval, since the objects it did not reach may be condemned, and the wait
+// grows, so that a server or cacheman that cannot answer does not cause a
+// mount scan on every tick.
+func (k *GCKeepAlive) retryWait() time.Duration {
+	limit := k.TouchInterval / 2
+	wait := gcTouchRetryWait
+	for i := 1; i < k.touchFailures && wait < limit; i++ {
+		wait *= 2
+	}
+	return k.nextWait(min(wait, limit))
 }
 
 func (k *GCKeepAlive) refreshRef() error {

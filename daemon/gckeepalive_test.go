@@ -121,13 +121,65 @@ func TestGCKeepAlive_Step(t *testing.T) {
 	require.Len(remote.batches[0], gcTouchBatchSize)
 	require.Len(remote.batches[1], 1)
 
-	// The next touch waits a full interval, also after a failure.
+	// The next touch waits a full interval; a failed one is retried sooner.
 	remote.headersErr = errors.New("not found")
 	k.step(context.Background(), start.Add(18*time.Hour+15*time.Minute))
 	require.Equal(1, scans)
 	k.step(context.Background(), start.Add(36*time.Hour))
 	require.Equal(2, scans)
 	require.Len(remote.batches, 2)
+	k.step(context.Background(), start.Add(36*time.Hour+gcTouchRetryWait-time.Second))
+	require.Equal(2, scans)
+	remote.headersErr = nil
+	k.step(context.Background(), start.Add(36*time.Hour+gcTouchRetryWait))
+	require.Equal(3, scans)
+	require.Len(remote.batches, 4)
+	require.Equal(k.TouchInterval, k.touchWait)
+}
+
+func TestGCKeepAlive_RetriesAFailedTouch(t *testing.T) {
+	require := require.New(t)
+
+	remote := &fakeGCRemote{headersErr: errors.New("unavailable")}
+	scans := 0
+	k := &GCKeepAlive{
+		Remote:        remote,
+		TouchInterval: 18 * time.Hour,
+		Scan:          hashesScan(testHashes(1), nil, &scans),
+	}
+	now := time.Now()
+	k.start(now)
+	now = now.Add(k.TouchInterval)
+	// The waits double from gcTouchRetryWait and stop at half the interval.
+	var waits []time.Duration
+	for range 10 {
+		k.step(context.Background(), now)
+		waits = append(waits, k.touchWait)
+		require.Equal(min(k.touchWait, gcKeepAliveMaxTick), k.untilNext(now))
+		now = now.Add(k.touchWait)
+	}
+	m := time.Minute
+	require.Equal([]time.Duration{5 * m, 10 * m, 20 * m, 40 * m, 80 * m, 160 * m, 320 * m, 9 * time.Hour, 9 * time.Hour, 9 * time.Hour}, waits)
+	require.Equal(10, scans)
+
+	// A touch that works waits the full interval again, and a later failure
+	// starts from the first retry wait.
+	remote.headersErr = nil
+	k.step(context.Background(), now)
+	require.Equal(k.TouchInterval, k.touchWait)
+	now = now.Add(k.TouchInterval)
+	remote.headersErr = errors.New("unavailable")
+	k.step(context.Background(), now)
+	require.Equal(gcTouchRetryWait, k.touchWait)
+
+	// The retry waits vary like the others and stay below the interval.
+	k.Rand = rand.New(rand.NewPCG(5, 6)).Float64
+	for range 20 {
+		now = now.Add(k.touchWait)
+		k.step(context.Background(), now)
+		require.Positive(k.touchWait)
+		require.Less(k.touchWait, k.TouchInterval)
+	}
 }
 
 func jitterKeepAlive(remote *fakeGCRemote, r func() float64, scans *int) *GCKeepAlive {
