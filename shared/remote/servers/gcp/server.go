@@ -58,9 +58,14 @@ type (
 // the 20-byte hash. It reduces heap allocations and GC pointer scans.
 type CachedHeader struct {
 	Size int64
+	// Loaded is the cacheNow time the header was read from Bigtable.
+	Loaded uint32
 	// Passing for up to 2^16 unique object types
 	Type  uint16
 	Valid bool
+	// Touched marks the touch period in which this server last touched the
+	// object; see touchMark.
+	Touched uint8
 }
 
 const (
@@ -156,9 +161,10 @@ func decodeObjectType(id uint16) string {
 
 func newCachedHeader(hdr *ObjectHeader) CachedHeader {
 	return CachedHeader{
-		Size:  hdr.Size,
-		Type:  encodeObjectType(hdr.Type),
-		Valid: true,
+		Size:   hdr.Size,
+		Loaded: cacheNow(),
+		Type:   encodeObjectType(hdr.Type),
+		Valid:  true,
 	}
 }
 
@@ -209,7 +215,7 @@ type GCPServer struct {
 	linksContentThreshold int64
 
 	headers        []*lru.Cache[entities.Hash, CachedHeader]
-	content        []*lru.Cache[entities.Hash, *ObjectContent]
+	content        []*lru.Cache[entities.Hash, contentEntry]
 	projectIDsLock sync.RWMutex
 	projectsByName map[[2]string]int64
 	projectsByID   map[int64][2]string
@@ -219,6 +225,8 @@ type GCPServer struct {
 	headersCacheMissCount atomic.Int64
 	headersErrCount       atomic.Int64
 	headersMissCount      atomic.Int64
+
+	gcHooks gcHooks
 }
 
 type NewServerOpts struct {
@@ -245,6 +253,15 @@ type NewServerOpts struct {
 	// NoGCEdges stops PutObject from writing the GC edges of new objects to the
 	// table gc. The garbage collector then needs a backfill first.
 	NoGCEdges bool
+	// CacheTTL is how long cached headers and content are used before they are
+	// read again; zero keeps them until they are evicted.
+	CacheTTL time.Duration
+	// GCTouchInterval is the length of the period in which this server touches
+	// each object and map row at most once; zero disables touches.
+	GCTouchInterval time.Duration
+	// GCHeartbeatInterval is the time between two heartbeats of this server in
+	// the table GcReplicas; zero disables the heartbeat.
+	GCHeartbeatInterval time.Duration
 }
 
 func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
@@ -262,7 +279,7 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid headers cache size: %w", err)
 	}
-	content, err := newShardedCache[*ObjectContent](maxCachedContents)
+	content, err := newShardedCache[contentEntry](maxCachedContents)
 	if err != nil {
 		return nil, fmt.Errorf("invalid contents cache size: %w", err)
 	}
@@ -301,6 +318,10 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if err := s.checkResources(ctx, opts.BucketName); err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("resources missing, run 'abfs server gcp init' to create them: %w", err)
+	}
+	if err := s.startGCHooks(opts); err != nil {
+		_ = s.Close()
+		return nil, err
 	}
 	// As file-based, so that trees and refs that link the empty file or
 	// directory pass link validation on a new database.
@@ -373,7 +394,7 @@ func (s *GCPServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 
 // Headers implements remote.RemoteProvider.
 func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities.ObjectHeader, error) {
-	headers, err := s.getHeaders(ctx, keys)
+	headers, err := s.getHeaders(ctx, pathHeaders, keys)
 	if err != nil {
 		return nil, err
 	}
@@ -413,51 +434,26 @@ func (s *GCPServer) supportsLinksContent(ctx context.Context) bool {
 }
 
 func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedHeader, *ObjectContent, error) {
-	shard := key[0]
-	cachedHdr, hdrOk := s.headers[shard].Get(key)
-	content, contentOk := s.content[shard].Get(key)
-
-	switch {
-	case hdrOk && contentOk:
-		return cachedHdr, content, nil
-	case hdrOk && !contentOk:
-		var err error
-		content, err = s.casdb.GetContent(ctx, key)
-		if errors.Is(err, casdb.ErrNotFound) || (err == nil && content == nil) {
-			s.headers[shard].Remove(key)
-			return CachedHeader{}, nil, entities.ErrNotExist
-		}
-		if err != nil {
-			return CachedHeader{}, nil, err
-		}
-		s.content[shard].PeekOrAdd(key, content)
-		return cachedHdr, content, nil
-	case !hdrOk && contentOk:
-		header, err := s.casdb.GetHeader(ctx, key)
-		if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
-			s.content[shard].Remove(key)
-			return CachedHeader{}, nil, entities.ErrNotExist
-		}
-		if err != nil {
-			return CachedHeader{}, nil, err
-		}
-		cachedHdr = newCachedHeader(header)
-		s.headers[shard].PeekOrAdd(key, cachedHdr)
-		return cachedHdr, content, nil
-	default:
-		header, objContent, err := s.casdb.GetObjectData(ctx, key)
-		if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
-			return CachedHeader{}, nil, entities.ErrNotExist
-		}
-		if err != nil {
-			return CachedHeader{}, nil, err
-		}
-		cachedHdr = newCachedHeader(header)
-		content = objContent
-		s.headers[shard].PeekOrAdd(key, cachedHdr)
-		s.content[shard].PeekOrAdd(key, content)
+	cachedHdr, hdrOk := s.lookupHeader(key)
+	content, contentOk := s.lookupContent(key)
+	if hdrOk && contentOk {
 		return cachedHdr, content, nil
 	}
+	// A read of the whole row sees the condemn marker with the content.
+	header, content, err := s.casdb.GetObjectData(ctx, key)
+	if err == nil && header != nil {
+		err = s.rescueCondemned(ctx, pathGetObject, header)
+	}
+	if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
+		s.forget(key)
+		return CachedHeader{}, nil, entities.ErrNotExist
+	}
+	if err != nil {
+		return CachedHeader{}, nil, err
+	}
+	cachedHdr = s.storeHeader(header)
+	s.storeContent(key, content)
+	return cachedHdr, content, nil
 }
 
 // GetObject implements remote.RemoteProvider.
@@ -485,6 +481,7 @@ func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.Cont
 	if err != nil {
 		return nil, err
 	}
+	r = &missingChunkReader{ReadCloser: r, ctx: ctx, s: s, key: key, content: content.Content}
 
 	return remote.NewContentReader(r, content.Encoding), nil
 }
@@ -555,8 +552,8 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	addAttempted = true
 	err = s.addObject(ctx, header, objContent)
 	if err == nil {
-		s.headers[key[0]].PeekOrAdd(key, newCachedHeader(header))
-		s.content[key[0]].PeekOrAdd(key, objContent)
+		s.storeHeader(header)
+		s.storeContent(key, objContent)
 	}
 
 	return err
@@ -577,7 +574,11 @@ func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
 
 // MapResults implements remote.RemoteProvider.
 func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.Hash, error) {
-	return s.casdb.MapResults(ctx, from)
+	results, err := s.casdb.MapResults(ctx, from)
+	if err != nil {
+		return nil, err
+	}
+	return s.liveMapResults(ctx, from, results)
 }
 
 // AddMapResult implements remote.RemoteProvider.
@@ -586,7 +587,7 @@ func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remot
 		return s.casdb.AddMapResult(ctx, from, to)
 	}
 	// Unlike object links, a zero hash is not allowed here, as in file-based.
-	hdrs, err := s.getHeaders(ctx, []entities.Hash{from, to})
+	hdrs, err := s.getHeaders(ctx, pathValidation, []entities.Hash{from, to})
 	if err != nil {
 		return err
 	}
@@ -801,6 +802,7 @@ func (s *GCPServer) WhoAmI(ctx context.Context) (string, error) {
 
 // Close implements remote.RemoteCloser.
 func (s *GCPServer) Close() error {
+	s.stopGCHooks()
 	err := s.casdb.Close()
 	if s.storage != nil {
 		err = errors.Join(err, s.storage.Close())
@@ -833,31 +835,37 @@ func (s *GCPServer) setMasterDepot(ctx context.Context, bucketName string, clien
 }
 
 func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHeader, error) {
-	if cached, ok := s.headers[hash[0]].Get(hash); ok {
+	if cached, ok := s.lookupHeader(hash); ok {
+		s.touchHit(hash, cached)
 		return cached, nil
 	}
 	obj, err := s.casdb.GetHeader(ctx, hash)
+	if err == nil && obj != nil {
+		err = s.rescueCondemned(ctx, pathPutObject, obj)
+	}
 	if err == casdb.ErrNotFound {
+		s.forget(hash)
 		return CachedHeader{}, nil
 	}
 	if err != nil || obj == nil {
 		return CachedHeader{}, err
 	}
-	cached := newCachedHeader(obj)
-	s.headers[hash[0]].PeekOrAdd(hash, cached)
+	cached := s.storeHeader(obj)
+	s.touchHit(hash, cached)
 	return cached, nil
 }
 
-func (s *GCPServer) getHeaders(ctx context.Context, hashes []entities.Hash) ([]CachedHeader, error) {
+func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []entities.Hash) ([]CachedHeader, error) {
 	result := make([]CachedHeader, len(hashes))
 	var misses []entities.Hash
 	missesIdx := make(map[entities.Hash][]int)
 	s.headersReqCount.Add(int64(len(hashes)))
 	missCount := 0
 	for i, h := range hashes {
-		if cached, ok := s.headers[h[0]].Get(h); ok {
+		if cached, ok := s.lookupHeader(h); ok {
 			result[i] = cached
 			s.headersRespCount.Add(1)
+			s.touchHit(h, cached)
 		} else if m, ok := missesIdx[h]; ok {
 			missesIdx[h] = append(m, i)
 			missCount++
@@ -875,6 +883,9 @@ func (s *GCPServer) getHeaders(ctx context.Context, hashes []entities.Hash) ([]C
 	s.headersCacheMissCount.Add(int64(missCount))
 
 	objs, err := s.casdb.GetHeaders(ctx, misses)
+	if err == nil {
+		objs, err = s.rescueHeaders(ctx, path, objs)
+	}
 	if err != nil {
 		s.headersErrCount.Add(int64(missCount))
 		return nil, err
@@ -882,12 +893,17 @@ func (s *GCPServer) getHeaders(ctx context.Context, hashes []entities.Hash) ([]C
 
 	foundCount := 0
 	for _, o := range objs {
-		cached := newCachedHeader(o)
-		s.headers[o.Id[0]].PeekOrAdd(o.Id, cached)
+		cached := s.storeHeader(o)
+		s.touchHit(o.Id, cached)
 		for _, i := range missesIdx[o.Id] {
 			foundCount++
 			result[i] = cached
 		}
+		delete(missesIdx, o.Id)
+	}
+	// The keys left do not exist; drop their expired entries.
+	for h := range missesIdx {
+		s.forget(h)
 	}
 
 	s.headersRespCount.Add(int64(foundCount))
@@ -908,7 +924,7 @@ func (s *GCPServer) validateObjectLinks(ctx context.Context, links []entities.Ha
 	}
 	links = nonZeroLinks
 
-	objs, err := s.getHeaders(ctx, links)
+	objs, err := s.getHeaders(ctx, pathValidation, links)
 	if err != nil {
 		return err
 	}

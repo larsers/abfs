@@ -95,7 +95,7 @@ func (f *fakeURLDepot) LinkedContent(ctx context.Context, s depot.Chunk) (remote
 func createTestServer(t *testing.T, master *depot.MasterDepot) *GCPServer {
 	s := &GCPServer{
 		headers:       make([]*lru.Cache[entities.Hash, CachedHeader], 256),
-		content:       make([]*lru.Cache[entities.Hash, *ObjectContent], 256),
+		content:       make([]*lru.Cache[entities.Hash, contentEntry], 256),
 		depot:         master,
 		storeLinks:    false,
 		validateHash:  true,
@@ -105,7 +105,7 @@ func createTestServer(t *testing.T, master *depot.MasterDepot) *GCPServer {
 		var err error
 		s.headers[i], err = lru.New[entities.Hash, CachedHeader](100)
 		require.NoError(t, err)
-		s.content[i], err = lru.New[entities.Hash, *ObjectContent](100)
+		s.content[i], err = lru.New[entities.Hash, contentEntry](100)
 		require.NoError(t, err)
 	}
 	return s
@@ -133,7 +133,7 @@ func TestGetObjectLinkedContentThresholdAndFallback(t *testing.T) {
 
 	// 1. Small object (size <= threshold): should return regular stream, not links
 	s.headers[hash[0]].Add(hash, newCachedHeader(&ObjectHeader{Id: hash, Size: 50, Type: "BLOB"}))
-	s.content[hash[0]].Add(hash, &ObjectContent{Encoding: "raw", Content: string(chunksJSON)})
+	s.storeContent(hash, &ObjectContent{Encoding: "raw", Content: string(chunksJSON)})
 
 	r, err := s.GetObject(ctx, hash)
 	require.NoError(t, err)
@@ -189,7 +189,7 @@ func TestGetObjectLinkedContentFallbackWhenUnsupported(t *testing.T) {
 
 	hash := entities.Hash{5, 6, 7, 8}
 	s.headers[hash[0]].Add(hash, newCachedHeader(&ObjectHeader{Id: hash, Size: 500, Type: "BLOB"}))
-	s.content[hash[0]].Add(hash, &ObjectContent{Encoding: "zstd", Content: string(chunksJSON)})
+	s.storeContent(hash, &ObjectContent{Encoding: "zstd", Content: string(chunksJSON)})
 
 	// Even though Size (500) > threshold (100), because depot doesn't support LinkedContent,
 	// GetObject cleanly falls back to normal streaming with original encoding "zstd".
