@@ -126,7 +126,6 @@ func TestMetricsServer_Headers(t *testing.T) {
 	require.True(headers[1].IsEmpty())
 
 	require.Equal(1.0, b.value("abfs_server_requests_total", "Headers", "ok"))
-	require.Len(b.observed("abfs_server_request_duration_seconds", "Headers"), 1)
 	require.Equal(0.0, b.value("abfs_server_requests_in_flight", "Headers"))
 	require.Equal(1.0, b.value("abfs_server_headers_keys_total", "found"))
 	require.Equal(1.0, b.value("abfs_server_headers_keys_total", "not_found"))
@@ -159,7 +158,6 @@ func TestMetricsServer_GetObject(t *testing.T) {
 	require.Equal(1.0, b.value("abfs_server_requests_total", "GetObject", "ok"))
 	require.Equal(0.0, b.value("abfs_server_requests_in_flight", "GetObject"))
 	require.Equal(float64(len(encodedBytes)), b.value("abfs_server_object_bytes_total", "out"))
-	require.Len(b.observed("abfs_server_request_duration_seconds", "GetObject"), 1)
 }
 
 func TestMetricsServer_Results(t *testing.T) {

@@ -123,7 +123,6 @@ abfs server --port 50051 --shutdown-timeout 60s file-based --local-dir "$SERVER_
 The server records the metrics below through the metrics provider that the `metrics-provider` config key selects, when `record-client-metrics` is `true`. Without a provider it records none of them.
 
 * `abfs_server_requests_total{method,result}` counts requests by method and result.
-* `abfs_server_request_duration_seconds{method}` is the duration of requests in seconds. For `GetObject` it lasts until the client has read the object.
 * `abfs_server_requests_in_flight{method}` is the number of requests in progress.
 * `abfs_server_headers_keys_total{result}` counts the keys that `Headers` looked up, with `result` `found` or `not_found`.
 * `abfs_server_headers_batch_keys` is a histogram of the number of keys in each `Headers` call.
