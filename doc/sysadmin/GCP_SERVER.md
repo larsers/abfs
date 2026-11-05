@@ -65,7 +65,7 @@ With `--gc` on, the server writes the `gc` row of each object it adds. Objects a
 abfs server gcp gc backfill --project <project> --instance <spanner-instance> --bucket <bucket> [--dry-run] [--rate 2000] [--shards 16]
 ```
 
-`--dry-run` only counts the rows to write. `--rate` limits the object rows scanned per second (0 means no limit). The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
+Each row it writes carries the time of the object row, so the garbage collector's `--grace` counts from the upload of the object, not from the backfill. `--dry-run` only counts the rows to write. `--rate` limits the object rows scanned per second (0 means no limit). The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
 
 ### Garbage collection dry run
 

@@ -89,8 +89,9 @@ func (s *BackfillStats) Failed() int64 {
 
 // Backfill writes the gc row of every object that has none or one of an older
 // extractor version, for objects added before the server wrote gc rows or
-// while --gc-edges was off. Blobs are not read; other objects are read through
-// objects and decoded. An object that cannot be read or decoded is logged and
+// while --gc was off. Each row gets the time of the object row, so the grace
+// counts from the upload of the object, not from the backfill. Blobs are not
+// read; other objects are read through objects and decoded. An object that cannot be read or decoded is logged and
 // counted, the scan goes on, and the error says how many failed; the object
 // keeps no gc row, so the next run tries it again.
 func Backfill(ctx context.Context, client *bigtable.Client, objects remote.RemoteProvider, opts *BackfillOpts) (*BackfillStats, error) {
@@ -172,10 +173,12 @@ func (b *backfill) scanShard(ctx context.Context, shard int, start, end string) 
 			return err
 		}
 		var keys, types []string
+		var times []bigtable.Timestamp
 		err := b.objectsTable.ReadRows(ctx, bigtable.NewRange(from, end), func(row bigtable.Row) bool {
 			for _, item := range row["meta"] {
 				keys = append(keys, row.Key())
 				types = append(types, string(item.Value))
+				times = append(times, item.Timestamp)
 			}
 			return true
 		}, filter, bigtable.LimitRows(int64(b.opts.BatchSize)))
@@ -183,7 +186,7 @@ func (b *backfill) scanShard(ctx context.Context, shard int, start, end string) 
 			return fmt.Errorf("failed to scan objects from %q: %w", from, err)
 		}
 		if len(keys) > 0 {
-			if err := b.handleBatch(ctx, keys, types); err != nil {
+			if err := b.handleBatch(ctx, keys, types, times); err != nil {
 				return err
 			}
 		}
@@ -202,7 +205,9 @@ func (b *backfill) scanShard(ctx context.Context, shard int, start, end string) 
 	}
 }
 
-func (b *backfill) handleBatch(ctx context.Context, keys, types []string) error {
+// handleBatch writes the gc rows of the objects keys, of the given types and
+// object row times.
+func (b *backfill) handleBatch(ctx context.Context, keys, types []string, times []bigtable.Timestamp) error {
 	versions := make(map[string]int64, len(keys))
 	err := b.gcTable.ReadRows(ctx, bigtable.RowList(keys), func(row bigtable.Row) bool {
 		// A row that does not parse is written again.
@@ -233,7 +238,7 @@ func (b *backfill) handleBatch(ctx context.Context, keys, types []string) error 
 			continue
 		}
 		if !b.opts.DryRun {
-			if err := b.writer.Write(ctx, hash, types[i], edges); err != nil {
+			if err := b.writer.WriteAt(ctx, hash, types[i], edges, times[i]); err != nil {
 				return err
 			}
 		}

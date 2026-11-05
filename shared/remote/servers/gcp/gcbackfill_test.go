@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/bigtable"
 	"github.com/stretchr/testify/require"
@@ -106,6 +107,10 @@ func TestBackfillGC_WritesMissingRows(t *testing.T) {
 	blobRow := readGCRow(t, f.s, f.blobs[0])
 	require.Equal("blob", blobRow.Type)
 	require.Empty(blobRow.Edges)
+	// The rows have the time of the object rows, not of the backfill.
+	for _, key := range f.keys {
+		require.Equal(objectRowTime(t, f.s, key), readGCRow(t, f.s, key).Written, key)
+	}
 
 	// Every row is current now.
 	stats, err = f.s.BackfillGC(ctx, &gc.BackfillOpts{})
@@ -142,7 +147,20 @@ func TestBackfillGC_RewritesOlderVersions(t *testing.T) {
 	stats, err := f.s.BackfillGC(ctx, &gc.BackfillOpts{})
 	require.NoError(err)
 	require.Equal(map[string]*gc.TypeCounts{"tree": {Written: 1, Edges: 1}}, stats.Types)
-	require.Equal(int64(gc.ExtractorVersion), readGCRow(t, f.s, f.tree).Version)
+	// The cells of the older row are newer than the object row; they are
+	// replaced, not shadowing the new ones.
+	row := readGCRow(t, f.s, f.tree)
+	require.Equal(int64(gc.ExtractorVersion), row.Version)
+	require.Equal(objectRowTime(t, f.s, f.tree), row.Written)
+}
+
+// objectRowTime returns the time of the meta:type cell of the object row of
+// key.
+func objectRowTime(t *testing.T, s *GCPServer, key entities.Hash) time.Time {
+	t.Helper()
+	ts, ok := touched(t, s, key.String(), "objects", "meta", "type")
+	require.True(t, ok)
+	return ts.Time()
 }
 
 func TestBackfillGC_KeyRange(t *testing.T) {

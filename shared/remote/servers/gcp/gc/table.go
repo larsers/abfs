@@ -79,10 +79,25 @@ func (w *EdgeWriter) Put(ctx context.Context, key Hash, typ string, obj objects.
 func (w *EdgeWriter) Write(ctx context.Context, key Hash, typ string, edges []Hash) error {
 	// The server sets the timestamps, so that the cell timestamp of e:links is
 	// the first write time on one clock for all replicas.
+	return w.write(ctx, key, typ, edges, bigtable.ServerTime, false)
+}
+
+// WriteAt writes the gc row of an object that already exists with the time of
+// its object row, so that the row records when the object was written, not
+// when its edges were. It replaces the edges of an older row, whose cells can
+// be newer than that time.
+func (w *EdgeWriter) WriteAt(ctx context.Context, key Hash, typ string, edges []Hash, written bigtable.Timestamp) error {
+	return w.write(ctx, key, typ, edges, written, true)
+}
+
+func (w *EdgeWriter) write(ctx context.Context, key Hash, typ string, edges []Hash, ts bigtable.Timestamp, replace bool) error {
 	mut := bigtable.NewMutation()
-	mut.Set(EdgesFamily, LinksColumn, bigtable.ServerTime, PackEdges(edges))
-	mut.Set(EdgesFamily, TypeColumn, bigtable.ServerTime, []byte(typ))
-	mut.Set(EdgesFamily, VersionColumn, bigtable.ServerTime, versionBytes(ExtractorVersion))
+	if replace {
+		mut.DeleteCellsInFamily(EdgesFamily)
+	}
+	mut.Set(EdgesFamily, LinksColumn, ts, PackEdges(edges))
+	mut.Set(EdgesFamily, TypeColumn, ts, []byte(typ))
+	mut.Set(EdgesFamily, VersionColumn, ts, versionBytes(ExtractorVersion))
 	if err := w.applyWithRetry(ctx, key.String(), mut); err != nil {
 		return fmt.Errorf("failed to write the gc row of %s: %v", key, err) //nolint:errorlint // a missing table must not reach the client as a missing object
 	}
@@ -93,7 +108,8 @@ func (w *EdgeWriter) Write(ctx context.Context, key Hash, typ string, edges []Ha
 // retry mutations with server timestamps, because a retry after a lost
 // response writes the cells again with a later timestamp. For a gc row that is
 // harmless: the newest cell wins and the first write time moves later, which
-// only keeps the object longer.
+// only keeps the object longer. A row written with a given time is the same
+// after a retry.
 func (w *EdgeWriter) applyWithRetry(ctx context.Context, row string, mut *bigtable.Mutation) error {
 	wait := w.retryWait
 	for attempt := 1; ; attempt++ {
