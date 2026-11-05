@@ -402,6 +402,9 @@ func searchRefs(project string, prjRefs ProjectRefs, refPrefix string, projectRe
 	refPrefixDir := refPrefix + "/"
 
 	for key, hash := range prjRefs {
+		if hash == entities.ZeroHash {
+			continue
+		}
 		if refPrefix == key || strings.HasPrefix(key, refPrefixDir) {
 			*projectRefHash = append(*projectRefHash, remote.ProjectRefHash{Project: project, Ref: key, Hash: hash})
 		}
