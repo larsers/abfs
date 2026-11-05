@@ -449,6 +449,8 @@ curl -s localhost:9998/info | jq '{
 
 `failed` lists the projects whose last push failed on that git-pusher, with the error.
 
+Build hosts and CI jobs that share a cache should mount the workspace at the same absolute path, or they share fewer cache entries and can replay links into another host's workspace. See [Mount at the same path on every host](../android-dev/WORKSPACES.md#mount-at-the-same-path-on-every-host).
+
 Once your mount succeeds, you are ready to move to the [Android Developer docs](../android-dev/README.md) and try out a build before sharing with your other developers.
 
 ## Client cache
