@@ -118,6 +118,19 @@ abfs server --port 50051 --shutdown-timeout 60s file-based --local-dir "$SERVER_
 * With `--ares-enabled`, proxied ARES requests can run much longer than the default timeout; set `--shutdown-timeout` to match.
 * On the first signal the server's gRPC health service reports `NOT_SERVING` for every service. Behind a load balancer or a health checker that uses it, set `--drain-delay` to keep serving new requests for that long before the server stops accepting connections, so the balancer moves traffic away first. Size it from the health check interval times the unhealthy threshold, and count it in the time your process manager waits: the delay comes before `--shutdown-timeout`. The default, `0`, starts the drain at once. A client that watches health with the streaming `Watch` call keeps its stream open until `--shutdown-timeout` closes it, so with `--shutdown-timeout 0` such a client keeps the server from exiting.
 
+#### Server metrics
+
+The server records the metrics below through the metrics provider that the `metrics-provider` config key selects, when `record-client-metrics` is `true`. Without a provider it records none of them.
+
+* `abfs_server_requests_total{method,result}` counts requests by method and result.
+* `abfs_server_request_duration_seconds{method}` is the duration of requests in seconds. For `GetObject` it lasts until the client has read the object.
+* `abfs_server_requests_in_flight{method}` is the number of requests in progress.
+* `abfs_server_headers_keys_total{result}` counts the keys that `Headers` looked up, with `result` `found` or `not_found`.
+* `abfs_server_headers_batch_keys` is a histogram of the number of keys in each `Headers` call.
+* `abfs_server_object_bytes_total{direction}` counts encoded object bytes, `in` for `PutObject` and `out` for `GetObject`.
+
+The `result` of a request is `ok`, `not_found` (the object does not exist, or the ref's server is unknown), `missing_links` (the server does not have every object the request links to), `permission_denied`, `canceled` (the client canceled the request or its deadline passed) or `error` (any other error).
+
 ### Configuration
 
 Some configuration of ABFS is still done through command-line flags, but we are trying to move everything to use configuration stored in the CAS itself for dynamic update purposes. We call this feature Hashpaths and you can read more in the [Hashpath code comments](../../shared/hashpath/README.md).

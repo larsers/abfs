@@ -36,6 +36,7 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/remote"
 	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/grpc/server"
@@ -137,6 +138,7 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	if !c.noLogging {
 		composedServer = servers.NewLoggingServer(composedServer, log.Default(), 3, c.logSampleRate)
 	}
+	composedServer = servers.NewMetricsServer(composedServer, metrics.GetProvider())
 	hs := health.NewServer()
 	s, err := server.NewGRPCServer(&server.GRPCServerOpts{
 		Server:                   composedServer,
