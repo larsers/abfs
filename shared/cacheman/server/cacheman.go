@@ -2578,6 +2578,8 @@ func (c *CacheMan) Stop() error {
 		multierr.AppendInto(&err, c.store.Close())
 	}
 
+	// The failed push lines go to the printer, so write their count before it closes.
+	dagsync.FlushFailureLog()
 	return entities.FirstError(err, c.printer.Close())
 }
 
