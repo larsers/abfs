@@ -22,7 +22,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,6 +37,8 @@ import (
 	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -116,6 +122,24 @@ func objectTouched(t *testing.T, s *GCPServer, key entities.Hash) bool {
 	return ok
 }
 
+// rescuesOf returns the rescues of path, of all types.
+func rescuesOf(s *GCPServer, path rescuePath) int64 {
+	var n int64
+	for i := range s.gcHooks.rescues[path] {
+		n += s.gcHooks.rescues[path][i].Load()
+	}
+	return n
+}
+
+// captureLog sends the standard logger to a buffer for the rest of the test.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return &buf
+}
+
 func readObject(s *GCPServer, key entities.Hash) error {
 	r, err := s.GetObject(context.Background(), key)
 	if err != nil {
@@ -172,7 +196,7 @@ func TestGCHooks_RescueOnEachPath(t *testing.T) {
 			require.NoError(tt.use(s, key))
 			require.False(isCondemned(t, s, key))
 			require.True(objectTouched(t, s, key), "the rescue wrote no touch")
-			require.Equal(int64(1), s.gcHooks.rescues[tt.path].Load())
+			require.Equal(int64(1), rescuesOf(s, tt.path))
 		})
 	}
 }
@@ -271,7 +295,7 @@ func TestGCHooks_RescuesABatchInParallel(t *testing.T) {
 			require.False(isCondemned(t, s, key))
 		}
 	}
-	require.Equal(int64(99), s.gcHooks.rescues[pathHeaders].Load())
+	require.Equal(int64(99), rescuesOf(s, pathHeaders))
 	require.Equal(int64(1), s.gcHooks.rescuesLost[pathHeaders].Load())
 	require.Greater(most, 1)
 	require.LessOrEqual(most, rescueWorkers)
@@ -305,7 +329,8 @@ func TestGCHooks_FailedRescueDoesNotStopTheBatch(t *testing.T) {
 	for _, key := range keys {
 		require.Equal(key == failing, isCondemned(t, s, key), key)
 	}
-	require.Equal(int64(99), s.gcHooks.rescues[pathHeaders].Load())
+	require.Equal(int64(99), rescuesOf(s, pathHeaders))
+	require.Equal(int64(1), s.gcHooks.rescueFailures[pathHeaders].Load())
 
 	// The retry rescues the one left.
 	s.gcHooks.rescue = rescue
@@ -410,7 +435,7 @@ func TestGCHooks_ReadOnly(t *testing.T) {
 	require.True(isCondemned(t, s, key))
 	require.False(objectTouched(t, s, key))
 	for p := range numRescuePaths {
-		require.Zero(s.gcHooks.rescues[p].Load())
+		require.Zero(rescuesOf(s, p))
 	}
 }
 
@@ -703,16 +728,24 @@ func TestGCHooks_RejectsNegativeDurations(t *testing.T) {
 	require.Error(t, s.startGCHooks(context.Background(), &NewServerOpts{GC: true, CacheTTL: -time.Second}))
 }
 
+// A rescue is counted by call and type and logged with the client, as the
+// load balancer forwards it, and the cycle of the marker.
 func TestGCHooks_Metrics(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 9), Port: 4711}})
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("x-forwarded-for", "10.1.2.3, 10.0.0.9", "client-version", "0.1.23"))
 	reader := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
 	key := putBlob(t, s, "hello")
 	condemnObject(t, s, key, 3)
+	logged := captureLog(t)
 	_, err := s.Headers(ctx, []entities.Hash{key})
 	require.NoError(err)
+	lines := strings.Split(strings.TrimSpace(logged.String()), "\n")
+	require.Len(lines, 2, logged.String())
+	require.Contains(lines[0], fmt.Sprintf("Rescued blob %s in headers, condemned by GC cycle 3", key))
+	require.Contains(lines[1], `Rescued 1 condemned objects of 1 read in headers, 0 failed: peer 10.0.0.9:4711, x-forwarded-for "10.1.2.3, 10.0.0.9", client-version "0.1.23"`)
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(reader.Collect(ctx, &rm))
@@ -725,6 +758,11 @@ func TestGCHooks_Metrics(t *testing.T) {
 			sum, ok := m.Data.(metricdata.Sum[int64])
 			require.True(ok, m.Name)
 			for _, dp := range sum.DataPoints {
+				if call, ok := dp.Attributes.Value("call"); ok {
+					if typ, ok := dp.Attributes.Value("type"); ok {
+						got[m.Name+"/"+call.AsString()+"/"+typ.AsString()] = dp.Value
+					}
+				}
 				for _, kv := range dp.Attributes.ToSlice() {
 					got[m.Name+"/"+kv.Value.AsString()] += dp.Value
 				}
@@ -735,8 +773,40 @@ func TestGCHooks_Metrics(t *testing.T) {
 		}
 	}
 	require.Equal(int64(1), got["abfs.gcp.gc.rescues/headers"])
+	require.Equal(int64(1), got["abfs.gcp.gc.rescues/headers/blob"])
+	require.Equal(int64(0), got["abfs.gcp.gc.rescues/headers/tree"])
+	require.Contains(got, "abfs.gcp.gc.rescues/get_object/other")
+	require.Equal(int64(0), got["abfs.gcp.gc.rescue_failures/headers"])
+	require.Contains(got, "abfs.gcp.gc.rescue_failures/headers")
 	require.Contains(got, "abfs.gcp.gc.touches/dropped")
 	require.Contains(got, "abfs.gcp.cache.ttl_expiries/content")
 	require.Contains(got, "abfs.gcp.gc.map_results_dropped")
 	require.Contains(got, "abfs.gcp.gc.heartbeat_failures")
+}
+
+// The object lines and the call lines of the rescue log are limited per
+// minute, and the next window says how many the limits left out.
+func TestRescueLog_LimitsLines(t *testing.T) {
+	require := require.New(t)
+	logged := captureLog(t)
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	l := newRescueLog()
+	l.now = func() time.Time { return now }
+	hdr := &ObjectHeader{Id: entities.EmptyDirHash, Type: "tree"}
+	for range rescueKeyLines + 5 {
+		l.object(pathHeaders, hdr, []byte{0, 0, 0, 0, 0, 0, 0, 2})
+	}
+	require.Equal(rescueKeyLines, strings.Count(logged.String(), "condemned by GC cycle 2"))
+	// GetObject logs one call per object.
+	for range rescueCallLines + 3 {
+		l.call(context.Background(), pathGetObject, 1, 1, 0)
+	}
+	require.Equal(rescueCallLines, strings.Count(logged.String(), "Rescued 1 condemned objects of 1 read in get_object"))
+	now = now.Add(rescueLogWindow)
+	l.object(pathHeaders, hdr, []byte{0, 0, 0, 0, 0, 0, 0, 2})
+	require.Contains(logged.String(), "Left out the lines of 5 rescued objects in the minute from 2026-11-07T12:00:00Z")
+	require.Contains(logged.String(), "Left out the lines of 3 calls with rescues in the minute from 2026-11-07T12:00:00Z")
+	require.Equal(rescueKeyLines+1, strings.Count(logged.String(), "condemned by GC cycle 2"))
+	l.call(context.Background(), pathGetObject, 1, 1, 0)
+	require.Equal(rescueCallLines+1, strings.Count(logged.String(), "Rescued 1 condemned objects of 1 read in get_object"))
 }

@@ -231,8 +231,8 @@ func TestCondemnGC_ServerRescuesCondemnedObjects(t *testing.T) {
 	require.NoError(readObject(f.s, tree))
 	require.Empty(f.markerCells(blob))
 	require.Empty(f.markerCells(tree))
-	require.Equal(int64(1), f.s.gcHooks.rescues[pathHeaders].Load())
-	require.Equal(int64(1), f.s.gcHooks.rescues[pathGetObject].Load())
+	require.Equal(int64(1), rescuesOf(f.s, pathHeaders))
+	require.Equal(int64(1), rescuesOf(f.s, pathGetObject))
 }
 
 // A cycle that cannot publish its list writes no marker, so that every

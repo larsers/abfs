@@ -103,9 +103,12 @@ type gcHooks struct {
 	touchedMapRows []*lru.Cache[mapRowKey, uint32]
 	stopHeartbeat  func()
 	metrics        metric.Registration
+	rescueLog      *rescueLog
 
-	rescues           [numRescuePaths]atomic.Int64
+	// rescues counts per path and index into rescueTypes.
+	rescues           [numRescuePaths][]atomic.Int64
 	rescuesLost       [numRescuePaths]atomic.Int64
+	rescueFailures    [numRescuePaths]atomic.Int64
 	headerExpiries    atomic.Int64
 	contentExpiries   atomic.Int64
 	mapResultsDropped atomic.Int64
@@ -141,6 +144,10 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	g := &s.gcHooks
 	g.on = true
 	g.cacheTTL = seconds(opts.CacheTTL)
+	for p := range g.rescues {
+		g.rescues[p] = make([]atomic.Int64, len(rescueTypes))
+	}
+	g.rescueLog = newRescueLog()
 	if !opts.GCReadOnly {
 		g.rescue = gc.NewRescuer(s.casdb.BTClient()).Rescue
 	}
@@ -185,6 +192,9 @@ func (s *GCPServer) stopGCHooks() {
 	}
 	if g.toucher != nil {
 		g.toucher.Close()
+	}
+	if g.rescueLog != nil {
+		g.rescueLog.flush()
 	}
 }
 
@@ -283,12 +293,25 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 // rescueCondemned rescues hdr if the collector condemned it. It returns
 // casdb.ErrNotFound when the collector deleted the object first.
 func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *ObjectHeader) error {
-	g := &s.gcHooks
-	if hdr.Condemned == nil || g.rescue == nil {
+	if hdr.Condemned == nil || s.gcHooks.rescue == nil {
 		return nil
 	}
-	live, err := g.rescue(ctx, hdr.Id, hdr.Condemned)
+	err := s.rescueOne(ctx, path, hdr)
+	if err == nil {
+		s.gcHooks.rescueLog.call(ctx, path, 1, 1, 0)
+	} else if !errors.Is(err, casdb.ErrNotFound) {
+		s.gcHooks.rescueLog.call(ctx, path, 1, 0, 1)
+	}
+	return err
+}
+
+// rescueOne rescues hdr, which the collector condemned, and counts the result.
+func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, hdr *ObjectHeader) error {
+	g := &s.gcHooks
+	condemned := hdr.Condemned
+	live, err := g.rescue(ctx, hdr.Id, condemned)
 	if err != nil {
+		g.rescueFailures[path].Add(1)
 		return err
 	}
 	if !live {
@@ -296,7 +319,8 @@ func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *O
 		log.Printf("Condemned object %s was deleted before it could be rescued", hdr.Id)
 		return casdb.ErrNotFound
 	}
-	g.rescues[path].Add(1)
+	g.rescues[path][rescueType(hdr.Type)].Add(1)
+	g.rescueLog.object(path, hdr, condemned)
 	hdr.Condemned = nil
 	return nil
 }
@@ -312,6 +336,7 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 		return hdrs, nil
 	}
 	gone := make([]bool, len(hdrs))
+	var rescued, failed atomic.Int64
 	var g errgroup.Group
 	g.SetLimit(rescueWorkers)
 	for i, h := range hdrs {
@@ -319,15 +344,22 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 			continue
 		}
 		g.Go(func() error {
-			err := s.rescueCondemned(ctx, path, h)
-			if errors.Is(err, casdb.ErrNotFound) {
+			err := s.rescueOne(ctx, path, h)
+			switch {
+			case err == nil:
+				rescued.Add(1)
+			case errors.Is(err, casdb.ErrNotFound):
 				gone[i] = true
 				return nil
+			default:
+				failed.Add(1)
 			}
 			return err
 		})
 	}
-	if err := g.Wait(); err != nil {
+	err := g.Wait()
+	s.gcHooks.rescueLog.call(ctx, path, len(hdrs), int(rescued.Load()), int(failed.Load()))
+	if err != nil {
 		return nil, err
 	}
 	live := hdrs[:0]
@@ -513,12 +545,17 @@ func (s *GCPServer) heartbeat(ctx context.Context, r *gc.Replica) {
 func (s *GCPServer) registerGCMetrics() (metric.Registration, error) {
 	meter := otel.Meter(metricsScope)
 	rescues, err := meter.Int64ObservableCounter("abfs.gcp.gc.rescues",
-		metric.WithDescription("Condemned objects that a server call rescued, by call"))
+		metric.WithDescription("Condemned objects that a server call rescued, by call and object type"))
 	if err != nil {
 		return nil, err
 	}
 	lost, err := meter.Int64ObservableCounter("abfs.gcp.gc.rescues_lost",
 		metric.WithDescription("Condemned objects that the collector deleted before a server call could rescue them, by call"))
+	if err != nil {
+		return nil, err
+	}
+	failures, err := meter.Int64ObservableCounter("abfs.gcp.gc.rescue_failures",
+		metric.WithDescription("Rescues of condemned objects that failed, so that the server call failed, by call"))
 	if err != nil {
 		return nil, err
 	}
@@ -545,9 +582,13 @@ func (s *GCPServer) registerGCMetrics() (metric.Registration, error) {
 	g := &s.gcHooks
 	return meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		for p := range numRescuePaths {
-			call := metric.WithAttributes(attribute.String("call", rescuePathNames[p]))
-			o.ObserveInt64(rescues, g.rescues[p].Load(), call)
+			callName := attribute.String("call", rescuePathNames[p])
+			for t, typ := range rescueTypes {
+				o.ObserveInt64(rescues, g.rescues[p][t].Load(), metric.WithAttributes(callName, attribute.String("type", typ)))
+			}
+			call := metric.WithAttributes(callName)
 			o.ObserveInt64(lost, g.rescuesLost[p].Load(), call)
+			o.ObserveInt64(failures, g.rescueFailures[p].Load(), call)
 		}
 		if g.toucher != nil {
 			st := g.toucher.Stats()
@@ -560,5 +601,5 @@ func (s *GCPServer) registerGCMetrics() (metric.Registration, error) {
 		o.ObserveInt64(dropped, g.mapResultsDropped.Load())
 		o.ObserveInt64(heartbeats, g.heartbeatFailures.Load())
 		return nil
-	}, rescues, lost, touches, expiries, dropped, heartbeats)
+	}, rescues, lost, failures, touches, expiries, dropped, heartbeats)
 }

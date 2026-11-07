@@ -39,6 +39,11 @@ const (
 // its type as an index into it.
 var typeNames, typeIndex = knownTypes()
 
+// TypeNames returns the object types the collector knows, sorted.
+func TypeNames() []string {
+	return slices.Clone(typeNames)
+}
+
 func knownTypes() ([]string, map[string]uint8) {
 	names := []string{string(entities.ObjectTypeBlob)}
 	for t := range maps.Keys(objects.Factory) {
