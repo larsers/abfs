@@ -723,6 +723,54 @@ func TestGCHooks_Heartbeat(t *testing.T) {
 	require.Zero(s.gcHooks.heartbeatFailures.Load())
 }
 
+// lossyToucher loses a touch while it closes.
+type lossyToucher struct {
+	fakeToucher
+	failed atomic.Int64
+}
+
+func (l *lossyToucher) Stats() gc.TouchStats { return gc.TouchStats{Failed: l.failed.Load()} }
+
+func (l *lossyToucher) Close() { l.failed.Store(1) }
+
+// A server that stops after writing its buffered touches deletes its
+// heartbeat row, so that a restart on the same host does not count as a
+// second live row. A stop that lost touches keeps the row, which marks the
+// stop as unclean for the collector.
+func TestGCHooks_StopDeletesHeartbeatRow(t *testing.T) {
+	for _, lose := range []bool{false, true} {
+		t.Run(fmt.Sprintf("touches lost %v", lose), func(t *testing.T) {
+			require := require.New(t)
+			ctx := context.Background()
+			s := newEmulatorCASDBServer(t)
+			require.NoError(s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Hour, GCTouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}))
+			t.Cleanup(s.stopGCHooks)
+			if lose {
+				s.gcHooks.toucher.Close()
+				s.gcHooks.toucher = &lossyToucher{}
+			}
+			require.Eventually(func() bool {
+				replicas, err := gc.ReadReplicas(ctx, s.casdb.SpannerClient())
+				require.NoError(err)
+				return len(replicas) == 1
+			}, 10*time.Second, 50*time.Millisecond)
+
+			logged := captureLog(t)
+			s.stopGCHooks()
+			replicas, err := gc.ReadReplicas(ctx, s.casdb.SpannerClient())
+			require.NoError(err)
+			if lose {
+				require.Len(replicas, 1)
+				require.Contains(logged.String(), "GC touches at stop: 0 written, 0 dropped and 1 failed while stopping")
+				require.Contains(logged.String(), "kept the GC heartbeat row "+replicas[0].ID)
+			} else {
+				require.Empty(replicas)
+				require.Contains(logged.String(), "GC touches at stop:")
+			}
+		})
+	}
+}
+
 func TestGCHooks_RejectsNegativeDurations(t *testing.T) {
 	s, _ := createTestServerWithCASDB(t)
 	require.Error(t, s.startGCHooks(context.Background(), &NewServerOpts{GC: true, CacheTTL: -time.Second}))

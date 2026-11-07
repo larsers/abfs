@@ -102,8 +102,11 @@ type gcHooks struct {
 	// byte of from.
 	touchedMapRows []*lru.Cache[mapRowKey, uint32]
 	stopHeartbeat  func()
-	metrics        metric.Registration
-	rescueLog      *rescueLog
+	// replicaID is the ID of this server's heartbeat row, empty without one.
+	replicaID string
+	metrics   metric.Registration
+	rescueLog *rescueLog
+	stopped   bool
 
 	// rescues counts per path and index into rescueTypes.
 	rescues           [numRescuePaths][]atomic.Int64
@@ -149,6 +152,7 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	s.gcEdges = gc.NewEdgeWriter(s.casdb.BTClient())
 	g := &s.gcHooks
 	g.on = true
+	g.stopped = false
 	g.cacheTTL = seconds(opts.CacheTTL)
 	for p := range g.rescues {
 		g.rescues[p] = make([]atomic.Int64, len(rescueTypes))
@@ -185,9 +189,15 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	return nil
 }
 
-// stopGCHooks stops the heartbeat and writes the buffered touches.
+// stopGCHooks stops the heartbeat, writes the buffered touches and, when it
+// wrote all of them, deletes the heartbeat row of this server. A row left
+// behind tells the collector that touches of this process may be lost.
 func (s *GCPServer) stopGCHooks() {
 	g := &s.gcHooks
+	if g.stopped {
+		return
+	}
+	g.stopped = true
 	if g.metrics != nil {
 		_ = g.metrics.Unregister()
 		g.metrics = nil
@@ -196,12 +206,33 @@ func (s *GCPServer) stopGCHooks() {
 		g.stopHeartbeat()
 		g.stopHeartbeat = nil
 	}
+	lost := false
 	if g.toucher != nil {
+		before := g.toucher.Stats()
 		g.toucher.Close()
+		after := g.toucher.Stats()
+		// The metrics are gone by now, so the log has the counts of the stop.
+		dropped, failed := after.Dropped-before.Dropped, after.Failed-before.Failed
+		log.Printf("GC touches at stop: %d written, %d dropped and %d failed while stopping; %d written, %d dropped and %d failed since the start",
+			after.Written-before.Written, dropped, failed, after.Written, after.Dropped, after.Failed)
+		lost = dropped > 0 || failed > 0
 	}
 	if g.rescueLog != nil {
 		g.rescueLog.flush()
 	}
+	if g.replicaID == "" {
+		return
+	}
+	if lost {
+		log.Printf("Warning: kept the GC heartbeat row %s, because touches were lost while stopping", g.replicaID)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), heartbeatTimeout)
+	defer cancel()
+	if err := gc.DeleteReplica(ctx, s.casdb.SpannerClient(), g.replicaID); err != nil {
+		log.Printf("Warning: %v", err)
+	}
+	g.replicaID = ""
 }
 
 func (g *gcHooks) expired(loaded uint32) bool {
@@ -517,6 +548,7 @@ func (s *GCPServer) chunkMissing(ctx context.Context, key entities.Hash, content
 // interval until stopGCHooks.
 func (s *GCPServer) startHeartbeat(interval time.Duration, r gc.Replica) {
 	r.ID = gc.NewReplicaID()
+	s.gcHooks.replicaID = r.ID
 	log.Printf("GC replica ID %s, heartbeat every %s", r.ID, interval)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
