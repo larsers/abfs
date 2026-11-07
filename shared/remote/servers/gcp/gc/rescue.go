@@ -17,7 +17,6 @@ package gc
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"cloud.google.com/go/bigtable"
@@ -47,12 +46,23 @@ func NewRescuer(client *bigtable.Client) *Rescuer {
 	}
 }
 
-// Rescue clears the condemn marker of the object key, which a read found set
-// to condemned, and touches the object. It returns false when the object row
-// is gone, because the collector deleted it first. The marker is cleared only
+// Rescue touches the object key, which a read found set to condemned, and
+// then clears its condemn marker. It returns false when the object row is
+// gone, because the collector deleted it first. The marker is cleared only
 // while it still holds the value read, so the result tells which side won.
+//
+// The touch comes first and a failed touch fails the rescue, with the marker
+// left in place: a condemn write that is retried or lands late can set the
+// marker again after it was cleared, and then only the touch keeps the next
+// mark from finding the object unreachable. A touch of a row that turns out
+// to be gone leaves a gc row with only the touch.
 func (r *Rescuer) Rescue(ctx context.Context, key Hash, condemned []byte) (bool, error) {
 	row := key.String()
+	mut := bigtable.NewMutation()
+	mut.Set(TouchFamily, TouchColumn, bigtable.ServerTime, nil)
+	if err := r.retry(ctx, func() error { return r.gcTable.Apply(ctx, row, mut) }); err != nil {
+		return false, fmt.Errorf("failed to rescue %s: failed to touch it: %v", key, err) //nolint:errorlint // a missing table must not reach the client as a missing object
+	}
 	for attempt := 1; ; attempt++ {
 		matched, err := r.clear(ctx, row, condemned)
 		if err != nil {
@@ -76,11 +86,6 @@ func (r *Rescuer) Rescue(ctx context.Context, key Hash, condemned []byte) (bool,
 			return false, fmt.Errorf("failed to rescue %s: its condemn marker keeps changing", key)
 		}
 		condemned = current
-	}
-	mut := bigtable.NewMutation()
-	mut.Set(TouchFamily, TouchColumn, bigtable.ServerTime, nil)
-	if err := r.retry(ctx, func() error { return r.gcTable.Apply(ctx, row, mut) }); err != nil {
-		log.Printf("Warning: failed to touch rescued object %s: %v", key, err)
 	}
 	return true, nil
 }

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigtable"
+	"cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
@@ -475,4 +476,64 @@ func TestCondemnGC_CrashMidwayLeavesNoOldMarker(t *testing.T) {
 	// no rescue.
 	require.False(lines[keys[2].String()].Rescued)
 	require.Equal(int64(1), *lines[keys[0].String()].Marker)
+}
+
+// newBigtableClientWith returns a client of the emulator whose unary calls
+// pass through intercept.
+func newBigtableClientWith(t *testing.T, intercept grpc.UnaryClientInterceptor) *bigtable.Client {
+	t.Helper()
+	conn, err := grpc.NewClient(os.Getenv("BIGTABLE_EMULATOR_HOST"), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithUnaryInterceptor(intercept))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	bt, err := bigtable.NewClient(context.Background(), emulatorProject, emulatorBigtable, option.WithGRPCConn(conn))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = bt.Close() })
+	return bt
+}
+
+// A rescue whose touch fails fails the call and leaves the marker. Once a
+// rescue touched the key, a marker of the same cycle set again, as by a
+// retried or late condemn write, does not make the key unreachable: the next
+// cycle finds it live through recent and clears the marker.
+func TestCondemnGC_ReappliedMarkerAfterRescue(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	k := f.blob("used after its condemn", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	require.Equal([][]byte{marker(1)}, f.markerCells(k))
+
+	// No toucher, so the only touch is the rescue's.
+	require.NoError(f.s.enableGCHooks(&NewServerOpts{}))
+	t.Cleanup(f.s.stopGCHooks)
+	rescue := f.s.gcHooks.rescue
+	failTouches := newBigtableClientWith(t, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if m, ok := req.(*bigtablepb.MutateRowRequest); ok && strings.HasSuffix(m.GetTableName(), "/tables/"+gc.TableName) {
+			return status.Error(codes.PermissionDenied, "touch refused by the test")
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
+	f.s.gcHooks.rescue = gc.NewRescuer(failTouches).Rescue
+	f.s.forget(k)
+	_, err = f.s.Headers(ctx, []entities.Hash{k})
+	require.ErrorContains(err, "touch refused by the test")
+	require.Equal([][]byte{marker(1)}, f.markerCells(k))
+	require.False(objectTouched(t, f.s, k))
+
+	f.s.gcHooks.rescue = rescue
+	_, err = f.s.Headers(ctx, []entities.Hash{k})
+	require.NoError(err)
+	require.Empty(f.markerCells(k))
+	mut := bigtable.NewMutation()
+	mut.Set(gc.ObjectsFamily, gc.CondemnedColumn, bigtable.Now(), marker(1))
+	require.NoError(f.s.casdb.BTClient().Open("objects").Apply(ctx, k.String(), mut))
+
+	res, err := f.condemn(nil)
+	require.NoError(err)
+	require.Empty(f.markerCells(k))
+	line := f.liveLines(res.Report.PreviousList.LiveList)[k.String()]
+	require.Equal("recent", line.Root.Class)
+	require.Equal(int64(1), *line.Marker)
 }
