@@ -134,6 +134,12 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 	if err := s.checkGCResources(ctx); err != nil {
 		return fmt.Errorf("garbage collector resources missing, run 'abfs server gcp init --gc' to create them: %w", err)
 	}
+	// Read-only, the server rescues nothing and needs no conditional writes.
+	if !opts.GCReadOnly {
+		if err := s.checkSingleRowTransactions(ctx, opts); err != nil {
+			return err
+		}
+	}
 	return s.enableGCHooks(opts)
 }
 

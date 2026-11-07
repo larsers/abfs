@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"cloud.google.com/go/bigtable"
@@ -26,6 +27,9 @@ import (
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/iterator"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/remote"
@@ -327,6 +331,67 @@ func TestNew_ChecksResources(t *testing.T) {
 			}
 			require.ErrorContains(t, err, tt.wantErr)
 			require.ErrorContains(t, err, "abfs server gcp init")
+		})
+	}
+}
+
+// A server with --gc stops at start on an app profile that refuses the
+// conditional writes of a rescue, and the error names the fix. A transient
+// error is retried, and another error stops the server without blaming the
+// profile. A read-only server, as the collector's commands use, rescues
+// nothing and starts.
+func TestNew_ChecksSingleRowTransactions(t *testing.T) {
+	const refusal = "single-row transactions are not allowed by this app profile"
+	const profileFix = "gcloud bigtable app-profiles update default --instance=test-bt --route-to=<cluster> --transactional-writes"
+	tests := []struct {
+		name string
+		// fail is the code of the first failed probes, failures their number,
+		// 0 for all.
+		fail     codes.Code
+		failures int32
+		readOnly bool
+		wantErr  []string
+		notErr   string
+	}{
+		{name: "profile refuses conditional writes", fail: codes.FailedPrecondition, wantErr: []string{profileFix, refusal}},
+		{name: "read-only on a profile that refuses them", fail: codes.FailedPrecondition, readOnly: true},
+		{name: "one transient error", fail: codes.Unavailable, failures: 1},
+		{name: "other error", fail: codes.PermissionDenied, wantErr: []string{"failed to check that a conditional write to Bigtable table objects works", refusal}, notErr: "app-profiles"},
+		{name: "emulator default profile"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			fail := grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+				if strings.HasSuffix(info.FullMethod, "/CheckAndMutateRow") {
+					if n := calls.Add(1); tt.fail != codes.OK && (tt.failures == 0 || n <= tt.failures) {
+						return nil, status.Error(tt.fail, refusal)
+					}
+				}
+				return handler(ctx, req)
+			})
+			newEmulatorBigtableWith(t, serverTables(true), fail)
+			o := setupOpts(t, newEmulatorDatabase(t))
+			s, err := New(context.Background(), &NewServerOpts{
+				ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID, BtInstance: o.BtInstance, BucketName: o.BucketName,
+				MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCReadOnly: tt.readOnly,
+			})
+			if err == nil {
+				_ = s.Close()
+			}
+			if tt.wantErr == nil {
+				require.NoError(t, err)
+				if tt.failures > 0 {
+					require.Equal(t, tt.failures+1, calls.Load())
+				}
+				return
+			}
+			for _, w := range tt.wantErr {
+				require.ErrorContains(t, err, w)
+			}
+			if tt.notErr != "" {
+				require.NotContains(t, err.Error(), tt.notErr)
+			}
 		})
 	}
 }

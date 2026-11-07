@@ -132,10 +132,18 @@ func (r *Rescuer) marker(ctx context.Context, row string) (bool, []byte, error) 
 	return true, nil, nil
 }
 
-// retry calls f until it succeeds, fails with an error that is not transient,
-// or has run writeAttempts times, as EdgeWriter.applyWithRetry does.
 func (r *Rescuer) retry(ctx context.Context, f func() error) error {
-	wait := r.retryWait
+	return retryWith(ctx, r.retryWait, f)
+}
+
+// Retry calls f with the retries of a rescue: until it succeeds, fails with
+// an error that is not transient, or has run writeAttempts times, as
+// EdgeWriter.applyWithRetry does.
+func Retry(ctx context.Context, f func() error) error {
+	return retryWith(ctx, firstRetryWait, f)
+}
+
+func retryWith(ctx context.Context, wait time.Duration, f func() error) error {
 	for attempt := 1; ; attempt++ {
 		err := f()
 		if err == nil || attempt == writeAttempts || !retryable(ctx, err) {

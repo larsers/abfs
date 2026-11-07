@@ -30,6 +30,7 @@ import (
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -117,10 +118,11 @@ func newEmulatorBigtable(t *testing.T) {
 	newEmulatorBigtableWith(t, serverTables(true))
 }
 
-// newEmulatorBigtableWith starts an in-process Bigtable with the given tables.
-func newEmulatorBigtableWith(t *testing.T, tables []tableFamilies) {
+// newEmulatorBigtableWith starts an in-process Bigtable with the given tables
+// and gRPC server options.
+func newEmulatorBigtableWith(t *testing.T, tables []tableFamilies, opt ...grpc.ServerOption) {
 	t.Helper()
-	newEmptyEmulatorBigtable(t)
+	newEmptyEmulatorBigtable(t, opt...)
 	adm, err := bigtable.NewAdminClient(context.Background(), emulatorProject, emulatorBigtable)
 	require.NoError(t, err)
 	defer adm.Close()
@@ -133,9 +135,9 @@ func newEmulatorBigtableWith(t *testing.T, tables []tableFamilies) {
 }
 
 // newEmptyEmulatorBigtable starts an in-process Bigtable without tables.
-func newEmptyEmulatorBigtable(t *testing.T) {
+func newEmptyEmulatorBigtable(t *testing.T, opt ...grpc.ServerOption) {
 	t.Helper()
-	srv, err := bttest.NewServer("localhost:0")
+	srv, err := bttest.NewServer("localhost:0", opt...)
 	require.NoError(t, err)
 	t.Cleanup(srv.Close)
 	t.Setenv("BIGTABLE_EMULATOR_HOST", srv.Addr)
