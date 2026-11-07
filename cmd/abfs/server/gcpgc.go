@@ -36,7 +36,11 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-const defaultBackfillRate = 2000
+const (
+	defaultBackfillRate = 2000
+	appProfileUsage     = "The GCP Bigtable App Profile ID (empty uses the instance default app profile). Give the GC commands their own profile with single-cluster routing, single-row transactions and priority low; the command checks it at the start and warns otherwise"
+	clientMetricsUsage  = "Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring, which show per-attempt latencies and retries per app profile"
+)
 
 type gcpGCCmd struct {
 	*root.RootCmd
@@ -84,7 +88,7 @@ func (c *gcpGCBackfillCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
-	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", "The GCP Bigtable App Profile ID (empty uses the instance default app profile)")
+	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.StringVar(&c.opts.Start, "start", "", "The first object key to scan, a lowercase hexadecimal hash or prefix (default: the start of the table)")
 	fl.StringVar(&c.opts.End, "end", "", "The object key to stop before (default: the end of the table)")
@@ -93,6 +97,7 @@ func (c *gcpGCBackfillCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.Float64Var(&c.opts.Rate, "rate", defaultBackfillRate, "The maximum number of object rows scanned per second (0 means no limit)")
 	fl.BoolVar(&c.opts.DryRun, "dry-run", false, "Count the gc rows to write and write none")
 	fl.DurationVar(&c.opts.WriteDeadline, "write-deadline", gc.DefaultWriteDeadline, "The deadline of one attempt of a gc row write, the client library's retries included")
+	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", true, clientMetricsUsage)
 }
 
 func (c *gcpGCBackfillCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -106,6 +111,7 @@ func (c *gcpGCBackfillCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	c.server.GCReadOnly = true
 	c.server.MaxCachedHeaders = 1
 	c.server.MaxCachedContents = 1
+	checkAppProfile(ctx, &c.server)
 	server, err := gcp.New(ctx, &c.server)
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
@@ -180,7 +186,8 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
-	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", "The GCP Bigtable App Profile ID for the scans, best one with low priority and single-cluster routing (empty uses the instance default app profile)")
+	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
+	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", true, clientMetricsUsage)
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing")
 	fl.BoolVar(&c.condemn, "condemn", false, "Mark the unreachable objects as condemned and delete nothing")
@@ -240,6 +247,7 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	c.server.GCReadOnly = true
 	c.server.MaxCachedHeaders = 1
 	c.server.MaxCachedContents = 1
+	profile := checkAppProfile(ctx, &c.server)
 	server, err := gcp.New(ctx, &c.server)
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
@@ -256,11 +264,25 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		res, err = server.DryRunGC(ctx, &c.opts.DryRunOpts)
 	}
 	if res != nil {
+		res.Report.AppProfile = profile
 		if werr := writeReport(c.report, res.Report); werr != nil {
 			return errors.Join(err, werr)
 		}
 	}
 	return err
+}
+
+// checkAppProfile reads the Bigtable app profile of a GC command and warns
+// about each setting the collector needs that it lacks.
+func checkAppProfile(ctx context.Context, o *gcp.NewServerOpts) *gc.ProfileReport {
+	rep := gc.ReadAppProfile(ctx, o.ProjectID, o.BtInstance, o.BtAppProfile)
+	for _, p := range rep.Problems {
+		log.Printf("Warning: Bigtable app profile %s: %s", rep.ID, p)
+	}
+	if rep.Fix != "" {
+		log.Printf("Warning: %s", rep.Fix)
+	}
+	return rep
 }
 
 func writeReport(file string, report *gc.Report) error {

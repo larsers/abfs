@@ -99,3 +99,26 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 	require.Equal(t, float64(gc.DefaultCondemnRate), c.opts.Rate)
 	require.Equal(t, gc.DefaultKeepLists, c.opts.KeepLists)
 }
+
+// The GC commands export the client library metrics by default, which show
+// the per-attempt latencies and retries of their app profile; the server
+// does not.
+func TestGCPGCFlags_ClientMetrics(t *testing.T) {
+	run := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
+	backfill := &gcpGCBackfillCmd{RootCmd: root.NewRootCommand()}
+	server := NewStandaloneGCPServerCmd(root.NewRootCommand())
+	for _, tt := range []struct {
+		register func(*pflag.FlagSet)
+		got      *bool
+		want     bool
+	}{
+		{run.RegisterFlags, &run.server.ClientMetrics, true},
+		{backfill.RegisterFlags, &backfill.server.ClientMetrics, true},
+		{server.RegisterFlags, &server.gcpCmd.clientMetrics, false},
+	} {
+		fl := pflag.NewFlagSet("gc", pflag.ContinueOnError)
+		tt.register(fl)
+		require.NoError(t, fl.Parse(nil))
+		require.Equal(t, tt.want, *tt.got)
+	}
+}

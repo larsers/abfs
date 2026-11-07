@@ -147,6 +147,9 @@ type Report struct {
 	Workspaces MountCounts `json:"workspaces"`
 	// Replicas reports the server replicas and their settings.
 	Replicas ReplicaReport `json:"replicas"`
+	// AppProfile reports the Bigtable app profile of the command, which the
+	// command checks before the cycle.
+	AppProfile *ProfileReport `json:"app_profile,omitempty"`
 	// Roots counts the roots per class; a root without a gc row is dangling.
 	Roots       map[string]*RootCounts  `json:"roots"`
 	Objects     ObjectCounts            `json:"objects"`
