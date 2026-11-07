@@ -129,6 +129,9 @@ type Report struct {
 	// RefsToTombstone counts the refs that retention would tombstone.
 	RefsToTombstone int64       `json:"refs_to_tombstone"`
 	LiveMounts      MountCounts `json:"live_mounts"`
+	// Workspaces reports the pinned manifests of the mounts that the
+	// workspace snapshots were taken from.
+	Workspaces MountCounts `json:"workspaces"`
 	// Replicas reports the server replicas and their settings.
 	Replicas ReplicaReport `json:"replicas"`
 	// Roots counts the roots per class; a root without a gc row is dangling.
@@ -234,8 +237,9 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 // DryRun runs one garbage collection cycle that only reports: it takes the
 // lease, reads the roots at one snapshot, marks the objects of the table gc
 // and counts what a collection would remove. It writes nothing but the
-// GcState row and deletes the GcReplicas rows not seen for a day. objs reads the mount details and pinned manifests of live
-// mounts.
+// GcState row and deletes the GcReplicas rows not seen for a day. objs reads
+// the workspace snapshots, mount details and pinned manifests of live mounts
+// and workspaces.
 func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
@@ -329,11 +333,11 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
-	revisions, mounts, err := pinnedRevisions(ctx, d.objs, refs.mounts)
+	revisions, mounts, workspaces, err := pinnedRevisions(ctx, d.objs, refs.mounts, refs.workspaces)
 	if err != nil {
 		return nil, err
 	}
-	r.LiveMounts = mounts
+	r.LiveMounts, r.Workspaces = mounts, workspaces
 	r.Seconds.Mounts = time.Since(step).Seconds()
 
 	step = time.Now()
@@ -374,8 +378,16 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	for _, root := range refs.roots {
 		d.addRoot(m, g, string(root.class), root.target)
 	}
-	for _, h := range revisions {
-		d.addRoot(m, g, RootPinnedRevisions, h)
+	for _, rev := range revisions {
+		if d.addRoot(m, g, RootPinnedRevisions, rev.hash) {
+			continue
+		}
+		c := &r.LiveMounts
+		if !rev.src.workspace.IsZero() {
+			c = &r.Workspaces
+		}
+		c.DanglingRevisions++
+		c.sample("dangling_revisions", rev.src)
 	}
 	for _, h := range []Hash{entities.EmptyFileHash, entities.EmptyDirHash} {
 		d.addRoot(m, g, RootPermanent, h)
@@ -442,15 +454,17 @@ func (d *dryRun) root(class string) *RootCounts {
 	return c
 }
 
-func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash) {
+// addRoot adds the root h of class and reports whether it has a gc row.
+func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash) bool {
 	c := d.root(class)
 	id := g.find(h)
 	if id == noNode {
 		c.Dangling++
-		return
+		return false
 	}
 	c.Roots++
 	m.add(id)
+	return true
 }
 
 // TypeReport counts the objects and edges of one type.
