@@ -61,13 +61,15 @@ The server checks the same resources at startup and stops with an error that nam
 
 ### Fill the gc table
 
-With `--gc` on, the server writes the `gc` row of each object it adds. Objects added before that, or while it was off, have none. `abfs server gcp gc backfill` scans the `objects` table and writes the missing rows, and the rows written by an older version of the edge rules; it reads every such object that is not a blob:
+With `--gc` on, the server writes the `gc` row of each object it adds. Objects added before that, or while it was off, have none. `abfs server gcp gc backfill` scans the `objects` table and writes the missing rows, and the rows whose edge rules are outdated for their object type; it reads every such object that is not a blob:
 
 ```sh
 abfs server gcp gc backfill --project <project> --instance <spanner-instance> --bucket <bucket> [--dry-run] [--rate 2000] [--shards 16]
 ```
 
 Each row it writes carries the time of the object row, so the garbage collector's `--grace` counts from the upload of the object, not from the backfill. `--dry-run` only counts the rows to write. `--rate` limits the object rows scanned per second (0 means no limit). The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
+
+A row is current when its version of the edge rules is at least the one its object type requires; only the rows of types whose rules changed are rewritten. Version 2 gives each deep tree an edge to every deep tree nested in it: a directory with 1,000 or more entries below it is stored as a deep tree of its own, which only deep trees link. Version 1 gave deep trees no edges, so the dry run counted those nested deep trees as unreachable although mounts read them. After upgrading from version 1, run the backfill again; it rewrites only the `deeptree` rows. A server still on version 1 keeps writing deep tree rows without these edges: the dry run counts them in `outdated_rows` (in total and per type) and warns about that server in `replicas.warnings`. Run the backfill again once the last server is upgraded.
 
 ### Garbage collection dry run
 
@@ -117,7 +119,7 @@ Garbage collection is off unless it is turned on, on the servers and on the clie
 2. Restart every server with `--gc`. From then on each new object gets its `gc` row.
 3. Run `abfs server gcp gc backfill` for the objects added before. Start it after the last server was restarted with `--gc`, so that no object is added without a row after the scan passed its key.
 4. Turn on the client option `gc-keepalive`, for all clients at once in the central client configuration (`abfs edit config:clients/configs`, see the [System Admin doc](README.md)) with `gc-keepalive: true` under `config:`, or per client with `abfs config`. Mounts started after the change rewrite their mount ref every `gc-keepalive-ref-interval` (default `15m`) and send the hashes of what they hold to the server every `gc-keepalive-touch-interval` (default `18h`), at most 10,000 hashes per second. A send that fails is tried again after 5 minutes, then after twice the previous wait, up to half the touch interval, until one works. Both intervals apply only with `gc-keepalive`; `0` turns either off.
-5. Run `abfs server gcp gc run --dry-run` once per `--cycle` while seeding and builds run, and check each report: no `replicas.warnings`, no `consistency.missing_gc_rows`, and the dangling edges and roots. Condemn and delete modes do not exist yet.
+5. Run `abfs server gcp gc run --dry-run` once per `--cycle` while seeding and builds run, and check each report: no `replicas.warnings`, no `consistency.missing_gc_rows`, no `objects.outdated_rows`, and the dangling edges and roots. Condemn and delete modes do not exist yet.
 
 Off means the state before step 1. A server without `--gc` reads and writes only what a server without garbage collection does and starts on a deployment that plain `init` created; a client without `gc-keepalive` sends nothing extra. The garbage collector resources can stay in place.
 

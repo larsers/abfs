@@ -71,12 +71,17 @@ func (f *gcFixture) put(key entities.Hash, data []byte, at time.Time) entities.H
 
 func (f *gcFixture) gcRow(key entities.Hash, typ string, edges []entities.Hash, at time.Time) {
 	f.t.Helper()
-	ts := bigtable.Time(at)
+	writeGCRow(f.t, f.s, key, typ, edges, bigtable.Time(at), gc.ExtractorVersion)
+}
+
+// writeGCRow writes a gc row as a server of the given extractor version does.
+func writeGCRow(t *testing.T, s *GCPServer, key entities.Hash, typ string, edges []entities.Hash, ts bigtable.Timestamp, version int64) {
+	t.Helper()
 	mut := bigtable.NewMutation()
 	mut.Set(gc.EdgesFamily, gc.LinksColumn, ts, gc.PackEdges(edges))
 	mut.Set(gc.EdgesFamily, gc.TypeColumn, ts, []byte(typ))
-	mut.Set(gc.EdgesFamily, gc.VersionColumn, ts, binary.BigEndian.AppendUint64(nil, gc.ExtractorVersion))
-	require.NoError(f.t, f.s.casdb.BTClient().Open(gc.TableName).Apply(context.Background(), key.String(), mut))
+	mut.Set(gc.EdgesFamily, gc.VersionColumn, ts, binary.BigEndian.AppendUint64(nil, uint64(version)))
+	require.NoError(t, s.casdb.BTClient().Open(gc.TableName).Apply(context.Background(), key.String(), mut))
 }
 
 func (f *gcFixture) touch(key entities.Hash, at time.Time) {
@@ -419,6 +424,52 @@ func TestDryRunGC_ChecksReplicaSettings(t *testing.T) {
 		ids = append(ids, rep.ID)
 	}
 	require.ElementsMatch([]string{"good", "bad", "stopped"}, ids)
+}
+
+// A directory with DeepTreeThreshold or more entries below it is a deep tree
+// chunk of its own, which only its parent deep tree links. The pusher map row
+// names only the top deep tree, so the chunks, nested here two levels deep,
+// are reachable only through their parents.
+func TestDryRunGC_ReachesNestedDeepTreeChunks(t *testing.T) {
+	f := newGCFixture(t)
+	old := f.old
+	blob := f.blob("file", old)
+	inner := f.tree(old, blob)
+	middle := f.tree(old, blob, blob)
+	source := f.tree(old, blob, blob, blob)
+	f.ref("platform/a", "refs/heads/main", f.commit(source, "main", old), old)
+
+	deepTree := func(dir entities.Hash, entries ...*entities.DeepEntry) entities.Hash {
+		return f.object(&gitobjects.DeepTreeObject{DeepTree: entities.DeepTree{Entries: append(
+			[]*entities.DeepEntry{{Mode: entities.FileModeDir, Hash: dir}}, entries...)}}, old)
+	}
+	innerChunk := deepTree(inner, &entities.DeepEntry{Name: "f0", Mode: entities.FileModeRegular, Hash: blob, Size: 4})
+	outerChunk := deepTree(middle, &entities.DeepEntry{Name: "inner", Mode: entities.FileModeDeepTree, Hash: innerChunk})
+	top := deepTree(source, &entities.DeepEntry{Name: "middle", Mode: entities.FileModeDeepTree, Hash: outerChunk})
+	req := f.object(&objects.DeepTreeRequest{Version: objects.CurrentDeepTreeRequestVersion, Tree: source}, old)
+	f.mapRow(req, top, old)
+
+	res := f.run(nil)
+	requireReachable(t, res, true, req, top, outerChunk, innerChunk)
+	require.Equal(t, &gc.TypeReport{Objects: 3, Reachable: 3, Edges: 2}, res.Report.Types["deeptree"])
+}
+
+// The dry run counts the rows of a type whose edge rules changed since they
+// were written, per type, and only those.
+func TestDryRunGC_CountsOutdatedRowsPerType(t *testing.T) {
+	f := newGCFixture(t)
+	blob := f.blob("file", f.old)
+	tree := f.tree(f.old, blob)
+	ts := bigtable.Time(f.old)
+	writeGCRow(t, f.s, objects.HashBlobBytes([]byte("old deep tree")), "deeptree", nil, ts, 1)
+	writeGCRow(t, f.s, objects.HashBlobBytes([]byte("old tree")), "tree", []entities.Hash{blob}, ts, 1)
+	writeGCRow(t, f.s, objects.HashBlobBytes([]byte("future tree")), "tree", []entities.Hash{tree}, ts, gc.ExtractorVersion+1)
+
+	r := f.run(nil).Report
+	require.Equal(t, int64(1), r.Objects.OutdatedRows)
+	require.Equal(t, int64(1), r.Objects.NewerRows)
+	require.Equal(t, int64(1), r.Types["deeptree"].OutdatedRows)
+	require.Zero(t, r.Types["tree"].OutdatedRows)
 }
 
 // The empty file and directory that servers write at start are kept even

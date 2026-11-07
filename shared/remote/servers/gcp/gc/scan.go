@@ -218,10 +218,12 @@ type nodeStats struct {
 	// TouchOnly counts rows that hold a touch but no edges: objects without a
 	// gc row that a server touched.
 	TouchOnly int64
-	// Outdated and Newer count rows written by an older or a newer edge
-	// extractor than this binary's.
-	Outdated int64
-	Newer    int64
+	// Outdated counts rows of an older edge extractor than their type
+	// requires, per type index in OutdatedTypes. Newer counts rows of a newer
+	// edge extractor than this binary's.
+	Outdated      int64
+	OutdatedTypes []int64
+	Newer         int64
 }
 
 type nodeShard struct {
@@ -245,6 +247,7 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 	for i := range shards {
 		g.Go(func() error {
 			s := &shards[i]
+			s.stats.OutdatedTypes = make([]int64, len(typeNames))
 			var rowErr error
 			err := table.ReadRows(gctx, bigtable.NewRange(bounds[i], bounds[i+1]), func(row bigtable.Row) bool {
 				r, err := ParseRow(row)
@@ -263,8 +266,9 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 					return false
 				}
 				switch {
-				case r.Version < ExtractorVersion:
+				case r.Version < requiredVersion(r.Type):
 					s.stats.Outdated++
+					s.stats.OutdatedTypes[typ]++
 				case r.Version > ExtractorVersion:
 					s.stats.Newer++
 				}
@@ -289,12 +293,15 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 	}
 
 	var n int
-	var stats nodeStats
+	stats := nodeStats{OutdatedTypes: make([]int64, len(typeNames))}
 	for i := range shards {
 		n += len(shards[i].keys)
 		stats.TouchOnly += shards[i].stats.TouchOnly
 		stats.Outdated += shards[i].stats.Outdated
 		stats.Newer += shards[i].stats.Newer
+		for t, c := range shards[i].stats.OutdatedTypes {
+			stats.OutdatedTypes[t] += c
+		}
 	}
 	if uint64(n) >= uint64(noNode) {
 		return nil, stats, fmt.Errorf("the table gc has %d rows, more than one mark can hold", n)
