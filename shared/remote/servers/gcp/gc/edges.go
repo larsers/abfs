@@ -31,9 +31,20 @@ import (
 type Hash = entities.Hash
 
 // ExtractorVersion is stored with the edges of every object. Bump it whenever
-// the rules of Edges change, so that a backfill rewrites the rows written with
-// the older rules.
-const ExtractorVersion = 1
+// the rules of Edges change, and raise requiredVersion to it for the types
+// whose edges changed, so that a backfill rewrites only the rows of those
+// types.
+const ExtractorVersion = 2
+
+// requiredVersion returns the oldest extractor version whose edges of type typ
+// are still correct. Version 1 gave deep trees no edges to their nested deep
+// tree chunks.
+func requiredVersion(typ string) int64 {
+	if typ == string(gitobjects.ObjectTypeDeepTree) {
+		return 2
+	}
+	return 1
+}
 
 var errUnsupportedType = errors.New("unsupported object type")
 
@@ -60,7 +71,14 @@ func Edges(typ string, obj objects.Object) (edges []Hash, malformed int, err err
 	case *binding.EvalResponse:
 		edges = evalResponseEdges(o)
 	case *gitobjects.DeepTreeObject:
-		// Its entries are trees and blobs of the source tree it was made from.
+		// Its other entries are trees and blobs of the source tree it was made
+		// from. A nested deep tree, usually the chunk of a large directory, may
+		// be named by no map row, so it can be reachable only from here.
+		for _, ent := range o.Entries {
+			if ent.Mode == entities.FileModeDeepTree {
+				edges = append(edges, ent.Hash)
+			}
+		}
 	case *binding.DigestMap:
 		// The digests are blobs of the source tree; the sub-maps are reachable
 		// only from here.

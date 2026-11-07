@@ -200,14 +200,25 @@ func TestEdges_EvalRequestKeepsInputPatch(t *testing.T) {
 	requireEdges(t, typ, obj, []Hash{testHash("input"), testHash("env")}, 0)
 }
 
-func TestEdges_DeepTreeHasNone(t *testing.T) {
+func TestEdges_DeepTreeKeepsOnlyNestedDeepTrees(t *testing.T) {
 	tree := &gitobjects.DeepTreeObject{DeepTree: entities.DeepTree{Entries: []*entities.DeepEntry{
+		{Mode: entities.FileModeDir, Hash: testHash("root")},
 		{Name: "a/b", Mode: entities.FileModeRegular, Hash: testHash("b"), Size: 1},
 		{Name: "a", Mode: entities.FileModeDir, Hash: testHash("a")},
+		{Name: "sub", Mode: entities.FileModeSubmodule, Hash: testHash("submodule")},
+		{Name: "big1", Mode: entities.FileModeDeepTree, Hash: testHash("chunk 1")},
+		{Name: "big2", Mode: entities.FileModeDeepTree, Hash: testHash("chunk 2")},
 	}}}
 	typ, obj := decoded(t, tree)
-	require.NotEmpty(t, obj.Links())
-	requireEdges(t, typ, obj, nil, 0)
+	requireEdges(t, typ, obj, []Hash{testHash("chunk 1"), testHash("chunk 2")}, 0)
+}
+
+// A type that requires a newer version than the backfill writes would be
+// rewritten by every backfill and counted outdated forever.
+func TestRequiredVersion_NotAboveExtractorVersion(t *testing.T) {
+	for _, typ := range typeNames {
+		require.LessOrEqual(t, requiredVersion(typ), int64(ExtractorVersion), typ)
+	}
 }
 
 func TestEdges_DigestMapKeepsOnlySubMaps(t *testing.T) {

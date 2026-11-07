@@ -67,8 +67,8 @@ type TypeCounts struct {
 // BackfillStats reports a backfill.
 type BackfillStats struct {
 	Scanned int64
-	// Current counts the objects whose gc row has the current extractor
-	// version or a newer one.
+	// Current counts the objects whose gc row has the extractor version their
+	// type requires or a newer one.
 	Current   int64
 	Malformed int64
 	Types     map[string]*TypeCounts
@@ -88,12 +88,13 @@ func (s *BackfillStats) Failed() int64 {
 }
 
 // Backfill writes the gc row of every object that has none or one of an older
-// extractor version, for objects added before the server wrote gc rows or
-// while --gc was off. Each row gets the time of the object row, so the grace
-// counts from the upload of the object, not from the backfill. Blobs are not
-// read; other objects are read through objects and decoded. An object that cannot be read or decoded is logged and
-// counted, the scan goes on, and the error says how many failed; the object
-// keeps no gc row, so the next run tries it again.
+// extractor version than its type requires, for objects added before the
+// server wrote gc rows or while --gc was off. Each row gets the time of the
+// object row, so the grace counts from the upload of the object, not from the
+// backfill. Blobs are not read; other objects are read through objects and
+// decoded. An object that cannot be read or decoded is logged and counted, the
+// scan goes on, and the error says how many failed; the object keeps no gc
+// row, so the next run tries it again.
 func Backfill(ctx context.Context, client *bigtable.Client, objects remote.RemoteProvider, opts *BackfillOpts) (*BackfillStats, error) {
 	o := *opts
 	if o.Shards <= 0 {
@@ -222,7 +223,7 @@ func (b *backfill) handleBatch(ctx context.Context, keys, types []string, times 
 
 	stats := BackfillStats{Scanned: int64(len(keys)), Types: make(map[string]*TypeCounts)}
 	for i, key := range keys {
-		if v, ok := versions[key]; ok && v >= ExtractorVersion {
+		if v, ok := versions[key]; ok && v >= requiredVersion(types[i]) {
 			stats.Current++
 			continue
 		}

@@ -182,8 +182,9 @@ type ObjectCounts struct {
 	// TouchOnly counts rows with a touch and no edges, for objects that have
 	// no gc row yet.
 	TouchOnly int64 `json:"touch_only"`
-	// OutdatedRows and NewerRows count rows written by an older or a newer
-	// edge extractor; a backfill rewrites the older ones.
+	// OutdatedRows counts rows written by an older edge extractor than their
+	// type requires, which a backfill rewrites; NewerRows counts rows of a
+	// newer one.
 	OutdatedRows int64 `json:"outdated_rows"`
 	NewerRows    int64 `json:"newer_rows"`
 	// ReachableBytes and UnreachableBytes sum the object sizes (meta:size),
@@ -273,6 +274,8 @@ type dryRun struct {
 	report *Report
 	// perType counts the edges per type index.
 	perType []int64
+	// outdated counts the outdated rows per type index.
+	outdated []int64
 }
 
 func (d *dryRun) run(ctx context.Context) (*Result, error) {
@@ -345,6 +348,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	d.outdated = nodes.OutdatedTypes
 	d.sampleMemory()
 	var mapRows [][]mapRow
 	var malformedMaps int64
@@ -455,6 +459,8 @@ type TypeReport struct {
 	Reachable   int64 `json:"reachable"`
 	Unreachable int64 `json:"unreachable"`
 	Edges       int64 `json:"edges"`
+	// OutdatedRows counts the rows that a backfill rewrites.
+	OutdatedRows int64 `json:"outdated_rows"`
 }
 
 func (d *dryRun) countTypes(g *graph, live bitmap) {
@@ -470,6 +476,9 @@ func (d *dryRun) countTypes(g *graph, live bitmap) {
 	}
 	for t, n := range d.perType {
 		counts[t].Edges = n
+	}
+	for t, n := range d.outdated {
+		counts[t].OutdatedRows = n
 	}
 	for t := range counts {
 		if counts[t].Objects > 0 {

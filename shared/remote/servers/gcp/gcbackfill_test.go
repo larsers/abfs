@@ -27,6 +27,7 @@ import (
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
+	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 	"github.com/google/abfs/shared/remote/servers/gcp/depot"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
@@ -152,6 +153,55 @@ func TestBackfillGC_RewritesOlderVersions(t *testing.T) {
 	row := readGCRow(t, f.s, f.tree)
 	require.Equal(int64(gc.ExtractorVersion), row.Version)
 	require.Equal(objectRowTime(t, f.s, f.tree), row.Written)
+}
+
+// After an upgrade that changed the edge rules of deep trees only, a backfill
+// rewrites the deep tree rows and leaves the others as they are.
+func TestBackfillGC_RewritesOnlyOutdatedTypes(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, _ := createTestServerWithCASDB(t)
+	createGCTable(t)
+	blob := objects.HashBlobBytes([]byte("file"))
+	require.NoError(putRaw(s, blob, []byte("blob 4\x00file")))
+	tree, data := treeOf(blob)
+	require.NoError(putRaw(s, tree, data))
+	chunk := &gitobjects.DeepTreeObject{DeepTree: entities.DeepTree{Entries: []*entities.DeepEntry{
+		{Mode: entities.FileModeDir, Hash: tree},
+		{Name: "f0", Mode: entities.FileModeRegular, Hash: blob, Size: 4},
+	}}}
+	require.NoError(chunk.Encode())
+	require.NoError(putRaw(s, chunk.Hash, chunk.Encoded))
+	top := &gitobjects.DeepTreeObject{DeepTree: entities.DeepTree{Entries: []*entities.DeepEntry{
+		{Mode: entities.FileModeDir, Hash: tree},
+		{Name: "big", Mode: entities.FileModeDeepTree, Hash: chunk.Hash},
+	}}}
+	require.NoError(top.Encode())
+	require.NoError(putRaw(s, top.Hash, top.Encoded))
+
+	// The rows a server of version 1 wrote, after the object rows.
+	v1 := bigtable.Now()
+	writeGCRow(t, s, blob, "blob", nil, v1, 1)
+	writeGCRow(t, s, tree, "tree", []entities.Hash{blob}, v1, 1)
+	writeGCRow(t, s, chunk.Hash, "deeptree", nil, v1, 1)
+	writeGCRow(t, s, top.Hash, "deeptree", nil, v1, 1)
+	treeRow := readGCRow(t, s, tree)
+
+	stats, err := s.BackfillGC(ctx, &gc.BackfillOpts{})
+	require.NoError(err)
+	require.Equal(int64(2), stats.Current)
+	require.Equal(map[string]*gc.TypeCounts{"deeptree": {Written: 2, Edges: 1}}, stats.Types)
+	row := readGCRow(t, s, top.Hash)
+	require.Equal(int64(gc.ExtractorVersion), row.Version)
+	require.Equal([]entities.Hash{chunk.Hash}, row.Edges)
+	require.Equal(objectRowTime(t, s, top.Hash), row.Written)
+	require.Equal(int64(gc.ExtractorVersion), readGCRow(t, s, chunk.Hash).Version)
+	require.Equal(treeRow, readGCRow(t, s, tree))
+
+	stats, err = s.BackfillGC(ctx, &gc.BackfillOpts{})
+	require.NoError(err)
+	require.Equal(int64(4), stats.Current)
+	require.Empty(stats.Types)
 }
 
 // objectRowTime returns the time of the meta:type cell of the object row of
