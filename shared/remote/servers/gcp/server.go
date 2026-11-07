@@ -575,12 +575,15 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	}
 
 	links := validator.Links()
+	guard := s.validationGuard()
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
 	}
 	// The edges go first, so that no object row exists without them.
 	if s.gcEdges != nil {
-		if err := s.gcEdges.Put(ctx, key, validator.Type(), validator.Object()); err != nil {
+		if err := guard.do(ctx, func(ctx context.Context) error {
+			return s.gcEdges.Put(ctx, key, validator.Type(), validator.Object())
+		}); err != nil {
 			return err
 		}
 	}
@@ -595,9 +598,11 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 		Content:  content,
 	}
 
-	addAttempted = true
 	written := cacheNow()
-	err = s.addObject(ctx, header, objContent)
+	err = guard.do(ctx, func(ctx context.Context) error {
+		addAttempted = true
+		return s.addObject(ctx, header, objContent)
+	})
 	if err == nil {
 		s.storeHeader(header, written)
 		s.storeContent(key, objContent, written)
@@ -640,6 +645,7 @@ func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remot
 		return s.casdb.AddMapResult(ctx, from, to)
 	}
 	// Unlike object links, a zero hash is not allowed here, as in file-based.
+	guard := s.validationGuard()
 	hdrs, err := s.getHeaders(ctx, pathValidation, []entities.Hash{from, to})
 	if err != nil {
 		return err
@@ -657,7 +663,7 @@ func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remot
 
 		return &remote.ErrObjectLinkValidation{MissingLinks: missing}
 	}
-	return s.casdb.AddMapResult(ctx, from, to)
+	return guard.do(ctx, func(ctx context.Context) error { return s.casdb.AddMapResult(ctx, from, to) })
 }
 
 func (s *GCPServer) projectForRefs(ctx context.Context, server string, project string, createIfMissing bool) (int64, error) {
@@ -808,10 +814,11 @@ func (s *GCPServer) PutRefs(ctx context.Context, server string, project string, 
 	for i, ref := range refs {
 		links[i] = ref.Hash
 	}
+	guard := s.validationGuard()
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
 	}
-	return s.casdb.AddRefs(ctx, id, refs)
+	return guard.do(ctx, func(ctx context.Context) error { return s.casdb.AddRefs(ctx, id, refs) })
 }
 
 // XchgRef implements remote.RemoteProvider.
@@ -841,10 +848,11 @@ func (s *GCPServer) XchgRefs(ctx context.Context, server string, project string,
 	for i, ref := range refs {
 		links[i] = ref.Desired
 	}
+	guard := s.validationGuard()
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
 	}
-	return s.casdb.XchgRefs(ctx, id, refs)
+	return guard.do(ctx, func(ctx context.Context) error { return s.casdb.XchgRefs(ctx, id, refs) })
 }
 
 // Mark implements remote.RemoteProvider.

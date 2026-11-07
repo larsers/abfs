@@ -28,6 +28,10 @@ const (
 	// GC. The collector waits up to this long for a heartbeat that read the
 	// touch stats after its snapshot.
 	MaxHeartbeatInterval = 10 * time.Minute
+	// ValidationWriteBound bounds the time from the start of a server's link
+	// validation to the end of the last write that records the reference it
+	// validated: a new object, ref or map result.
+	ValidationWriteBound = 2 * time.Minute
 )
 
 // Server is the heartbeat row of a server process in GcServers. Unlike a
