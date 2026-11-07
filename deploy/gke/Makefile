@@ -153,7 +153,8 @@ images:
 # The release bundle from the local images of `make images`.
 bundle:
 	@[[ -f "$(IMAGES_TXT)" ]] || { echo "$(IMAGES_TXT) not found; run make images first" >&2; exit 2; }
-	scripts/bundle.sh --images $(IMAGES_TXT) --from-docker --out $(OUT) $(COMMIT)
+	@[[ -n "$(CASFS)" ]] || { echo "set CASFS=<abfs-casfs repository>" >&2; exit 2; }
+	scripts/bundle.sh --images $(IMAGES_TXT) --casfs $(CASFS) --from-docker --out $(OUT) $(COMMIT)
 
 clean:
 	rm -rf $(OUT)

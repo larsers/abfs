@@ -19,7 +19,14 @@ scripts/build-images.sh --casfs <abfs-casfs repo> --push \
   europe-west4-docker.pkg.dev/example-project/abfs <commit>
 ```
 
-`<commit>` is the ABFS commit to deploy. The script prints `images.txt` with the name, reference and registry digest of each image. The chart takes the digests. The build needs the ABFS and abfs-casfs repositories; with a release bundle, push its image archives instead.
+`<commit>` is the ABFS commit to deploy. The script prints `images.txt` with the name, reference and registry digest of each image. The chart takes the digests. The build needs the ABFS and abfs-casfs repositories. With a release bundle, copy its image archives instead; the script prints the chart's image values with the digests of your registry:
+
+```sh
+gcloud auth configure-docker europe-west4-docker.pkg.dev
+scripts/load-images.sh europe-west4-docker.pkg.dev/example-project/abfs >values-images.yaml
+```
+
+Pass `-f values-images.yaml` after your values file in every `helm install` and `helm upgrade`, or copy the digests into it.
 
 ### 2. Configure and apply the KCC overlay
 
@@ -404,16 +411,33 @@ Never delete the `ConfigConnectorContext` while KCC objects exist in the namespa
 
 ## Bundle and source tree
 
-The release bundle holds this folder's `README.md`, `Makefile`, `chart/`, `kcc/`, `docs/` and `scripts/`, the four images as OCI archives, `images.txt` and `SHA256SUMS`. From the bundle root, these run as they do in `deploy/gke`:
+The release bundle holds this folder's `README.md`, `Makefile`, `chart/`, `kcc/`, `docs/` and `scripts/`, the four images as OCI archives, `images.txt`, `source/` and `SHA256SUMS`. `source/` holds the ABFS tree of the bundle's commit and the abfs-casfs tree of the loader image; unpack both to build the images yourself. The `abfs-client` image carries the source packages of the static `ps` and `fuser` it ships, in `/usr/share/abfs/source`. Check the bundle with `sha256sum -c SHA256SUMS` in its root. From the bundle root, these run as they do in `deploy/gke`:
 
-- every `kubectl` and `helm` command of this runbook;
+- every `kubectl` and `helm` command of this runbook, and `scripts/load-images.sh`;
 - `make check` (lint, template, kustomize, and `ddl-check` against the hash in the ddl file) and `scripts/check-ddl.sh` without a schema source.
 
 These need the ABFS source tree, a clone of the repository at the deployed commit:
 
-- `scripts/build-images.sh` and `make images`: they build from the repository and the abfs-casfs repository, with the Dockerfiles in `images/`, which the bundle does not carry, so run the copy in `deploy/gke` of the clone; `-C` only names another ABFS repository to build from. With a bundle, push the archives of `images/` to the registry instead, for example with `skopeo copy oci-archive:images/abfs-server.oci.tar docker://<registry>/abfs-server:<tag>`;
+- `scripts/build-images.sh` and `make images`: they build from the repository and the abfs-casfs repository, with the Dockerfiles in `images/`, so run the copy in `deploy/gke` of the clone; `-C` only names another ABFS repository to build from. With a bundle, load the archives of `images/` with `scripts/load-images.sh` instead, or build from `source/` as below;
 - `scripts/bundle.sh` and `make bundle`; the copy in the bundle runs with `-C <clone>`, which supplies the commit and its `deploy/gke`;
 - `scripts/gen-ddl.sh`, `make ddl`, and `make ddl-check` with `DDL_SOURCE`: they read the GCP server schema files.
+
+The trees in `source/` carry no git history, and the scripts take the version from a git tag. To build the images from them, make each tree a repository and tag the ABFS one with the bundle's version:
+
+```sh
+V=<version>                       # the bundle's name without abfs-gke-
+tar -xzf source/abfs-$V.tar.gz && tar -xzf source/abfs-casfs-*.tar.gz
+C=$(ls -d abfs-casfs-*/)
+for d in abfs-$V "$C"; do
+  git -C "$d" init -q && git -C "$d" add -A &&
+    git -C "$d" -c user.name=build -c user.email=build@localhost commit -qm source
+done
+git -C abfs-$V -c user.name=build -c user.email=build@localhost tag -a -m "abfs $V" v$V
+abfs-$V/deploy/gke/scripts/build-images.sh --casfs "$C" --casfs-commit HEAD --push \
+  europe-west4-docker.pkg.dev/example-project/abfs HEAD
+```
+
+The images then report the same version as the bundle's.
 
 ## Security
 

@@ -45,14 +45,20 @@ deploy/gke/
       settings/          fills the base from the overlay's settings.yaml
     overlays/example/  a worked example
   images/            Dockerfiles of abfs-server, abfs-pusher, abfs-client, casfs-loader
-  scripts/           gen-ddl.sh, check-ddl.sh (with ddl-lib.sh), build-images.sh, bundle.sh
+  scripts/           gen-ddl.sh, check-ddl.sh (with ddl-lib.sh), build-images.sh, bundle.sh, load-images.sh
   docs/              usage, prerequisites, runbook, configuration, troubleshooting, ci-job
 ```
 
 ## Quick start
 
 1. Prepare the cluster, the network, Config Connector (installed by hand from its operator bundle at a pinned version, 1.130.1 or later, not the GKE add-on) and its identity: [prerequisites](docs/prerequisites.md).
-2. Build and push the images, and keep `images.txt`:
+2. Put the images into your Artifact Registry. From a release bundle, copy its image archives and keep the printed digest values:
+
+   ```sh
+   scripts/load-images.sh europe-west4-docker.pkg.dev/<project>/abfs >values-images.yaml
+   ```
+
+   From a source tree, build and push them instead, and keep `images.txt`:
 
    ```sh
    scripts/build-images.sh --casfs <abfs-casfs repo> --push \
@@ -66,7 +72,7 @@ deploy/gke/
    kubectl -n abfs wait --for=condition=Ready --all gcp --timeout=30m
    ```
 
-4. Copy `chart/abfs/values-example.yaml`, set the digests, `gateway.vip` and the Gerrit manifest, create the Gerrit Secret, and install without `--wait`:
+4. Copy `chart/abfs/values-example.yaml`, set the digests (or pass `-f values-images.yaml` after your values file), `gateway.vip` and the Gerrit manifest, create the Gerrit Secret, and install without `--wait`:
 
    ```sh
    helm install abfs chart/abfs -n abfs -f <values.yaml> --timeout 30m
@@ -95,10 +101,10 @@ make check        # lint, template, kustomize, ddl-check against the hash in the
 make check DDL_REPO=<abfs repo> DDL_SOURCE=<commit>   # ddl-check also against the GCP server schema
 make ddl DDL_REPO=<abfs repo> DDL_SOURCE=<commit>     # regenerate the ddl list into out/ and compare it
 make images CASFS=<abfs-casfs repo> COMMIT=<commit>   # local build, no push; needs docker
-make bundle COMMIT=<commit>                           # after make images; needs docker
+make bundle CASFS=<abfs-casfs repo> COMMIT=<commit>  # after make images; needs docker
 ```
 
-The release bundle (`scripts/bundle.sh`) holds this README, the Makefile, `chart/`, `kcc/`, `docs/`, `scripts/`, the four images as OCI archives, `images.txt`, `SHA256SUMS` and the commit id. It does not hold `images/`: the image build needs the source tree ([runbook](docs/runbook.md#bundle-and-source-tree)).
+The release bundle (`scripts/bundle.sh`) holds this README, the Makefile, `chart/`, `kcc/`, `docs/`, `scripts/`, the four images as OCI archives, `images.txt`, the source of the ABFS and abfs-casfs commits in `source/`, `SHA256SUMS` and the commit id ([runbook](docs/runbook.md#bundle-and-source-tree)).
 
 ## Limits
 
