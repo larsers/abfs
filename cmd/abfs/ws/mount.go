@@ -163,6 +163,7 @@ func (c *mountCmd) mount(ctx context.Context) error {
 	mountCmd.ConfigProvider = c.ConfigProvider
 	mountCmd.StoreProvider = c.StoreProvider
 	mountCmd.CachemanProvider = c.CachemanProvider
+	c.setSnapshotPin(ctx, mountCmd)
 	serving := make(chan struct{})
 	if !c.Foreground {
 		mountCmd.AddCallback(func() error {
