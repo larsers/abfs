@@ -157,16 +157,17 @@ func (c *mountCmd) newMountDetails() (*binding.MountDetails, error) {
 
 	now := time.Now()
 	return &binding.MountDetails{
-		Version:        binding.CurrentMountDetailsVersion,
-		PID:            os.Getpid(),
-		StartTime:      now,
-		StartTimestamp: now.UnixNano(),
-		MetaRefPrefix:  refPrefix,
-		CmdArgs:        os.Args,
-		UserName:       currUser.Username,
-		HostName:       hostname,
-		ABFSVersion:    version.Version(),
-		Config:         c.Config.Clone(),
+		Version:           binding.CurrentMountDetailsVersion,
+		PID:               os.Getpid(),
+		StartTime:         now,
+		StartTimestamp:    now.UnixNano(),
+		MetaRefPrefix:     refPrefix,
+		CmdArgs:           os.Args,
+		UserName:          currUser.Username,
+		HostName:          hostname,
+		ABFSVersion:       version.Version(),
+		Config:            c.Config.Clone(),
+		GCLocalWriteCheck: c.Config.GCKeepAlive && daemon.GCLocalWriteCheck(c.Config, c.Cacheman),
 	}, nil
 }
 

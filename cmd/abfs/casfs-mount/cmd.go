@@ -240,6 +240,7 @@ func (c *casfsMountCmd) newMountDetails() (*binding.MountDetails, error) {
 		ManifestHash:       c.manifestHash,
 		PinnedManifestHash: c.pinnedManifestHash,
 		Config:             c.Config.Clone(),
+		GCLocalWriteCheck:  c.Config.GCKeepAlive && daemon.GCLocalWriteCheck(c.Config, c.Cacheman),
 	}, nil
 }
 

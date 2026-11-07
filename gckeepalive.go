@@ -22,6 +22,7 @@ import (
 
 func (a *ABFS) startGCKeepAlive(ctx context.Context) {
 	if k := daemon.NewGCKeepAlive(a.MountInfo, a.MountDetails, a.ManifestServer, a.cacheman, a.MountPoint); k != nil {
+		k.WatchLocalWriteCheck(a.MountDetails, a.cacheman.Features, a.store)
 		go k.Run(ctx)
 	}
 }
