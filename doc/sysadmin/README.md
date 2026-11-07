@@ -509,7 +509,7 @@ mkdir $MOUNT
 abfs mount --branch android-latest-release --tmp-ws $MOUNT
 ```
 
-A failed mount stays mounted, so unmount it before you try again:
+A failed mount unmounts itself. If its error says that the unmount failed too, unmount it before you try again:
 
 ```sh
 abfs unmount -k $MOUNT
