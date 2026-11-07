@@ -1,0 +1,53 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.alerts.enabled .Values.pusher.enabled }}
+# Guards against a pusher pool that no longer matches the StatefulSet, for example after a
+# manual `kubectl scale`: projects of a missing shard go unpolled without an error. Each
+# pusher reports the whole pool in abfs_pusher_pool_projects and its own share in
+# abfs_pusher_projects.
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: abfs-pusher
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "pusher" | nindent 4 }}
+spec:
+  groups:
+    - name: abfs-pusher
+      interval: 60s
+      rules:
+        - alert: AbfsPusherProjectsUnassigned
+          expr: sum(abfs_pusher_projects) < max(abfs_pusher_pool_projects)
+          for: {{ .Values.alerts.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Projects of the pusher pool are assigned to no running pusher.
+        - alert: AbfsPusherBelowPoolCount
+          expr: count(abfs_pusher_pool_projects) < {{ .Values.pusher.count }}
+          for: {{ .Values.alerts.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Fewer pushers report than pushers-count ({{ .Values.pusher.count }}).
+        - alert: AbfsPusherAbsent
+          expr: absent(abfs_pusher_pool_projects)
+          for: {{ .Values.alerts.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: No pusher reports metrics.
+{{- end }}

@@ -1,0 +1,54 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.networkPolicy.enabled .Values.server.enabled }}
+{{- $n := .Values.networkPolicy }}
+{{- if not $n.proxyOnlySubnetCidr }}
+{{- fail "networkPolicy.proxyOnlySubnetCidr is required when networkPolicy.enabled is true" }}
+{{- end }}
+# Server ingress: the Gateway proxies (proxy-only subnet), the load balancer health checks,
+# the bootstrap Job and the Helm test. Egress stays open (Spanner, Bigtable, Cloud Storage,
+# the telemetry collector). Inert without Dataplane V2.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "abfs.server.name" . }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "server" | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "abfs.selectorLabels" "server" | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: {{ $n.proxyOnlySubnetCidr }}
+        {{- range $n.healthCheckCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["abfs"]
+              - key: app.kubernetes.io/component
+                operator: In
+                values: ["bootstrap", "test"]
+      ports:
+        - protocol: TCP
+          port: {{ include "abfs.server.port" . }}
+{{- end }}

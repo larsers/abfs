@@ -1,0 +1,56 @@
+{{/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/}}
+ABFS {{ .Chart.AppVersion }} ({{ include "abfs.chart" . }}) in namespace {{ .Release.Namespace }}.
+{{- if .Values.server.enabled }}
+
+Server:   {{ include "abfs.server.service" . }} (in-cluster), {{ .Values.gateway.vip }}:50051 (Gateway VIP)
+  kubectl -n {{ .Release.Namespace }} get deploy,hpa,pods -l app.kubernetes.io/component=server
+  kubectl -n {{ .Release.Namespace }} get gateway abfs
+{{- $vpa := .Values.server.vpa }}
+{{- if and $vpa.enabled $vpa.hpaRightsizing (eq $vpa.mode "Off") }}
+
+WARNING: server.vpa.hpaRightsizing is true while server.vpa.mode is Off. The VPA carries
+the rightsizing annotation, but in mode Off it changes no pod. The annotation is meant for
+mode Recreate; set server.vpa.mode=Recreate, or hpaRightsizing=false.
+{{- end }}
+{{- end }}
+{{- if .Values.bootstrap.enabled }}
+
+Bootstrap Job (post-install/post-upgrade hook). Read its log now: its node goes away a few
+minutes after the Job ends, and the log is then only in Cloud Logging (container bootstrap).
+  kubectl -n {{ .Release.Namespace }} logs job/abfs-bootstrap
+{{- end }}
+{{- if .Values.pusher.enabled }}
+
+Pushers: {{ .Values.pusher.count }} in phase {{ .Values.pusher.phase }}. Never scale the StatefulSet by hand;
+a count change is a re-shard. Wipe the PVCs when the backend is replaced.
+  kubectl -n {{ .Release.Namespace }} get sts,pods -l app.kubernetes.io/component=pusher
+{{- end }}
+{{- if .Values.ci.enabled }}
+
+CI nodes (namespace {{ .Values.ci.namespace }}, class abfs-ci, provider {{ .Values.ci.casfs.provider }}):
+  kubectl -n {{ .Values.ci.namespace }} logs ds/abfs-casfs-loader
+  kubectl -n {{ .Values.ci.namespace }} get pods -l app.kubernetes.io/component=cacheman -o wide
+cacheman uses OnDelete: drain a node before deleting its cacheman pod.
+{{- end }}
+{{- if .Values.tests.enabled }}
+
+Checks:
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- end }}
+
+The server has no authentication or TLS: any host that reaches the VIP can read and write
+the store.

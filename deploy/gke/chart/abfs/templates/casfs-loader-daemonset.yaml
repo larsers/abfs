@@ -1,0 +1,73 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.ci.enabled }}
+# Loads casfs on every abfs-ci node. Privileged with the host root at /host and the host
+# network: it installs build tools from the host's apt sources, builds the module against
+# the running kernel and loads it. It needs no RBAC on nodes.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: abfs-casfs-loader
+  namespace: {{ .Values.ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "casfs-loader" | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "abfs.selectorLabels" "casfs-loader" | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "abfs.labels" . | nindent 8 }}
+        {{- include "abfs.selectorLabels" "casfs-loader" | nindent 8 }}
+      annotations:
+        checksum/script: {{ include (print $.Template.BasePath "/casfs-loader-configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      # Host network: apt-get runs in a chroot of the host and resolves names with the
+      # host's /etc/resolv.conf, which on Ubuntu points at the systemd-resolved stub on
+      # 127.0.0.53. That address answers only in the host network namespace. The loader
+      # listens on no port. cacheman and the build pods stay in the pod network.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- include "abfs.ci.scheduling" . | nindent 6 }}
+      containers:
+        - name: casfs-loader
+          image: {{ include "abfs.image" (dict "root" . "image" "casfsLoader") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "/scripts/load.sh"]
+          securityContext:
+            privileged: true
+          resources:
+            {{- toYaml .Values.ci.casfs.resources | nindent 12 }}
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+            - name: host
+              mountPath: /host
+      volumes:
+        - name: script
+          configMap:
+            name: abfs-casfs-loader
+            defaultMode: 0555
+        - name: host
+          hostPath:
+            path: /
+            type: Directory
+{{- end }}

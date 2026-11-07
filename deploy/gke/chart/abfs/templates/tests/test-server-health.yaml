@@ -1,0 +1,60 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.tests.enabled .Values.server.enabled }}
+{{- $srv := include "abfs.server.service" . }}
+{{- $vip := include "abfs.vip" . }}
+# gRPC health of the server through the ClusterIP Service and through the Gateway VIP.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: abfs-test-server-health
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "test" | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with include "abfs.placement" (dict "root" . "cfg" .Values.tests "what" "tests") | trim }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  containers:
+    - name: health
+      image: {{ include "abfs.image" (dict "root" . "image" "client") }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          for a in {{ $srv }} {{ $vip }}; do
+            abfs --remote-servers "$a" --tunnel-ports 0 --disable-tls --auth-type none test-client health-check
+            echo "OK: $a"
+          done
+      env:
+        - name: HOME
+          value: /tmp
+        {{- include "abfs.userEnv" . | nindent 8 }}
+      securityContext:
+        {{- include "abfs.restrictedSecurityContext" (dict "uid" .Values.ci.uid "gid" .Values.ci.gid) | nindent 8 }}
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
+{{- end }}

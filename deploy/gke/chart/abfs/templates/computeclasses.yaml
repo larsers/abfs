@@ -1,0 +1,152 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.computeClasses.enabled }}
+{{- $cc := .Values.computeClasses }}
+{{- if not $cc.nodeServiceAccount }}
+{{- fail "computeClasses.nodeServiceAccount is required: the node service account of the KCC base" }}
+{{- end }}
+# Custom ComputeClasses: a fallback order over four machine families per role, node pool
+# auto-creation, and nodes that follow the pod requests. Pods select a class with the
+# cloud.google.com/compute-class node selector; GKE taints the class nodes and adds the
+# toleration to those pods.
+{{- if .Values.ci.enabled }}
+---
+# CI build nodes: Ubuntu for the casfs build, secure boot off for the unsigned module,
+# upgrades of existing pools held back.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: abfs-ci
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  priorities:
+    {{- with $cc.ci.nodepools }}
+    - nodepools:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- $spots := list }}
+    {{- if $cc.ci.spot }}{{ $spots = append $spots true }}{{ end }}
+    {{- $spots = append $spots false }}
+    {{- range $spot := $spots }}
+    {{- range $f := $cc.ci.families }}
+    - machineFamily: {{ $f }}
+      minCores: {{ $cc.ci.minCores }}
+      minMemoryGb: {{ $cc.ci.minMemoryGb }}
+      spot: {{ $spot }}
+      storage:
+        bootDiskType: hyperdisk-balanced
+        bootDiskSize: {{ $cc.ci.bootDiskGb }}
+    {{- end }}
+    {{- end }}
+  nodePoolConfig:
+    imageType: ubuntu_containerd
+    serviceAccount: {{ $cc.nodeServiceAccount }}
+    maintenanceExclusion: UNTIL_END_OF_SUPPORT
+  nodePoolAutoCreation:
+    enabled: true
+    shieldedInstanceConfig:
+      enableSecureBoot: false
+  autoscalingPolicy:
+    consolidationDelayMinutes: {{ $cc.ci.consolidationDelayMinutes }}
+    {{- if ne (toString $cc.ci.consolidationThreshold) "" }}
+    consolidationThreshold: {{ $cc.ci.consolidationThreshold }}
+    {{- end }}
+  activeMigration:
+    optimizeRulePriority: {{ $cc.ci.activeMigration }}
+  whenUnsatisfiable: DoNotScaleUp
+{{- end }}
+{{- if .Values.server.enabled }}
+---
+# Servers: the zone of the Bigtable cluster, never Spot.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: abfs-server
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  priorities:
+    {{- $zone := $cc.server.zone | default .Values.backend.zone }}
+    {{- range $f := $cc.server.families }}
+    - machineFamily: {{ $f }}
+      spot: false
+      storage:
+        bootDiskType: hyperdisk-balanced
+      location:
+        zones: [{{ $zone | quote }}]
+    {{- end }}
+  nodePoolConfig:
+    imageType: cos_containerd
+    serviceAccount: {{ $cc.nodeServiceAccount }}
+  nodePoolAutoCreation:
+    enabled: true
+  activeMigration:
+    optimizeRulePriority: {{ $cc.server.activeMigration }}
+  whenUnsatisfiable: DoNotScaleUp
+{{- end }}
+{{- if .Values.pusher.enabled }}
+---
+# Pushers during the seed: highmem shapes for the largest repository.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: abfs-pusher-seed
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  priorities:
+    {{- range $f := $cc.pusherSeed.families }}
+    - machineFamily: {{ $f }}
+      minCores: {{ $cc.pusherSeed.minCores }}
+      minMemoryGb: {{ $cc.pusherSeed.minMemoryGb }}
+      spot: false
+      storage:
+        bootDiskType: hyperdisk-balanced
+    {{- end }}
+  nodePoolConfig:
+    imageType: cos_containerd
+    serviceAccount: {{ $cc.nodeServiceAccount }}
+  nodePoolAutoCreation:
+    enabled: true
+  activeMigration:
+    optimizeRulePriority: false
+  whenUnsatisfiable: DoNotScaleUp
+---
+# Pushers after the seed: nodes follow the steady requests.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: abfs-pusher-steady
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  priorities:
+    {{- range $f := $cc.pusherSteady.families }}
+    - machineFamily: {{ $f }}
+      spot: false
+      storage:
+        bootDiskType: hyperdisk-balanced
+    {{- end }}
+  nodePoolConfig:
+    imageType: cos_containerd
+    serviceAccount: {{ $cc.nodeServiceAccount }}
+  nodePoolAutoCreation:
+    enabled: true
+  activeMigration:
+    optimizeRulePriority: false
+  whenUnsatisfiable: DoNotScaleUp
+{{- end }}
+{{- end }}

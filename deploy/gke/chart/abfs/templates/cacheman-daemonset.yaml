@@ -1,0 +1,140 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.ci.enabled }}
+{{- $ci := .Values.ci }}
+{{- $base := printf "%s/base" $ci.hostCacheDir }}
+{{- $bin := printf "%s/bin" $ci.hostCacheDir }}
+{{- $vip := include "abfs.vip" . }}
+# One cacheman per CI node, cache on the boot disk, shared by every build pod on the node.
+# It runs as ci.uid:ci.gid, unprivileged and without hostPID: it listens on a unix socket
+# and starts no mount. Build pods use the same host path and the tools this pod copies to
+# <hostCacheDir>/bin, so a node's tools always match its cacheman.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: abfs-cacheman
+  namespace: {{ $ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "cacheman" | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "abfs.selectorLabels" "cacheman" | nindent 6 }}
+  # A stopped cacheman makes every mount on the node refuse reads and writes: drain the
+  # node, then delete the pod.
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        {{- include "abfs.labels" . | nindent 8 }}
+        {{- include "abfs.selectorLabels" "cacheman" | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "abfs.ci.scheduling" . | nindent 6 }}
+      initContainers:
+        # Root: copies the static tools with their file capabilities (cp -a keeps the
+        # xattr) and creates the base dir owned by ci.uid, because the hostPath is created
+        # root-owned and `abfs init` writes the instance and the cache there as ci.uid.
+        # casfs-mounter checks only the mount point (owned by the caller, owner rwx), which
+        # the build pod creates.
+        - name: install-tools
+          image: {{ include "abfs.image" (dict "root" . "image" "client") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              H={{ $ci.hostCacheDir | quote }}
+              rm -rf "$H/bin.new" "$H/bin.old"
+              cp -a {{ $ci.cacheman.toolDir | quote }} "$H/bin.new"
+              getcap "$H/bin.new/casfs-mounter" | grep -qi cap_sys_admin || { echo "casfs-mounter lost its file capabilities" >&2; exit 1; }
+              "$H/bin.new/abfs" --version
+              # Running processes keep the old files; new ones get the new set.
+              if [ -d "$H/bin" ]; then mv "$H/bin" "$H/bin.old"; fi
+              mv "$H/bin.new" "$H/bin"
+              rm -rf "$H/bin.old"
+              mkdir -p "$H/base"
+              chown {{ int $ci.uid }}:{{ int $ci.gid }} "$H/base"
+              chmod 0700 "$H/base"
+          # Root with the capabilities to copy the tools with their file capabilities
+          # (SETFCAP) and to own the base dir; casfs-mounter is not run here, because
+          # its file capabilities need the full bounding set of a build pod.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETFCAP"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: host
+              mountPath: {{ $ci.hostCacheDir }}
+      containers:
+        - name: cacheman
+          image: {{ include "abfs.image" (dict "root" . "image" "client") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              abfs -i ci {{ include "abfs.clientFlags" $vip }} \
+                --evict-threshold {{ $ci.cacheman.evictThreshold }} \
+                --fsync-objects={{ $ci.cacheman.fsyncObjects }} \
+                {{- range $k, $v := fromYaml (include "abfs.clientManifest" .) }}
+                --kv {{ printf "%s=%s" $k $v | quote }} \
+                {{- end }}
+                {{ include "abfs.otelKv" . }} config -w
+              # Reset a cache by removing the cache dir and restarting this pod, never by
+              # emptying it.
+              if [ ! -d "$ABFS_BASE_DIR/ci/cache" ]; then
+                abfs -i ci init
+              fi
+              exec abfs --instance ci cacheman run
+          env:
+            - name: ABFS_BASE_DIR
+              value: {{ $base }}
+            - name: HOME
+              value: {{ $base }}
+            {{- include "abfs.userEnv" . | nindent 12 }}
+            - name: PATH
+              value: {{ $bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            # No GOMAXPROCS: cacheman has no CPU limit to be throttled against, and the
+            # one cacheman of a node serves every build pod there.
+            {{- include "abfs.otelEnv" (dict "root" . "queue" 0 "traces" false) | trim | nindent 12 }}
+          securityContext:
+            {{- include "abfs.restrictedSecurityContext" (dict "uid" $ci.uid "gid" $ci.gid) | nindent 12 }}
+          resources:
+            {{- toYaml $ci.cacheman.resources | nindent 12 }}
+          volumeMounts:
+            # Same path as in the build pods: the kernel reconnects to <cache>/socket by
+            # its host path.
+            - name: host
+              mountPath: {{ $ci.hostCacheDir }}
+      volumes:
+        - name: host
+          hostPath:
+            path: {{ $ci.hostCacheDir }}
+            type: DirectoryOrCreate
+{{- end }}

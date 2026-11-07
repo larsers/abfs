@@ -1,0 +1,130 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.ci.enabled .Values.ci.exampleJob.enabled }}
+{{- $ci := .Values.ci }}
+{{- $j := $ci.exampleJob }}
+{{- if not $j.image }}
+{{- fail "ci.exampleJob.image is required: the build image of the CI system" }}
+{{- end }}
+# Example build Job with the full build pod contract; adapt it to the CI system.
+#   - abfs-ci namespace and class; GKE adds the class toleration.
+#   - Privileged: the non-root casfs-mounter gets CAP_SYS_ADMIN only from its file
+#     capabilities, which need a full bounding set.
+#   - runAsUser and runAsGroup equal to cacheman's: the cache directory and the cacheman
+#     sockets belong to that pair. USER is the numeric uid for images without a passwd
+#     entry for it.
+#   - The tools come from the node: <hostCacheDir>/bin first on PATH, the host path at the
+#     same path as in cacheman.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: abfs-example-build
+  namespace: {{ $ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "example-build" | nindent 4 }}
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        {{- include "abfs.labels" . | nindent 8 }}
+        {{- include "abfs.selectorLabels" "example-build" | nindent 8 }}
+      annotations:
+        # The autoscaler must not remove the node during a build.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        cloud.google.com/compute-class: abfs-ci
+      initContainers:
+        {{- include "abfs.waitForCasfsInit" . | nindent 8 }}
+        - name: wait-for-cacheman
+          image: {{ include "abfs.image" (dict "root" . "image" "client") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              end=$(( $(date +%s) + {{ include "abfs.seconds" $ci.waitForCasfsTimeout }} ))
+              until [ -x {{ $ci.hostCacheDir }}/bin/abfs ] && [ -S {{ $ci.hostCacheDir }}/base/ci/cache/socket ]; do
+                if [ "$(date +%s)" -ge "$end" ]; then
+                  echo "no ABFS tools or cacheman socket on this node; see the abfs-cacheman pod" >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+          securityContext:
+            {{- include "abfs.restrictedSecurityContext" (dict "uid" $ci.uid "gid" $ci.gid) | nindent 12 }}
+          volumeMounts:
+            - name: abfs
+              mountPath: {{ $ci.hostCacheDir }}
+              readOnly: true
+      containers:
+        - name: build
+          image: {{ $j.image }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p "$HOME" "$WORK/src"
+              abfs -i ci ready -b "$BRANCH" --wait --timeout 2h -o "$WORK/pinned.xml"
+              abfs -i ci mount -b "$BRANCH" -f "$WORK/pinned.xml" -r "ci/$JOB_ID" --tmp-ws "$WORK/src"
+              trap 'cd /; abfs -i ci unmount "$WORK/src"' EXIT
+              cd "$WORK/src"
+              {{- $j.command | trim | nindent 14 }}
+          env:
+            - name: BRANCH
+              value: {{ $j.branch | quote }}
+            - name: TARGET
+              value: {{ $j.target | quote }}
+            - name: JOB_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: WORK
+              value: /work
+            - name: HOME
+              value: /work/home
+            {{- include "abfs.userEnv" . | nindent 12 }}
+            - name: ABFS_BASE_DIR
+              value: {{ $ci.hostCacheDir }}/base
+            - name: PATH
+              value: {{ $ci.hostCacheDir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            {{- include "abfs.otelEnv" (dict "root" . "queue" 0 "traces" false) | trim | nindent 12 }}
+          securityContext:
+            privileged: true
+            runAsUser: {{ int $ci.uid }}
+            runAsGroup: {{ int $ci.gid }}
+          resources:
+            {{- toYaml $j.resources | nindent 12 }}
+          volumeMounts:
+            - name: abfs
+              mountPath: {{ $ci.hostCacheDir }}
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: abfs
+          hostPath:
+            path: {{ $ci.hostCacheDir }}
+            type: DirectoryOrCreate
+        # HOME and the mount point. casfs-mounter needs the mount point owned by the build
+        # user with owner rwx; mkdir as that user in the world-writable emptyDir gives that.
+        - name: work
+          emptyDir: {}
+{{- end }}

@@ -1,0 +1,44 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.pusher.enabled (eq .Values.pusher.phase "steady") }}
+{{- $v := .Values.pusher.vpa }}
+{{- if not (has $v.mode (list "Initial" "Recreate")) }}
+{{- fail "pusher.vpa.mode must be Initial or Recreate" }}
+{{- end }}
+# Steady phase only, so the history never holds the seed peak. Memory only: the CPU request
+# sets GOMAXPROCS.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: {{ include "abfs.pusher.name" . }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "pusher" | nindent 4 }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: {{ include "abfs.pusher.name" . }}
+  updatePolicy:
+    updateMode: {{ $v.mode | quote }}
+  resourcePolicy:
+    containerPolicies:
+      - containerName: git-pusher
+        controlledResources: ["memory"]
+        minAllowed:
+          memory: {{ $v.minMemory | quote }}
+        maxAllowed:
+          memory: {{ $v.maxMemory | quote }}
+{{- end }}
