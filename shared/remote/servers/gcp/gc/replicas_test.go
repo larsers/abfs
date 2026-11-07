@@ -55,6 +55,7 @@ func TestCheckReplicas(t *testing.T) {
 			require.Contains(t, rep.Warnings[0], tt.want)
 		})
 	}
-	rep := checkReplicas([]Replica{good, {LastSeen: now.Add(-time.Hour)}}, now, &o)
-	require.Equal(t, ReplicaReport{Live: 1, Stale: 1}, rep)
+	good.ID = "srv-0-1a2b3c"
+	rep := checkReplicas([]Replica{good, {ID: "srv-1-4d5e6f", LastSeen: now.Add(-time.Hour)}}, now, &o)
+	require.Equal(t, ReplicaReport{Live: 1, Stale: 1, Hosts: 1, RowsPerHost: map[string]int64{"srv-0": 1}}, rep)
 }

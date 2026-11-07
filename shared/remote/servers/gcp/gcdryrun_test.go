@@ -172,14 +172,34 @@ func pinnedManifest(revisions ...string) string {
 
 func (f *gcFixture) mount(ref string, revisions []string, updated time.Time) (details, pinned entities.Hash) {
 	f.t.Helper()
+	details, pinned = f.mountDetails(revisions)
+	f.ref(entities.ABFSMetaProject, ref, details, updated)
+	return details, pinned
+}
+
+// mountDetails stores the details of a mount that pinned the revisions.
+func (f *gcFixture) mountDetails(revisions []string) (details, pinned entities.Hash) {
+	f.t.Helper()
 	pinned = f.blob(pinnedManifest(revisions...), f.old)
 	details = f.object(&binding.MountDetails{
 		Version:            binding.CurrentMountDetailsVersion,
 		MetaRefPrefix:      "user/u",
+		HostName:           "host-a",
+		UserName:           "u",
 		PinnedManifestHash: pinned,
 	}, f.old)
-	f.ref(entities.ABFSMetaProject, ref, details, updated)
 	return details, pinned
+}
+
+// workspace writes a workspace ref to a snapshot of root taken from the mount
+// with the given details, which need not exist.
+func (f *gcFixture) workspace(ref string, details, root entities.Hash) entities.Hash {
+	f.t.Helper()
+	f.s.validateLinks = false
+	defer func() { f.s.validateLinks = true }()
+	ws := f.object(&binding.WSSnapshot{Version: binding.CurrentWSSnapshotVersion, MountDetails: details, Snapshot: binding.Snapshot{Root: root}}, f.old)
+	f.ref(entities.ABFSMetaProject, ref, ws, f.old)
+	return ws
 }
 
 func TestDryRunGC_RetentionClasses(t *testing.T) {
@@ -207,9 +227,11 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	newLog := f.blob("new ninja log", old)
 	newBuild := f.object(&binding.BuildInfo{Version: binding.CurrentBuildInfoVersion, BuildStartData: binding.BuildStartData{BuildID: "b2"}, NinjaLog: newLog.String()}, old)
 	f.ref(entities.ABFSMetaProject, "refs/abfs/build/user/u/b2", newBuild, recentRef)
-	unmount := f.blob("unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", unmount, old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/2", unmount, recentRef)
+	// Unmount refs keep their details for the build retention.
+	oldUnmount := f.blob("old unmount details", old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", oldUnmount, old)
+	newUnmount := f.blob("new unmount details", old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/2", newUnmount, recentRef)
 
 	// Eval maps: one unused past the map retention, one used recently.
 	env := f.object(&binding.EnvVars{Vars: map[string]string{"PATH": "/bin"}}, old)
@@ -258,7 +280,7 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 
 	// A workspace is kept however old.
 	wsBlob := f.blob("workspace file", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/ws/user/u/ws1", f.tree(old, wsBlob), old)
+	f.workspace("refs/abfs/ws/user/u/ws1", entities.Hash{}, f.tree(old, wsBlob))
 
 	// Recent objects keep what they reach; so does a recent touch.
 	recentTreeBlob := f.blob("reached by a recent tree", old)
@@ -271,13 +293,16 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	danglingTree, _ := treeOf(missing)
 	f.gcRow(danglingTree, "tree", []entities.Hash{missing}, old)
 
-	res := f.run(nil)
+	o := gc.DefaultDryRunOpts()
+	o.Shards = 3
+	o.Explain = []entities.Hash{newBlob, status, newLog, newUnmount, wsBlob, liveDetails, pinnedTree, recentTreeBlob, newOut, liveDT, lfsContent, oldBlob}
+	res := f.run(&o)
 	r := res.Report
 
 	requireReachable(t, res, true, newCommit, newTree, newBlob, status)
 	requireReachable(t, res, false, oldCommit, oldTree, oldBlob)
-	requireReachable(t, res, true, newBuild, newLog)
-	requireReachable(t, res, false, oldBuild, oldLog, oldRootEnd, unmount)
+	requireReachable(t, res, true, newBuild, newLog, newUnmount)
+	requireReachable(t, res, false, oldBuild, oldLog, oldRootEnd, oldUnmount)
 	requireReachable(t, res, true, newReq, newResp, newOut, env)
 	requireReachable(t, res, false, oldReq, oldResp, oldOut)
 	requireReachable(t, res, true, liveDTReq, liveDT, dmReq, dm)
@@ -293,11 +318,14 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	require.Equal(&gc.RefCounts{Refs: 2, Null: 1, Roots: 1}, r.Refs[gc.RefSource])
 	require.Equal(&gc.RefCounts{Refs: 1, Roots: 1}, r.Refs[gc.RefProjectStatus])
 	require.Equal(&gc.RefCounts{Refs: 2, Roots: 1, Expired: 1}, r.Refs[gc.RefBuild])
-	require.Equal(&gc.RefCounts{Refs: 2, Expired: 1, Kept: 1}, r.Refs[gc.RefUnmount])
+	require.Equal(&gc.RefCounts{Refs: 2, Roots: 1, Expired: 1}, r.Refs[gc.RefUnmount])
 	require.Equal(&gc.RefCounts{Refs: 2, Roots: 1, Expired: 1}, r.Refs[gc.RefMount])
 	require.Equal(&gc.RefCounts{Refs: 1, Roots: 1}, r.Refs[gc.RefWorkspace])
 	require.Equal(int64(3), r.RefsToTombstone)
-	require.Equal(gc.MountCounts{Live: 1, PinnedManifests: 1, Revisions: 1, IgnoredRevisions: 1}, r.LiveMounts)
+	live := gc.MountSample{Details: liveDetails.String(), Host: "host-a", User: "u"}
+	require.Equal(gc.MountCounts{Live: 1, WithoutKeepAlive: 1, PinnedManifests: 1, Revisions: 1, IgnoredRevisions: 1, Samples: map[string][]gc.MountSample{
+		"without_keepalive": {live}, "ignored_revisions": {live},
+	}}, r.LiveMounts)
 	require.Equal(&gc.RootCounts{Roots: 1}, r.Roots[gc.RootPinnedRevisions])
 	require.Equal(&gc.RootCounts{Roots: 2}, r.Roots[gc.RootRecent])
 
@@ -320,9 +348,69 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	require.Positive(*r.Objects.UnreachableBytes)
 	require.Positive(r.Memory.PeakHeapBytes)
 
+	// Each explained key names the class of the root that reached it first.
+	var classes []string
+	for _, k := range r.Explain {
+		require.True(k.GCRow, k.Key)
+		require.True(k.ObjectRow, k.Key)
+		require.NotNil(k.WriteTime, k.Key)
+		require.Nil(k.Condemned, k.Key)
+		if k.FirstRoot == nil {
+			classes = append(classes, "")
+			continue
+		}
+		classes = append(classes, k.FirstRoot.Class)
+	}
+	require.Equal([]string{"source", "project-status", "build", "unmount", "workspace", "mount", "pinned-revisions", "recent", "map-eval", "map-pusher", "map-lfs", ""}, classes)
+	require.False(r.Explain[11].Reachable)
+	src := r.Explain[0].FirstRoot
+	require.Equal("platform/a", src.Project)
+	require.Equal("refs/heads/main", src.Ref)
+	require.Equal(newCommit.String(), src.Key)
+	require.WithinDuration(old, *src.UpdateTime, time.Millisecond)
+	require.Equal(&gc.MountSample{Details: liveDetails.String(), Host: "host-a", User: "u"}, r.Explain[6].FirstRoot.Pin)
+	require.Equal(recentTree.String(), r.Explain[7].FirstRoot.Key)
+	require.Equal(newReq.String(), r.Explain[8].FirstRoot.Key)
+	require.Equal(newResp.String(), r.Explain[8].FirstRoot.Result)
+	require.Contains(r.Types["blob"].UnreachableSample, oldBlob.String())
+
 	// The dry run left the lease free and counted the cycle.
 	res = f.run(nil)
 	require.Equal(int64(2), res.Report.Cycle)
+}
+
+// A workspace keeps the commits its mount was pinned to after the branch it
+// was mounted from moved to a commit that shares nothing with them, and after
+// the mount ended. A workspace whose mount details were never stored is
+// counted as not found, not as a read error.
+func TestDryRunGC_WorkspaceKeepsPinnedBase(t *testing.T) {
+	require := require.New(t)
+	f := newGCFixture(t)
+	old := f.old
+	baseTree := f.tree(old, f.blob("base file", old))
+	base := f.commit(baseTree, "base", old)
+	details, pinned := f.mountDetails([]string{base.String()})
+	orphan := f.commit(f.tree(old, f.blob("orphan file", old)), "orphan", old)
+	f.ref("platform/a", "refs/heads/main", orphan, old)
+	wsTree := f.tree(old, f.blob("edited file", old))
+	ws := f.workspace("refs/abfs/ws/user/u/ws1", details, wsTree)
+	lost := f.workspace("refs/abfs/ws/user/u/ws2", objects.HashBlobBytes([]byte("never stored")), wsTree)
+	bare := f.workspace("refs/abfs/ws/user/u/ws3", entities.Hash{}, wsTree)
+
+	res := f.run(nil)
+	requireReachable(t, res, true, base, baseTree, details, pinned, ws, wsTree, orphan)
+	r := res.Report
+	require.Equal(&gc.RootCounts{Roots: 1}, r.Roots[gc.RootPinnedRevisions])
+	w := r.Workspaces
+	require.Equal(int64(3), w.Live)
+	require.Equal(int64(1), w.PinnedManifests)
+	require.Equal(int64(1), w.Revisions)
+	require.Equal(int64(1), w.NotFound)
+	require.Zero(w.Errors)
+	require.Equal(int64(1), w.WithoutPinnedManifest)
+	require.Equal([]gc.MountSample{{Workspace: bare.String()}}, w.Samples["without_pinned_manifest"])
+	require.Equal([]gc.MountSample{{Details: objects.HashBlobBytes([]byte("never stored")).String(), Workspace: lost.String()}}, w.Samples["not_found"])
+	require.Zero(r.LiveMounts.Live)
 }
 
 func TestDryRunGC_UnknownTypeFailsClosed(t *testing.T) {
@@ -500,21 +588,24 @@ func TestDryRunGC_ReadsLeaveCondemnMarkers(t *testing.T) {
 	condemnObject(t, f.s, pinned, 3)
 
 	r := f.run(nil).Report
-	require.Equal(gc.MountCounts{Live: 1, PinnedManifests: 1, Revisions: 1}, r.LiveMounts)
+	require.Equal(int64(1), r.LiveMounts.PinnedManifests)
+	require.Equal(int64(1), r.LiveMounts.Revisions)
 	require.True(isCondemned(t, f.s, details))
 	require.True(isCondemned(t, f.s, pinned))
 	require.False(objectTouched(t, f.s, details))
 }
 
-// Mount details or pinned manifests that cannot be read, touches of objects
-// without a gc row and map rows with malformed keys are counted and do not
-// stop the run.
+// Mount details or pinned manifests that are missing or cannot be read,
+// touches of objects without a gc row and map rows with malformed keys are
+// counted and do not stop the run. A missing object is counted apart from a
+// read error, because only a read error can hide a pin.
 func TestDryRunGC_CountsBrokenInputs(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	f := newGCFixture(t)
 	recent := f.now.Add(-time.Hour)
 	f.ref(entities.ABFSMetaProject, "refs/abfs/mount/user/u/1", objects.HashBlobBytes([]byte("no such mount details")), recent)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/mount/user/u/3", f.blob("not mount details", f.old), recent)
 	// Link validation would refuse mount details whose manifest is missing.
 	f.s.validateLinks = false
 	details := f.object(&binding.MountDetails{
@@ -531,7 +622,10 @@ func TestDryRunGC_CountsBrokenInputs(t *testing.T) {
 
 	res := f.run(nil)
 	r := res.Report
-	require.Equal(gc.MountCounts{Live: 2, Errors: 2}, r.LiveMounts)
+	require.Equal(int64(3), r.LiveMounts.Live)
+	require.Equal(int64(2), r.LiveMounts.NotFound)
+	require.Equal(int64(1), r.LiveMounts.Errors)
+	require.Len(r.LiveMounts.Samples["not_found"], 2)
 	require.Equal(int64(1), r.Objects.TouchOnly)
 	require.Equal(&gc.MapCounts{Rows: 1}, r.Maps[gc.MapMalformed])
 	requireReachable(t, res, true, details)

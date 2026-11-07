@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS GcState (
     UpdateTime TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
 ) PRIMARY KEY (Name);
 
+-- The condemned list of the last condemn cycle: ListLocation is its object in
+-- the server bucket, ListSnapshotTime the snapshot time of that cycle, and
+-- ListComplete tells that every marker of the list was written. Added after
+-- the table, so that init --gc adds them to a GcState created without them.
+ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListSnapshotTime TIMESTAMP;
+ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListComplete BOOL;
+
 -- One heartbeat row per server replica. Version is the GC edge extractor
 -- version the replica writes into the Bigtable table gc; GcEnabled, the touch
 -- period and the cache TTL are its settings, zero meaning off.

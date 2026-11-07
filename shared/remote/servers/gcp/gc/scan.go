@@ -39,6 +39,11 @@ const (
 // its type as an index into it.
 var typeNames, typeIndex = knownTypes()
 
+// TypeNames returns the object types the collector knows, sorted.
+func TypeNames() []string {
+	return slices.Clone(typeNames)
+}
+
 func knownTypes() ([]string, map[string]uint8) {
 	names := []string{string(entities.ObjectTypeBlob)}
 	for t := range maps.Keys(objects.Factory) {
@@ -522,4 +527,19 @@ func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *g
 		bad += m
 	}
 	return rows, bad, nil
+}
+
+// key returns the key of node id.
+func (g *graph) key(id uint32) Hash {
+	i, _ := slices.BinarySearchFunc(g.shards, id, func(s keyShard, id uint32) int {
+		switch {
+		case s.lo > id:
+			return 1
+		case s.lo+uint32(len(s.keys)) <= id:
+			return -1
+		}
+		return 0
+	})
+	s := &g.shards[i]
+	return s.keys[id-s.lo]
 }

@@ -28,7 +28,8 @@ import (
 const replicasTable = "GcReplicas"
 
 // NewReplicaID returns an ID for the heartbeat of this server process: the
-// host name and a random suffix, so that a restarted process gets a new row.
+// host name and a random suffix, so that a restarted process gets a new row
+// and the row of a process that stopped without deleting its own stays.
 func NewReplicaID() string {
 	host, err := os.Hostname()
 	if err != nil {
@@ -65,6 +66,16 @@ func WriteHeartbeat(ctx context.Context, client *spanner.Client, r *Replica) err
 		[]any{r.ID, r.Version, r.GC, int64(r.TouchInterval / time.Second), int64(r.CacheTTL / time.Second), spanner.CommitTimestamp})
 	if _, err := client.Apply(ctx, []*spanner.Mutation{m}); err != nil {
 		return fmt.Errorf("failed to write the heartbeat of replica %s: %w", r.ID, err)
+	}
+	return nil
+}
+
+// DeleteReplica deletes the row of the replica id from GcReplicas. A server
+// does so when it stops after writing its buffered touches, so that a row
+// left behind marks a process that stopped without them.
+func DeleteReplica(ctx context.Context, client *spanner.Client, id string) error {
+	if _, err := client.Apply(ctx, []*spanner.Mutation{spanner.Delete(replicasTable, spanner.Key{id})}); err != nil {
+		return fmt.Errorf("failed to delete the heartbeat of replica %s: %w", id, err)
 	}
 	return nil
 }

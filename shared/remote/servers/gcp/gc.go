@@ -16,6 +16,7 @@ package gcp
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
@@ -29,4 +30,13 @@ func (s *GCPServer) BackfillGC(ctx context.Context, opts *gc.BackfillOpts) (*gc.
 // DryRunGC runs a garbage collection cycle that only reports; see gc.DryRun.
 func (s *GCPServer) DryRunGC(ctx context.Context, opts *gc.DryRunOpts) (*gc.Result, error) {
 	return gc.DryRun(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s, opts)
+}
+
+// CondemnGC runs a garbage collection cycle that condemns, with its lists in
+// bucket; see gc.Condemn.
+func (s *GCPServer) CondemnGC(ctx context.Context, bucket string, opts *gc.CondemnOpts) (*gc.Result, error) {
+	if s.storage == nil {
+		return nil, errors.New("the server has no Cloud Storage client for the condemned lists")
+	}
+	return gc.Condemn(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s.storage.Bucket(bucket), s, opts)
 }

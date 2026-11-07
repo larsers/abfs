@@ -66,12 +66,16 @@ func (c *CASDB) headerFamilies() string {
 	return headerFamily
 }
 
-// CheckGCSchema checks that the garbage collector tables are readable.
+// CheckGCSchema checks that the garbage collector tables are readable, with
+// the columns added after they were first created.
 func (c *CASDB) CheckGCSchema(ctx context.Context) error {
-	for _, table := range []string{"GcState", "GcReplicas"} {
-		err := c.dbClient.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table + " LIMIT 1"}).Do(func(*spanner.Row) error { return nil })
+	for _, q := range []struct{ table, columns string }{
+		{"GcState", "ListLocation, ListSnapshotTime, ListComplete"},
+		{"GcReplicas", "1"},
+	} {
+		err := c.dbClient.Single().Query(ctx, spanner.Statement{SQL: "SELECT " + q.columns + " FROM " + q.table + " LIMIT 1"}).Do(func(*spanner.Row) error { return nil })
 		if err != nil {
-			return fmt.Errorf("cannot read Spanner table %s: %w", table, err)
+			return fmt.Errorf("cannot read Spanner table %s: %w", q.table, err)
 		}
 	}
 	return nil

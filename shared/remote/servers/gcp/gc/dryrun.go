@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"slices"
 	"time"
 
 	"cloud.google.com/go/bigtable"
@@ -47,8 +48,8 @@ type DryRunOpts struct {
 	Grace time.Duration
 	// MountIdle is how long a mount ref stays a root after its last write.
 	MountIdle time.Duration
-	// BuildRetention is how long build and build-start refs stay roots, and
-	// unmount refs are kept, after their last write.
+	// BuildRetention is how long build, build-start and unmount refs stay
+	// roots after their last write.
 	BuildRetention time.Duration
 	// MapRetention is how long an eval map row stays a root after its last
 	// write or use.
@@ -70,6 +71,8 @@ type DryRunOpts struct {
 	Holder string
 	// StateName is the GcState row; empty uses DefaultStateName.
 	StateName string
+	// Explain lists keys whose state and first root the report explains.
+	Explain []Hash
 }
 
 // DefaultDryRunOpts returns the default options.
@@ -129,6 +132,9 @@ type Report struct {
 	// RefsToTombstone counts the refs that retention would tombstone.
 	RefsToTombstone int64       `json:"refs_to_tombstone"`
 	LiveMounts      MountCounts `json:"live_mounts"`
+	// Workspaces reports the pinned manifests of the mounts that the
+	// workspace snapshots were taken from.
+	Workspaces MountCounts `json:"workspaces"`
 	// Replicas reports the server replicas and their settings.
 	Replicas ReplicaReport `json:"replicas"`
 	// Roots counts the roots per class; a root without a gc row is dangling.
@@ -138,8 +144,14 @@ type Report struct {
 	Edges       EdgeCounts              `json:"edges"`
 	Maps        map[MapClass]*MapCounts `json:"maps"`
 	Consistency ConsistencyReport       `json:"consistency"`
-	Memory      MemoryReport            `json:"memory"`
-	Seconds     Timings                 `json:"seconds"`
+	// Condemn reports the condemn step of a condemn cycle, and PreviousList
+	// what it found of the keys of the list before.
+	Condemn      *CondemnReport      `json:"condemn,omitempty"`
+	PreviousList *PreviousListReport `json:"previous_list,omitempty"`
+	// Explain explains the keys of DryRunOpts.Explain.
+	Explain []KeyReport  `json:"explain,omitempty"`
+	Memory  MemoryReport `json:"memory"`
+	Seconds Timings      `json:"seconds"`
 }
 
 // Settings records the options of the run.
@@ -211,6 +223,7 @@ type Timings struct {
 	Scan        float64 `json:"scan"`
 	Mark        float64 `json:"mark"`
 	Consistency float64 `json:"consistency"`
+	Condemn     float64 `json:"condemn,omitempty"`
 	Total       float64 `json:"total"`
 }
 
@@ -219,6 +232,22 @@ type Result struct {
 	Report *Report
 	graph  *graph
 	live   bitmap
+	// first holds the first root of each tracked node, resolved by roots.
+	first map[uint32]rootRef
+	roots *rootTable
+	// unreachable lists, in key order, the unreachable nodes that the
+	// consistency scan found an objects row for: the ones a condemn marks.
+	unreachable []sizedNode
+}
+
+// firstRoot returns the root whose walk first reached the tracked node id, or
+// nil when id is not tracked or not reachable.
+func (r *Result) firstRoot(id uint32) *Root {
+	ref, ok := r.first[id]
+	if !ok {
+		return nil
+	}
+	return r.roots.describe(ref)
 }
 
 // Reachable reports whether the mark found h reachable, and whether h has a gc
@@ -234,21 +263,32 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 // DryRun runs one garbage collection cycle that only reports: it takes the
 // lease, reads the roots at one snapshot, marks the objects of the table gc
 // and counts what a collection would remove. It writes nothing but the
-// GcState row and deletes the GcReplicas rows not seen for a day. objs reads the mount details and pinned manifests of live
-// mounts.
+// GcState row and deletes the GcReplicas rows not seen for a day. objs reads
+// the workspace snapshots, mount details and pinned manifests of live mounts
+// and workspaces.
 func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
+	return runCycle(ctx, sp, bt, objs, &o, nil)
+}
+
+// runCycle runs one cycle: a dry run when c is nil, else a condemn cycle
+// whose steps c runs on the mark, under the same lease.
+func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, o *DryRunOpts, c *condemner) (*Result, error) {
 	if o.Holder == "" {
 		o.Holder = DefaultHolder()
 	}
 	if o.StateName == "" {
 		o.StateName = DefaultStateName
 	}
+	phase := PhaseDryRun
+	if c != nil {
+		phase = PhaseCondemn
+	}
 	start := time.Now()
-	lease, err := AcquireLease(ctx, sp, o.StateName, o.Holder, PhaseDryRun, o.LeaseDuration, o.Grace)
+	lease, err := AcquireLease(ctx, sp, o.StateName, o.Holder, phase, o.LeaseDuration, o.Grace)
 	if err != nil {
 		return nil, err
 	}
@@ -256,10 +296,19 @@ func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs r
 	runCtx, stop := lease.Keep(ctx)
 	defer stop()
 
-	d := &dryRun{opts: &o, lease: lease, sp: sp, bt: bt, objs: objs, start: start}
-	res, err := d.run(runCtx)
+	d := &dryRun{opts: o, lease: lease, sp: sp, bt: bt, objs: objs, start: start, phase: phase, keepUnreachable: c != nil}
+	var res *Result
+	if c != nil {
+		err = c.readPrevious(runCtx, lease, d)
+	}
+	if err == nil {
+		res, err = d.run(runCtx)
+	}
+	if err == nil && c != nil {
+		err = c.run(runCtx, lease, res)
+	}
 	if err != nil && runCtx.Err() != nil && ctx.Err() == nil {
-		return nil, fmt.Errorf("the GC dry run stopped: %w", context.Cause(runCtx))
+		return nil, fmt.Errorf("the GC %s cycle stopped: %w", phase, context.Cause(runCtx))
 	}
 	return res, err
 }
@@ -276,6 +325,13 @@ type dryRun struct {
 	perType []int64
 	// outdated counts the outdated rows per type index.
 	outdated []int64
+	// tracked lists keys whose first root the mark records, besides those of
+	// the Explain option.
+	tracked []Hash
+	phase   string
+	// keepUnreachable keeps the unreachable objects that have an objects row,
+	// for a condemn.
+	keepUnreachable bool
 }
 
 func (d *dryRun) run(ctx context.Context) (*Result, error) {
@@ -283,7 +339,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	snapshot := d.lease.Start
 	r := &Report{
 		Cycle:        d.lease.Cycle,
-		Phase:        PhaseDryRun,
+		Phase:        d.phase,
 		Holder:       o.Holder,
 		StartTime:    d.start,
 		SnapshotTime: snapshot,
@@ -329,11 +385,11 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
-	revisions, mounts, err := pinnedRevisions(ctx, d.objs, refs.mounts)
+	revisions, mounts, workspaces, err := pinnedRevisions(ctx, d.objs, refs.mounts, refs.workspaces)
 	if err != nil {
 		return nil, err
 	}
-	r.LiveMounts = mounts
+	r.LiveMounts, r.Workspaces = mounts, workspaces
 	r.Seconds.Mounts = time.Since(step).Seconds()
 
 	step = time.Now()
@@ -370,24 +426,49 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
+	// The roots are walked one at a time in a fixed order of classes, so that
+	// a tracked node is attributed to the first root, in that order, that
+	// reaches it.
 	m := newMarker(g, g.size())
-	for _, root := range refs.roots {
-		d.addRoot(m, g, string(root.class), root.target)
+	for _, keys := range [][]Hash{d.tracked, o.Explain} {
+		ids := make([]uint32, len(keys))
+		for i, h := range keys {
+			ids[i] = g.find(h)
+		}
+		m.track(ids)
 	}
-	for _, h := range revisions {
-		d.addRoot(m, g, RootPinnedRevisions, h)
+	sortRefRoots(refs.roots)
+	pinnedAt := slices.IndexFunc(refs.roots, func(r refRoot) bool { return refClassRank(r.class) > refClassRank(pinnedAfter) })
+	if pinnedAt < 0 {
+		pinnedAt = len(refs.roots)
+	}
+	for i, root := range refs.roots[:pinnedAt] {
+		d.addRoot(m, g, string(root.class), root.target, rootRef{kind: rootOfRef, i: i})
+	}
+	for i, rev := range revisions {
+		if d.addRoot(m, g, RootPinnedRevisions, rev.hash, rootRef{kind: rootPinned, i: i}) {
+			continue
+		}
+		c := &r.LiveMounts
+		if !rev.src.workspace.IsZero() {
+			c = &r.Workspaces
+		}
+		c.DanglingRevisions++
+		c.sample("dangling_revisions", rev.src)
+	}
+	for i, root := range refs.roots[pinnedAt:] {
+		d.addRoot(m, g, string(root.class), root.target, rootRef{kind: rootOfRef, i: pinnedAt + i})
 	}
 	for _, h := range []Hash{entities.EmptyFileHash, entities.EmptyDirHash} {
-		d.addRoot(m, g, RootPermanent, h)
+		d.addRoot(m, g, RootPermanent, h, rootRef{kind: rootPermanentObject, i: int(g.find(h))})
 	}
 	recent := d.root(RootRecent)
 	for id := range uint32(g.size()) {
 		if g.recent.has(id) {
-			m.add(id)
+			m.addRoot(id, rootRef{kind: rootRecentObject, i: int(id)})
 			recent.Roots++
 		}
 	}
-	m.walk()
 	r.Maps = m.markMaps(g, mapRows, snapshot.Add(-o.MapRetention).UnixMicro())
 	for class, mc := range r.Maps {
 		d.root(rootMapPrefix + string(class)).Roots = mc.Live
@@ -409,16 +490,23 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	r.Objects.Unreachable = r.Objects.Rows - r.Objects.Reachable
 	d.countTypes(g, m.live)
 
+	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}}
 	if o.Consistency {
 		step = time.Now()
-		cr, sizes, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin))
+		scan, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin), d.keepUnreachable)
 		if err != nil {
 			return nil, err
 		}
-		r.Consistency = *cr
-		r.Objects.ReachableBytes = &sizes.reachable
-		r.Objects.UnreachableBytes = &sizes.unreachable
+		r.Consistency = *scan.report
+		r.Objects.ReachableBytes = &scan.sizes.reachable
+		r.Objects.UnreachableBytes = &scan.sizes.unreachable
+		res.unreachable = scan.unreachable
 		r.Seconds.Consistency = time.Since(step).Seconds()
+	}
+	if len(o.Explain) > 0 {
+		if r.Explain, err = res.explainKeys(ctx, d.bt, o.Explain); err != nil {
+			return nil, err
+		}
 	}
 	d.sampleMemory()
 	r.Memory.KeysBytes = g.keysBytes()
@@ -430,7 +518,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	}
 	r.Seconds.Total = time.Since(d.start).Seconds()
 	logSummary(r)
-	return &Result{Report: r, graph: g, live: m.live}, nil
+	return res, nil
 }
 
 func (d *dryRun) root(class string) *RootCounts {
@@ -442,15 +530,18 @@ func (d *dryRun) root(class string) *RootCounts {
 	return c
 }
 
-func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash) {
+// addRoot walks the root h of class, which ref names, and reports whether h
+// has a gc row.
+func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash, ref rootRef) bool {
 	c := d.root(class)
 	id := g.find(h)
 	if id == noNode {
 		c.Dangling++
-		return
+		return false
 	}
 	c.Roots++
-	m.add(id)
+	m.addRoot(id, ref)
+	return true
 }
 
 // TypeReport counts the objects and edges of one type.
@@ -461,6 +552,8 @@ type TypeReport struct {
 	Edges       int64 `json:"edges"`
 	// OutdatedRows counts the rows that a backfill rewrites.
 	OutdatedRows int64 `json:"outdated_rows"`
+	// UnreachableSample lists the first unreachable keys of the type.
+	UnreachableSample []string `json:"unreachable_sample,omitempty"`
 }
 
 func (d *dryRun) countTypes(g *graph, live bitmap) {
@@ -470,8 +563,11 @@ func (d *dryRun) countTypes(g *graph, live bitmap) {
 		c.Objects++
 		if live.has(uint32(id)) {
 			c.Reachable++
-		} else {
-			c.Unreachable++
+			continue
+		}
+		c.Unreachable++
+		if len(c.UnreachableSample) < maxSamples {
+			c.UnreachableSample = append(c.UnreachableSample, g.key(uint32(id)).String())
 		}
 	}
 	for t, n := range d.perType {
@@ -507,7 +603,7 @@ func logSummary(r *Report) {
 	if r.Consistency.Ran {
 		missing = fmt.Sprint(r.Consistency.MissingGCRows)
 	}
-	log.Printf("GC dry run of cycle %d: %d objects, %d reachable, %d unreachable, %d dangling edges, %d dangling roots, %d refs and %d map rows to expire, missing gc rows %s, peak heap %d MiB, %.0f s",
-		r.Cycle, r.Objects.Rows, r.Objects.Reachable, r.Objects.Unreachable, r.Edges.Dangling, danglingRoots,
+	log.Printf("GC %s cycle %d: %d objects, %d reachable, %d unreachable, %d dangling edges, %d dangling roots, %d refs and %d map rows to expire, missing gc rows %s, peak heap %d MiB, %.0f s",
+		r.Phase, r.Cycle, r.Objects.Rows, r.Objects.Reachable, r.Objects.Unreachable, r.Edges.Dangling, danglingRoots,
 		r.RefsToTombstone, mapsExpired, missing, r.Memory.PeakHeapBytes>>20, r.Seconds.Total)
 }

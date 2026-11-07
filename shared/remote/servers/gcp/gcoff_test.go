@@ -355,7 +355,8 @@ func TestGCOff_GCOnHasGCTraffic(t *testing.T) {
 	require.Contains(traffic, "family(meta|g)")
 	require.Contains(traffic, "MutateRows gc ")
 	require.NotEmpty(gcTraffic(late), "the TTL expired, so the reads went to Bigtable again")
-	require.Eventually(func() bool { return spannerRows(t, dbID, "GcReplicas") == 2 }, 10*time.Second, 50*time.Millisecond)
+	// Both servers wrote heartbeats and deleted their rows when they closed.
+	require.Zero(spannerRows(t, dbID, "GcReplicas"))
 }
 
 // A server with GC off starts on a deployment that plain init created, without

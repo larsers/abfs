@@ -69,6 +69,10 @@ type marker struct {
 	adj   adjacency
 	live  bitmap
 	stack []uint32
+	// root is the root being walked. first holds the tracked nodes and, once
+	// a walk reached them, the root of that walk.
+	root  rootRef
+	first map[uint32]rootRef
 }
 
 func newMarker(adj adjacency, n int) *marker {
@@ -79,7 +83,33 @@ func newMarker(adj adjacency, n int) *marker {
 func (m *marker) add(id uint32) {
 	if id != noNode && m.live.set(id) {
 		m.stack = append(m.stack, id)
+		if _, ok := m.first[id]; ok {
+			m.first[id] = m.root
+		}
 	}
+}
+
+// track records the first root of the nodes ids. Call it before any add.
+func (m *marker) track(ids []uint32) {
+	if len(ids) == 0 {
+		return
+	}
+	if m.first == nil {
+		m.first = make(map[uint32]rootRef, len(ids))
+	}
+	for _, id := range ids {
+		if id != noNode {
+			m.first[id] = rootRef{}
+		}
+	}
+}
+
+// addRoot marks id live as the root r and walks what it reaches, so that the
+// nodes the walk reaches first are recorded with r.
+func (m *marker) addRoot(id uint32, r rootRef) {
+	m.root = r
+	m.add(id)
+	m.walk()
 }
 
 // walk marks everything reachable from the nodes added since the last walk.
@@ -181,17 +211,11 @@ func (m *marker) markMaps(g *graph, shards [][]mapRow, evalAfter int64) map[MapC
 			case MapPusher:
 				pusher = append(pusher, r)
 				continue
-			case MapNoRequest:
-				m.add(r.to)
-				mc.Live++
-				continue
 			}
-			m.add(r.from)
-			m.add(r.to)
+			m.addMapRow(r, c)
 			mc.Live++
 		}
 	}
-	m.walk()
 
 	for changed := true; changed; {
 		changed = false
@@ -201,18 +225,27 @@ func (m *marker) markMaps(g *graph, shards [][]mapRow, evalAfter int64) map[MapC
 				kept = append(kept, r)
 				continue
 			}
-			m.add(r.from)
-			m.add(r.to)
+			m.addMapRow(r, MapPusher)
 			count(MapPusher).Live++
 			changed = true
 		}
 		pusher = kept
-		m.walk()
 	}
 	for _, mc := range counts {
 		mc.Expired = mc.Rows - mc.Live
 	}
 	return counts
+}
+
+// addMapRow marks the request and the result of the live map row r live and
+// walks what they reach. A row without a request keeps only its result.
+func (m *marker) addMapRow(r *mapRow, c MapClass) {
+	m.root = rootRef{kind: rootMap, row: r, mapClass: c}
+	if c != MapNoRequest {
+		m.add(r.from)
+	}
+	m.add(r.to)
+	m.walk()
 }
 
 // treeLive reports whether a live node is among the edges of the request

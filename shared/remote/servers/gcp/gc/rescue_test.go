@@ -64,7 +64,9 @@ func TestRescuer_Rescue(t *testing.T) {
 		{name: "condemned", stored: cycle(7), read: cycle(7), wantLive: true, wantTouch: true},
 		{name: "condemned again after the read", stored: cycle(8), read: cycle(7), wantLive: true, wantTouch: true},
 		{name: "rescued by another server", read: cycle(7), wantLive: true, wantTouch: true},
-		{name: "deleted after the read", deleted: true, read: cycle(7)},
+		// The touch comes before the row is found gone, so it stays as a gc
+		// row with only the touch.
+		{name: "deleted after the read", deleted: true, read: cycle(7), wantTouch: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -89,6 +91,31 @@ func TestRescuer_Rescue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A rescue whose touch fails fails and leaves the marker, so that a marker
+// set again by a late condemn write cannot meet a used object without a
+// touch. The retry rescues it.
+func TestRescuer_FailedTouchKeepsTheMarker(t *testing.T) {
+	require := require.New(t)
+	client := newHooksTestBigtable(t)
+	key := entities.NewHash("7777777777777777777777777777777777777777")
+	putObjectRow(t, client, key, versionBytes(7))
+	r := NewRescuer(client)
+	r.gcTable = client.Open("no-such-table")
+
+	_, err := r.Rescue(context.Background(), key, versionBytes(7))
+	require.ErrorContains(err, "failed to touch")
+	require.Equal(versionBytes(7), condemnedOf(t, client, key))
+	_, touched := cellTime(t, client, TableName, key.String(), TouchFamily, TouchColumn)
+	require.False(touched)
+
+	live, err := NewRescuer(client).Rescue(context.Background(), key, versionBytes(7))
+	require.NoError(err)
+	require.True(live)
+	require.Nil(condemnedOf(t, client, key))
+	_, touched = cellTime(t, client, TableName, key.String(), TouchFamily, TouchColumn)
+	require.True(touched)
 }
 
 // Two servers rescue the same object while the collector keeps rewriting
