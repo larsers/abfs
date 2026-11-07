@@ -31,6 +31,7 @@ const (
 	DefaultStateName     = "default"
 	DefaultLeaseDuration = 5 * time.Minute
 	PhaseDryRun          = "dry-run"
+	PhaseCondemn         = "condemn"
 	minLeaseDuration     = 3 * time.Second
 	releaseTimeout       = 10 * time.Second
 )
@@ -153,6 +154,53 @@ func (l *Lease) RecordSnapshot(ctx context.Context, snapshot time.Time) error {
 		return map[string]any{"SnapshotTime": snapshot}
 	}); err != nil {
 		return fmt.Errorf("failed to record the GC snapshot time: %w", err)
+	}
+	return nil
+}
+
+// ListState is the condemned list that GcState records.
+type ListState struct {
+	// Location is the name of the list object in the server bucket, empty
+	// when no condemn cycle published one.
+	Location string
+	// SnapshotTime is the snapshot time of the cycle that wrote it.
+	SnapshotTime time.Time
+	// Complete tells that every marker of the list was written.
+	Complete bool
+}
+
+// ReadList returns the condemned list recorded in the state of the lease.
+func (l *Lease) ReadList(ctx context.Context) (ListState, error) {
+	row, err := l.client.Single().ReadRow(ctx, stateTable, spanner.Key{l.name}, []string{"ListLocation", "ListSnapshotTime", "ListComplete"})
+	if err != nil {
+		return ListState{}, fmt.Errorf("failed to read the GC list state: %w", err)
+	}
+	var location spanner.NullString
+	var snapshot spanner.NullTime
+	var complete spanner.NullBool
+	if err := row.Columns(&location, &snapshot, &complete); err != nil {
+		return ListState{}, fmt.Errorf("failed to read the GC list state: %w", err)
+	}
+	return ListState{Location: location.StringVal, SnapshotTime: snapshot.Time, Complete: complete.Valid && complete.Bool}, nil
+}
+
+// RecordList records the condemned list of this cycle, not complete yet.
+func (l *Lease) RecordList(ctx context.Context, location string, snapshot time.Time) error {
+	if err := l.update(ctx, func(time.Time) map[string]any {
+		return map[string]any{"ListLocation": location, "ListSnapshotTime": snapshot, "ListComplete": false}
+	}); err != nil {
+		return fmt.Errorf("failed to record the GC condemned list: %w", err)
+	}
+	return nil
+}
+
+// CompleteList records that every marker of the list of this cycle was
+// written.
+func (l *Lease) CompleteList(ctx context.Context) error {
+	if err := l.update(ctx, func(time.Time) map[string]any {
+		return map[string]any{"ListComplete": true}
+	}); err != nil {
+		return fmt.Errorf("failed to record the GC condemned list as complete: %w", err)
 	}
 	return nil
 }

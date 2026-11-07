@@ -17,6 +17,7 @@ package gcp
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"cloud.google.com/go/bigtable"
@@ -179,6 +180,48 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	})
 	require.NoError(err)
 	require.NoError(s.Close())
+}
+
+// A database whose GcState was created before the condemned list columns
+// existed stops a server with --gc with a message that names init --gc, and
+// init --gc adds the columns and keeps the state.
+func TestSetup_AddsGCStateListColumns(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	var phase1 []string
+	for _, stmt := range casdb.GCSchemaStatements() {
+		if !strings.HasPrefix(stmt, "ALTER TABLE GcState") {
+			phase1 = append(phase1, stmt)
+		}
+	}
+	dbID := newEmulatorDatabaseWith(t, append(casdb.SchemaStatements(), phase1...))
+	newEmulatorBigtableWith(t, serverTables(true))
+	opts := setupOpts(t, dbID)
+	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
+	require.NoError(err)
+	defer client.Close()
+	_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcState",
+		[]string{"Name", "Cycle", "LeaseEpoch", "UpdateTime"}, []any{"default", int64(41), int64(5), spanner.CommitTimestamp})})
+	require.NoError(err)
+	serverOpts := &NewServerOpts{
+		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true,
+	}
+	_, err = New(ctx, serverOpts)
+	require.ErrorContains(err, "init --gc")
+
+	opts.GC = true
+	require.NoError(Setup(ctx, opts))
+	s, err := New(ctx, serverOpts)
+	require.NoError(err)
+	require.NoError(s.Close())
+	row, err := client.Single().ReadRow(ctx, "GcState", spanner.Key{"default"}, []string{"Cycle", "ListComplete"})
+	require.NoError(err)
+	var cycle int64
+	var complete spanner.NullBool
+	require.NoError(row.Columns(&cycle, &complete))
+	require.Equal(int64(41), cycle)
+	require.False(complete.Valid)
 }
 
 func TestSetup_MissingBucket(t *testing.T) {
