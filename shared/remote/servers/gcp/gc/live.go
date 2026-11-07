@@ -74,8 +74,7 @@ type liveKey struct {
 	Marker *int64 `json:"marker,omitempty"`
 	// Rescued tells that the marker was gone before this cycle: a server
 	// cleared it on a read. It is also set, with no read, for a key whose
-	// marker a cycle cleared before it stopped short of its own list, and for
-	// a key whose marker write Bigtable left out of a bulk write response.
+	// marker a cycle cleared before it stopped short of its own list.
 	Rescued bool `json:"rescued"`
 }
 

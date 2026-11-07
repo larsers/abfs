@@ -18,10 +18,13 @@ import (
 	"context"
 	"crypto/sha1"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/bigtable"
+	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/bttest"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/option"
@@ -32,14 +35,14 @@ import (
 )
 
 // newHooksTestBigtable starts an in-process Bigtable with the tables objects,
-// maps and gc and returns a client for it.
-func newHooksTestBigtable(t *testing.T) *bigtable.Client {
+// maps and gc and returns a client for it that dials with opts.
+func newHooksTestBigtable(t *testing.T, opts ...grpc.DialOption) *bigtable.Client {
 	t.Helper()
 	ctx := context.Background()
 	srv, err := bttest.NewServer("localhost:0")
 	require.NoError(t, err)
 	t.Cleanup(srv.Close)
-	conn, err := grpc.NewClient(srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(srv.Addr, append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opts...)...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 
@@ -210,4 +213,60 @@ func TestToucher_FlushesWhileRunning(t *testing.T) {
 	key := entities.NewHash("4444444444444444444444444444444444444444")
 	require.True(t, toucher.TouchObject(key))
 	require.Eventually(t, func() bool { return toucher.Stats().Written == 1 }, 5*time.Second, 50*time.Millisecond)
+}
+
+// omitFirstEntry is a client stream that drops the result of entry 0 from
+// MutateRows responses, as a server that leaves an entry out does. It counts
+// the entries sent in sent.
+type omitFirstEntry struct {
+	grpc.ClientStream
+	sent *atomic.Int32
+}
+
+func (s omitFirstEntry) SendMsg(m any) error {
+	s.sent.Add(int32(len(m.(*btpb.MutateRowsRequest).Entries)))
+	return s.ClientStream.SendMsg(m)
+}
+
+func (s omitFirstEntry) RecvMsg(m any) error {
+	if err := s.ClientStream.RecvMsg(m); err != nil {
+		return err
+	}
+	res := m.(*btpb.MutateRowsResponse)
+	var kept []*btpb.MutateRowsResponse_Entry
+	for _, e := range res.Entries {
+		if e.Index != 0 {
+			kept = append(kept, e)
+		}
+	}
+	res.Entries = kept
+	return nil
+}
+
+// A touch whose entry is missing from the MutateRows response counts as
+// failed, not as written, and is not sent again.
+func TestToucher_CountsAnOmittedEntryAsFailed(t *testing.T) {
+	require := require.New(t)
+	var calls, sent atomic.Int32
+	omit := grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		s, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil || !strings.HasSuffix(method, "/MutateRows") {
+			return s, err
+		}
+		calls.Add(1)
+		return omitFirstEntry{ClientStream: s, sent: &sent}, nil
+	})
+	client := newHooksTestBigtable(t, omit)
+	toucher := NewToucher(client, 10)
+	keys := testHashes(3)
+	for _, key := range keys {
+		require.True(toucher.TouchObject(key))
+	}
+	toucher.Close()
+	// The workers may split the touches over several calls; each call loses
+	// one entry.
+	omitted := int64(calls.Load())
+	require.Positive(omitted)
+	require.Equal(TouchStats{Written: int64(len(keys)) - omitted, Failed: omitted}, toucher.Stats())
+	require.Equal(int32(len(keys)), sent.Load(), "an omitted entry was sent again")
 }
