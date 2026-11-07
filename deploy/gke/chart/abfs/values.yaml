@@ -154,7 +154,7 @@ pusher:
       memory: 200Gi
     limits:
       memory: 200Gi
-  # Interim value until the steady RSS is measured. 7 CPU fits an 8-vCPU node next to
+  # A starting value; the VPA adjusts the memory. 7 CPU fits an 8-vCPU node next to
   # the GKE reservation and the system DaemonSets.
   steadyResources:
     requests:
@@ -254,9 +254,8 @@ ci:
     provider: daemonset
     # Build pods per node plus 2 for remounts. Read-only after load.
     maxMounts: 4
-    # Kernel slab per active workspace. Mid-build, one AAOS workspace on casfs 0.1.23 held
-    # about 1.5 GB in casfs_node_0 plus about 1.8 GB in a merged 128-byte cache, and was
-    # still growing; 6 keeps a margin over that. The end-of-build peak is not measured.
+    # Kernel slab per active workspace. An active full-tree workspace holds a few GB of
+    # casfs slab; 6 keeps a margin.
     mountGbPerWorkspace: 6
     # Upper bound: maxMounts * mountGbPerWorkspace must fit in this share of MemTotal.
     maxRamShare: 0.4
