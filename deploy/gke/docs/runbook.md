@@ -320,7 +320,7 @@ helm upgrade abfs chart/abfs -n abfs -f <values.yaml> --timeout 30m
 Without `--wait`, as for the install. The bootstrap Job runs again after each upgrade and rewrites the two configs when they changed.
 
 - Server: a rolling update with one extra replica, never one fewer. Each pod drains for 120 s before SIGTERM (`server.preStopSleepSeconds`). The pod gets 240 s in all (`server.terminationGracePeriodSeconds`): the 120 s, up to 105 s for the server's own stop with `server.gc.enabled`, and 15 s of margin.
-- Pushers: a rolling update, one pod at a time.
+- Pushers: a rolling update, one pod at a time, so two releases run in the pool for a while. Pushers are not checked against each other. When the new release changes how pushers split the projects or read the pool config, stop the pool first: `helm upgrade` with `--set pusher.enabled=false`, then the upgrade with the new images and `pusher.enabled` true. The PVCs stay.
 - casfs loader: a rolling update. A loaded module stays loaded: it cannot be removed while a casfs filesystem exists, and `casfs_max_mounts` is read-only after load. A new casfs version or a new `ci.casfs.maxMounts` takes effect on new nodes only.
 - cacheman: `updateStrategy: OnDelete`. A stopped cacheman makes every mount on its node refuse reads and writes, so the DaemonSet never restarts it by itself. Drain or recycle the CI nodes: either cordon a node, wait until its builds end and delete its cacheman pod as in [Cache reset](#cache-reset) (without the reset pod), or cordon the old nodes and let the autoscaler remove them once they are empty. Each cacheman pod copies its tool set to `/var/lib/abfs/bin` when it starts, so the tools on a node always match its cacheman.
 

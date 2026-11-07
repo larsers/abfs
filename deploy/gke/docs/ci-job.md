@@ -39,17 +39,9 @@ Every mount, remount and unmount first pings the instance's cacheman over its so
 
 ### Build cache hits
 
-Measured: the same pod spec got about 0 hits at `/work/src` and about 70,000 at the path VM clients had used, so the mount path enters the cache keys of many build steps. Every build pod must therefore mount at the same path, `$WORK/src` with `WORK=/work` as in the example Job, for its steps to hit the outputs of other pods. The cache warms from builds at that path: outputs that clients elsewhere pushed from another mount path do not serve a pod at `/work/src`.
+The mount path enters the cache keys of many build steps. Every build pod must therefore mount at the same path, `$WORK/src` with `WORK=/work` as in the example Job, for its steps to hit the outputs of other pods. The cache warms from builds at that path: outputs that clients elsewhere pushed from another mount path do not serve a pod at `/work/src`, so most steps of the first builds at that path miss.
 
-Measured on AAOS 15 (`m droid`, about 156,000 steps) against a store that VM clients had warmed at another path:
-
-| Build | Mount path | Steps from the cache |
-| --- | --- | --- |
-| first pod | `/work/src` | about 0 of the main graph, a cold build |
-| the same pod spec, mount moved | the VM clients' path | about 70,000; the rest missed for a cause in the build host not yet found |
-| a later pod, after two cold or partly cold builds at `/work/src` | `/work/src` | 155,971 of 155,973 (99.999 %), `m droid` in 28 s |
-
-All of these pods ran on one node; hits across nodes at the same path were not measured. Plan for the first builds of a new deployment to run cold, even on a store that other clients use.
+Plan for the first builds of a new deployment to run cold, even on a store that other clients use. Once a build at `/work/src` has filled the cache, a later build of the same commit and lunch target takes nearly all of its steps from the cache.
 
 ## Example Job
 
@@ -178,10 +170,10 @@ casfs keeps per-workspace state in kernel slab memory, which kubelet does not re
 
 1. **Build pods per node.** A node's allocatable CPU is its vCPUs minus the CPU GKE reserves (about 0.15 CPU on 32 vCPU, 0.25 on 64). From that, subtract the DaemonSet requests: cacheman 2 CPU and 4Gi, the loader 100m and 256Mi, and the GKE system DaemonSets (leave about 1 CPU; `kubectl describe node` lists them). Divide the rest by the build pod request. Memory works the same way, with GKE's memory reservation (about 9.3 GiB on 128 GB). The rule for one build pod per node: CPU request <= vCPUs - 3.3 (28 on 32 vCPU).
 2. **`ci.casfs.maxMounts`** = build pods per node + 2, for remounts. The default is 4. The value is fixed when the module loads, so a change applies to new nodes only.
-3. **Slab budget** = `maxMounts` x `ci.casfs.mountGbPerWorkspace` (6 GB per active full-tree workspace by default). In the middle of a cold AAOS 15 build on casfs 0.1.23, one workspace held about 1.5 GB in `casfs_node_0` plus about 1.8 GB in a merged 128-byte cache, and unreclaimable slab (`SUnreclaim`) rose from about 1.1 GB to 3.0 GB. Both were still growing, and both went away with the unmount. 6 GB keeps a margin over that. The peak at the end of a full build is not measured yet. casfs caches without a constructor merge into other caches of the same size, so measure with `slab_nomerge` on the kernel command line, or read the aliases under `/sys/kernel/slab`.
+3. **Slab budget** = `maxMounts` x `ci.casfs.mountGbPerWorkspace` (6 GB per active full-tree workspace by default). An active full-tree workspace holds a few GB of casfs slab during a build, and the slab goes away with the unmount; 6 GB keeps a margin. casfs caches without a constructor merge into other caches of the same size, so measure with `slab_nomerge` on the kernel command line, or read the aliases under `/sys/kernel/slab`.
 4. **Rule:** build pod memory requests + slab budget + DaemonSet memory + GKE's memory reservation must fit the node's memory. The loader enforces only an upper bound: it lowers `maxMounts` until the slab budget fits `ci.casfs.maxRamShare` (0.4) of `MemTotal`.
 
-**Build pod memory.** Size for a cold build, not for the warm case. A cold AAOS 15 `m droid`, with most steps run locally, went above 40Gi: a pod limited to 40Gi was OOMKilled at about 93 % of the steps (146,163 of 155,530), and its `emptyDir` with the logs went with it. At 80Gi, the example Job's size, a build that ran 22,747 steps locally passed in 17 minutes, and a warm build passed. The peak of a fully cold build at 80Gi was not measured. With the class floor of 32 vCPU and 120 GB (`computeClasses.ci.minCores`, `computeClasses.ci.minMemoryGb`), one 80Gi pod fits a 128 GB node, and two need a 256 GB node, as the example below shows. Two 40Gi pods fit a 128 GB node, but each of them can run out of memory on a cold build.
+**Build pod memory.** Size for a cold build, not for the warm case. A cold full-platform `m droid`, with most steps run locally, needs more than 40Gi; a pod that runs out of memory is OOMKilled, and its `emptyDir` with the logs goes with it. The example Job's 80Gi is the size to start from. With the class floor of 32 vCPU and 120 GB (`computeClasses.ci.minCores`, `computeClasses.ci.minMemoryGb`), one 80Gi pod fits a 128 GB node, and two need a 256 GB node, as the example below shows. Two 40Gi pods fit a 128 GB node, but each of them can run out of memory on a cold build.
 
 Example with the example Job's request of 28 CPU and 80Gi. A 32-vCPU node of the class floor, for example n4-standard-32 with 128 GB, has about 31.85 allocatable CPU; after cacheman, the loader and about 1 CPU of GKE DaemonSets, 28.75 remain, so one build pod fits. `maxMounts` = 1 + 2 = 3, and the default of 4 is enough. The slab budget is 4 x 6 = 24 GB. 86 GB (80Gi) + 24 GB + about 5 GB of DaemonSets + 10 GB reserved = 125 GB, which fits in 128 GB. Two such pods per node need a 64-vCPU shape such as n4-standard-64 with 256 GB: 56 CPU plus 3.1 for the DaemonSets fit the 63.75 allocatable, `maxMounts` is 4, and 172 GB + 24 GB + 5 GB + 13 GB = 214 GB fits. A larger request, such as 30 CPU, no longer fits a 32-vCPU node, and GKE creates a 48-vCPU node for each pod.
 

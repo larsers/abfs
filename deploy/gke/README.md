@@ -46,7 +46,7 @@ deploy/gke/
     overlays/example/  a worked example
   images/            Dockerfiles of abfs-server, abfs-pusher, abfs-client, casfs-loader
   scripts/           gen-ddl.sh, check-ddl.sh (with ddl-lib.sh), build-images.sh, bundle.sh
-  docs/              prerequisites, runbook, configuration, troubleshooting, ci-job
+  docs/              usage, prerequisites, runbook, configuration, troubleshooting, ci-job
 ```
 
 ## Quick start
@@ -79,6 +79,7 @@ The [runbook](docs/runbook.md) has every step with its checks, and the seed, ste
 
 ## Documents
 
+- [usage.md](docs/usage.md): how ABFS is meant to be used here: the parts, how a build uses the store and the node cache, the first days and steady state, scaling and upgrades. Read it first.
 - [prerequisites.md](docs/prerequisites.md): cluster settings, network, identities, the IOPS fallback node pool.
 - [runbook.md](docs/runbook.md): install order, seed and steady phase, upgrades, cache reset, backend replacement, teardown, security.
 - [configuration.md](docs/configuration.md): every chart value with its default, the KCC to chart name table, right-sizing.

@@ -113,7 +113,7 @@ The health check is gRPC on port 50051 every 5 s, timeout 5 s, 2 checks to chang
 | `pusher.dataDisk.createStorageClass` | `true` | Create that StorageClass (Hyperdisk Balanced, `WaitForFirstConsumer`, expandable) |
 | `pusher.phase` | `seed` | `seed`: class `abfs-pusher-seed`, `seedResources`. `steady`: class `abfs-pusher-steady`, `steadyResources` and the memory VPA. |
 | `pusher.seedResources` | 28 CPU, 200Gi request and limit | Sized for the largest repository |
-| `pusher.steadyResources` | 7 CPU, 32Gi request and limit | Interim value until the steady memory use is measured. 7 CPU fits an 8-vCPU node, for the same reason as the server request. |
+| `pusher.steadyResources` | 7 CPU, 32Gi request and limit | A starting value; the VPA adjusts the memory. 7 CPU fits an 8-vCPU node, for the same reason as the server request. |
 | `pusher.vpa.mode` | `Initial` | Steady phase only, memory only. `Initial` applies the recommendation when a pusher restarts for another reason; `Recreate` also evicts. |
 | `pusher.vpa.minMemory`, `.maxMemory` | `16Gi`, `200Gi` | VPA bounds; `maxMemory` is the seed size |
 | `pusher.terminationGracePeriodSeconds` | `90` | |
@@ -168,7 +168,7 @@ The chart reads `pusher.pool.manifest` also with `pusher.enabled: false`, so a r
 | `ci.cacheman.resources` | 2 CPU, 4Gi request, 8Gi limit | No CPU limit and no `GOMAXPROCS`: the node's one cacheman may use every core for the build pods it serves. The CPU request is a scheduling floor. |
 | `ci.casfs.provider` | `daemonset` | `daemonset`: build casfs on each Ubuntu node. `image`: the node image ships casfs; load and check only. |
 | `ci.casfs.maxMounts` | `4` | `casfs_max_mounts`: build pods per node plus 2. Read-only after load. |
-| `ci.casfs.mountGbPerWorkspace` | `6` | Kernel memory per active workspace, for the slab budget. Mid-build, one AAOS workspace on casfs 0.1.23 held about 3.3 GB of slab and was still growing ([sizing](ci-job.md#sizing)); 6 keeps a margin over that. |
+| `ci.casfs.mountGbPerWorkspace` | `6` | Kernel memory per active workspace, for the slab budget. An active full-tree workspace holds a few GB of casfs slab ([sizing](ci-job.md#sizing)); 6 keeps a margin. |
 | `ci.casfs.maxRamShare` | `0.4` | Upper bound: the loader lowers `maxMounts` until `maxMounts` x `mountGbPerWorkspace` fits this share of `MemTotal` |
 | `ci.casfs.interfaceVersion` | `1.5.0` | Interface the client needs |
 | `ci.casfs.source.path`, `.commit`, `.version` | `/usr/src/casfs`, `c946f8e`, `0.1.23` | Source in the loader image and the module version the loader expects (prefix match; empty skips the check) |
