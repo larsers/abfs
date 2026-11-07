@@ -22,7 +22,7 @@ replace github.com/iafan/cwalk => ./third_party/cwalk
 require (
 	al.essio.dev/pkg/shellescape v1.6.0
 	cloud.google.com/go/auth v0.23.2
-	cloud.google.com/go/bigtable v1.41.0
+	cloud.google.com/go/bigtable v1.58.0
 	cloud.google.com/go/longrunning v1.2.0
 	cloud.google.com/go/pubsub/v2 v2.7.0
 	cloud.google.com/go/spanner v1.95.0

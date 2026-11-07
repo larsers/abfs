@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/casgit"
@@ -80,6 +81,7 @@ func (c *mountRepoCmd) setPinnedManifest(ctx context.Context, m manifestHashesSe
 // moves. A project in the groups that does not resolve keeps its branch name;
 // one outside them is left out.
 func (c *mountRepoCmd) pinBranch(ctx context.Context, m manifestHashesSetter) error {
+	start := time.Now()
 	r := repo.New(c.Store, casgit.New(c.Store), c.Config.ManifestServer, c.Config.ManifestProjectName, c.Config.ManifestScheme, "", false)
 	if err := r.ResolveManifestBranch(c.Config.ManifestProjectName, c.Branch); err != nil {
 		return err
@@ -120,6 +122,7 @@ func (c *mountRepoCmd) pinBranch(ctx context.Context, m manifestHashesSetter) er
 		return fmt.Errorf("failed to store the pinned manifest: %w", err)
 	}
 	m.SetManifestHashes(h, h)
+	log.Printf("Pinned the manifest of branch %s: %d projects in %s", c.Branch, len(pinned.Project), time.Since(start))
 	return nil
 }
 
