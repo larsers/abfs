@@ -44,6 +44,13 @@ const (
 	// The rows of the table maps, as casdb.AddMapResult writes them.
 	mapsTableName = "maps"
 	mapsFamily    = "cf"
+	// TouchBufferSize is the number of touches a server's Toucher buffers.
+	TouchBufferSize = 100 * 1000
+	// TouchDrainBound bounds the time from a use to the write of its touch,
+	// or to its count as lost: a full buffer drains in batches that each
+	// worker writes within touchWriteTimeout, and a batch waits at most
+	// touchFlushInterval to fill.
+	TouchDrainBound = TouchBufferSize/touchBatchSize/touchWorkers*touchWriteTimeout + touchFlushInterval
 )
 
 // TouchStats counts the touches of a Toucher.

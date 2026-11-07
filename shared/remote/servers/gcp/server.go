@@ -58,7 +58,8 @@ type (
 // the 20-byte hash. It reduces heap allocations and GC pointer scans.
 type CachedHeader struct {
 	Size int64
-	// Loaded is the cacheNow time the header was read from Bigtable.
+	// Loaded is the cacheNow time at which the Bigtable read of the header
+	// started; without GC, at which it was cached.
 	Loaded uint32
 	// Passing for up to 2^16 unique object types
 	Type  uint16
@@ -463,7 +464,7 @@ func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedH
 		if err != nil {
 			return CachedHeader{}, nil, err
 		}
-		s.storeContent(key, content)
+		s.storeContent(key, content, cacheNow())
 		return cachedHdr, content, nil
 	case !hdrOk && contentOk:
 		header, err := s.casdb.GetHeader(ctx, key)
@@ -488,7 +489,7 @@ func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedH
 		cachedHdr = newCachedHeader(header)
 		content = objContent
 		s.headers[shard].PeekOrAdd(key, cachedHdr)
-		s.storeContent(key, content)
+		s.storeContent(key, content, cacheNow())
 		return cachedHdr, content, nil
 	}
 }
@@ -595,10 +596,11 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	}
 
 	addAttempted = true
+	written := cacheNow()
 	err = s.addObject(ctx, header, objContent)
 	if err == nil {
-		s.storeHeader(header)
-		s.storeContent(key, objContent)
+		s.storeHeader(header, written)
+		s.storeContent(key, objContent, written)
 	}
 
 	return err
@@ -902,9 +904,12 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 		s.touchHit(pathPutObject, hash, cached)
 		return cached, nil
 	}
+	start := cacheNow()
 	obj, err := s.casdb.GetHeader(ctx, hash)
 	if err == nil && obj != nil {
-		err = s.rescueCondemned(ctx, pathPutObject, obj)
+		if err = s.gcHooks.checkReadAge(start); err == nil {
+			err = s.rescueCondemned(ctx, pathPutObject, obj)
+		}
 	}
 	if err == casdb.ErrNotFound {
 		s.forgetMissing(hash)
@@ -913,7 +918,7 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 	if err != nil || obj == nil {
 		return CachedHeader{}, err
 	}
-	cached := s.storeHeader(obj)
+	cached := s.storeHeader(obj, start)
 	s.touchHit(pathPutObject, hash, cached)
 	return cached, nil
 }
@@ -945,9 +950,12 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 
 	s.headersCacheMissCount.Add(int64(missCount))
 
+	start := cacheNow()
 	objs, err := s.casdb.GetHeaders(ctx, misses)
 	if err == nil && s.gcHooks.on {
-		objs, err = s.rescueHeaders(ctx, path, objs)
+		if err = s.gcHooks.checkReadAge(start); err == nil {
+			objs, err = s.rescueHeaders(ctx, path, objs)
+		}
 	}
 	if err != nil {
 		s.headersErrCount.Add(int64(missCount))
@@ -956,7 +964,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 
 	foundCount := 0
 	for _, o := range objs {
-		cached := s.storeHeader(o)
+		cached := s.storeHeader(o, start)
 		s.touchHit(path, o.Id, cached)
 		for _, i := range missesIdx[o.Id] {
 			foundCount++

@@ -133,7 +133,7 @@ func TestGetObjectLinkedContentThresholdAndFallback(t *testing.T) {
 
 	// 1. Small object (size <= threshold): should return regular stream, not links
 	s.headers[hash[0]].Add(hash, newCachedHeader(&ObjectHeader{Id: hash, Size: 50, Type: "BLOB"}))
-	s.storeContent(hash, &ObjectContent{Encoding: "raw", Content: string(chunksJSON)})
+	s.storeContent(hash, &ObjectContent{Encoding: "raw", Content: string(chunksJSON)}, cacheNow())
 
 	r, err := s.GetObject(ctx, hash)
 	require.NoError(t, err)
@@ -189,7 +189,7 @@ func TestGetObjectLinkedContentFallbackWhenUnsupported(t *testing.T) {
 
 	hash := entities.Hash{5, 6, 7, 8}
 	s.headers[hash[0]].Add(hash, newCachedHeader(&ObjectHeader{Id: hash, Size: 500, Type: "BLOB"}))
-	s.storeContent(hash, &ObjectContent{Encoding: "zstd", Content: string(chunksJSON)})
+	s.storeContent(hash, &ObjectContent{Encoding: "zstd", Content: string(chunksJSON)}, cacheNow())
 
 	// Even though Size (500) > threshold (100), because depot doesn't support LinkedContent,
 	// GetObject cleanly falls back to normal streaming with original encoding "zstd".

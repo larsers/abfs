@@ -147,8 +147,15 @@ func newEmptyEmulatorBigtable(t *testing.T, opt ...grpc.ServerOption) {
 // whose content is in memory.
 func newEmulatorCASDBServer(t *testing.T) *GCPServer {
 	t.Helper()
+	return newEmulatorCASDBServerWith(t)
+}
+
+// newEmulatorCASDBServerWith is newEmulatorCASDBServer with the given gRPC
+// server options for the in-process Bigtable.
+func newEmulatorCASDBServerWith(t *testing.T, opt ...grpc.ServerOption) *GCPServer {
+	t.Helper()
 	dbID := newEmulatorDatabase(t)
-	newEmulatorBigtable(t)
+	newEmulatorBigtableWith(t, serverTables(true), opt...)
 
 	db, err := casdb.New(context.Background(), fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID), emulatorProject, emulatorBigtable, "", 1, false)
 	require.NoError(t, err)

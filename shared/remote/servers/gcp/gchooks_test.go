@@ -450,7 +450,7 @@ func TestGCHooks_TouchThrottle(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		s.gcHooks.toucher.Close()
 		st := s.gcHooks.toucher.Stats()
-		s.gcHooks.toucher = gc.NewToucher(s.casdb.BTClient(), touchBufferSize)
+		s.gcHooks.toucher = gc.NewToucher(s.casdb.BTClient(), gc.TouchBufferSize)
 		return st.Written
 	}
 
@@ -625,8 +625,8 @@ func TestGCHooks_ChunkMissingDuringRead(t *testing.T) {
 	// The collector deleted the row during the read.
 	require.NoError(readObject(s, putBlob(t, s, "other")))
 	deleteObjectRow(t, s, key)
-	s.storeHeader(&ObjectHeader{Id: key, Type: "blob", Size: 5})
-	s.storeContent(key, content)
+	s.storeHeader(&ObjectHeader{Id: key, Type: "blob", Size: 5}, cacheNow())
+	s.storeContent(key, content, cacheNow())
 	err = readObject(s, key)
 	require.ErrorIs(err, entities.ErrNotExist)
 	_, ok := s.headers[key[0]].Peek(key)

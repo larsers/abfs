@@ -45,7 +45,6 @@ const (
 	DefaultCacheTTL            = gc.DefaultCacheTTL
 	DefaultGCTouchInterval     = 36 * time.Hour
 	DefaultGCHeartbeatInterval = 5 * time.Minute
-	touchBufferSize            = 100 * 1000
 	maxTouchedMapRows          = 256 * 1024
 	heartbeatTimeout           = 30 * time.Second
 	firstHeartbeatRetry        = 5 * time.Second
@@ -73,13 +72,6 @@ var rescuePathNames = [numRescuePaths]string{"headers", "validation", "put_objec
 var (
 	firstHeartbeatTimeout = time.Minute
 	writeServer           = gc.WriteServer
-)
-
-// cacheEpoch and cacheNow give cache entries their load and touch times in
-// seconds since the process started, plus one so that zero means unset.
-var (
-	cacheEpoch = time.Now()
-	cacheNow   = func() uint32 { return uint32(time.Since(cacheEpoch)/time.Second) + 1 }
 )
 
 // contentEntry is an entry of the s.content LRU cache.
@@ -124,9 +116,13 @@ type gcHooks struct {
 	// serving; zero without a heartbeat.
 	heartbeatStale uint32
 	lastHeartbeat  atomic.Uint32
-	metrics        metric.Registration
-	rescueLog      *rescueLog
-	stopped        bool
+	// pause and pausePending record a pause of the process that the next
+	// heartbeat records as a touch loss.
+	pause        pauseDetector
+	pausePending bool
+	metrics      metric.Registration
+	rescueLog    *rescueLog
+	stopped      bool
 
 	// rescues counts per path and index into rescueTypes.
 	rescues           [numRescuePaths][]atomic.Int64
@@ -196,7 +192,7 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 				return err
 			}
 		}
-		g.toucher = gc.NewToucher(s.casdb.BTClient(), touchBufferSize)
+		g.toucher = gc.NewToucher(s.casdb.BTClient(), gc.TouchBufferSize)
 	}
 	reg, err := s.registerGCMetrics()
 	if err != nil {
@@ -313,11 +309,14 @@ func (s *GCPServer) lookupHeader(key entities.Hash) (CachedHeader, bool) {
 	return h, ok
 }
 
-// storeHeader caches hdr, read from Bigtable. With GC it replaces an expired
-// entry and keeps the touch mark of the entry it replaces when that touch is
-// of the current period; without GC it keeps an existing entry.
-func (s *GCPServer) storeHeader(hdr *ObjectHeader) CachedHeader {
+// storeHeader caches hdr, read from Bigtable by a read that started at
+// loaded on the cacheNow clock, so that the entry ages from the start of the
+// read. With GC it replaces an expired entry and keeps the touch mark of the
+// entry it replaces when that touch is of the current period; without GC it
+// keeps an existing entry.
+func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32) CachedHeader {
 	h := newCachedHeader(hdr)
+	h.Loaded = loaded
 	shard := s.headers[hdr.Id[0]]
 	if !s.gcHooks.on {
 		shard.PeekOrAdd(hdr.Id, h)
@@ -341,8 +340,8 @@ func (s *GCPServer) lookupContent(key entities.Hash) (*ObjectContent, bool) {
 }
 
 // storeContent caches content; see storeHeader.
-func (s *GCPServer) storeContent(key entities.Hash, content *ObjectContent) {
-	entry := contentEntry{content: content, loaded: cacheNow()}
+func (s *GCPServer) storeContent(key entities.Hash, content *ObjectContent, loaded uint32) {
+	entry := contentEntry{content: content, loaded: loaded}
 	if !s.gcHooks.on {
 		s.content[key[0]].PeekOrAdd(key, entry)
 		return
@@ -374,9 +373,12 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 		return cachedHdr, content, nil
 	}
 	// A read of the whole row sees the condemn marker with the content.
+	start := cacheNow()
 	header, content, err := s.casdb.GetObjectData(ctx, key)
 	if err == nil && header != nil {
-		err = s.rescueCondemned(ctx, pathGetObject, header)
+		if err = s.gcHooks.checkReadAge(start); err == nil {
+			err = s.rescueCondemned(ctx, pathGetObject, header)
+		}
 	}
 	if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
 		s.forget(key)
@@ -385,8 +387,8 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	if err != nil {
 		return CachedHeader{}, nil, err
 	}
-	cachedHdr = s.storeHeader(header)
-	s.storeContent(key, content)
+	cachedHdr = s.storeHeader(header, start)
+	s.storeContent(key, content, start)
 	s.touchHit(pathGetObject, key, cachedHdr)
 	return cachedHdr, content, nil
 }
@@ -661,9 +663,14 @@ func (s *GCPServer) heartbeat(ctx context.Context) error {
 	sp := s.casdb.SpannerClient()
 	statsTime, err := gc.ReadServerTime(hctx, sp, g.server.ID)
 	if err == nil {
+		if g.pause.check(clockElapsed()) {
+			log.Printf("Warning: the wall clock advanced more than the monotonic clock by over %s since the last GC heartbeat; recording the pause as a touch loss", maxPause)
+			g.pausePending = true
+		}
 		losses := g.losses()
-		if err = writeServer(hctx, sp, &g.server, statsTime, losses > g.reportedLosses); err == nil {
+		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || losses > g.reportedLosses); err == nil {
 			g.reportedLosses = losses
+			g.pausePending = false
 			g.hasRow = true
 			g.lastHeartbeat.Store(start)
 			return nil
