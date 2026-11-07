@@ -67,6 +67,11 @@ type DryRunOpts struct {
 	Shards int
 	// LeaseDuration is the lease the run holds and renews.
 	LeaseDuration time.Duration
+	// WriteDeadline is the deadline of one attempt of a Bigtable write call
+	// of the run; a streamed Cloud Storage object gets it plus its size at
+	// 8 MiB/s. Two attempts must fit into a quarter of the lease, the margin
+	// at which the run stops.
+	WriteDeadline time.Duration
 	// Holder names this process in the lease; empty uses DefaultHolder.
 	Holder string
 	// StateName is the GcState row; empty uses DefaultStateName.
@@ -88,6 +93,7 @@ func DefaultDryRunOpts() DryRunOpts {
 		Consistency:    true,
 		Shards:         DefaultScanShards,
 		LeaseDuration:  DefaultLeaseDuration,
+		WriteDeadline:  DefaultWriteDeadline,
 	}
 }
 
@@ -102,6 +108,7 @@ func (o *DryRunOpts) Validate() error {
 	}{
 		{"grace", o.Grace}, {"mount idle time", o.MountIdle}, {"build retention", o.BuildRetention},
 		{"map retention", o.MapRetention}, {"cycle", o.Cycle}, {"lease duration", o.LeaseDuration},
+		{"write deadline", o.WriteDeadline},
 	} {
 		if d.value <= 0 {
 			return fmt.Errorf("invalid %s %s: it must be positive", d.name, d.value)
@@ -115,6 +122,9 @@ func (o *DryRunOpts) Validate() error {
 	}
 	if o.Shards <= 0 {
 		return fmt.Errorf("invalid number of shards %d", o.Shards)
+	}
+	if 2*o.WriteDeadline > o.LeaseDuration/4 {
+		return fmt.Errorf("write deadline %s is too long for the lease %s: two attempts must fit into a quarter of it", o.WriteDeadline, o.LeaseDuration)
 	}
 	return nil
 }

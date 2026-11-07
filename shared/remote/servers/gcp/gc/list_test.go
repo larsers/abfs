@@ -73,7 +73,7 @@ func TestList_WriteReadAndCreateOnce(t *testing.T) {
 	h := &listHeader{cycle: 7, snapshot: time.UnixMicro(time.Now().UnixMicro()), holder: "gc-host-1", epoch: 3, count: int64(len(recs)), types: typeNames}
 	name := listObjectName("default", 7)
 	require.Equal("gc/condemned/default/7", name)
-	require.NoError(writeList(ctx, bucket, name, h, listOf(recs)))
+	require.NoError(writeList(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, h, listOf(recs)))
 
 	l, err := readList(ctx, bucket, name)
 	require.NoError(err)
@@ -83,15 +83,15 @@ func TestList_WriteReadAndCreateOnce(t *testing.T) {
 		require.Equal(typeNames[r.typ], l.typeName(i))
 	}
 
-	require.NoError(writeList(ctx, bucket, name, h, listOf(recs)))
+	require.NoError(writeList(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, h, listOf(recs)))
 	other := *h
 	other.epoch = 4
-	require.ErrorContains(writeList(ctx, bucket, name, &other, listOf(recs)), `written by the GC run "gc-host-1#3"`)
+	require.ErrorContains(writeList(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, &other, listOf(recs)), `written by the GC run "gc-host-1#3"`)
 
 	// A record count that does not match the header writes nothing.
 	short := *h
 	short.cycle = 8
-	require.Error(writeList(ctx, bucket, listObjectName("default", 8), &short, listOf(recs[:2])))
+	require.Error(writeList(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, listObjectName("default", 8), &short, listOf(recs[:2])))
 	_, err = bucket.Object(listObjectName("default", 8)).Attrs(ctx)
 	require.ErrorIs(err, storage.ErrObjectNotExist)
 }

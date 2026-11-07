@@ -32,17 +32,19 @@ const (
 // Rescuer clears the condemn marker of objects that are used again, so that
 // the collector does not delete them.
 type Rescuer struct {
-	objects   *bigtable.Table
-	gcTable   *bigtable.Table
-	retryWait time.Duration
+	objects        *bigtable.Table
+	gcTable        *bigtable.Table
+	retryWait      time.Duration
+	attemptTimeout time.Duration
 }
 
 // NewRescuer returns a Rescuer for the tables of client's instance.
 func NewRescuer(client *bigtable.Client) *Rescuer {
 	return &Rescuer{
-		objects:   client.Open(objectsTableName),
-		gcTable:   client.Open(TableName),
-		retryWait: firstRetryWait,
+		objects:        client.Open(objectsTableName),
+		gcTable:        client.Open(TableName),
+		retryWait:      firstRetryWait,
+		attemptTimeout: touchWriteTimeout,
 	}
 }
 
@@ -60,7 +62,7 @@ func (r *Rescuer) Rescue(ctx context.Context, key Hash, condemned []byte) (bool,
 	row := key.String()
 	mut := bigtable.NewMutation()
 	mut.Set(TouchFamily, TouchColumn, bigtable.ServerTime, nil)
-	if err := r.retry(ctx, func() error { return r.gcTable.Apply(ctx, row, mut) }); err != nil {
+	if err := r.retry(ctx, func(ctx context.Context) error { return r.gcTable.Apply(ctx, row, mut) }); err != nil {
 		return false, fmt.Errorf("failed to rescue %s: failed to touch it: %v", key, err) //nolint:errorlint // a missing table must not reach the client as a missing object
 	}
 	for attempt := 1; ; attempt++ {
@@ -105,7 +107,7 @@ func (r *Rescuer) clear(ctx context.Context, row string, condemned []byte) (bool
 	del.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
 	mut := bigtable.NewCondMutation(predicate, del, nil)
 	var matched bool
-	err := r.retry(ctx, func() error {
+	err := r.retry(ctx, func(ctx context.Context) error {
 		return r.objects.Apply(ctx, row, mut, bigtable.GetCondMutationResult(&matched))
 	})
 	return matched, err
@@ -115,7 +117,7 @@ func (r *Rescuer) clear(ctx context.Context, row string, condemned []byte) (bool
 // it has none.
 func (r *Rescuer) marker(ctx context.Context, row string) (bool, []byte, error) {
 	var res bigtable.Row
-	err := r.retry(ctx, func() error {
+	err := r.retry(ctx, func(ctx context.Context) error {
 		var err error
 		res, err = r.objects.ReadRow(ctx, row, bigtable.RowFilter(bigtable.ChainFilters(
 			bigtable.FamilyFilter("meta|"+ObjectsFamily), bigtable.LatestNFilter(1))))
@@ -132,20 +134,28 @@ func (r *Rescuer) marker(ctx context.Context, row string) (bool, []byte, error) 
 	return true, nil, nil
 }
 
-func (r *Rescuer) retry(ctx context.Context, f func() error) error {
-	return retryWith(ctx, r.retryWait, f)
+// retry runs f with the retries of a rescue, each attempt within
+// touchWriteTimeout under the client's context, so that a stalled write
+// cannot hold the call or land long after the rescue gave up.
+func (r *Rescuer) retry(ctx context.Context, f func(ctx context.Context) error) error {
+	return retryWith(ctx, r.retryWait, writeBudget{deadline: r.attemptTimeout}, f)
 }
 
 // Retry calls f with the retries of a rescue: until it succeeds, fails with
 // an error that is not transient, or has run writeAttempts times, as
 // EdgeWriter.applyWithRetry does.
 func Retry(ctx context.Context, f func() error) error {
-	return retryWith(ctx, firstRetryWait, f)
+	return retryWith(ctx, firstRetryWait, writeBudget{}, func(context.Context) error { return f() })
 }
 
-func retryWith(ctx context.Context, wait time.Duration, f func() error) error {
+func retryWith(ctx context.Context, wait time.Duration, b writeBudget, f func(ctx context.Context) error) error {
 	for attempt := 1; ; attempt++ {
-		err := f()
+		actx, cancel, err := b.attempt(ctx)
+		if err != nil {
+			return err
+		}
+		err = f(actx)
+		cancel()
 		if err == nil || attempt == writeAttempts || !retryable(ctx, err) {
 			return err
 		}

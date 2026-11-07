@@ -163,8 +163,8 @@ type listRecord struct {
 // writeList writes the condemned list name with the header h and the
 // records that next returns, until it returns false. The object is created
 // only if it does not exist.
-func writeList(ctx context.Context, bucket *storage.BucketHandle, name string, h *listHeader, next func() (listRecord, bool)) error {
-	return createObject(ctx, bucket, name, h.runID(), "application/octet-stream", func(w io.Writer) error {
+func writeList(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *listHeader, next func() (listRecord, bool)) error {
+	return createObject(ctx, b, bucket, name, h.runID(), "application/octet-stream", func(w io.Writer) error {
 		if err := h.write(w); err != nil {
 			return err
 		}
@@ -187,17 +187,23 @@ func writeList(ctx context.Context, bucket *storage.BucketHandle, name string, h
 }
 
 // createObject writes the object name with write, only if no object of that
-// name exists. If one exists, written by the same run, an earlier attempt of
-// this call wrote it and the call succeeds.
-func createObject(ctx context.Context, bucket *storage.BucketHandle, name, runID, contentType string, write func(io.Writer) error) error {
+// name exists, within the streaming deadline of the budget b. If one exists,
+// written by the same run, an earlier attempt of this call wrote it and the
+// call succeeds.
+func createObject(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name, runID, contentType string, write func(io.Writer) error) error {
 	obj := bucket.Object(name)
-	wctx, cancel := context.WithCancel(ctx)
+	sctx, wrap, stop, err := b.stream(ctx)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	wctx, cancel := context.WithCancel(sctx)
 	defer cancel()
 	w := obj.If(storage.Conditions{DoesNotExist: true}).NewWriter(wctx)
 	w.ContentType = contentType
 	w.Metadata = map[string]string{runIDMetadata: runID}
-	bw := bufio.NewWriterSize(w, 1<<20)
-	err := write(bw)
+	bw := bufio.NewWriterSize(wrap(w), 1<<20)
+	err = write(bw)
 	if err == nil {
 		err = bw.Flush()
 	}

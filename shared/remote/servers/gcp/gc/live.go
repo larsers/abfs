@@ -181,7 +181,7 @@ func (c *condemner) clearLive(ctx context.Context, lease *Lease, res *Result) (*
 		}
 	}
 	name := listObjectName(c.opts.StateName, res.Report.Cycle) + liveSuffix
-	err = createObject(ctx, c.bucket, name, runID(c.opts.Holder, lease.Epoch), "application/gzip", func(w io.Writer) error {
+	err = createObject(ctx, c.budget, c.bucket, name, runID(c.opts.Holder, lease.Epoch), "application/gzip", func(w io.Writer) error {
 		zw := gzip.NewWriter(w)
 		enc := json.NewEncoder(zw)
 		for i := range lines {
@@ -209,7 +209,7 @@ func (c *condemner) clearMarkers(ctx context.Context, rows []string) error {
 		if err := lim.wait(ctx, len(batch)); err != nil {
 			return err
 		}
-		if err := applyBulk(ctx, table, batch, mut); err != nil {
+		if err := applyBulk(ctx, c.budget, table, batch, mut); err != nil {
 			return fmt.Errorf("failed to clear the condemn markers of live objects: %w", err)
 		}
 	}

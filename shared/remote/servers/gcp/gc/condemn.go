@@ -180,6 +180,7 @@ type condemner struct {
 	opts   *CondemnOpts
 	bt     *bigtable.Client
 	bucket *storage.BucketHandle
+	budget writeBudget
 	// prev is the list of the last condemn cycle, prevState its state in
 	// GcState and prevErr why it could not be read.
 	prev      *condemnedList
@@ -192,6 +193,7 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 	r := res.Report
 	rep := &CondemnReport{ExpectedReplicas: c.opts.ExpectedReplicas}
 	r.Condemn = rep
+	c.budget = writeBudget{deadline: c.opts.WriteDeadline, lease: lease}
 	defer func() {
 		r.Seconds.Condemn = time.Since(start).Seconds()
 		r.Seconds.Total += r.Seconds.Condemn
@@ -217,7 +219,7 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 	name := listObjectName(c.opts.StateName, r.Cycle)
 	h := &listHeader{cycle: r.Cycle, snapshot: r.SnapshotTime, holder: c.opts.Holder, epoch: lease.Epoch, count: int64(len(nodes)), types: typeNames}
 	next := 0
-	err = writeList(ctx, c.bucket, name, h, func() (listRecord, bool) {
+	err = writeList(ctx, c.budget, c.bucket, name, h, func() (listRecord, bool) {
 		if next == len(nodes) {
 			return listRecord{}, false
 		}
@@ -278,7 +280,7 @@ func (c *condemner) mark(ctx context.Context, res *Result, cycle int64) error {
 		mut := bigtable.NewMutation()
 		mut.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
 		mut.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), value)
-		if err := applyBulk(ctx, table, rows, mut); err != nil {
+		if err := applyBulk(ctx, c.budget, table, rows, mut); err != nil {
 			return fmt.Errorf("failed to write the condemn markers of cycle %d: %w", cycle, err)
 		}
 	}
@@ -286,16 +288,21 @@ func (c *condemner) mark(ctx context.Context, res *Result, cycle int64) error {
 }
 
 // applyBulk applies mut to rows and retries the rows that fail with a
-// transient error, with the waits of EdgeWriter. It fails on the first row
-// that fails otherwise.
-func applyBulk(ctx context.Context, table *bigtable.Table, rows []string, mut *bigtable.Mutation) error {
+// transient error, with the waits of EdgeWriter, each attempt within the
+// budget b. It fails on the first row that fails otherwise.
+func applyBulk(ctx context.Context, b writeBudget, table *bigtable.Table, rows []string, mut *bigtable.Mutation) error {
 	wait := firstRetryWait
 	for attempt := 1; ; attempt++ {
 		muts := make([]*bigtable.Mutation, len(rows))
 		for i := range muts {
 			muts[i] = mut
 		}
-		errs, err := table.ApplyBulk(ctx, rows, muts)
+		actx, cancel, err := b.attempt(ctx)
+		if err != nil {
+			return err
+		}
+		errs, err := table.ApplyBulk(actx, rows, muts)
+		cancel()
 		var retry []string
 		var last error
 		if err != nil {

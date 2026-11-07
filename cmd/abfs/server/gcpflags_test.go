@@ -75,6 +75,8 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--condemn", "--expected-replicas=3", "--consistency=false"}, "needs the consistency check"},
 		{[]string{"--condemn", "--expected-replicas=3", "--keep-lists=0"}, "invalid number of kept lists"},
 		{[]string{"--dry-run", "--explain=nothex"}, `invalid key "nothex"`},
+		{[]string{"--dry-run", "--write-deadline=38s"}, "two attempts must fit into a quarter of it"},
+		{[]string{"--dry-run", "--write-deadline=37s"}, ""},
 		{[]string{"--condemn", "--expected-replicas=3", "--condemn-rate=100", "--explain=" + strings.Repeat("ab", 20)}, ""},
 	}
 	for _, tt := range tests {

@@ -17,6 +17,7 @@ package gc
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -49,9 +50,12 @@ const (
 type EdgeWriter struct {
 	apply     func(ctx context.Context, row string, m *bigtable.Mutation) error
 	retryWait time.Duration
+	budget    writeBudget
 }
 
 // NewEdgeWriter returns an EdgeWriter for the table gc of client's instance.
+// Its writes run under the caller's context; a server bounds them from the
+// link validation of the call.
 func NewEdgeWriter(client *bigtable.Client) *EdgeWriter {
 	table := client.Open(TableName)
 	return &EdgeWriter{
@@ -113,7 +117,12 @@ func (w *EdgeWriter) write(ctx context.Context, key Hash, typ string, edges []Ha
 func (w *EdgeWriter) applyWithRetry(ctx context.Context, row string, mut *bigtable.Mutation) error {
 	wait := w.retryWait
 	for attempt := 1; ; attempt++ {
-		err := w.apply(ctx, row, mut)
+		actx, cancel, err := w.budget.attempt(ctx)
+		if err != nil {
+			return err
+		}
+		err = w.apply(actx, row, mut)
+		cancel()
 		if err == nil || attempt == writeAttempts || !retryable(ctx, err) {
 			return err
 		}
@@ -126,9 +135,16 @@ func (w *EdgeWriter) applyWithRetry(ctx context.Context, row string, mut *bigtab
 	}
 }
 
+// retryable reports whether err of a call made under ctx, or under an attempt
+// context derived from it, is transient. An attempt that reached its deadline
+// is, while ctx lives: the library returns either a DeadlineExceeded status or
+// the plain context error, depending on where the attempt was when it ended.
 func retryable(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	switch status.Code(err) {
 	case codes.Unavailable, codes.Aborted, codes.DeadlineExceeded:

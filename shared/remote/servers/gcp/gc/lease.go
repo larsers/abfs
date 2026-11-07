@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -34,6 +35,15 @@ const (
 	PhaseCondemn         = "condemn"
 	minLeaseDuration     = 3 * time.Second
 	releaseTimeout       = 10 * time.Second
+)
+
+// renewRetry is the wait before a failed lease renewal is tried again,
+// renewLease renews a lease and wallNow reads the clock of the write checks;
+// tests change them.
+var (
+	renewRetry = 10 * time.Second
+	renewLease = (*Lease).renew
+	wallNow    = time.Now
 )
 
 // ErrLeaseLost reports that another process took the lease over.
@@ -76,6 +86,9 @@ type Lease struct {
 	// taken is the local time just before the lease was taken, the base of the
 	// watchdog.
 	taken time.Time
+	// expiry is the expiry that Spanner recorded when the lease was taken or
+	// last renewed, in Unix nanoseconds.
+	expiry atomic.Int64
 }
 
 // DefaultHolder names this process as a lease holder.
@@ -97,11 +110,13 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		return nil, fmt.Errorf("lease duration %s is shorter than %s", duration, minLeaseDuration)
 	}
 	l := &Lease{client: client, name: name, holder: holder, duration: duration, taken: time.Now()}
+	var leaseExpiry time.Time
 	commit, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		now, err := spannerNow(ctx, txn)
 		if err != nil {
 			return err
 		}
+		leaseExpiry = now.Add(duration)
 		var cycle, epoch int64
 		var prevStart, expiry spanner.NullTime
 		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime"})
@@ -129,7 +144,7 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 			"Phase":                  phase,
 			"LeaseHolder":            holder,
 			"LeaseEpoch":             l.Epoch,
-			"LeaseExpiry":            now.Add(duration),
+			"LeaseExpiry":            leaseExpiry,
 			"PreviousLeaseExpiry":    expiry,
 			"CycleStartTime":         now,
 			"PreviousCycleStartTime": prevStart,
@@ -145,6 +160,7 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		return nil, fmt.Errorf("failed to take the GC lease: %w", err)
 	}
 	l.Start = commit
+	l.expiry.Store(leaseExpiry.UnixNano())
 	return l, nil
 }
 
@@ -219,9 +235,28 @@ func (l *Lease) Release() {
 }
 
 func (l *Lease) renew(ctx context.Context) error {
-	return l.update(ctx, func(now time.Time) map[string]any {
-		return map[string]any{"LeaseExpiry": now.Add(l.duration)}
+	var expiry time.Time
+	err := l.update(ctx, func(now time.Time) map[string]any {
+		expiry = now.Add(l.duration)
+		return map[string]any{"LeaseExpiry": expiry}
 	})
+	if err == nil {
+		l.expiry.Store(expiry.UnixNano())
+	}
+	return err
+}
+
+// checkWrite fails when a write call of two attempts of d each, started now,
+// could end after the expiry of the lease less the clock skew margin. The
+// check runs on the wall clock against the expiry Spanner recorded, so a run
+// whose renewals failed, or whose process was paused while its monotonic
+// clock stood still, stops writing before another holder can take the lease
+// over.
+func (l *Lease) checkWrite(d time.Duration) error {
+	if wallNow().Add(2*d + clockSkewMargin).After(time.Unix(0, l.expiry.Load())) {
+		return errLeaseExpiring
+	}
+	return nil
 }
 
 // update writes the columns that set returns, given the Spanner time, if the
@@ -263,11 +298,12 @@ func (l *Lease) margin() time.Duration {
 	return l.duration / 4
 }
 
-// Keep renews the lease in the background until stop is called. The returned
-// context is canceled when the lease is lost, or when it is about to expire
-// because renewals failed; context.Cause tells which. The watchdog runs on the
-// local clock from the start of the last successful renewal, which is never
-// later than the expiry Spanner recorded.
+// Keep renews the lease in the background until stop is called, every third
+// of the lease duration and renewRetry after a renewal that failed. The
+// returned context is canceled when the lease is lost, or when it is about to
+// expire because renewals failed; context.Cause tells which. The watchdog runs
+// on the local clock from the start of the last successful renewal, which is
+// never later than the expiry Spanner recorded.
 func (l *Lease) Keep(ctx context.Context) (_ context.Context, stop func()) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
@@ -277,8 +313,8 @@ func (l *Lease) Keep(ctx context.Context) (_ context.Context, stop func()) {
 		deadline := l.taken.Add(l.duration - l.margin())
 		watchdog := time.NewTimer(time.Until(deadline))
 		defer watchdog.Stop()
-		ticker := time.NewTicker(l.duration / 3)
-		defer ticker.Stop()
+		next := time.NewTimer(l.duration / 3)
+		defer next.Stop()
 		for {
 			select {
 			case <-done:
@@ -288,20 +324,22 @@ func (l *Lease) Keep(ctx context.Context) (_ context.Context, stop func()) {
 			case <-watchdog.C:
 				cancel(errLeaseExpiring)
 				return
-			case <-ticker.C:
+			case <-next.C:
 				start := time.Now()
 				rctx, rcancel := context.WithDeadline(ctx, deadline)
-				err := l.renew(rctx)
+				err := renewLease(l, rctx)
 				rcancel()
 				switch {
 				case err == nil:
 					deadline = start.Add(l.duration - l.margin())
 					watchdog.Reset(time.Until(deadline))
+					next.Reset(l.duration / 3)
 				case errors.Is(err, ErrLeaseLost):
 					cancel(ErrLeaseLost)
 					return
 				default:
 					log.Printf("Warning: failed to renew the GC lease: %v", err)
+					next.Reset(min(renewRetry, l.duration/3))
 				}
 			}
 		}
