@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/casgit"
@@ -77,11 +78,13 @@ func (c *mountRepoCmd) setPinnedManifest(ctx context.Context, m manifestHashesSe
 // stores the pinned manifest, so the mount keeps them after the branch moves.
 // Every project has to resolve, whatever the groups.
 func (c *mountRepoCmd) pinBranch(ctx context.Context, m manifestHashesSetter) error {
+	start := time.Now()
 	r := repo.New(c.Store, casgit.New(c.Store), c.Config.ManifestServer, c.Config.ManifestProjectName, c.Config.ManifestScheme, "", false)
 	if err := r.ManifestFromBranch(ctx, c.Branch, c.Config.ManifestProjectName, "default.xml"); err != nil {
 		return err
 	}
-	content, err := xml.MarshalIndent(r.PinnedManifest(), "", " ")
+	pinned := r.PinnedManifest()
+	content, err := xml.MarshalIndent(pinned, "", " ")
 	if err != nil {
 		return fmt.Errorf("failed to encode the pinned manifest: %w", err)
 	}
@@ -90,6 +93,7 @@ func (c *mountRepoCmd) pinBranch(ctx context.Context, m manifestHashesSetter) er
 		return fmt.Errorf("failed to store the pinned manifest: %w", err)
 	}
 	m.SetManifestHashes(h, h)
+	log.Printf("Pinned the manifest of branch %s: %d projects in %s", c.Branch, len(pinned.Project), time.Since(start))
 	return nil
 }
 
