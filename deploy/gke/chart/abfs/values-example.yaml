@@ -1,0 +1,70 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Values for the KCC overlay kcc/overlays/example. Every name here equals the
+# one in that overlay's settings.yaml or a fixed name of the KCC base; the table
+# in docs/configuration.md maps them. Copy this file next to your overlay and
+# change both together.
+
+image:
+  registry: europe-west4-docker.pkg.dev/example-project/abfs
+  # The digests from images.txt of scripts/build-images.sh --push.
+  server: {digest: ""}
+  pusher: {digest: ""}
+  client: {digest: ""}
+  casfsLoader: {digest: ""}
+
+# settings.yaml: project, spannerInstance, spannerDatabase, bigtableInstance,
+# bucket, zone.
+backend:
+  project: example-project
+  spannerInstance: abfs
+  spannerDatabase: cas
+  bigtableInstance: abfs-objects
+  bucket: example-project-abfs-blobs
+  zone: europe-west4-b
+
+# The KCC base creates the IAMServiceAccount abfs-server; empty means
+# abfs-server@<backend.project>.iam.gserviceaccount.com.
+server:
+  gcpServiceAccount: ""
+
+# The KCC base creates the ComputeAddress abfs-gateway. Its IP:
+#   kubectl -n abfs get computeaddress abfs-gateway \
+#     -o jsonpath='{.status.observedState.address}'
+gateway:
+  addressName: abfs-gateway
+  vip: ""
+
+pusher:
+  count: 3
+  phase: seed
+  gerrit:
+    secretName: gerrit-credentials
+  pool:
+    manifest:
+      url: https://gerrit.example.com/a/platform/manifest
+      project: platform/manifest
+    overrides:
+      - name: platform/manifest
+        fetch-ref-spec: ["+refs/heads/*:refs/heads/*"]
+
+# The KCC base creates the IAMServiceAccount abfs-nodes.
+computeClasses:
+  nodeServiceAccount: abfs-nodes@example-project.iam.gserviceaccount.com
+
+# settings.yaml: proxySubnetRange, or the range of the proxy-only subnet the
+# network already has.
+networkPolicy:
+  proxyOnlySubnetCidr: 10.129.0.0/23

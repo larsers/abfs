@@ -1,0 +1,156 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.pusher.enabled }}
+{{- $p := .Values.pusher }}
+{{- if not (has $p.phase (list "seed" "steady")) }}
+{{- fail "pusher.phase must be seed or steady" }}
+{{- end }}
+{{- $vip := include "abfs.vip" . }}
+# git-pushers. Pod names <namePrefix>-<ordinal> are the pool entry names. A phase change
+# changes the node selector, so the rolling update recreates each pusher on a node of the
+# other class, in its PVC's zone. Runs as root under PSA baseline, as on VMs, so a new
+# volume needs no fsGroup.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "abfs.pusher.name" . }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "pusher" | nindent 4 }}
+spec:
+  serviceName: {{ include "abfs.pusher.name" . }}
+  replicas: {{ $p.count }}
+  podManagementPolicy: Parallel
+  revisionHistoryLimit: 5
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "abfs.selectorLabels" "pusher" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "abfs.labels" . | nindent 8 }}
+        {{- include "abfs.selectorLabels" "pusher" | nindent 8 }}
+      annotations:
+        # Consolidation must not restart a pusher mid-fetch.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        cloud.google.com/compute-class: {{ ternary "abfs-pusher-seed" "abfs-pusher-steady" (eq $p.phase "seed") }}
+      terminationGracePeriodSeconds: {{ $p.terminationGracePeriodSeconds }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # A pusher fails its config handling until the pool config exists.
+        - name: wait-for-config
+          image: {{ include "abfs.image" (dict "root" . "image" "pusher") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until abfs --no-local-cache {{ include "abfs.clientFlags" $vip }} cat config:git-pusher/default >/dev/null 2>&1; do
+                echo "waiting for config:git-pusher/default on {{ $vip }}"
+                sleep 10
+              done
+              echo "pool config present"
+          env:
+            - name: HOME
+              value: /tmp/home
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: git-pusher
+          image: {{ include "abfs.image" (dict "root" . "image" "pusher") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - exec abfs {{ include "abfs.clientFlags" $vip }} {{ include "abfs.otelKv" . }} git-pusher --storage-path /data --instance "$POD_NAME"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HOME
+              value: /root
+            - name: GIT_TERMINAL_PROMPT
+              value: "0"
+            {{- if $p.gerrit.cookies }}
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: http.cookiefile
+            - name: GIT_CONFIG_VALUE_0
+              value: /root/.gitcookies
+            {{- end }}
+            {{- include "abfs.gomaxprocsEnv" . | nindent 12 }}
+            {{- include "abfs.otelEnv" (dict "root" . "queue" 8192 "traces" true) | trim | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $p.port }}
+          resources:
+            {{- toYaml (ternary $p.seedResources $p.steadyResources (eq $p.phase "seed")) | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: home
+              mountPath: /root
+            - name: gerrit
+              mountPath: /root/.netrc
+              subPath: .netrc
+              readOnly: true
+            {{- if $p.gerrit.cookies }}
+            - name: gerrit
+              mountPath: /root/.gitcookies
+              subPath: .gitcookies
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+        - name: gerrit
+          secret:
+            secretName: {{ $p.gerrit.secretName }}
+            defaultMode: 0400
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        # Selector labels only: claim templates are immutable.
+        labels:
+          {{- include "abfs.selectorLabels" "pusher" | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $p.dataDisk.storageClass }}
+        resources:
+          requests:
+            storage: {{ $p.dataDisk.size }}
+{{- end }}

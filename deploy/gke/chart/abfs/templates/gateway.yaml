@@ -1,0 +1,113 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.server.enabled }}
+{{- $g := .Values.gateway }}
+# Internal Application Load Balancer in front of the servers. Every client except the
+# bootstrap Job uses its address: a ClusterIP connection would pin one gRPC client to one
+# replica. The address is internal; anything that reaches it can read and write the store.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: abfs
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  gatewayClassName: {{ $g.className }}
+  addresses:
+    - type: NamedAddress
+      value: {{ $g.addressName }}
+  listeners:
+    - name: grpc
+      protocol: HTTP
+      port: {{ include "abfs.server.port" . }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "abfs.server.name" . }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: abfs
+  rules:
+    - backendRefs:
+        - name: {{ include "abfs.server.name" . }}
+          port: {{ include "abfs.server.port" . }}
+---
+# gRPC health of the overall status on the serving port, every 5 s.
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: {{ include "abfs.server.name" . }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  default:
+    checkIntervalSec: 5
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 2
+    config:
+      type: GRPC
+      grpcHealthCheck:
+        portSpecification: USE_FIXED_PORT
+        port: {{ include "abfs.server.port" . }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ include "abfs.server.name" . }}
+---
+# The longest RPC is one whole-object GetObject or PutObject stream.
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: {{ include "abfs.server.name" . }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  default:
+    timeoutSec: {{ $g.timeoutSec }}
+    connectionDraining:
+      drainingTimeoutSec: {{ $g.drainingTimeoutSec }}
+    logging:
+      enabled: {{ $g.logging.enabled }}
+      {{- if $g.logging.enabled }}
+      sampleRate: {{ $g.logging.sampleRate }}
+      {{- end }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ include "abfs.server.name" . }}
+{{- if $g.allowGlobalAccess }}
+---
+apiVersion: networking.gke.io/v1
+kind: GCPGatewayPolicy
+metadata:
+  name: abfs
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  default:
+    allowGlobalAccess: true
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: abfs
+{{- end }}
+{{- end }}

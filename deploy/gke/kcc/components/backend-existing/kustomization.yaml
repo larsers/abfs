@@ -1,0 +1,51 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Mode "existing": no Config Connector object for the Spanner instance or
+# database, the Bigtable instance or tables, or the bucket, so nothing here can
+# change or delete them. Only the server's roles are granted. The backend must
+# already have what `abfs server gcp init --gc` creates; running init again
+# without changes is the check.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - iam.yaml
+replacements:
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.project}
+    targets:
+      - select: {kind: IAMPolicyMember, name: abfs-server-spanner-database-user}
+        fieldPaths: [spec.resourceRef.external]
+        options: {delimiter: /, index: 1}
+      - select: {kind: IAMPolicyMember, name: abfs-server-bigtable-user}
+        fieldPaths: [spec.resourceRef.external]
+        options: {delimiter: /, index: 1}
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.spannerInstance}
+    targets:
+      - select: {kind: IAMPolicyMember, name: abfs-server-spanner-database-user}
+        fieldPaths: [spec.resourceRef.external]
+        options: {delimiter: /, index: 3}
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.spannerDatabase}
+    targets:
+      - select: {kind: IAMPolicyMember, name: abfs-server-spanner-database-user}
+        fieldPaths: [spec.resourceRef.external]
+        options: {delimiter: /, index: 5}
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bigtableInstance}
+    targets:
+      - select: {kind: IAMPolicyMember, name: abfs-server-bigtable-user}
+        fieldPaths: [spec.resourceRef.external]
+        options: {delimiter: /, index: 3}
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bucket}
+    targets:
+      - select: {kind: IAMPolicyMember, name: abfs-server-storage-object-user}
+        fieldPaths: [spec.resourceRef.external]

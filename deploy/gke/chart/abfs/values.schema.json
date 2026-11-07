@@ -1,0 +1,346 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "backend", "server", "gateway", "pusher", "bootstrap", "ci", "computeClasses"],
+  "definitions": {
+    "digest": {"type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$"},
+    "imageRef": {
+      "type": "object",
+      "required": ["name", "digest"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "digest": {"$ref": "#/definitions/digest"}
+      }
+    },
+    "quantity": {"type": ["string", "integer"], "pattern": "^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?$"},
+    "duration": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"},
+    "families": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "resources": {
+      "type": "object",
+      "properties": {
+        "requests": {"type": "object"},
+        "limits": {"type": "object"}
+      }
+    }
+  },
+  "properties": {
+    "commonLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+    "image": {
+      "type": "object",
+      "required": ["registry", "server", "pusher", "client", "casfsLoader"],
+      "properties": {
+        "registry": {"type": "string", "minLength": 1},
+        "pullPolicy": {"enum": ["IfNotPresent", "Always", "Never"]},
+        "allowTag": {"type": "boolean"},
+        "tag": {"type": "string"},
+        "server": {"$ref": "#/definitions/imageRef"},
+        "pusher": {"$ref": "#/definitions/imageRef"},
+        "client": {"$ref": "#/definitions/imageRef"},
+        "casfsLoader": {"$ref": "#/definitions/imageRef"}
+      }
+    },
+    "backend": {
+      "type": "object",
+      "required": ["project", "spannerInstance", "spannerDatabase", "bigtableInstance", "bucket", "zone"],
+      "properties": {
+        "project": {"type": "string", "pattern": "^$|^[a-z][-a-z0-9]{4,28}[a-z0-9]$"},
+        "spannerInstance": {"type": "string", "pattern": "^$|^[a-z][-a-z0-9]{0,62}[a-z0-9]$"},
+        "spannerDatabase": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,28}[a-z0-9]$"},
+        "bigtableInstance": {"type": "string", "pattern": "^$|^[a-z][-a-z0-9]{4,31}[a-z0-9]$"},
+        "bigtableAppProfile": {"type": "string", "pattern": "^$|^[_a-zA-Z0-9][-_.a-zA-Z0-9]*$"},
+        "bucket": {"type": "string", "pattern": "^$|^[a-z0-9][-_.a-z0-9]{1,61}[a-z0-9]$"},
+        "zone": {"type": "string", "pattern": "^$|^[a-z]+-[a-z]+[0-9]+-[a-z]$"}
+      }
+    },
+    "namespaces": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "createCi": {"type": "boolean"}
+      }
+    },
+    "server": {
+      "type": "object",
+      "required": ["caches", "memoryLimit", "cpuRequest", "vpa"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "gcpServiceAccount": {"type": "string"},
+        "replicas": {
+          "type": "object",
+          "properties": {
+            "min": {"type": "integer", "minimum": 1},
+            "max": {"type": "integer", "minimum": 1}
+          }
+        },
+        "hpa": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "cpuTarget": {"type": "integer", "minimum": 1, "maximum": 100}
+          }
+        },
+        "caches": {
+          "type": "object",
+          "required": ["headers", "contents"],
+          "properties": {
+            "headers": {"type": "integer", "minimum": 1},
+            "contents": {"type": "integer", "minimum": 1}
+          }
+        },
+        "memoryLimit": {"$ref": "#/definitions/quantity"},
+        "cpuRequest": {"type": ["integer", "string"]},
+        "vpa": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "mode": {"enum": ["Off", "Recreate"]},
+            "hpaRightsizing": {"type": "boolean"},
+            "minCpu": {"type": ["integer", "string"]},
+            "maxCpu": {"type": ["integer", "string"]}
+          }
+        },
+        "drainDelay": {"$ref": "#/definitions/duration"},
+        "healthProbeInterval": {"$ref": "#/definitions/duration"},
+        "shutdownTimeout": {"$ref": "#/definitions/duration"},
+        "logSampleRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "gc": {"type": "object", "properties": {"enabled": {"type": "boolean"}}},
+        "extraArgs": {"type": "array", "items": {"type": "string"}},
+        "preStopSleepSeconds": {"type": "integer", "minimum": 0},
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 0},
+        "minReadySeconds": {"type": "integer", "minimum": 0}
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "properties": {
+        "className": {"type": "string", "minLength": 1},
+        "addressName": {"type": "string", "minLength": 1},
+        "vip": {"type": "string", "pattern": "^$|^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"},
+        "timeoutSec": {"type": "integer", "minimum": 1},
+        "drainingTimeoutSec": {"type": "integer", "minimum": 0, "maximum": 3600},
+        "logging": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "sampleRate": {"type": "integer", "minimum": 0, "maximum": 1000000}
+          }
+        },
+        "allowGlobalAccess": {"type": "boolean"}
+      }
+    },
+    "pusher": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "count": {"type": "integer", "minimum": 1},
+        "namePrefix": {"type": "string", "pattern": "^[a-z][-a-z0-9]*$"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "dataDisk": {
+          "type": "object",
+          "properties": {
+            "size": {"$ref": "#/definitions/quantity"},
+            "storageClass": {"type": "string", "minLength": 1},
+            "createStorageClass": {"type": "boolean"}
+          }
+        },
+        "phase": {"enum": ["seed", "steady"]},
+        "seedResources": {"$ref": "#/definitions/resources"},
+        "steadyResources": {"$ref": "#/definitions/resources"},
+        "vpa": {
+          "type": "object",
+          "properties": {
+            "mode": {"enum": ["Initial", "Recreate"]},
+            "minMemory": {"$ref": "#/definitions/quantity"},
+            "maxMemory": {"$ref": "#/definitions/quantity"}
+          }
+        },
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 0},
+        "gerrit": {
+          "type": "object",
+          "properties": {
+            "secretName": {"type": "string", "minLength": 1},
+            "cookies": {"type": "boolean"}
+          }
+        },
+        "pool": {
+          "type": "object",
+          "properties": {
+            "manifest": {
+              "type": "object",
+              "properties": {
+                "url": {"type": "string"},
+                "project": {"type": "string"},
+                "server": {"type": "string"},
+                "checkInterval": {"type": "string"}
+              }
+            },
+            "branchFiles": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "properties": {"branch": {"type": "string"}, "file": {"type": "string"}}
+              }
+            },
+            "fetchRefSpec": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+            "projectDefaults": {"type": "object"},
+            "overrides": {"type": "array", "items": {"type": "object"}},
+            "defaults": {"type": "object"}
+          }
+        }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "deadlineSeconds": {"type": "integer", "minimum": 60},
+        "backoffLimit": {"type": "integer", "minimum": 0},
+        "clientConfig": {
+          "type": "object",
+          "not": {
+            "anyOf": [
+              {"required": ["disable-tls"]},
+              {"required": ["root-ca-file"]},
+              {"required": ["partial-clone"]}
+            ]
+          }
+        },
+        "repoSetup": {
+          "type": "object",
+          "properties": {"enabled": {"type": "boolean"}}
+        },
+        "computeClass": {"type": "string"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"}
+      }
+    },
+    "ci": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespace": {"type": "string", "minLength": 1},
+        "uid": {"type": "integer", "minimum": 1},
+        "gid": {"type": "integer", "minimum": 1},
+        "hostCacheDir": {"type": "string", "pattern": "^/"},
+        "waitForCasfsTimeout": {"type": "string", "pattern": "^[0-9]+(s|m|h)$"},
+        "cacheman": {
+          "type": "object",
+          "properties": {
+            "evictThreshold": {"type": "string", "pattern": "^[0-9]+(B|KB|MB|GB|TB)?$"},
+            "fsyncObjects": {"type": "boolean"},
+            "toolDir": {"type": "string", "pattern": "^/"},
+            "resources": {"$ref": "#/definitions/resources"}
+          }
+        },
+        "casfs": {
+          "type": "object",
+          "required": ["provider", "maxMounts"],
+          "properties": {
+            "provider": {"enum": ["daemonset", "image"]},
+            "maxMounts": {"type": "integer", "minimum": 1},
+            "mountGbPerWorkspace": {"type": "integer", "minimum": 1},
+            "maxRamShare": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+            "interfaceVersion": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+            "source": {
+              "type": "object",
+              "properties": {
+                "path": {"type": "string", "pattern": "^/"},
+                "commit": {"type": "string"},
+                "version": {"type": "string"}
+              }
+            },
+            "resources": {"$ref": "#/definitions/resources"}
+          }
+        },
+        "localSsd": {"type": "object", "properties": {"enabled": {"type": "boolean"}}},
+        "exampleJob": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "image": {"type": "string"},
+            "branch": {"type": "string", "minLength": 1},
+            "target": {"type": "string"},
+            "command": {"type": "string", "minLength": 1},
+            "resources": {"$ref": "#/definitions/resources"}
+          }
+        }
+      }
+    },
+    "computeClasses": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "nodeServiceAccount": {"type": "string"},
+        "ci": {
+          "type": "object",
+          "properties": {
+            "families": {"$ref": "#/definitions/families"},
+            "minCores": {"type": "integer", "minimum": 1},
+            "minMemoryGb": {"type": "integer", "minimum": 1},
+            "bootDiskGb": {"type": "integer", "minimum": 10},
+            "spot": {"type": "boolean"},
+            "consolidationDelayMinutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+            "consolidationThreshold": {"type": ["integer", "string"], "pattern": "^$|^[0-9]+$"},
+            "activeMigration": {"type": "boolean"},
+            "nodepools": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "server": {
+          "type": "object",
+          "properties": {
+            "families": {"$ref": "#/definitions/families"},
+            "zone": {"type": "string"},
+            "activeMigration": {"type": "boolean"}
+          }
+        },
+        "pusherSeed": {
+          "type": "object",
+          "properties": {
+            "families": {"$ref": "#/definitions/families"},
+            "minCores": {"type": "integer", "minimum": 1},
+            "minMemoryGb": {"type": "integer", "minimum": 1}
+          }
+        },
+        "pusherSteady": {
+          "type": "object",
+          "properties": {"families": {"$ref": "#/definitions/families"}}
+        }
+      }
+    },
+    "otel": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "endpoint": {"type": "string"},
+        "protocol": {"enum": ["grpc", "http/protobuf"]}
+      }
+    },
+    "pdb": {"type": "object", "properties": {"enabled": {"type": "boolean"}}},
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "proxyOnlySubnetCidr": {"type": "string", "pattern": "^$|^[0-9.]+/[0-9]{1,2}$"},
+        "healthCheckCidrs": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "alerts": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "for": {"type": "string"}
+      }
+    },
+    "tests": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "ciTools": {"type": "boolean"},
+        "computeClass": {"type": "string"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"}
+      }
+    }
+  }
+}

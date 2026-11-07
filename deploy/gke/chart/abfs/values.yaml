@@ -1,0 +1,356 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Values for the ABFS chart. Names of Google Cloud resources must equal the names in the KCC
+# overlay. Install the KCC objects first and wait until they are Ready, then
+# `helm install --timeout 30m` without `--wait` (the pushers wait for the bootstrap Job,
+# which is a post-install hook).
+
+# Extra labels on every object.
+commonLabels: {}
+
+# Images, built by scripts/build-images.sh from one ABFS commit and pinned by
+# digest. The chart refuses an empty digest unless allowTag is true (development only),
+# which then uses <registry>/<name>:<tag>.
+image:
+  registry: europe-west4-docker.pkg.dev/example-project/abfs
+  pullPolicy: IfNotPresent
+  allowTag: false
+  # Tag used only with allowTag; empty means the chart appVersion.
+  tag: ""
+  server:
+    name: abfs-server
+    digest: ""
+  pusher:
+    name: abfs-pusher
+    digest: ""
+  client:
+    name: abfs-client
+    digest: ""
+  casfsLoader:
+    name: casfs-loader
+    digest: ""
+
+# Backend names. They must equal the KCC names in both backend modes.
+backend:
+  project: ""
+  spannerInstance: ""
+  spannerDatabase: cas
+  bigtableInstance: ""
+  # Empty uses the instance default profile, which must use single-cluster routing.
+  bigtableAppProfile: ""
+  bucket: ""
+  # Zone of the Bigtable cluster. The server class places its nodes there.
+  zone: ""
+
+# Namespaces. The release namespace (abfs) holds the server, pushers and the bootstrap Job;
+# the KCC base creates it, with its project annotation and Pod Security level baseline.
+# ci.namespace holds the CI node workloads and the build pods. With createCi the chart
+# creates it with Pod Security level privileged; set it to false when the namespace is
+# managed elsewhere.
+namespaces:
+  createCi: true
+
+server:
+  enabled: true
+  # GSA bound to the abfs-server KSA through Workload Identity. Empty means
+  # abfs-server@<backend.project>.iam.gserviceaccount.com.
+  gcpServiceAccount: ""
+  replicas:
+    min: 3
+    max: 10
+  hpa:
+    enabled: true
+    cpuTarget: 60
+  # Entry counts, not bytes: headers about 180 B each, contents up to about 49 KB each.
+  # The render fails when both bounds plus 6 GiB exceed memoryLimit.
+  caches:
+    headers: 100000000
+    contents: 400000
+  # Memory request and limit. GOMEMLIMIT is set to 90 % of it.
+  memoryLimit: 48Gi
+  # CPU request; no CPU limit. GOMAXPROCS follows it. 14 fits one replica on a 16-vCPU
+  # node next to the GKE reservation and the system DaemonSets; 16 would never fit one.
+  cpuRequest: 14
+  # CPU only. Off gives recommendations; Recreate applies them by recreating pods.
+  # In-place resizing is not offered: GOMAXPROCS is fixed when the container starts.
+  vpa:
+    enabled: true
+    mode: "Off"
+    # Preview, GKE 1.36.3-gke.1630000 or later: HPA and VPA share the CPU request.
+    # Recreate with the HPA on needs it: a plain VPA on CPU next to a CPU HPA makes the
+    # two fight, so the render fails on that combination.
+    hpaRightsizing: false
+    minCpu: 12
+    maxCpu: 32
+  drainDelay: 15s
+  healthProbeInterval: 10s
+  shutdownTimeout: 25s
+  logSampleRate: 0.01
+  gc:
+    enabled: false
+  extraArgs: []
+  preStopSleepSeconds: 120
+  # preStop, then the server's longest stop after SIGTERM, then a margin: 120 s +
+  # 105 s (15 s drain, 25 s graceful gRPC stop, with gc 20 s touch drain and 30 s
+  # heartbeat row delete, 15 s telemetry flush) + 15 s = 240 s.
+  terminationGracePeriodSeconds: 240
+  minReadySeconds: 60
+  probes:
+    readiness:
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 2
+    liveness:
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 6
+
+gateway:
+  className: gke-l7-rilb
+  # Name of the KCC ComputeAddress (purpose SHARED_LOADBALANCER_VIP).
+  addressName: abfs-gateway
+  # IP of that address. Pushers, cacheman and build pods use <vip>:50051.
+  vip: ""
+  timeoutSec: 600
+  drainingTimeoutSec: 60
+  logging:
+    enabled: true
+    # Out of 1,000,000.
+    sampleRate: 1000
+  allowGlobalAccess: false
+
+pusher:
+  enabled: true
+  # Fixed after the seed. A change re-shards the pool (hours of re-clone). Never scale
+  # the StatefulSet by hand: the pool is rendered from this value.
+  count: 3
+  namePrefix: abfs-pusher
+  # HTTP /info port of each pusher (defaults.port in the pool config).
+  port: 9998
+  dataDisk:
+    size: 1Ti
+    storageClass: abfs-hyperdisk-balanced
+    # Create the StorageClass above (Hyperdisk Balanced, WaitForFirstConsumer).
+    createStorageClass: true
+  # seed: class abfs-pusher-seed with seedResources. steady: class abfs-pusher-steady with
+  # steadyResources and the memory VPA. Switch back to seed for a re-shard, a lost PVC or a
+  # large new branch.
+  phase: seed
+  seedResources:
+    requests:
+      cpu: 28
+      memory: 200Gi
+    limits:
+      memory: 200Gi
+  # Interim value until the steady RSS is measured. 7 CPU fits an 8-vCPU node next to
+  # the GKE reservation and the system DaemonSets.
+  steadyResources:
+    requests:
+      cpu: 7
+      memory: 32Gi
+    limits:
+      memory: 32Gi
+  # Steady phase only, memory only. Initial applies the recommendation when a pusher
+  # restarts for another reason; Recreate also evicts.
+  vpa:
+    mode: Initial
+    minMemory: 16Gi
+    maxMemory: 200Gi
+  terminationGracePeriodSeconds: 90
+  gerrit:
+    # Secret in the release namespace with key .netrc, and .gitcookies if cookies is true.
+    secretName: gerrit-credentials
+    cookies: false
+  pool:
+    manifest:
+      # For example https://gerrit.example.com/a/platform/manifest
+      url: ""
+      # The pool registers the manifest under server/project: server defaults to the host
+      # of url (port included), project to its path. Set project when url has a path
+      # prefix such as /a/. The bootstrap Job and cacheman give the clients the same
+      # values as manifest-server, manifest-scheme and manifest-project-name, also
+      # with pusher.enabled false. A URL without a scheme gets https://.
+      project: ""
+      server: ""
+      checkInterval: ""
+    branchFiles:
+      - branch: main
+        file: default.xml
+    fetchRefSpec:
+      - +refs/heads/*:refs/heads/*
+      - +refs/tags/*:refs/tags/*
+    # Further FetchConfig keys for every project (workers, push-interval, ...).
+    projectDefaults: {}
+    # Per-project overrides, for example the manifest project with all its branches.
+    overrides: []
+    # GitPusherDefaultsConfig keys (max-remote-pushes, max-projects-syncs,
+    # max-memory-usage). port comes from pusher.port.
+    defaults: {}
+
+bootstrap:
+  enabled: true
+  deadlineSeconds: 1500
+  backoffLimit: 3
+  # Written to config:clients/configs. Never disable-tls, root-ca-file or
+  # partial-clone here. manifest-server, manifest-scheme and manifest-project-name come
+  # from pusher.pool.manifest; set them here only to override that.
+  clientConfig:
+    sync.auto-setup: true
+    force-workspaces: true
+    git-prefetching: false
+    ignore-soong-env-avail: true
+  # Seed the patched repo tool (refs/heads/stable-abfs of gerrit.googlesource.com/git-repo)
+  # when the store has none, as on a new backend. Every mount -b fails without it. The Job
+  # checks the ref first and skips the seed when it exists, so an existing backend is left
+  # alone. The seed needs egress to gerrit.googlesource.com. A failed check or seed fails
+  # the hook, and with it helm install or upgrade; the Job log then names this value.
+  repoSetup:
+    enabled: true
+  # The Job runs on a node of this class (selector and toleration added). The system pool
+  # often has a node account that cannot pull from Artifact Registry; the class nodes use
+  # computeClasses.nodeServiceAccount, which can. Empty leaves placement to nodeSelector
+  # and tolerations.
+  computeClass: abfs-server
+  nodeSelector: {}
+  tolerations: []
+
+ci:
+  enabled: true
+  namespace: abfs-ci
+  uid: 1000
+  gid: 1000
+  hostCacheDir: /var/lib/abfs
+  # Build pods fail after this, so the CI system retries them on another node.
+  waitForCasfsTimeout: 15m
+  cacheman:
+    # 80 % of the boot disk minus the out/ budget (runbook).
+    evictThreshold: 500GB
+    fsyncObjects: true
+    # Directory of the static tool set in the abfs-client image.
+    toolDir: /opt/abfs/bin
+    # No CPU limit and no GOMAXPROCS: the one cacheman of a node serves every build pod
+    # there, so it may use all cores. The request is a scheduling floor only.
+    resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+      limits:
+        memory: 8Gi
+  casfs:
+    # daemonset: build casfs 0.1.23 on each Ubuntu node. image: the node image ships casfs
+    # (COS 133 build 44-193 or later); load and check only.
+    provider: daemonset
+    # Build pods per node plus 2 for remounts. Read-only after load.
+    maxMounts: 4
+    # Kernel slab per active workspace. Mid-build, one AAOS workspace on casfs 0.1.23 held
+    # about 1.5 GB in casfs_node_0 plus about 1.8 GB in a merged 128-byte cache, and was
+    # still growing; 6 keeps a margin over that. The end-of-build peak is not measured.
+    mountGbPerWorkspace: 6
+    # Upper bound: maxMounts * mountGbPerWorkspace must fit in this share of MemTotal.
+    maxRamShare: 0.4
+    # Interface the client needs: implemented >= this, required <= this.
+    interfaceVersion: 1.5.0
+    source:
+      # Source tree in the casfs-loader image.
+      path: /usr/src/casfs
+      commit: c946f8e
+      # Module version the loader expects (prefix match); empty skips the check. With
+      # provider image, set the version the node image ships or leave it empty.
+      version: 0.1.23
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 2Gi
+  # Not implemented in this chart version.
+  localSsd:
+    enabled: false
+  exampleJob:
+    enabled: false
+    # Build image of the customer's CI; it needs bash and the Android build host tools.
+    image: ""
+    branch: main
+    target: aosp_cf_x86_64_phone-trunk_staging-userdebug
+    command: "source build/envsetup.sh && lunch \"$TARGET\" && m"
+    # Fits one pod on a 32-vCPU, 128 GB node of the class floor: the node's vCPUs minus
+    # the GKE reservation, cacheman, the loader and the GKE system DaemonSets (docs/ci-job.md).
+    resources:
+      requests:
+        cpu: "28"
+        memory: 80Gi
+      limits:
+        memory: 80Gi
+
+computeClasses:
+  enabled: true
+  # Node service account of every class (KCC base).
+  nodeServiceAccount: ""
+  ci:
+    families: [n4, n4d, c4d, c4]
+    minCores: 32
+    minMemoryGb: 120
+    bootDiskGb: 1000
+    # Spot rules before the on-demand ones. Only if the CI retries preempted builds.
+    spot: false
+    consolidationDelayMinutes: 30
+    # Empty keeps the GKE default.
+    consolidationThreshold: ""
+    activeMigration: false
+    # gcloud-created pools with provisioned boot disk IOPS, tried first.
+    nodepools: []
+  server:
+    families: [n4, n4d, c4d, c4]
+    # Empty means backend.zone.
+    zone: ""
+    activeMigration: true
+  pusherSeed:
+    families: [n4, n4d, c4d, c4]
+    minCores: 32
+    minMemoryGb: 240
+  pusherSteady:
+    families: [n4, n4d, c4d, c4]
+
+otel:
+  enabled: true
+  endpoint: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+  protocol: grpc
+
+pdb:
+  enabled: true
+
+# Inert without Dataplane V2.
+networkPolicy:
+  enabled: true
+  # Proxy-only subnet of the region (REGIONAL_MANAGED_PROXY).
+  proxyOnlySubnetCidr: ""
+  healthCheckCidrs:
+    - 35.191.0.0/16
+
+# Managed Service for Prometheus Rules for the pusher guards. Off by default: the rules read
+# the OTLP metrics the managed collector stores, which is not checked on a cluster yet.
+alerts:
+  enabled: false
+  for: 30m
+
+tests:
+  enabled: true
+  # Also check the tools on a CI node. This can create a CI node.
+  ciTools: true
+  # Placement of the server health test, as for bootstrap.computeClass. The CI tools test
+  # always runs on the abfs-ci class.
+  computeClass: abfs-server
+  nodeSelector: {}
+  tolerations: []

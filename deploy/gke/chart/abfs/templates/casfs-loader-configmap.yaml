@@ -1,0 +1,119 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.ci.enabled }}
+{{- $c := .Values.ci.casfs }}
+{{- if not (has $c.provider (list "daemonset" "image")) }}
+{{- fail "ci.casfs.provider must be daemonset or image" }}
+{{- end }}
+# Loader script of the casfs-loader DaemonSet. Idempotent: a loaded module is checked and
+# kept. It never runs rmmod: the module cannot be removed while a casfs superblock exists,
+# and casfs_max_mounts is read-only after load. Any failure exits non-zero, so the pod
+# crash loops visibly and build pods on the node time out in wait-for-casfs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: abfs-casfs-loader
+  namespace: {{ .Values.ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "casfs-loader" | nindent 4 }}
+data:
+  load.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    log() { echo "casfs-loader: $*"; }
+    die() { echo "casfs-loader: ERROR: $*" >&2; exit 1; }
+    # True when version $1 >= $2.
+    vge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
+
+    PROVIDER={{ $c.provider | quote }}
+    WANT_IFACE={{ $c.interfaceVersion | quote }}
+    WANT_VERSION={{ $c.source.version | quote }}
+    SRC={{ $c.source.path | quote }}
+    MAX_MOUNTS={{ int $c.maxMounts }}
+    GB_PER_MOUNT={{ int $c.mountGbPerWorkspace }}
+    RAM_SHARE={{ $c.maxRamShare | quote }}
+    KVER="$(uname -r)"
+
+    # nsjail needs unprivileged user namespaces (Ubuntu 24.04 and later restrict them).
+    F=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+    if [ -e "$F" ] && [ "$(cat "$F")" != 0 ]; then
+      echo 0 >"$F"
+      log "set kernel.apparmor_restrict_unprivileged_userns=0"
+    fi
+
+    check() {
+      local p=/sys/module/casfs/parameters have_impl have_req have_max have_ver
+      have_impl="$(cat "$p/implemented_interface_version")"
+      have_req="$(cat "$p/required_interface_version")"
+      have_max="$(cat "$p/casfs_max_mounts")"
+      have_ver="$(cat /sys/module/casfs/version 2>/dev/null || echo unknown)"
+      log "loaded: version $have_ver, interface implemented $have_impl required $have_req, casfs_max_mounts $have_max, kernel $KVER"
+      vge "$have_impl" "$WANT_IFACE" || die "module implements interface $have_impl, the client needs $WANT_IFACE"
+      vge "$WANT_IFACE" "$have_req" || die "module requires interface $have_req, the client implements $WANT_IFACE"
+      if [ -n "$WANT_VERSION" ]; then
+        case "$have_ver" in
+          "$WANT_VERSION"*) ;;
+          *) die "module version $have_ver, expected $WANT_VERSION" ;;
+        esac
+      fi
+      if [ "$have_max" != "$MAX_MOUNTS" ]; then
+        log "WARNING: casfs_max_mounts is $have_max, not $MAX_MOUNTS; only a new node changes it"
+      fi
+    }
+
+    if [ -d /sys/module/casfs ]; then
+      check
+      exec sleep infinity
+    fi
+
+    # The slab budget of maxMounts workspaces must fit in maxRamShare of MemTotal.
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    cap="$(awk -v kb="$mem_kb" -v s="$RAM_SHARE" -v g="$GB_PER_MOUNT" 'BEGIN { n = int(kb * s / (g * 1000000)); if (n < 1) n = 1; print n }')"
+    if [ "$MAX_MOUNTS" -gt "$cap" ]; then
+      log "casfs_max_mounts $MAX_MOUNTS needs more than $RAM_SHARE of MemTotal; using $cap"
+      MAX_MOUNTS="$cap"
+    fi
+
+    if [ "$PROVIDER" = daemonset ]; then
+      . /host/etc/os-release
+      [ "${ID:-}" = ubuntu ] || die "provider daemonset needs Ubuntu nodes, this node runs ${ID:-unknown}"
+      B=/var/lib/abfs-casfs/build
+      rm -rf "/host$B"
+      mkdir -p "/host$B"
+      cp -a "$SRC/." "/host$B/"
+      log "building casfs $WANT_VERSION for kernel $KVER"
+      chroot /host /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive \
+        CASFS_VERSION="$WANT_VERSION" KVER="$KVER" B="$B" /bin/bash -euo pipefail -c '
+          # A new node can run its own apt jobs at boot. The lock timeout covers the dpkg
+          # locks of install only; update fails at once on the lists lock, so retry it for
+          # up to 5 minutes.
+          n=0
+          until apt-get update -qq; do
+            n=$((n + 1))
+            [ "$n" -lt 30 ] || { echo "apt-get update failed 30 times" >&2; exit 1; }
+            sleep 10
+          done
+          apt-get -o DPkg::Lock::Timeout=300 install -y -qq "linux-headers-$KVER" build-essential gettext-base
+          make -C "$B" ko KERNEL_RELEASE="$KVER"
+          install -D -m 0644 "$B/casfs.ko" "/lib/modules/$KVER/extra/casfs/casfs.ko"
+          depmod "$KVER"
+        ' || die "build failed on kernel $KVER"
+    fi
+    chroot /host modprobe casfs casfs_max_mounts="$MAX_MOUNTS" || die "modprobe casfs failed on kernel $KVER"
+    [ -d /sys/module/casfs ] || die "casfs did not load"
+    check
+    exec sleep infinity
+{{- end }}

@@ -1,0 +1,29 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.pusher.enabled .Values.pusher.dataDisk.createStorageClass }}
+# Hyperdisk Balanced for the pusher PVCs; it attaches to all four families. The disk is
+# created in the zone of the pod's first node.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.pusher.dataDisk.storageClass }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: hyperdisk-balanced
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+{{- end }}

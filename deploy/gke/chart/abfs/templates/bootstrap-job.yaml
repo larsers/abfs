@@ -1,0 +1,164 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.bootstrap.enabled }}
+{{- $b := .Values.bootstrap }}
+{{- $srv := include "abfs.server.service" . }}
+# Writes config:git-pusher/default and config:clients/configs into the store through the
+# ClusterIP Service, and with bootstrap.repoSetup the patched repo tool when the store has
+# none. It runs a client with its own cacheman on an emptyDir; it needs no
+# casfs and no privileges. Install with --timeout 30m: the hook waits for the server.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: abfs-bootstrap
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "bootstrap" | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ $b.backoffLimit }}
+  activeDeadlineSeconds: {{ $b.deadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "abfs.labels" . | nindent 8 }}
+        {{- include "abfs.selectorLabels" "bootstrap" | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/bootstrap-configmap.yaml") . | sha256sum }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with include "abfs.placement" (dict "root" . "cfg" $b "what" "bootstrap") | trim }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: bootstrap
+          image: {{ include "abfs.image" (dict "root" . "image" "client") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              A=(abfs -i admin)
+              echo "waiting for gRPC health of {{ $srv }}"
+              n=0
+              until out=$(abfs {{ include "abfs.clientFlags" $srv }} test-client health-check 2>&1); do
+                n=$((n + 1))
+                # The last error every minute, so a failure that is not the server shows.
+                if [ $((n % 12)) -eq 1 ]; then
+                  echo "not healthy yet: $(printf '%s\n' "$out" | head -n 2)"
+                fi
+                sleep 5
+              done
+              "${A[@]}" {{ include "abfs.clientFlags" $srv }} config -w
+              "${A[@]}" init
+              abfs --instance admin cacheman run &
+              "${A[@]}" cacheman remote-ok -t 120s
+              "${A[@]}" edit --add config:. </dev/null 2>/dev/null || true
+              # edit -a refuses an existing file; edit --stdin updates one.
+              write() {
+                if "${A[@]}" cat "$1" >/dev/null 2>&1; then
+                  "${A[@]}" edit --stdin "$1" <"$2"
+                else
+                  "${A[@]}" edit -a --stdin "$1" <"$2"
+                fi
+              }
+              strip() { grep -v '^ *#' | grep -v '^ *$' || true; }
+              set -- {{ if .Values.pusher.enabled }}"config:git-pusher/default=/config/git-pusher-default" {{ end }}"config:clients/configs=/config/clients-configs"
+              for pair in "$@"; do write "${pair%%=*}" "${pair#*=}"; done
+              "${A[@]}" cacheman wait -t 600
+              for pair in "$@"; do
+                "${A[@]}" cat "${pair%%=*}" >/tmp/readback
+                if ! diff <(strip <"${pair#*=}") <(strip </tmp/readback); then
+                  echo "read-back of ${pair%%=*} differs" >&2
+                  exit 1
+                fi
+                echo "${pair%%=*} written"
+              done
+              {{- if dig "enabled" false ($b.repoSetup | default dict) }}
+              # mount -b clones the patched repo tool from the store at stable-abfs of
+              # gerrit.googlesource.com/git-repo, and a new store has none. Seed it once, as
+              # the sysadmin guide does; this needs egress to gerrit.googlesource.com.
+              G=(-s gerrit.googlesource.com -p git-repo)
+              REF='^[0-9a-f]{40} refs/heads/stable-abfs$'
+              # The two answers of a store without the ref: the server has no such project,
+              # or the store has no such server. Any other answer is a read error, and a read
+              # error never replaces the ref.
+              MISSING='^ *\(not exists\) refs/heads/stable-abfs$|the server "gerrit\.googlesource\.com" not found'
+              OFF="to skip this step, set bootstrap.repoSetup.enabled=false and seed the ref by hand (see the runbook)"
+              getref() { echo refs/heads/stable-abfs | "${A[@]}" test-client get-ref "${G[@]}" 2>&1; }
+              res=$(getref || true)
+              have=$(printf '%s\n' "$res" | grep -E "$REF" || true)
+              if [ -n "$have" ]; then
+                echo "git-repo stable-abfs is in the store at ${have%% *}"
+              elif ! printf '%s\n' "$res" | grep -Eq "$MISSING"; then
+                echo "cannot read the git-repo ref: $(printf '%s\n' "$res" | head -n 2)" >&2
+                echo "$OFF" >&2
+                exit 1
+              else
+                echo "git-repo stable-abfs is not in the store; running abfs repo-setup"
+                trap 'echo "git-repo seed failed; $OFF" >&2' ERR
+                # tee to a file: reopening /dev/stderr can fail for a non-root user.
+                "${A[@]}" repo-setup | tee /tmp/repo-setup.out >&2
+                dir=$(sed -n 's/^Repository patched successfully in //p' /tmp/repo-setup.out)
+                if [ -z "$dir" ]; then
+                  echo "abfs repo-setup printed no directory; $OFF" >&2
+                  exit 1
+                fi
+                "${A[@]}" --no-local-cache push -r "$dir"
+                echo "$(git -C "$dir" rev-parse HEAD) refs/heads/stable-abfs" | "${A[@]}" test-client put-ref "${G[@]}"
+                res=$(getref || true)
+                if ! printf '%s\n' "$res" | grep -Eq "$REF"; then
+                  echo "git-repo stable-abfs is not in the store after the seed: $(printf '%s\n' "$res" | head -n 2)" >&2
+                  echo "$OFF" >&2
+                  exit 1
+                fi
+                trap - ERR
+                echo "git-repo stable-abfs seeded: $(printf '%s\n' "$res" | grep -E "$REF")"
+              fi
+              {{- end }}
+          env:
+            - name: HOME
+              value: /work
+            {{- include "abfs.userEnv" . | nindent 12 }}
+            {{- include "abfs.otelEnv" (dict "root" . "queue" 0 "traces" false) | trim | nindent 12 }}
+          securityContext:
+            {{- include "abfs.restrictedSecurityContext" (dict "uid" .Values.ci.uid "gid" .Values.ci.gid) | nindent 12 }}
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: abfs-bootstrap-config
+{{- end }}

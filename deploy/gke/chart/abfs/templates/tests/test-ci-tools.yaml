@@ -1,0 +1,69 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.tests.enabled .Values.tests.ciTools .Values.ci.enabled }}
+{{- $ci := .Values.ci }}
+# File capabilities of the tools that cacheman copied to a CI node, and a run of
+# casfs-mounter as ci.uid. Its file capabilities need a full bounding set, so the
+# container is privileged like a build pod; an exec without them fails with EPERM.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: abfs-test-ci-tools
+  namespace: {{ $ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "test" | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  nodeSelector:
+    cloud.google.com/compute-class: abfs-ci
+  containers:
+    - name: getcap
+      image: {{ include "abfs.image" (dict "root" . "image" "client") }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          B={{ $ci.hostCacheDir }}/bin
+          for _ in $(seq 1 60); do [ -x "$B/casfs-mounter" ] && break; sleep 10; done
+          getcap "$B/casfs-mounter" "$B/casfuse-mounter" "$B/abfs-resources"
+          getcap "$B/casfs-mounter" | grep -qi cap_sys_admin
+          echo "OK: casfs-mounter has its file capabilities"
+          "$B/casfs-mounter" --version
+          echo "OK: casfs-mounter runs as uid $(id -u)"
+      env:
+        - name: HOME
+          value: /tmp
+        {{- include "abfs.userEnv" . | nindent 8 }}
+      securityContext:
+        privileged: true
+        runAsUser: {{ int $ci.uid }}
+        runAsGroup: {{ int $ci.gid }}
+      volumeMounts:
+        - name: abfs
+          mountPath: {{ $ci.hostCacheDir }}
+          readOnly: true
+  volumes:
+    - name: abfs
+      hostPath:
+        path: {{ $ci.hostCacheDir }}
+        type: DirectoryOrCreate
+{{- end }}
