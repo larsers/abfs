@@ -56,5 +56,8 @@ func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 	for i, hdr := range hdrs {
 		found[i] = !hdr.IsEmpty()
 	}
+	if len(found) == len(keys) {
+		c.checkRemoteHeaders(ctx, keys, found)
+	}
 	c.WriteJSON(w, r, found)
 }

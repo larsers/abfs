@@ -142,6 +142,8 @@ type CacheManStats struct {
 	Phony       PushGroupStat
 	Execute     ExecStat
 	Fallback    FallbackStats
+	// RemoteChecks is nil while cacheman does not check local writes with the server.
+	RemoteChecks *RemoteCheckStats `json:"remote_checks,omitempty"`
 }
 
 type FallbackStats struct {

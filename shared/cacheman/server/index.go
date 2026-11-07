@@ -126,6 +126,33 @@ type IndexStore interface {
 
 	// KeepAlive should be called to update the last alive time of the entry.
 	KeepAlive(key entities.Hash) error
+
+	// SetLocalWriteCheck makes eviction keep entries that are not Remote or hold a check
+	// marker, and makes deletes remove the marker.
+	SetLocalWriteCheck()
+
+	// ClearRemote records a local write of hash. When the existing entry is Remote, it clears
+	// Remote, writes a check marker and takes the entry out of the LRU in one transaction.
+	// A nil entry clears the existing entry if it is Local and Remote. It makes one attempt
+	// and returns ErrTxnConflict on a conflict.
+	ClearRemote(hash entities.Hash, entry *IndexEntry) (prevEnt *IndexEntry, cleared bool, err error)
+
+	// ConfirmRemote deletes the check marker of hash, if it has one, and marks the local
+	// entry Remote and tracks it in the LRU. It reports whether there was a marker.
+	ConfirmRemote(hash entities.Hash) (bool, error)
+
+	// HasCheckMarker reports whether hash holds a check marker.
+	HasCheckMarker(hash entities.Hash) bool
+
+	// CheckMarkers returns the hashes that hold a check marker.
+	CheckMarkers() ([]entities.Hash, error)
+
+	// EvictUpTo is Evict limited to entries last used at or before maxTimestamp.
+	EvictUpTo(maxTimestamp int64) ([]*IndexKeyEntry, int64, int64, error)
+
+	// EvictSkippedUnconfirmed returns how many LRU entries eviction kept because the server
+	// had not confirmed them.
+	EvictSkippedUnconfirmed() int64
 }
 
 type EntryType int
@@ -459,6 +486,10 @@ type badgerIndex struct {
 	evictCount atomic.Int64
 	oldestUsed time.Time
 	closed     atomic.Bool
+
+	// localWriteCheck is set by enableLocalWriteCheck; gate holds eviction for the start pass.
+	localWriteCheck atomic.Bool
+	gate            evictGate
 }
 
 type IndexOptions struct {
@@ -580,6 +611,9 @@ func (i *badgerIndex) LockEviction() func() {
 // until sufficient space is available. The metadata is purged prior
 // to disk contents.
 func (i *badgerIndex) evictIndexAndCache() error {
+	if i.evictionHeld() {
+		return nil
+	}
 	i.evictStart = time.Now()
 	startLRUSz := i.indexStore.LRUSize()
 	currLRUSz := startLRUSz
@@ -601,9 +635,10 @@ func (i *badgerIndex) evictIndexAndCache() error {
 		// It is possible that we are interrupted in between evicting
 		// a cached item from the index, but before removing it from disk.
 		// This will get rectified on a cacheman maintenance run.
-		i.evictRWLock.Lock()
-		victims, _, lruSz, err := i.indexStore.Evict()
-		i.evictRWLock.Unlock()
+		victims, lruSz, err := i.evictBatch(currLRUSz, int64(i.evictThreshold))
+		if errors.Is(err, errEvictionHeld) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}

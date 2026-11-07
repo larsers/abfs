@@ -225,6 +225,8 @@ type CacheMan struct {
 
 	statStore StatStore
 
+	localWrites localWriteCheck
+
 	printer              Printer
 	cacheBlockSize       int64
 	requestCallbacksLock sync.Mutex
@@ -775,6 +777,7 @@ func (c *CacheMan) applyLocalConfig(config *instance.Config, force bool) (applyE
 	}
 
 	c.config = config
+	c.applyLocalWriteCheck(config)
 	return nil
 }
 
@@ -1602,7 +1605,7 @@ func (c *CacheMan) addObjectToIndexWithSize(hash entities.Hash, entryType EntryT
 		return false, err
 	}
 
-	_, _, prevEnt, _, err := c.index.Put(ke.Key, ke.IndexEntry)
+	prevEnt, err := c.putIndexEntry(ke, remote)
 	if err != nil {
 		return false, err
 	}
@@ -2148,6 +2151,7 @@ func (c *CacheMan) checkCreds(ctx context.Context) error {
 func (c *CacheMan) Serve(ctx context.Context) error {
 	c.printer.Printf("Listening on %s...\n", c.socket.Addr())
 
+	c.startLocalWriteCheck(ctx)
 	go c.handleNewConfig(ctx)
 
 	go func() {
@@ -2353,6 +2357,7 @@ func (c *CacheMan) Stats() protocol.CacheManStats {
 	if cli, ok := c.abfsClient.(*client.ABFSClient); ok {
 		stat.ClientStat = cli.Stat()
 	}
+	stat.RemoteChecks = c.localWriteStats()
 
 	return stat
 }
@@ -2529,6 +2534,8 @@ func (c *CacheMan) NewObject(hash entities.Hash, objType protocol.RequestObjectT
 		// This is self-correcting because the next time it is read, it will be re-fetched.
 		if !entities.IsNotExist(addErr) {
 			c.printer.Printf("NewObject(%s): Unable to add to index err: %v\n", hash, addErr)
+		} else {
+			c.checkLostLocalWrite(hash, objType)
 		}
 	}
 }
@@ -2553,7 +2560,7 @@ func (c *CacheMan) Phony(priority dagsync.RequestPriority, objects []entities.Ha
 	}
 
 	if sync := c.getSync(); sync != nil && !c.noRemotePush() { // calling this function with localOnly=true doesn't make much sense, but we check just in case
-		go sync.Phony(priority, misses, callback)
+		go sync.Phony(priority, misses, c.confirmAfterPhony(misses, callback))
 	} else {
 		callback(nil)
 	}
@@ -2904,6 +2911,9 @@ func (c *CacheMan) reconcileDiskObject(hash entities.Hash, objType protocol.Requ
 	}
 
 	entry := c.index.Get(hash)
+	if c.reindexLocalWrite(hash, entry) {
+		return
+	}
 	resolveObjType := func() protocol.RequestObjectType {
 		if objType != protocol.TypeObject {
 			return objType
