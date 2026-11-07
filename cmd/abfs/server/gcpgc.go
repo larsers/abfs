@@ -146,8 +146,9 @@ func printBackfillStats(stats *gc.BackfillStats, dryRun bool) {
 type gcpGCRunCmd struct {
 	*root.RootCmd
 	server  gcp.NewServerOpts
-	opts    gc.DryRunOpts
+	opts    gc.CondemnOpts
 	dryRun  bool
+	condemn bool
 	report  string
 	explain []string
 }
@@ -155,25 +156,36 @@ type gcpGCRunCmd struct {
 func (c *gcpGCRunCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "run",
-		Usage: "--dry-run --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
-		Desc: `Run one garbage collection cycle. Only --dry-run is implemented: it takes the GC lease,
-reads the refs at one snapshot, scans the gc and maps tables, marks what the roots, the
-retention rules and the grace keep, and reports what a collection would remove as JSON. It
-writes nothing but the garbage collector state in Spanner. With --consistency it also scans
-the meta family of the objects table to check that every object has a gc row. Needs the
-resources of 'abfs server gcp init --gc'.`,
+		Usage: "(--dry-run | --condemn --expected-replicas <n>) --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
+		Desc: `Run one garbage collection cycle and report it as JSON. Both modes take the GC lease,
+read the refs at one snapshot, scan the gc and maps tables and mark what the roots, the
+retention rules and the grace keep. With --consistency (required for --condemn) the cycle
+also scans the meta family of the objects table to check that every object has a gc row.
+
+--dry-run reports what a collection would remove and writes nothing but the garbage
+collector state in Spanner. --condemn also marks the unreachable objects with the cycle
+number, after it wrote their list to the bucket; it deletes nothing, and servers with --gc
+clear the marker of any marked object they read. It refuses, and writes nothing, unless
+every check of the cycle passed: --expected-replicas distinct server hosts write a GC
+heartbeat, one live row each, with settings that fit the timing rules; no object lacks a gc
+row; and no pin or root could not be read. --explain adds, per key, the root that keeps it.
+Needs the resources of 'abfs server gcp init --gc'.`,
 	}
 }
 
 func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
-	c.opts = gc.DefaultDryRunOpts()
+	c.opts = gc.DefaultCondemnOpts()
 	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
 	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", "The GCP Bigtable App Profile ID for the scans, best one with low priority and single-cluster routing (empty uses the instance default app profile)")
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
-	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing (required: the only mode so far)")
+	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing")
+	fl.BoolVar(&c.condemn, "condemn", false, "Mark the unreachable objects as condemned and delete nothing")
+	fl.IntVar(&c.opts.ExpectedReplicas, "expected-replicas", 0, "With --condemn, the number of distinct server hosts that must run with --gc (required)")
+	fl.Float64Var(&c.opts.Rate, "condemn-rate", gc.DefaultCondemnRate, "With --condemn, the maximum number of objects marked per second (0 means no limit)")
+	fl.IntVar(&c.opts.KeepLists, "keep-lists", gc.DefaultKeepLists, "With --condemn, the number of condemned lists of the newest cycles kept in the bucket")
 	fl.StringVar(&c.report, "report", "", "Write the JSON report to this file instead of stdout")
 	fl.DurationVar(&c.opts.Grace, "grace", gc.DefaultGrace, "Keep objects written or touched within this time before the snapshot, and what they reach")
 	fl.DurationVar(&c.opts.MountIdle, "mount-idle", gc.DefaultMountIdle, "Keep what a mount ref reaches while the mount wrote its ref within this time")
@@ -188,25 +200,40 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringSliceVar(&c.explain, "explain", nil, "Object keys, separated by commas, whose gc row, reachability, first root, times and condemn marker the report explains")
 }
 
-func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
-	args.EnsureNoArgs(fl)
-	if !c.dryRun {
-		return errors.New("only dry runs are implemented: pass --dry-run")
+// checkOpts checks the mode flags and fills the keys to explain.
+func (c *gcpGCRunCmd) checkOpts() error {
+	if c.dryRun == c.condemn {
+		return errors.New("pass one of --dry-run and --condemn")
 	}
-	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+	var err error
+	if c.condemn {
+		err = c.opts.Validate()
+	} else {
+		err = c.opts.DryRunOpts.Validate()
+	}
+	if err != nil {
 		return err
 	}
-	if err := c.opts.Validate(); err != nil {
-		return err
-	}
+	c.opts.Explain = nil
 	for _, k := range c.explain {
 		if !entities.IsHash(k) {
 			return fmt.Errorf("invalid key %q for --explain", k)
 		}
 		c.opts.Explain = append(c.opts.Explain, entities.NewHash(k))
 	}
-	// The run reads only the mount details and pinned manifests of live
-	// mounts, once each, and must not rescue them.
+	return nil
+}
+
+func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
+	args.EnsureNoArgs(fl)
+	if err := c.checkOpts(); err != nil {
+		return err
+	}
+	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+		return err
+	}
+	// The run reads only the workspace snapshots, mount details and pinned
+	// manifests, once each, and must not rescue them.
 	c.server.GC = true
 	c.server.GCReadOnly = true
 	c.server.MaxCachedHeaders = 1
@@ -220,11 +247,18 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 			log.Printf("Warning: error closing ABFS server: %v", err)
 		}
 	}()
-	res, err := server.DryRunGC(ctx, &c.opts)
-	if err != nil {
-		return err
+	var res *gc.Result
+	if c.condemn {
+		res, err = server.CondemnGC(ctx, c.server.BucketName, &c.opts)
+	} else {
+		res, err = server.DryRunGC(ctx, &c.opts.DryRunOpts)
 	}
-	return writeReport(c.report, res.Report)
+	if res != nil {
+		if werr := writeReport(c.report, res.Report); werr != nil {
+			return errors.Join(err, werr)
+		}
+	}
+	return err
 }
 
 func writeReport(file string, report *gc.Report) error {

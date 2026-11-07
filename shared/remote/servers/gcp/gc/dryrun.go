@@ -144,6 +144,8 @@ type Report struct {
 	Edges       EdgeCounts              `json:"edges"`
 	Maps        map[MapClass]*MapCounts `json:"maps"`
 	Consistency ConsistencyReport       `json:"consistency"`
+	// Condemn reports the condemn step of a condemn cycle.
+	Condemn *CondemnReport `json:"condemn,omitempty"`
 	// Explain explains the keys of DryRunOpts.Explain.
 	Explain []KeyReport  `json:"explain,omitempty"`
 	Memory  MemoryReport `json:"memory"`
@@ -219,6 +221,7 @@ type Timings struct {
 	Scan        float64 `json:"scan"`
 	Mark        float64 `json:"mark"`
 	Consistency float64 `json:"consistency"`
+	Condemn     float64 `json:"condemn,omitempty"`
 	Total       float64 `json:"total"`
 }
 
@@ -230,6 +233,9 @@ type Result struct {
 	// first holds the first root of each tracked node, resolved by roots.
 	first map[uint32]rootRef
 	roots *rootTable
+	// unreachable lists, in key order, the unreachable nodes that the
+	// consistency scan found an objects row for: the ones a condemn marks.
+	unreachable []sizedNode
 }
 
 // firstRoot returns the root whose walk first reached the tracked node id, or
@@ -263,14 +269,24 @@ func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs r
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
+	return runCycle(ctx, sp, bt, objs, &o, nil)
+}
+
+// runCycle runs one cycle: a dry run when c is nil, else a condemn cycle
+// whose steps c runs on the mark, under the same lease.
+func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, o *DryRunOpts, c *condemner) (*Result, error) {
 	if o.Holder == "" {
 		o.Holder = DefaultHolder()
 	}
 	if o.StateName == "" {
 		o.StateName = DefaultStateName
 	}
+	phase := PhaseDryRun
+	if c != nil {
+		phase = PhaseCondemn
+	}
 	start := time.Now()
-	lease, err := AcquireLease(ctx, sp, o.StateName, o.Holder, PhaseDryRun, o.LeaseDuration, o.Grace)
+	lease, err := AcquireLease(ctx, sp, o.StateName, o.Holder, phase, o.LeaseDuration, o.Grace)
 	if err != nil {
 		return nil, err
 	}
@@ -278,10 +294,13 @@ func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs r
 	runCtx, stop := lease.Keep(ctx)
 	defer stop()
 
-	d := &dryRun{opts: &o, lease: lease, sp: sp, bt: bt, objs: objs, start: start}
+	d := &dryRun{opts: o, lease: lease, sp: sp, bt: bt, objs: objs, start: start, phase: phase, keepUnreachable: c != nil}
 	res, err := d.run(runCtx)
+	if err == nil && c != nil {
+		err = c.run(runCtx, lease, res)
+	}
 	if err != nil && runCtx.Err() != nil && ctx.Err() == nil {
-		return nil, fmt.Errorf("the GC dry run stopped: %w", context.Cause(runCtx))
+		return nil, fmt.Errorf("the GC %s cycle stopped: %w", phase, context.Cause(runCtx))
 	}
 	return res, err
 }
@@ -301,6 +320,10 @@ type dryRun struct {
 	// tracked lists keys whose first root the mark records, besides those of
 	// the Explain option.
 	tracked []Hash
+	phase   string
+	// keepUnreachable keeps the unreachable objects that have an objects row,
+	// for a condemn.
+	keepUnreachable bool
 }
 
 func (d *dryRun) run(ctx context.Context) (*Result, error) {
@@ -308,7 +331,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	snapshot := d.lease.Start
 	r := &Report{
 		Cycle:        d.lease.Cycle,
-		Phase:        PhaseDryRun,
+		Phase:        d.phase,
 		Holder:       o.Holder,
 		StartTime:    d.start,
 		SnapshotTime: snapshot,
@@ -457,18 +480,19 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	r.Objects.Unreachable = r.Objects.Rows - r.Objects.Reachable
 	d.countTypes(g, m.live)
 
+	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}}
 	if o.Consistency {
 		step = time.Now()
-		cr, sizes, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin))
+		scan, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin), d.keepUnreachable)
 		if err != nil {
 			return nil, err
 		}
-		r.Consistency = *cr
-		r.Objects.ReachableBytes = &sizes.reachable
-		r.Objects.UnreachableBytes = &sizes.unreachable
+		r.Consistency = *scan.report
+		r.Objects.ReachableBytes = &scan.sizes.reachable
+		r.Objects.UnreachableBytes = &scan.sizes.unreachable
+		res.unreachable = scan.unreachable
 		r.Seconds.Consistency = time.Since(step).Seconds()
 	}
-	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}}
 	if len(o.Explain) > 0 {
 		if r.Explain, err = res.explainKeys(ctx, d.bt, o.Explain); err != nil {
 			return nil, err
@@ -569,7 +593,7 @@ func logSummary(r *Report) {
 	if r.Consistency.Ran {
 		missing = fmt.Sprint(r.Consistency.MissingGCRows)
 	}
-	log.Printf("GC dry run of cycle %d: %d objects, %d reachable, %d unreachable, %d dangling edges, %d dangling roots, %d refs and %d map rows to expire, missing gc rows %s, peak heap %d MiB, %.0f s",
-		r.Cycle, r.Objects.Rows, r.Objects.Reachable, r.Objects.Unreachable, r.Edges.Dangling, danglingRoots,
+	log.Printf("GC %s cycle %d: %d objects, %d reachable, %d unreachable, %d dangling edges, %d dangling roots, %d refs and %d map rows to expire, missing gc rows %s, peak heap %d MiB, %.0f s",
+		r.Phase, r.Cycle, r.Objects.Rows, r.Objects.Reachable, r.Objects.Unreachable, r.Edges.Dangling, danglingRoots,
 		r.RefsToTombstone, mapsExpired, missing, r.Memory.PeakHeapBytes>>20, r.Seconds.Total)
 }

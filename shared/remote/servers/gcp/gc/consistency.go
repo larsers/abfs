@@ -60,15 +60,34 @@ type objectBytes struct {
 	reachable, unreachable int64
 }
 
+// sizedNode is a node and the size of its object.
+type sizedNode struct {
+	id   uint32
+	size int64
+}
+
+// consistencyScan is the result of the consistency check.
+type consistencyScan struct {
+	report *ConsistencyReport
+	sizes  objectBytes
+	// seen holds the nodes that have an objects row.
+	seen bitmap
+	// unreachable lists the unreachable nodes that have an objects row, in
+	// key order, when the scan was asked to keep them.
+	unreachable []sizedNode
+}
+
 // checkConsistency scans the meta family of the table objects. It checks that
 // every object written before checkBefore has a node in g, and sums the sizes
-// of the reachable and unreachable objects.
-func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []string, g *graph, live bitmap, checkBefore time.Time) (*ConsistencyReport, objectBytes, error) {
+// of the reachable and unreachable objects. With keep it also lists the
+// unreachable nodes that have an objects row.
+func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []string, g *graph, live bitmap, checkBefore time.Time, keep bool) (*consistencyScan, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.LatestNFilter(1))
 	seen := newBitmap(g.size())
 	var mu sync.Mutex
 	report := &ConsistencyReport{Ran: true}
 	var sizes objectBytes
+	unreachable := make([][]sizedNode, len(bounds)-1)
 	eg, gctx := errgroup.WithContext(ctx)
 	for i := range len(bounds) - 1 {
 		eg.Go(func() error {
@@ -96,14 +115,18 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 					return true
 				}
 				seen.setAtomic(id)
+				var size int64
 				for _, item := range items {
 					if item.Column == objectsSizeColumn && len(item.Value) == 8 {
-						size := int64(binary.BigEndian.Uint64(item.Value))
-						if live.has(id) {
-							b.reachable += size
-						} else {
-							b.unreachable += size
-						}
+						size = int64(binary.BigEndian.Uint64(item.Value))
+					}
+				}
+				if live.has(id) {
+					b.reachable += size
+				} else {
+					b.unreachable += size
+					if keep {
+						unreachable[i] = append(unreachable[i], sizedNode{id: id, size: size})
 					}
 				}
 				return true
@@ -123,10 +146,14 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 		})
 	}
 	if err := eg.Wait(); err != nil {
-		return nil, objectBytes{}, err
+		return nil, err
 	}
 	slices.Sort(report.FirstMissing)
 	report.FirstMissing = report.FirstMissing[:min(len(report.FirstMissing), maxMissingKept)]
 	report.GCRowsWithoutObject = int64(g.size()) - seen.count()
-	return report, sizes, nil
+	scan := &consistencyScan{report: report, sizes: sizes, seen: seen}
+	for _, nodes := range unreachable {
+		scan.unreachable = append(scan.unreachable, nodes...)
+	}
+	return scan, nil
 }

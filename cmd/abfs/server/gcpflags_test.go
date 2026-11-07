@@ -15,6 +15,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/remote/servers/gcp"
+	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
 func TestGCPFlags_GCHooks(t *testing.T) {
@@ -57,4 +59,41 @@ func TestGCPInitFlags_GC(t *testing.T) {
 		require.NoError(t, fl.Parse(tt.args))
 		require.Equal(t, tt.gc, cmd.opts.GC)
 	}
+}
+
+// gc run takes exactly one mode, and --condemn needs the expected number of
+// server hosts and the consistency check.
+func TestGCPGCRunFlags_Modes(t *testing.T) {
+	tests := []struct {
+		args    []string
+		wantErr string
+	}{
+		{nil, "pass one of --dry-run and --condemn"},
+		{[]string{"--dry-run", "--condemn", "--expected-replicas=3"}, "pass one of --dry-run and --condemn"},
+		{[]string{"--dry-run"}, ""},
+		{[]string{"--condemn"}, "invalid expected replicas 0"},
+		{[]string{"--condemn", "--expected-replicas=3", "--consistency=false"}, "needs the consistency check"},
+		{[]string{"--condemn", "--expected-replicas=3", "--keep-lists=0"}, "invalid number of kept lists"},
+		{[]string{"--dry-run", "--explain=nothex"}, `invalid key "nothex"`},
+		{[]string{"--condemn", "--expected-replicas=3", "--condemn-rate=100", "--explain=" + strings.Repeat("ab", 20)}, ""},
+	}
+	for _, tt := range tests {
+		c := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
+		fl := pflag.NewFlagSet("run", pflag.ContinueOnError)
+		c.RegisterFlags(fl)
+		require.NoError(t, fl.Parse(tt.args))
+		err := c.checkOpts()
+		if tt.wantErr != "" {
+			require.ErrorContains(t, err, tt.wantErr, tt.args)
+			continue
+		}
+		require.NoError(t, err, tt.args)
+	}
+	c := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
+	fl := pflag.NewFlagSet("run", pflag.ContinueOnError)
+	c.RegisterFlags(fl)
+	require.NoError(t, fl.Parse([]string{"--condemn", "--expected-replicas=3"}))
+	require.Equal(t, 3, c.opts.ExpectedReplicas)
+	require.Equal(t, float64(gc.DefaultCondemnRate), c.opts.Rate)
+	require.Equal(t, gc.DefaultKeepLists, c.opts.KeepLists)
 }

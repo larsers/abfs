@@ -16,6 +16,7 @@ package gc
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -34,9 +35,22 @@ type ReplicaReport struct {
 	Stale int64 `json:"stale"`
 	// Removed counts the rows not seen for a day, which the run deleted.
 	Removed int64 `json:"removed"`
+	// Hosts counts the distinct host names among the live replicas, and
+	// RowsPerHost the live rows of each host. A host has more than one live
+	// row after a server restarted without removing its row.
+	Hosts       int64            `json:"hosts"`
+	RowsPerHost map[string]int64 `json:"rows_per_host,omitempty"`
 	// Warnings lists the live replicas whose settings break the timing rules
 	// of the collector. A condemn mode would refuse to run with any of them.
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// ReplicaHost returns the host name of a replica ID made by NewReplicaID.
+func ReplicaHost(id string) string {
+	if i := strings.LastIndexByte(id, '-'); i > 0 {
+		return id[:i]
+	}
+	return id
 }
 
 // checkReplicas checks the settings of the replicas seen within
@@ -55,6 +69,14 @@ func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaRepo
 			continue
 		}
 		rep.Live++
+		if rep.RowsPerHost == nil {
+			rep.RowsPerHost = make(map[string]int64)
+		}
+		host := ReplicaHost(r.ID)
+		if rep.RowsPerHost[host] == 0 {
+			rep.Hosts++
+		}
+		rep.RowsPerHost[host]++
 		if !r.GC {
 			warn(r, "runs without the garbage collector hooks")
 			continue
