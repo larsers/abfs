@@ -115,8 +115,10 @@ type refSnapshot struct {
 }
 
 type refRoot struct {
-	class  RefClass
-	target Hash
+	class        RefClass
+	target       Hash
+	project, ref string
+	updated      time.Time
 }
 
 // readRefs reads every ref at the snapshot time and sorts them by retention.
@@ -153,7 +155,7 @@ func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapsh
 		}
 		c.Roots++
 		h := entities.NewHash(target.StringVal)
-		snap.roots = append(snap.roots, refRoot{class: class, target: h})
+		snap.roots = append(snap.roots, refRoot{class: class, target: h, project: project, ref: ref, updated: updated})
 		switch class {
 		case RefMount:
 			snap.mounts = append(snap.mounts, h)

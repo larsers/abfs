@@ -293,7 +293,10 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	danglingTree, _ := treeOf(missing)
 	f.gcRow(danglingTree, "tree", []entities.Hash{missing}, old)
 
-	res := f.run(nil)
+	o := gc.DefaultDryRunOpts()
+	o.Shards = 3
+	o.Explain = []entities.Hash{newBlob, status, newLog, newUnmount, wsBlob, liveDetails, pinnedTree, recentTreeBlob, newOut, liveDT, lfsContent, oldBlob}
+	res := f.run(&o)
 	r := res.Report
 
 	requireReachable(t, res, true, newCommit, newTree, newBlob, status)
@@ -344,6 +347,32 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	require.NotNil(r.Objects.UnreachableBytes)
 	require.Positive(*r.Objects.UnreachableBytes)
 	require.Positive(r.Memory.PeakHeapBytes)
+
+	// Each explained key names the class of the root that reached it first.
+	var classes []string
+	for _, k := range r.Explain {
+		require.True(k.GCRow, k.Key)
+		require.True(k.ObjectRow, k.Key)
+		require.NotNil(k.WriteTime, k.Key)
+		require.Nil(k.Condemned, k.Key)
+		if k.FirstRoot == nil {
+			classes = append(classes, "")
+			continue
+		}
+		classes = append(classes, k.FirstRoot.Class)
+	}
+	require.Equal([]string{"source", "project-status", "build", "unmount", "workspace", "mount", "pinned-revisions", "recent", "map-eval", "map-pusher", "map-lfs", ""}, classes)
+	require.False(r.Explain[11].Reachable)
+	src := r.Explain[0].FirstRoot
+	require.Equal("platform/a", src.Project)
+	require.Equal("refs/heads/main", src.Ref)
+	require.Equal(newCommit.String(), src.Key)
+	require.WithinDuration(old, *src.UpdateTime, time.Millisecond)
+	require.Equal(&gc.MountSample{Details: liveDetails.String(), Host: "host-a", User: "u"}, r.Explain[6].FirstRoot.Pin)
+	require.Equal(recentTree.String(), r.Explain[7].FirstRoot.Key)
+	require.Equal(newReq.String(), r.Explain[8].FirstRoot.Key)
+	require.Equal(newResp.String(), r.Explain[8].FirstRoot.Result)
+	require.Contains(r.Types["blob"].UnreachableSample, oldBlob.String())
 
 	// The dry run left the lease free and counted the cycle.
 	res = f.run(nil)

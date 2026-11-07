@@ -523,3 +523,18 @@ func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *g
 	}
 	return rows, bad, nil
 }
+
+// key returns the key of node id.
+func (g *graph) key(id uint32) Hash {
+	i, _ := slices.BinarySearchFunc(g.shards, id, func(s keyShard, id uint32) int {
+		switch {
+		case s.lo > id:
+			return 1
+		case s.lo+uint32(len(s.keys)) <= id:
+			return -1
+		}
+		return 0
+	})
+	s := &g.shards[i]
+	return s.keys[id-s.lo]
+}

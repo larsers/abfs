@@ -31,6 +31,7 @@ import (
 	"github.com/google/abfs/shared/cmd/args"
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
+	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/remote/servers/gcp"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
@@ -144,16 +145,17 @@ func printBackfillStats(stats *gc.BackfillStats, dryRun bool) {
 
 type gcpGCRunCmd struct {
 	*root.RootCmd
-	server gcp.NewServerOpts
-	opts   gc.DryRunOpts
-	dryRun bool
-	report string
+	server  gcp.NewServerOpts
+	opts    gc.DryRunOpts
+	dryRun  bool
+	report  string
+	explain []string
 }
 
 func (c *gcpGCRunCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "run",
-		Usage: "--dry-run --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>]",
+		Usage: "--dry-run --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
 		Desc: `Run one garbage collection cycle. Only --dry-run is implemented: it takes the GC lease,
 reads the refs at one snapshot, scans the gc and maps tables, marks what the roots, the
 retention rules and the grace keep, and reports what a collection would remove as JSON. It
@@ -183,6 +185,7 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.opts.Consistency, "consistency", true, "Check that every object has a gc row, and sum object sizes, with a scan of the meta family of the objects table")
 	fl.IntVar(&c.opts.Shards, "shards", gc.DefaultScanShards, "The number of key ranges scanned in parallel")
 	fl.DurationVar(&c.opts.LeaseDuration, "lease", gc.DefaultLeaseDuration, "The duration of the GC lease, renewed while the cycle runs")
+	fl.StringSliceVar(&c.explain, "explain", nil, "Object keys, separated by commas, whose gc row, reachability, first root, times and condemn marker the report explains")
 }
 
 func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -195,6 +198,12 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	}
 	if err := c.opts.Validate(); err != nil {
 		return err
+	}
+	for _, k := range c.explain {
+		if !entities.IsHash(k) {
+			return fmt.Errorf("invalid key %q for --explain", k)
+		}
+		c.opts.Explain = append(c.opts.Explain, entities.NewHash(k))
 	}
 	// The run reads only the mount details and pinned manifests of live
 	// mounts, once each, and must not rescue them.

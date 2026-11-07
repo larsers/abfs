@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"slices"
 	"time"
 
 	"cloud.google.com/go/bigtable"
@@ -70,6 +71,8 @@ type DryRunOpts struct {
 	Holder string
 	// StateName is the GcState row; empty uses DefaultStateName.
 	StateName string
+	// Explain lists keys whose state and first root the report explains.
+	Explain []Hash
 }
 
 // DefaultDryRunOpts returns the default options.
@@ -141,8 +144,10 @@ type Report struct {
 	Edges       EdgeCounts              `json:"edges"`
 	Maps        map[MapClass]*MapCounts `json:"maps"`
 	Consistency ConsistencyReport       `json:"consistency"`
-	Memory      MemoryReport            `json:"memory"`
-	Seconds     Timings                 `json:"seconds"`
+	// Explain explains the keys of DryRunOpts.Explain.
+	Explain []KeyReport  `json:"explain,omitempty"`
+	Memory  MemoryReport `json:"memory"`
+	Seconds Timings      `json:"seconds"`
 }
 
 // Settings records the options of the run.
@@ -222,6 +227,19 @@ type Result struct {
 	Report *Report
 	graph  *graph
 	live   bitmap
+	// first holds the first root of each tracked node, resolved by roots.
+	first map[uint32]rootRef
+	roots *rootTable
+}
+
+// firstRoot returns the root whose walk first reached the tracked node id, or
+// nil when id is not tracked or not reachable.
+func (r *Result) firstRoot(id uint32) *Root {
+	ref, ok := r.first[id]
+	if !ok {
+		return nil
+	}
+	return r.roots.describe(ref)
 }
 
 // Reachable reports whether the mark found h reachable, and whether h has a gc
@@ -280,6 +298,9 @@ type dryRun struct {
 	perType []int64
 	// outdated counts the outdated rows per type index.
 	outdated []int64
+	// tracked lists keys whose first root the mark records, besides those of
+	// the Explain option.
+	tracked []Hash
 }
 
 func (d *dryRun) run(ctx context.Context) (*Result, error) {
@@ -374,12 +395,25 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
+	// The roots are walked one at a time in a fixed order of classes, so that
+	// a tracked node is attributed to the first root, in that order, that
+	// reaches it.
 	m := newMarker(g, g.size())
-	for _, root := range refs.roots {
-		d.addRoot(m, g, string(root.class), root.target)
+	var tracked []uint32
+	for _, h := range append(slices.Clone(d.tracked), o.Explain...) {
+		tracked = append(tracked, g.find(h))
 	}
-	for _, rev := range revisions {
-		if d.addRoot(m, g, RootPinnedRevisions, rev.hash) {
+	m.track(tracked)
+	sortRefRoots(refs.roots)
+	pinnedAt := slices.IndexFunc(refs.roots, func(r refRoot) bool { return refClassRank(r.class) > refClassRank(pinnedAfter) })
+	if pinnedAt < 0 {
+		pinnedAt = len(refs.roots)
+	}
+	for i, root := range refs.roots[:pinnedAt] {
+		d.addRoot(m, g, string(root.class), root.target, rootRef{kind: rootOfRef, i: i})
+	}
+	for i, rev := range revisions {
+		if d.addRoot(m, g, RootPinnedRevisions, rev.hash, rootRef{kind: rootPinned, i: i}) {
 			continue
 		}
 		c := &r.LiveMounts
@@ -389,17 +423,19 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		c.DanglingRevisions++
 		c.sample("dangling_revisions", rev.src)
 	}
+	for i, root := range refs.roots[pinnedAt:] {
+		d.addRoot(m, g, string(root.class), root.target, rootRef{kind: rootOfRef, i: pinnedAt + i})
+	}
 	for _, h := range []Hash{entities.EmptyFileHash, entities.EmptyDirHash} {
-		d.addRoot(m, g, RootPermanent, h)
+		d.addRoot(m, g, RootPermanent, h, rootRef{kind: rootPermanentObject, i: int(g.find(h))})
 	}
 	recent := d.root(RootRecent)
 	for id := range uint32(g.size()) {
 		if g.recent.has(id) {
-			m.add(id)
+			m.addRoot(id, rootRef{kind: rootRecentObject, i: int(id)})
 			recent.Roots++
 		}
 	}
-	m.walk()
 	r.Maps = m.markMaps(g, mapRows, snapshot.Add(-o.MapRetention).UnixMicro())
 	for class, mc := range r.Maps {
 		d.root(rootMapPrefix + string(class)).Roots = mc.Live
@@ -432,6 +468,12 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		r.Objects.UnreachableBytes = &sizes.unreachable
 		r.Seconds.Consistency = time.Since(step).Seconds()
 	}
+	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}}
+	if len(o.Explain) > 0 {
+		if r.Explain, err = res.explainKeys(ctx, d.bt, o.Explain); err != nil {
+			return nil, err
+		}
+	}
 	d.sampleMemory()
 	r.Memory.KeysBytes = g.keysBytes()
 	for _, s := range g.segs {
@@ -442,7 +484,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	}
 	r.Seconds.Total = time.Since(d.start).Seconds()
 	logSummary(r)
-	return &Result{Report: r, graph: g, live: m.live}, nil
+	return res, nil
 }
 
 func (d *dryRun) root(class string) *RootCounts {
@@ -454,8 +496,9 @@ func (d *dryRun) root(class string) *RootCounts {
 	return c
 }
 
-// addRoot adds the root h of class and reports whether it has a gc row.
-func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash) bool {
+// addRoot walks the root h of class, which ref names, and reports whether h
+// has a gc row.
+func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash, ref rootRef) bool {
 	c := d.root(class)
 	id := g.find(h)
 	if id == noNode {
@@ -463,7 +506,7 @@ func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash) bool {
 		return false
 	}
 	c.Roots++
-	m.add(id)
+	m.addRoot(id, ref)
 	return true
 }
 
@@ -475,6 +518,8 @@ type TypeReport struct {
 	Edges       int64 `json:"edges"`
 	// OutdatedRows counts the rows that a backfill rewrites.
 	OutdatedRows int64 `json:"outdated_rows"`
+	// UnreachableSample lists the first unreachable keys of the type.
+	UnreachableSample []string `json:"unreachable_sample,omitempty"`
 }
 
 func (d *dryRun) countTypes(g *graph, live bitmap) {
@@ -484,8 +529,11 @@ func (d *dryRun) countTypes(g *graph, live bitmap) {
 		c.Objects++
 		if live.has(uint32(id)) {
 			c.Reachable++
-		} else {
-			c.Unreachable++
+			continue
+		}
+		c.Unreachable++
+		if len(c.UnreachableSample) < maxSamples {
+			c.UnreachableSample = append(c.UnreachableSample, g.key(uint32(id)).String())
 		}
 	}
 	for t, n := range d.perType {
