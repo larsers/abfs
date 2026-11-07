@@ -207,9 +207,11 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	newLog := f.blob("new ninja log", old)
 	newBuild := f.object(&binding.BuildInfo{Version: binding.CurrentBuildInfoVersion, BuildStartData: binding.BuildStartData{BuildID: "b2"}, NinjaLog: newLog.String()}, old)
 	f.ref(entities.ABFSMetaProject, "refs/abfs/build/user/u/b2", newBuild, recentRef)
-	unmount := f.blob("unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", unmount, old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/2", unmount, recentRef)
+	// Unmount refs keep their details for the build retention.
+	oldUnmount := f.blob("old unmount details", old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", oldUnmount, old)
+	newUnmount := f.blob("new unmount details", old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/2", newUnmount, recentRef)
 
 	// Eval maps: one unused past the map retention, one used recently.
 	env := f.object(&binding.EnvVars{Vars: map[string]string{"PATH": "/bin"}}, old)
@@ -276,8 +278,8 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 
 	requireReachable(t, res, true, newCommit, newTree, newBlob, status)
 	requireReachable(t, res, false, oldCommit, oldTree, oldBlob)
-	requireReachable(t, res, true, newBuild, newLog)
-	requireReachable(t, res, false, oldBuild, oldLog, oldRootEnd, unmount)
+	requireReachable(t, res, true, newBuild, newLog, newUnmount)
+	requireReachable(t, res, false, oldBuild, oldLog, oldRootEnd, oldUnmount)
 	requireReachable(t, res, true, newReq, newResp, newOut, env)
 	requireReachable(t, res, false, oldReq, oldResp, oldOut)
 	requireReachable(t, res, true, liveDTReq, liveDT, dmReq, dm)
@@ -293,7 +295,7 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	require.Equal(&gc.RefCounts{Refs: 2, Null: 1, Roots: 1}, r.Refs[gc.RefSource])
 	require.Equal(&gc.RefCounts{Refs: 1, Roots: 1}, r.Refs[gc.RefProjectStatus])
 	require.Equal(&gc.RefCounts{Refs: 2, Roots: 1, Expired: 1}, r.Refs[gc.RefBuild])
-	require.Equal(&gc.RefCounts{Refs: 2, Expired: 1, Kept: 1}, r.Refs[gc.RefUnmount])
+	require.Equal(&gc.RefCounts{Refs: 2, Roots: 1, Expired: 1}, r.Refs[gc.RefUnmount])
 	require.Equal(&gc.RefCounts{Refs: 2, Roots: 1, Expired: 1}, r.Refs[gc.RefMount])
 	require.Equal(&gc.RefCounts{Refs: 1, Roots: 1}, r.Refs[gc.RefWorkspace])
 	require.Equal(int64(3), r.RefsToTombstone)

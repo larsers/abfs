@@ -68,23 +68,21 @@ func TestRefRetention(t *testing.T) {
 	o := DefaultDryRunOpts()
 	now := time.Now()
 	tests := []struct {
-		class         RefClass
-		age           time.Duration
-		root, expired bool
+		class   RefClass
+		age     time.Duration
+		expired bool
 	}{
-		{RefSource, 10000 * time.Hour, true, false},
-		{RefWorkspace, 10000 * time.Hour, true, false},
-		{RefMount, 335 * time.Hour, true, false},
-		{RefMount, 337 * time.Hour, false, true},
-		{RefBuild, 719 * time.Hour, true, false},
-		{RefBuildStart, 721 * time.Hour, false, true},
-		{RefUnmount, time.Hour, false, false},
-		{RefUnmount, 721 * time.Hour, false, true},
+		{RefSource, 10000 * time.Hour, false},
+		{RefWorkspace, 10000 * time.Hour, false},
+		{RefMount, 335 * time.Hour, false},
+		{RefMount, 337 * time.Hour, true},
+		{RefBuild, 719 * time.Hour, false},
+		{RefBuildStart, 721 * time.Hour, true},
+		{RefUnmount, time.Hour, false},
+		{RefUnmount, 721 * time.Hour, true},
 	}
 	for _, tt := range tests {
-		root, expired := o.refRetention(tt.class, now.Add(-tt.age), now)
-		require.Equal(t, tt.root, root, "%s %s", tt.class, tt.age)
-		require.Equal(t, tt.expired, expired, "%s %s", tt.class, tt.age)
+		require.Equal(t, tt.expired, o.refRetention(tt.class, now.Add(-tt.age), now), "%s %s", tt.class, tt.age)
 	}
 }
 

@@ -100,9 +100,6 @@ type RefCounts struct {
 	Roots int64 `json:"roots"`
 	// Expired counts the refs that retention would tombstone.
 	Expired int64 `json:"expired"`
-	// Kept counts refs that are neither roots nor expired: unmount records
-	// within the build retention.
-	Kept int64 `json:"kept,omitempty"`
 	// Malformed counts targets that are not hashes.
 	Malformed int64 `json:"malformed,omitempty"`
 }
@@ -144,13 +141,8 @@ func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapsh
 			c.Null++
 			return nil
 		}
-		root, expired := o.refRetention(class, updated, snapshot)
-		switch {
-		case expired:
+		if o.refRetention(class, updated, snapshot) {
 			c.Expired++
-			return nil
-		case !root:
-			c.Kept++
 			return nil
 		}
 		if !entities.IsHash(target.StringVal) {
@@ -171,20 +163,18 @@ func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapsh
 	return snap, nil
 }
 
-// refRetention tells whether the target of a ref of class c last written at
-// updated is a root, and whether retention would tombstone the ref.
-func (o *DryRunOpts) refRetention(c RefClass, updated, snapshot time.Time) (root, expired bool) {
+// refRetention tells whether retention would tombstone a ref of class c last
+// written at updated. The target of every other ref is a root.
+func (o *DryRunOpts) refRetention(c RefClass, updated, snapshot time.Time) bool {
 	switch c {
 	case RefMount:
-		live := updated.After(snapshot.Add(-o.MountIdle))
-		return live, !live
-	case RefUnmount:
-		return false, !updated.After(snapshot.Add(-o.BuildRetention))
-	case RefBuild, RefBuildStart:
-		live := updated.After(snapshot.Add(-o.BuildRetention))
-		return live, !live
+		return !updated.After(snapshot.Add(-o.MountIdle))
+	case RefBuild, RefBuildStart, RefUnmount:
+		// An unmount ref keeps its unmount details and the mount details
+		// they link, so that no ref names a missing object.
+		return !updated.After(snapshot.Add(-o.BuildRetention))
 	}
-	return true, false
+	return false
 }
 
 // MountCounts reports the pinned manifests of the live mounts.

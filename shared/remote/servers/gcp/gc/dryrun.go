@@ -47,8 +47,8 @@ type DryRunOpts struct {
 	Grace time.Duration
 	// MountIdle is how long a mount ref stays a root after its last write.
 	MountIdle time.Duration
-	// BuildRetention is how long build and build-start refs stay roots, and
-	// unmount refs are kept, after their last write.
+	// BuildRetention is how long build, build-start and unmount refs stay
+	// roots after their last write.
 	BuildRetention time.Duration
 	// MapRetention is how long an eval map row stays a root after its last
 	// write or use.
