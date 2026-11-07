@@ -53,3 +53,23 @@ CREATE TABLE IF NOT EXISTS GcReplicas (
     CacheTTLSeconds INT64 NOT NULL,
     LastSeen TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
 ) PRIMARY KEY (ReplicaId);
+
+-- One heartbeat row per server process with GC, kept when it stops, so that
+-- the collector can check every process that ran in a time window. StatsTime
+-- is a Spanner read time taken before the process read the touch stats its
+-- last heartbeat recorded; TouchLossTime is set when a heartbeat or the stop
+-- records lost touches, StoppedAt by a clean stop. A process that has neither
+-- a recent heartbeat nor StoppedAt crashed.
+CREATE TABLE IF NOT EXISTS GcServers (
+    ServerId STRING(MAX) NOT NULL,
+    Version INT64 NOT NULL,
+    GcEnabled BOOL NOT NULL,
+    TouchIntervalSeconds INT64 NOT NULL,
+    CacheTTLSeconds INT64 NOT NULL,
+    HeartbeatIntervalSeconds INT64 NOT NULL,
+    LinkValidation BOOL NOT NULL,
+    LastSeen TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+    StatsTime TIMESTAMP NOT NULL,
+    TouchLossTime TIMESTAMP OPTIONS (allow_commit_timestamp=true),
+    StoppedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true),
+) PRIMARY KEY (ServerId);

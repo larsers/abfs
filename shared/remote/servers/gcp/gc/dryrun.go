@@ -364,7 +364,13 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.Replicas = checkReplicas(replicas, snapshot, o)
+	servers, err := ReadServers(ctx, d.sp)
+	if err != nil {
+		return nil, err
+	}
+	fromServers, stopped := serverReplicas(servers)
+	r.Replicas = checkReplicas(append(replicas, fromServers...), snapshot, o)
+	r.Replicas.Stopped = stopped
 	for _, w := range r.Replicas.Warnings {
 		log.Printf("Warning: %s", w)
 	}

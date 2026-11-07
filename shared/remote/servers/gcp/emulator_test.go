@@ -201,6 +201,9 @@ func newEmulatorServer(t *testing.T, opts *NewServerOpts) *GCPServer {
 	if o.MaxCachedContents == 0 {
 		o.MaxCachedContents = 1024
 	}
+	if o.GC && o.GCHeartbeatInterval == 0 {
+		o.GCHeartbeatInterval = DefaultGCHeartbeatInterval
+	}
 	s, err := New(context.Background(), &o)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })

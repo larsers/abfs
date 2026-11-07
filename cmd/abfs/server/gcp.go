@@ -88,7 +88,7 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.gc, "gc", false, "Run the server side of the garbage collector: write the GC edges of new objects to the Bigtable table gc, rescue condemned objects that are used, and apply --cache-ttl, --gc-touch-interval and --gc-heartbeat-interval. Needs the resources of 'abfs server gcp init --gc'")
 	fl.DurationVar(&c.cacheTTL, "cache-ttl", gcp.DefaultCacheTTL, "With --gc, how long cached object headers and content are used before they are read again from Bigtable (0 keeps them until they are evicted). The garbage collector needs it shorter than its cycle")
 	fl.DurationVar(&c.gcTouchInterval, "gc-touch-interval", gcp.DefaultGCTouchInterval, "With --gc, length of the period in which the server records at most one use of each object and map row for the garbage collector (0 disables these writes)")
-	fl.DurationVar(&c.gcHeartbeatInterval, "gc-heartbeat-interval", gcp.DefaultGCHeartbeatInterval, "With --gc, time between two heartbeats of this server in the Spanner table GcReplicas, which the garbage collector reads (0 disables them)")
+	fl.DurationVar(&c.gcHeartbeatInterval, "gc-heartbeat-interval", gcp.DefaultGCHeartbeatInterval, "With --gc, time between two heartbeats of this server in the Spanner table GcServers, which the garbage collector reads: above 0 and at most 10m. The server does not start without its first heartbeat and answers Unavailable while its last successful one is older than two intervals plus 30s")
 }
 
 func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -158,7 +158,7 @@ func (c *gcpInitCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.opts.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.opts.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.opts.BucketName, "bucket", "", "The GCS Bucket Name (required)")
-	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table gc, the column family g of the table objects and the Spanner tables GcState and GcReplicas")
+	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table gc, the column family g of the table objects and the Spanner tables GcState, GcReplicas and GcServers")
 }
 
 func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {

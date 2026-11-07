@@ -27,14 +27,19 @@ const (
 	staleReplicaAge = 24 * time.Hour
 )
 
-// ReplicaReport reports the server replicas seen in GcReplicas.
+// ReplicaReport reports the server replicas seen in GcReplicas and
+// GcServers.
 type ReplicaReport struct {
 	// Live counts the replicas whose heartbeat is younger than liveReplicaAge.
 	Live int64 `json:"live"`
 	// Stale counts the other rows.
 	Stale int64 `json:"stale"`
-	// Removed counts the rows not seen for a day, which the run deleted.
+	// Removed counts the rows of GcReplicas not seen for a day, which the
+	// run deleted.
 	Removed int64 `json:"removed"`
+	// Stopped counts the rows of GcServers of processes that stopped without
+	// losing touches. They are not checked here and stay.
+	Stopped int64 `json:"stopped"`
 	// Hosts counts the distinct host names among the live replicas, and
 	// RowsPerHost the live rows of each host. A host has more than one live
 	// row after a server restarted without removing its row.
@@ -51,6 +56,23 @@ func ReplicaHost(id string) string {
 		return id[:i]
 	}
 	return id
+}
+
+// serverReplicas returns the rows of GcServers that checkReplicas checks,
+// all but those of processes that stopped without losing touches, and how
+// many it left out. A process that stopped after losing touches counts until
+// its row is stale, as a row that a server keeps in GcReplicas then.
+func serverReplicas(servers []Server) ([]Replica, int64) {
+	var replicas []Replica
+	var stopped int64
+	for _, s := range servers {
+		if !s.StoppedAt.IsZero() && s.TouchLossTime.IsZero() {
+			stopped++
+			continue
+		}
+		replicas = append(replicas, Replica{ID: s.ID, Version: s.Version, GC: s.GC, TouchInterval: s.TouchInterval, CacheTTL: s.CacheTTL, LastSeen: s.LastSeen})
+	}
+	return replicas, stopped
 }
 
 // checkReplicas checks the settings of the replicas seen within

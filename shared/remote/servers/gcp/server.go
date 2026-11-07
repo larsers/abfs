@@ -262,7 +262,9 @@ type NewServerOpts struct {
 	// each object and map row at most once; zero disables touches.
 	GCTouchInterval time.Duration
 	// GCHeartbeatInterval is the time between two heartbeats of this server in
-	// the table GcReplicas; zero disables the heartbeat.
+	// the table GcServers. With GC and not GCReadOnly it must be above zero
+	// and at most gc.MaxHeartbeatInterval, and the server stops serving while
+	// its last successful heartbeat is older than two intervals and 30 s.
 	GCHeartbeatInterval time.Duration
 	// GCReadOnly, with GC, leaves the state of the garbage collector as it is:
 	// reads answer for condemned objects without rescuing them, and the server
@@ -398,6 +400,9 @@ func (s *GCPServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 
 // Headers implements remote.RemoteProvider.
 func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities.ObjectHeader, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	headers, err := s.getHeaders(ctx, pathHeaders, keys)
 	if err != nil {
 		return nil, err
@@ -490,6 +495,9 @@ func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedH
 
 // GetObject implements remote.RemoteProvider.
 func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.ContentReadCloser, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	header, content, err := s.getObjectData(ctx, key)
 	if err != nil {
 		return nil, err
@@ -523,6 +531,9 @@ func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.Cont
 // PutObject implements remote.RemoteProvider.
 func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remote.ContentReadCloser) (retErr error) {
 	defer entities.CloseErrCheck(reader, &retErr)
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 
 	existingHdr, err := s.getHeader(ctx, key)
 	if err != nil || existingHdr.Valid {
@@ -608,6 +619,9 @@ func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
 
 // MapResults implements remote.RemoteProvider.
 func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.Hash, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	results, err := s.casdb.MapResults(ctx, from)
 	if err != nil || !s.gcHooks.on {
 		return results, err
@@ -617,6 +631,9 @@ func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.
 
 // AddMapResult implements remote.RemoteProvider.
 func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remote.Hash) error {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 	if !s.validateLinks {
 		return s.casdb.AddMapResult(ctx, from, to)
 	}
@@ -677,6 +694,9 @@ func (s *GCPServer) projectForRefs(ctx context.Context, server string, project s
 
 // GetRefs implements remote.RemoteProvider.
 func (s *GCPServer) GetRefs(ctx context.Context, server string, project string, refs []string) ([]remote.Hash, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	id, err := s.projectForRefs(ctx, server, project, false)
 	if errors.Is(err, casdb.ErrNotFound) {
 		if err := s.checkServerExists(ctx, server); err != nil {
@@ -705,6 +725,9 @@ func (s *GCPServer) checkServerExists(ctx context.Context, server string) error 
 
 // SearchRefs implements remote.RemoteProvider.
 func (s *GCPServer) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	var projectID *int64
 	if project != "" {
 		id, err := s.projectForRefs(ctx, server, project, false)
@@ -772,6 +795,9 @@ func (s *GCPServer) SearchRefs(ctx context.Context, server string, project strin
 
 // PutRefs implements remote.RemoteProvider.
 func (s *GCPServer) PutRefs(ctx context.Context, server string, project string, refs []remote.RefHash) error {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 	id, err := s.projectForRefs(ctx, server, project, true)
 	if err != nil {
 		return err
@@ -799,6 +825,9 @@ func (s *GCPServer) XchgRef(ctx context.Context, server string, project string, 
 
 // XchgRefs implements remote.RemoteProvider.
 func (s *GCPServer) XchgRefs(ctx context.Context, server string, project string, refs []remote.RefXchg) error {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 	if len(refs) == 0 {
 		return nil
 	}
