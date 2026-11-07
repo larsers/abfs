@@ -1,0 +1,47 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Every project-specific value of the KCC tree. The components copy them into
+# the objects; the ConfigMap itself is not applied (local-config). The backend
+# names must equal the chart's backend values in either mode.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: abfs-kcc-settings
+  annotations:
+    config.kubernetes.io/local-config: "true"
+data:
+  project: example-project
+  region: europe-west4
+  # The Bigtable cluster's zone, also the zone of the servers.
+  zone: europe-west4-b
+  # The project that holds the network: the project itself, or the host
+  # project of a Shared VPC.
+  networkProject: example-project
+  network: example-network
+  # The cluster's subnetwork, for the Gateway address.
+  subnetwork: example-subnet
+  # Used only by the network components.
+  proxySubnetRange: 10.129.0.0/23
+  # The Google service account of Config Connector for the namespace abfs.
+  kccServiceAccount: kcc-abfs@example-project.iam.gserviceaccount.com
+  # Always serviceAccount:<project>.svc.id.goog[abfs/abfs-server].
+  serverWorkloadIdentityMember: serviceAccount:example-project.svc.id.goog[abfs/abfs-server]
+  spannerInstance: abfs
+  spannerDatabase: cas
+  # Bigtable instance ids have 6 to 33 characters, cluster ids 6 to 30.
+  bigtableInstance: abfs-objects
+  bigtableCluster: abfs-objects-c1
+  # Bucket names are global; pick one you own.
+  bucket: example-project-abfs-blobs

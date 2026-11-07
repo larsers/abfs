@@ -1,0 +1,74 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Written by scripts/gen-ddl.sh from the GCP server schema files
+# casdb/schema.sql and casdb/gcschema.sql of the release that first created
+# the database. Never edit or remove an entry: Config Connector sends only
+# the entries past the old list length and refuses a changed one. A later
+# schema change is a new ALTER or CREATE ... IF NOT EXISTS entry appended at
+# the end, in the same "- |-" form. The base line is the sha256 of the
+# first entries; scripts/check-ddl.sh checks the list against it.
+# ddl-base: sha256:3fc1c22e623fd8683ec1874531bb8f1b6f41ccd3d1e73913732d2f2eac3fef4e 7 entries
+apiVersion: spanner.cnrm.cloud.google.com/v1beta1
+kind: SpannerDatabase
+metadata:
+  name: abfs-cas
+  namespace: abfs
+spec:
+  ddl:
+    - |-
+      CREATE SEQUENCE IF NOT EXISTS ProjectIdSequence OPTIONS (sequence_kind="bit_reversed_positive")
+    - |-
+      CREATE TABLE IF NOT EXISTS Projects (
+          ProjectId INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE ProjectIdSequence)),
+          Host STRING(MAX) NOT NULL,
+          Project STRING(MAX) NOT NULL,
+      ) PRIMARY KEY (ProjectId)
+    - |-
+      CREATE UNIQUE INDEX IF NOT EXISTS ProjectsIndex ON Projects(Host, Project)
+    - |-
+      CREATE TABLE IF NOT EXISTS Refs (
+          ProjectId INT64 NOT NULL,
+          Ref STRING(MAX) NOT NULL,
+          UpdateTime TIMESTAMP NOT NULL,
+          Target STRING(128),
+          CONSTRAINT FK_Refs_ProjectId FOREIGN KEY (ProjectId) REFERENCES Projects (ProjectId),
+      ) PRIMARY KEY (ProjectId, Ref)
+    - |-
+      CREATE INDEX IF NOT EXISTS RefsRefIndex ON Refs(Ref)
+    - |-
+      CREATE TABLE IF NOT EXISTS GcState (
+          Name STRING(64) NOT NULL,
+          Cycle INT64 NOT NULL,
+          Phase STRING(64),
+          LeaseHolder STRING(MAX),
+          LeaseEpoch INT64 NOT NULL,
+          LeaseExpiry TIMESTAMP,
+          PreviousLeaseExpiry TIMESTAMP,
+          CycleStartTime TIMESTAMP,
+          PreviousCycleStartTime TIMESTAMP,
+          SnapshotTime TIMESTAMP,
+          GraceSeconds INT64,
+          ListLocation STRING(MAX),
+          UpdateTime TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+      ) PRIMARY KEY (Name)
+    - |-
+      CREATE TABLE IF NOT EXISTS GcReplicas (
+          ReplicaId STRING(MAX) NOT NULL,
+          Version INT64 NOT NULL,
+          GcEnabled BOOL NOT NULL,
+          TouchIntervalSeconds INT64 NOT NULL,
+          CacheTTLSeconds INT64 NOT NULL,
+          LastSeen TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+      ) PRIMARY KEY (ReplicaId)

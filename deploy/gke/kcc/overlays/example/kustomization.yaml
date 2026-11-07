@@ -1,0 +1,41 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Worked example. Copy this directory, set settings.yaml, and pick the
+# components:
+#   - the backend mode: exactly one of backend-new (Config Connector creates
+#     Spanner, Bigtable and the bucket) and backend-existing (they exist; only
+#     the server's roles are granted). Listing both fails the build.
+#   - network/proxy-subnet when the network has no proxy-only subnet in the
+#     region.
+#   - settings, always.
+# Render with `kubectl kustomize`, apply with `kubectl apply -k`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - settings.yaml
+components:
+  - ../../components/backend-new
+  # - ../../components/backend-existing
+  # - ../../components/network/proxy-subnet
+  - ../../components/settings
+# Numbers cannot come from settings.yaml (its values are strings), so set them
+# with a patch. Example for backend-new, the Bigtable cost cap:
+# patches:
+#   - target: {kind: BigtableInstance, name: abfs-objects}
+#     patch: |-
+#       - op: replace
+#         path: /spec/cluster/0/autoscalingConfig/maxNodes
+#         value: 5

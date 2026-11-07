@@ -1,0 +1,63 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Mode "new": Config Connector creates the backend, schema included. Use it
+# only for resources that do not exist yet: adopting a live Bigtable instance
+# or table can delete clusters and column families, and the ddl list is sent
+# again. For a backend that exists, use backend-existing.
+#
+# Every data resource carries deletion-policy abandon, so deleting the objects
+# keeps the data; remove the resources by hand when they are no longer needed.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - spanner.yaml
+  - bigtable-instance.yaml
+  - bigtable-tables.yaml
+  - storage.yaml
+  - iam.yaml
+patches:
+  - path: spanner-database-ddl.yaml
+replacements:
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.region}
+    targets:
+      - select: {kind: SpannerInstance, name: abfs-refs}
+        fieldPaths: [spec.config]
+        options: {delimiter: regional-, index: 1}
+      - select: {kind: StorageBucket, name: abfs-blobs}
+        fieldPaths: [spec.location]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.zone}
+    targets:
+      - select: {kind: BigtableInstance, name: abfs-objects}
+        fieldPaths: [spec.cluster.0.zone]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.spannerInstance}
+    targets:
+      - select: {kind: SpannerInstance, name: abfs-refs}
+        fieldPaths: [spec.resourceID]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.spannerDatabase}
+    targets:
+      - select: {kind: SpannerDatabase, name: abfs-cas}
+        fieldPaths: [spec.resourceID]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bigtableInstance}
+    targets:
+      - select: {kind: BigtableInstance, name: abfs-objects}
+        fieldPaths: [spec.resourceID]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bigtableCluster}
+    targets:
+      - select: {kind: BigtableInstance, name: abfs-objects}
+        fieldPaths: [spec.cluster.0.clusterId]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bucket}
+    targets:
+      - select: {kind: StorageBucket, name: abfs-blobs}
+        fieldPaths: [spec.resourceID]
