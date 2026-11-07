@@ -237,7 +237,7 @@ The garbage collector runs as a separate job. With `--gc`, the server records fo
 
 Cost: one Bigtable write per object and map row used, per server and touch period, batched; one touch and one conditional write per rescue.
 
-Metrics, as OpenTelemetry counters (Prometheus replaces the dots with underscores and adds `_total`):
+Metrics, as OpenTelemetry counters. Their names keep the dots when they are exported with OTLP. Cloud Monitoring stores them as they arrive, for example `prometheus.googleapis.com/abfs.gcp.gc.rescues/counter` through the Ops Agent OTLP receiver, so a PromQL query names them with `__name__`: `sum by (call, type) ({__name__="abfs.gcp.gc.rescues"})`. On a Prometheus `/metrics` endpoint the dots become underscores and the names end in `_total`, for example `abfs_gcp_gc_rescues_total`.
 
 | Metric | Labels | Counts |
 | --- | --- | --- |
