@@ -89,7 +89,7 @@ The [runbook](docs/runbook.md) has every step with its checks, and the seed, ste
 - [prerequisites.md](docs/prerequisites.md): cluster settings, network, identities, the IOPS fallback node pool.
 - [runbook.md](docs/runbook.md): install order, seed and steady phase, upgrades, cache reset, backend replacement, teardown, security.
 - [configuration.md](docs/configuration.md): every chart value with its default, the KCC to chart name table, right-sizing.
-- [ci-job.md](docs/ci-job.md): the build pod contract for any CI system, the example Job, node sizing.
+- [ci-job.md](docs/ci-job.md): the build pod contract for any CI system, the example Job, Airflow, node sizing.
 - [troubleshooting.md](docs/troubleshooting.md): known failures and their causes.
 
 ## Checks

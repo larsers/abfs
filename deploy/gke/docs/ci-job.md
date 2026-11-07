@@ -164,6 +164,51 @@ spec:
 
 The build image needs `bash` and the Android build host tools. The Job's pod name serves as the job id.
 
+## Airflow as the CI system
+
+Airflow, for example in Managed Service for Apache Airflow, starts each build as a pod in the ABFS cluster with `GKEStartPodOperator`. `KubernetesPodOperator` runs pods only in the Airflow environment's own cluster, which has no CI nodes. Nothing of ABFS runs in the Airflow environment.
+
+**Access.** Grant the Airflow environment's service account `roles/container.clusterViewer` on the ABFS cluster's project, which lets it connect, and give it a Role in `abfs-ci` that allows only build pods:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: airflow-builds, namespace: abfs-ci}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, watch, delete, patch]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: airflow-builds, namespace: abfs-ci}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: airflow-builds}
+subjects:
+  - {kind: User, name: <environment service account email>}
+```
+
+The Airflow workers must reach the cluster's control plane endpoint.
+
+**Pod template.** Write the pod spec of the [example Job](#example-job) as a Pod manifest and pass it as `pod_template_file`. The operator fills in its own main container, which it finds by the name `base`, so rename the build container from `build` to `base`. Keep everything else of the contract in the template: the namespace, the class selector, both init containers, the security contexts, the hostPath, the annotation and the environment. Set the per-build values with `env_vars` (`BRANCH`, `TARGET`; `JOB_ID` from the task's run id).
+
+**Operator settings:**
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `namespace` | `abfs-ci` | Pod Security level `privileged` |
+| `startup_timeout_seconds` | 1800 or more | the pod waits for a new node, the casfs build and cacheman; the init containers alone may wait 15 minutes each |
+| `retries` | 1 or more | a pod whose node never loads casfs fails after 15 minutes and must run again on another node |
+| `deferrable` | `True` | a build takes up to hours; a deferred task does not hold a worker slot while it waits |
+| `get_logs` | `True` | the build log in the task log |
+
+The task fails when the build fails, because the pod's exit code is the build's.
+
 ## Sizing
 
 casfs keeps per-workspace state in kernel slab memory, which kubelet does not reserve. Size the build pods and the module together, per node:
