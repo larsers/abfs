@@ -15,8 +15,15 @@
 package gcp
 
 import (
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +32,11 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -164,7 +176,7 @@ func TestCondemnGC_MarksUnreachableObjects(t *testing.T) {
 	for _, k := range []entities.Hash{gone, goneTree, goneBlob} {
 		require.Equal([][]byte{marker(2)}, f.markerCells(k), k)
 	}
-	require.Equal([]string{"gc/condemned/default/1", "gc/condemned/default/2"}, f.listNames())
+	require.Equal([]string{"gc/condemned/default/1", "gc/condemned/default/2", "gc/condemned/default/2.live"}, f.listNames())
 }
 
 // A refused cycle writes no marker, no list and no list state, and still
@@ -240,4 +252,227 @@ func TestCondemnGC_NoMarkerWithoutList(t *testing.T) {
 	require.Empty(f.markerCells(blob))
 	location, _ := f.listState()
 	require.False(location.Valid)
+}
+
+// A cycle clears the markers of the previous list's live keys before its own
+// list replaces the previous one in GcState. A cycle that stops at its list
+// write therefore leaves no marker on a live key, and the previous list stays
+// in GcState for the next cycle, which leaves no marker of cycle 1.
+func TestCondemnGC_ClearsLiveKeysBeforeItsList(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	live := f.blob("reached again", f.old)
+	still := f.blob("still unreachable", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	require.Equal([][]byte{marker(1)}, f.markerCells(live))
+
+	f.ref("platform/a", "refs/heads/main", f.tree(f.old, live), f.old)
+	w := f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/2").NewWriter(ctx)
+	w.Metadata = map[string]string{"abfs-gc-run": "another-collector#9"}
+	require.NoError(w.Close())
+	_, err = f.condemn(nil)
+	require.ErrorContains(err, `written by the GC run "another-collector#9"`)
+	require.Empty(f.markerCells(live))
+	require.Equal([][]byte{marker(1)}, f.markerCells(still))
+	location, complete := f.listState()
+	require.Equal("gc/condemned/default/1", location.StringVal)
+	require.True(complete.Bool)
+
+	res, err := f.condemn(nil)
+	require.NoError(err)
+	require.Equal("gc/condemned/default/1", res.Report.PreviousList.Location)
+	f.requireNoMarker(1)
+	require.Equal([][]byte{marker(3)}, f.markerCells(still))
+}
+
+// A previous list that is gone does not stop the next cycle: the report says
+// so, and the cycle condemns and rewrites the markers of what is still
+// unreachable.
+func TestCondemnGC_MissingPreviousList(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	k := f.blob("unreachable file", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	require.NoError(f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/1").Delete(ctx))
+
+	res, err := f.condemn(nil)
+	require.NoError(err)
+	prev := res.Report.PreviousList
+	require.Equal("gc/condemned/default/1", prev.Location)
+	require.Equal("not found", prev.Error)
+	require.Equal(int64(1), res.Report.Condemn.Condemned)
+	require.Equal([][]byte{marker(2)}, f.markerCells(k))
+	location, _ := f.listState()
+	require.Equal("gc/condemned/default/2", location.StringVal)
+}
+
+// liveLine is a line of a live list.
+type liveLine struct {
+	Key       string     `json:"key"`
+	Type      string     `json:"type"`
+	Root      *gc.Root   `json:"root"`
+	TouchTime *time.Time `json:"touch_time"`
+	Marker    *int64     `json:"marker"`
+	Rescued   bool       `json:"rescued"`
+}
+
+func (f *condemnFixture) liveLines(name string) map[string]liveLine {
+	f.t.Helper()
+	r, err := f.s.storage.Bucket(f.bucket).Object(name).NewReader(context.Background())
+	require.NoError(f.t, err)
+	defer r.Close()
+	zr, err := gzip.NewReader(r)
+	require.NoError(f.t, err)
+	lines := make(map[string]liveLine)
+	dec := json.NewDecoder(zr)
+	for dec.More() {
+		var l liveLine
+		require.NoError(f.t, dec.Decode(&l))
+		lines[l.Key] = l
+	}
+	return lines
+}
+
+// requireNoMarker checks that no objects row holds the marker of cycle.
+func (f *condemnFixture) requireNoMarker(cycle byte) {
+	f.t.Helper()
+	err := f.s.casdb.BTClient().Open("objects").ReadRows(context.Background(), bigtable.InfiniteRange(""), func(row bigtable.Row) bool {
+		for _, item := range row[gc.ObjectsFamily] {
+			require.NotEqual(f.t, marker(cycle), item.Value, row.Key())
+		}
+		return true
+	}, bigtable.RowFilter(bigtable.FamilyFilter(gc.ObjectsFamily)))
+	require.NoError(f.t, err)
+}
+
+// The next condemn cycle clears the markers of the previous list's keys that
+// are live again and lists every such key with the root that keeps it: a
+// key a ref reaches again under source with the ref, a key touched since
+// under recent with its touch time, and a key a server read under recent as
+// rescued.
+func TestCondemnGC_ListsLiveKeysOfPreviousList(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	reRooted := f.blob("re-rooted file", f.old)
+	touched := f.blob("touched file", f.old)
+	rescued := f.blob("rescued file", f.old)
+	still := f.blob("still unreachable file", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+
+	refTime := f.now.Add(-time.Minute)
+	f.ref("platform/b", "refs/heads/again", reRooted, refTime)
+	touchTime := f.now.Add(-2 * time.Minute)
+	f.touch(touched, touchTime)
+	require.NoError(f.s.enableGCHooks(&NewServerOpts{}))
+	t.Cleanup(f.s.stopGCHooks)
+	f.s.forget(rescued)
+	_, err = f.s.Headers(ctx, []entities.Hash{rescued})
+	require.NoError(err)
+	require.Empty(f.markerCells(rescued))
+
+	res, err := f.condemn(nil)
+	require.NoError(err)
+	for _, k := range []entities.Hash{reRooted, touched, rescued} {
+		require.Empty(f.markerCells(k), k)
+	}
+	require.Equal([][]byte{marker(2)}, f.markerCells(still))
+
+	prev := res.Report.PreviousList
+	require.Equal("gc/condemned/default/1", prev.Location)
+	require.Equal(int64(1), prev.Cycle)
+	require.True(prev.Complete)
+	require.Equal(int64(4), prev.Keys)
+	require.Equal(int64(2), prev.Cleared)
+	require.Equal("gc/condemned/default/2.live", prev.LiveList)
+	blobs := prev.Types["blob"]
+	require.Equal(int64(1), blobs.StillUnreachable)
+	require.Equal(map[string]int64{"source": 1, "recent": 2}, blobs.Live)
+	require.Equal(int64(1), blobs.Rescued)
+	require.Equal([]string{reRooted.String()}, blobs.Samples["source"])
+
+	lines := f.liveLines(prev.LiveList)
+	require.Len(lines, 3)
+	ref := lines[reRooted.String()]
+	require.Equal("source", ref.Root.Class)
+	require.Equal("platform/b", ref.Root.Project)
+	require.Equal("refs/heads/again", ref.Root.Ref)
+	require.WithinDuration(refTime, *ref.Root.UpdateTime, time.Millisecond)
+	require.Equal(int64(1), *ref.Marker)
+	require.False(ref.Rescued)
+	tl := lines[touched.String()]
+	require.Equal("recent", tl.Root.Class)
+	require.WithinDuration(touchTime, *tl.TouchTime, time.Millisecond)
+	require.False(tl.Rescued)
+	rl := lines[rescued.String()]
+	require.Equal("recent", rl.Root.Class)
+	require.Nil(rl.Marker)
+	require.True(rl.Rescued)
+	require.Equal("blob", rl.Type)
+}
+
+// A cycle that stops after half its marker batches leaves markers of its
+// number on part of its list. The next cycle clears those of keys that are
+// live again and rewrites the rest, so no marker of the stopped cycle is
+// left for an exact-number delete to match.
+func TestCondemnGC_CrashMidwayLeavesNoOldMarker(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	var keys []entities.Hash
+	for i := range 4 {
+		keys = append(keys, f.blob(fmt.Sprintf("file %d", i), f.old))
+	}
+	slices.SortFunc(keys, func(a, b entities.Hash) int { return strings.Compare(a.String(), b.String()) })
+
+	// A Bigtable client whose second bulk write fails, as if the collector
+	// stopped there.
+	var mutates atomic.Int32
+	stop := grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		if strings.HasSuffix(method, "/MutateRows") && mutates.Add(1) > 1 {
+			return nil, status.Error(codes.PermissionDenied, "stopped by the test")
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	})
+	conn, err := grpc.NewClient(os.Getenv("BIGTABLE_EMULATOR_HOST"), grpc.WithTransportCredentials(insecure.NewCredentials()), stop)
+	require.NoError(err)
+	bt, err := bigtable.NewClient(ctx, emulatorProject, emulatorBigtable, option.WithGRPCConn(conn))
+	require.NoError(err)
+	defer bt.Close()
+	_, err = gc.Condemn(ctx, f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), f.s, f.opts())
+	require.ErrorContains(err, "stopped by the test")
+	require.Equal([][]byte{marker(1)}, f.markerCells(keys[0]))
+	require.Equal([][]byte{marker(1)}, f.markerCells(keys[1]))
+	require.Empty(f.markerCells(keys[2]))
+	location, complete := f.listState()
+	require.Equal("gc/condemned/default/1", location.StringVal)
+	require.False(complete.Bool)
+
+	// One key of each batch is reached again.
+	f.ref("platform/a", "refs/heads/main", f.tree(f.old, keys[0], keys[2]), f.old)
+	res, err := f.condemn(nil)
+	require.NoError(err)
+	f.requireNoMarker(1)
+	require.Empty(f.markerCells(keys[0]))
+	require.Empty(f.markerCells(keys[2]))
+	require.Equal([][]byte{marker(2)}, f.markerCells(keys[1]))
+	require.Equal([][]byte{marker(2)}, f.markerCells(keys[3]))
+	prev := res.Report.PreviousList
+	require.False(prev.Complete)
+	require.Equal(int64(1), prev.Cleared)
+	lines := f.liveLines(prev.LiveList)
+	require.Len(lines, 2)
+	// The marker of a key the stopped cycle never reached is missing, which is
+	// no rescue.
+	require.False(lines[keys[2].String()].Rescued)
+	require.Equal(int64(1), *lines[keys[0].String()].Marker)
 }

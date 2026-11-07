@@ -180,6 +180,11 @@ type condemner struct {
 	opts   *CondemnOpts
 	bt     *bigtable.Client
 	bucket *storage.BucketHandle
+	// prev is the list of the last condemn cycle, prevState its state in
+	// GcState and prevErr why it could not be read.
+	prev      *condemnedList
+	prevState ListState
+	prevErr   string
 }
 
 func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
@@ -198,13 +203,21 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		return &ErrCondemnRefused{Reasons: rep.Refused}
 	}
 
+	// The markers of the previous list's live keys are cleared before this
+	// cycle's list replaces it in GcState, so that a crash in between leaves
+	// the previous list in place for the next cycle to clear again.
+	var err error
+	if r.PreviousList, err = c.clearLive(ctx, lease, res); err != nil {
+		return err
+	}
+
 	// The list comes before any marker, so that every marker a crashed run
 	// leaves is in a list the next cycle reads.
 	nodes := res.unreachable
 	name := listObjectName(c.opts.StateName, r.Cycle)
 	h := &listHeader{cycle: r.Cycle, snapshot: r.SnapshotTime, holder: c.opts.Holder, epoch: lease.Epoch, count: int64(len(nodes)), types: typeNames}
 	next := 0
-	err := writeList(ctx, c.bucket, name, h, func() (listRecord, bool) {
+	err = writeList(ctx, c.bucket, name, h, func() (listRecord, bool) {
 		if next == len(nodes) {
 			return listRecord{}, false
 		}

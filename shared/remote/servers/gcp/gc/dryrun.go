@@ -144,8 +144,10 @@ type Report struct {
 	Edges       EdgeCounts              `json:"edges"`
 	Maps        map[MapClass]*MapCounts `json:"maps"`
 	Consistency ConsistencyReport       `json:"consistency"`
-	// Condemn reports the condemn step of a condemn cycle.
-	Condemn *CondemnReport `json:"condemn,omitempty"`
+	// Condemn reports the condemn step of a condemn cycle, and PreviousList
+	// what it found of the keys of the list before.
+	Condemn      *CondemnReport      `json:"condemn,omitempty"`
+	PreviousList *PreviousListReport `json:"previous_list,omitempty"`
 	// Explain explains the keys of DryRunOpts.Explain.
 	Explain []KeyReport  `json:"explain,omitempty"`
 	Memory  MemoryReport `json:"memory"`
@@ -295,7 +297,13 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs
 	defer stop()
 
 	d := &dryRun{opts: o, lease: lease, sp: sp, bt: bt, objs: objs, start: start, phase: phase, keepUnreachable: c != nil}
-	res, err := d.run(runCtx)
+	var res *Result
+	if c != nil {
+		err = c.readPrevious(runCtx, lease, d)
+	}
+	if err == nil {
+		res, err = d.run(runCtx)
+	}
 	if err == nil && c != nil {
 		err = c.run(runCtx, lease, res)
 	}
@@ -422,11 +430,13 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	// a tracked node is attributed to the first root, in that order, that
 	// reaches it.
 	m := newMarker(g, g.size())
-	var tracked []uint32
-	for _, h := range append(slices.Clone(d.tracked), o.Explain...) {
-		tracked = append(tracked, g.find(h))
+	for _, keys := range [][]Hash{d.tracked, o.Explain} {
+		ids := make([]uint32, len(keys))
+		for i, h := range keys {
+			ids[i] = g.find(h)
+		}
+		m.track(ids)
 	}
-	m.track(tracked)
 	sortRefRoots(refs.roots)
 	pinnedAt := slices.IndexFunc(refs.roots, func(r refRoot) bool { return refClassRank(r.class) > refClassRank(pinnedAfter) })
 	if pinnedAt < 0 {

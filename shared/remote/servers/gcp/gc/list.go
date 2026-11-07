@@ -70,7 +70,12 @@ type listHeader struct {
 }
 
 func (h *listHeader) runID() string {
-	return h.holder + "#" + strconv.FormatInt(h.epoch, 10)
+	return runID(h.holder, h.epoch)
+}
+
+// runID names the run of a lease holder and epoch.
+func runID(holder string, epoch int64) string {
+	return holder + "#" + strconv.FormatInt(epoch, 10)
 }
 
 func (h *listHeader) write(w io.Writer) error {
