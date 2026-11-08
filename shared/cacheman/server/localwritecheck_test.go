@@ -579,6 +579,21 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		require.Eventually(t, func() bool { return confirmed(c, h) && inLRU(t, c, h) }, 5*time.Second, 10*time.Millisecond)
 	})
 
+	// With eviction off the index tracks no use, so every entry is outside the LRU and none
+	// can be evicted: maintenance leaves them as they are instead of checking the whole cache
+	// on every run.
+	t.Run("maintenance without eviction", func(t *testing.T) {
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+		c.index.(*badgerIndex).indexStore.(*BadgerIndexStore).trackUse = false
+		c.startLocalWriteCheck(ctx)
+		h := fetchedBlob(t, c, "eviction off")
+		putOnServer(t, r, "eviction off")
+		c.reconcileDiskObject(h, protocol.TypeBlob, map[entities.Hash]struct{}{})
+		require.True(t, confirmed(c, h))
+		require.Zero(t, c.Stats().RemoteChecks.Sent)
+	})
+
 	// A clear that fails with an error other than a conflict leaves the old entry Remote; the
 	// check finds the server lacks it and takes the entry out of the LRU.
 	t.Run("clear fails", func(t *testing.T) {

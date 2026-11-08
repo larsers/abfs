@@ -487,10 +487,12 @@ func (lw *localWriteCheck) useSync(sync *dagsync.DAGSync, offlineThreshold uint6
 
 // checkUntrackedEntry handles a Local and Remote entry that maintenance found outside the
 // LRU. The start pass checked only the LRU entries, and the entry can be a local write whose
-// notification was lost, so it stays out of eviction until the server confirms it.
+// notification was lost, so it stays out of eviction until the server confirms it. An index
+// that does not track use evicts nothing and holds every entry outside the LRU, so it needs no
+// check.
 func (c *CacheMan) checkUntrackedEntry(hash entities.Hash, entry *IndexEntry) bool {
 	idx, ok := c.checkedIndex()
-	if !ok || !localWriteChecked(entry.EntryType) {
+	if !ok || !localWriteChecked(entry.EntryType) || !idx.tracksUse() {
 		return false
 	}
 	_, cleared, retries, err := idx.clearRemote(hash, nil, c.closeChan)

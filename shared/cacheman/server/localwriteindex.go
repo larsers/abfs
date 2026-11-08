@@ -42,6 +42,7 @@ type localWriteIndex interface {
 	releaseEviction()
 	evictSkippedUnconfirmed() int64
 	evictedUnchecked() int64
+	tracksUse() bool
 }
 
 var _ localWriteIndex = (*badgerIndex)(nil)
@@ -127,6 +128,12 @@ func (i *badgerIndex) evictSkippedUnconfirmed() int64 {
 
 func (i *badgerIndex) evictedUnchecked() int64 {
 	return i.gate.unchecked.Load()
+}
+
+// tracksUse reports whether the index keeps the LRU, without which nothing is evicted.
+func (i *badgerIndex) tracksUse() bool {
+	store, ok := i.indexStore.(*BadgerIndexStore)
+	return !ok || store.trackUse
 }
 
 // evictionHeld reports whether eviction is held and may take nothing now, so that a run
