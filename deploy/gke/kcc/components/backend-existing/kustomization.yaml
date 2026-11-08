@@ -15,8 +15,9 @@
 # Mode "existing": no Config Connector object for the Spanner instance or
 # database, the Bigtable instance or tables, or the bucket, so nothing here can
 # change or delete them. Only the server's roles are granted. The backend must
-# already have what `abfs server gcp init --gc` creates; running init again
-# without changes is the check.
+# already have what `abfs server gcp init` creates, and what `init --gc` adds
+# when GC is on; running init again without changes is the check. The gc
+# component does not apply here: `init --gc` creates every GC resource.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 resources:

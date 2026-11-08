@@ -97,7 +97,8 @@ template:
 	@echo "OK: an empty digest fails as expected: $$(grep -o 'image.server.digest.*' $(OUT)/template/fail.err)"
 
 # Each overlay, then the components the example overlay leaves out, then the
-# rule that the two backend modes exclude each other.
+# rules that the two backend modes exclude each other, that backend-new holds
+# no garbage collector resource, and that gc builds only with backend-new.
 kustomize:
 	@mkdir -p $(OUT)/kustomize
 	@for k in $(OVERLAYS); do \
@@ -117,7 +118,29 @@ kustomize:
 	if kubectl kustomize "$$t" >/dev/null 2>&1; then \
 	  echo "FAIL: backend-new and backend-existing together built, but must fail" >&2; exit 1; \
 	fi; \
-	echo "OK: backend-new + backend-existing fails as expected"
+	echo "OK: backend-new + backend-existing fails as expected"; \
+	kz backend-new settings >"$$t/kustomization.yaml"; \
+	kubectl kustomize "$$t" >$(OUT)/kustomize/new.yaml; \
+	if grep -qE 'name: abfs-(table-gc|gc-policy-(gc|objects-g))$$|family: g$$|Gc[A-Z][a-z]+ \(' $(OUT)/kustomize/new.yaml; then \
+	  echo "FAIL: backend-new without gc holds a garbage collector resource" >&2; exit 1; \
+	fi; \
+	echo "OK: backend-new without gc holds no garbage collector resource ($$(grep -c '^kind:' $(OUT)/kustomize/new.yaml) objects)"; \
+	kz backend-new gc settings >"$$t/kustomization.yaml"; \
+	kubectl kustomize "$$t" >$(OUT)/kustomize/new-gc.yaml; \
+	[[ $$(grep -cE '^  name: abfs-(table-gc|gc-policy-(gc-[et]|objects-g))$$|^  - family: g$$' $(OUT)/kustomize/new-gc.yaml) == 5 ]] || \
+	  { echo "FAIL: backend-new + gc lacks the table gc, the family objects:g or their policies" >&2; exit 1; }; \
+	fam() { awk '/^kind: BigtableTable$$/ { t = 1 } /^---$$/ { t = 0 } t && /^  name: abfs-table-objects$$/ { o = 1 } \
+	  o && /^  - family: / { printf "%s ", $$3 } /^---$$/ { o = 0 }' "$$1"; } ; \
+	[[ $$(fam $(OUT)/kustomize/new.yaml) == "meta data " ]] || \
+	  { echo "FAIL: the table objects of backend-new has the families $$(fam $(OUT)/kustomize/new.yaml), not meta data" >&2; exit 1; }; \
+	[[ $$(fam $(OUT)/kustomize/new-gc.yaml) == "meta data g " ]] || \
+	  { echo "FAIL: the table objects of backend-new + gc has the families $$(fam $(OUT)/kustomize/new-gc.yaml), not meta data g" >&2; exit 1; }; \
+	echo "OK: backend-new + gc ($$(grep -c '^kind:' $(OUT)/kustomize/new-gc.yaml) objects; objects families meta data g)"; \
+	kz backend-existing gc settings >"$$t/kustomization.yaml"; \
+	if kubectl kustomize "$$t" >/dev/null 2>&1; then \
+	  echo "FAIL: backend-existing and gc together built, but must fail" >&2; exit 1; \
+	fi; \
+	echo "OK: backend-existing + gc fails as expected"
 
 # The schema source of ddl and ddl-check: an ABFS source tree, or a commit of
 # DDL_REPO that has the GCP server, for example

@@ -76,7 +76,7 @@ The chart never creates the release namespace: the KCC base creates `abfs` with 
 | `server.healthProbeInterval` | `10s` | `--health-probe-interval` of the backend probe |
 | `server.shutdownTimeout` | `25s` | `--shutdown-timeout` |
 | `server.logSampleRate` | `0.01` | `--log-sample-rate` |
-| `server.gc.enabled` | `false` | `--gc`; needs the resources of `init --gc`, which both backend modes have |
+| `server.gc.enabled` | `false` | `--gc`; needs the garbage collector resources, which neither backend mode creates by default: `components/gc` with `backend-new`, then `init --gc` ([runbook](runbook.md#garbage-collection)) |
 | `server.extraArgs` | `[]` | More server flags |
 | `server.preStopSleepSeconds` | `120` | Time the pod keeps serving after its endpoint is removed, at least `gateway.drainingTimeoutSec` plus about 60 s |
 | `server.terminationGracePeriodSeconds` | `240` | preStop + the longest stop after SIGTERM + a margin: 120 s + 105 s + 15 s. The stop is `server.drainDelay` (15 s), `server.shutdownTimeout` (25 s), with `server.gc.enabled` up to 20 s to write the buffered GC touches and up to 30 s to delete the heartbeat row, and up to 15 s of telemetry flush. Raise it with any of these. |

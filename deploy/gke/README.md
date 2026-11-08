@@ -41,6 +41,7 @@ deploy/gke/
     components/
       backend-new/       Spanner, Bigtable, tables, bucket and the server's roles
       backend-existing/  the server's roles on a backend that already exists
+      gc/                the garbage collector's Bigtable parts, with backend-new, only when GC is on
       network/proxy-subnet/  the proxy-only subnet, for a network without one
       settings/          fills the base from the overlay's settings.yaml
     overlays/example/  a worked example
@@ -110,5 +111,5 @@ The release bundle (`scripts/bundle.sh`) holds this README, the Makefile, `chart
 
 - GKE Standard only. Autopilot does not allow the privileged CI pods.
 - CI nodes run Ubuntu and build casfs on each node. The casfs commit in the image does not build on kernel series 6.14 and 6.19.
-- No TLS, no authentication, no garbage collection by default (the server's `--gc` is off).
+- No TLS, no authentication, no garbage collection by default: the server's `--gc` is off, and the backend gets no garbage collector tables until it is turned on ([runbook](docs/runbook.md#garbage-collection)).
 - Terraform for Compute Engine VMs, Cloud Workstations and local SSD caches are not part of this folder.
