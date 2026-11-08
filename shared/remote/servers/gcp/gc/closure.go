@@ -98,8 +98,8 @@ type DeletePlanReport struct {
 	Levels int `json:"levels"`
 	// MapRows counts the map rows that name a candidate and go first,
 	// ExpiredEvalMapRows the eval rows past the map retention whose ends
-	// stay, and MapRowsKeptForTypes the rows naming a candidate whose two
-	// ends are of types the cycle may not delete.
+	// stay, and MapRowsKeptForTypes the rows naming a candidate with an end
+	// of a type the cycle may not delete, which keep their candidate ends.
 	MapRows             int64 `json:"map_rows"`
 	ExpiredEvalMapRows  int64 `json:"expired_eval_map_rows"`
 	MapRowsKeptForTypes int64 `json:"map_rows_kept_for_types,omitempty"`
@@ -278,13 +278,16 @@ func (p *deletePlan) blockNoncandidateParents(res *Result) {
 	}
 }
 
-// planMapRows selects the map rows that name a candidate, except those whose
-// two ends are both of types the cycle may not delete, and the eval rows past
-// the map retention whose two ends are live.
+// planMapRows selects the map rows that name a candidate and the eval rows
+// past the map retention whose two ends are live. A row goes only when the
+// cycle may delete the types of both its ends; an end without a node has no
+// type and allows it. So a cycle limited to some types drops no cached result
+// of the others. A row that names a candidate and stays for its types keeps
+// its candidate ends, as a kept row does in the step.
 func (p *deletePlan) planMapRows(res *Result, evalAfter int64, allows func(string) bool) {
 	g, rep := p.g, p.report
 	allowed := func(id uint32) bool {
-		return id != noNode && allows(typeNames[g.types[id]])
+		return id == noNode || allows(typeNames[g.types[id]])
 	}
 	if res.maps == nil {
 		return
@@ -293,16 +296,32 @@ func (p *deletePlan) planMapRows(res *Result, evalAfter int64, allows func(strin
 		for i := range rows {
 			r := &rows[i]
 			names := (r.from != noNode && p.isCand.has(r.from)) || (r.to != noNode && p.isCand.has(r.to))
+			expired := !names && g.mapClass(r) == MapEval && r.time < evalAfter && r.to != noNode && res.live.has(r.from) && res.live.has(r.to)
+			if !names && !expired {
+				continue
+			}
 			switch {
-			case names && !allowed(r.from) && !allowed(r.to):
-				rep.MapRowsKeptForTypes++
+			case !allowed(r.from) || !allowed(r.to):
+				if names {
+					rep.MapRowsKeptForTypes++
+					p.blockAllowed(r.from, allows)
+					p.blockAllowed(r.to, allows)
+				}
 			case names:
 				p.mapRows = append(p.mapRows, plannedMapRow{key: res.maps.rowKey(g, s, i), from: r.from, to: r.to})
 				rep.MapRows++
-			case g.mapClass(r) == MapEval && r.time < evalAfter && r.to != noNode && res.live.has(r.from) && res.live.has(r.to):
+			default:
 				p.mapRows = append(p.mapRows, plannedMapRow{key: res.maps.rowKey(g, s, i), from: r.from, to: r.to, expired: true})
 				rep.ExpiredEvalMapRows++
 			}
 		}
+	}
+}
+
+// blockAllowed blocks node id if it is a candidate the step would try and of
+// a type allows accepts; a candidate of another type is never tried.
+func (p *deletePlan) blockAllowed(id uint32, allows func(string) bool) {
+	if j := p.index(id); j >= 0 && p.outcome[j] == outcomePending && allows(typeNames[p.g.types[id]]) {
+		p.outcome[j] = outcomeBlocked
 	}
 }

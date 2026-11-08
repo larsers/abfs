@@ -226,6 +226,69 @@ func TestPlanDeletes(t *testing.T) {
 	require.Equal(outcomePending, p.outcome[p.index(res.graph.find(ghostChild))])
 }
 
+// A map row goes only when the cycle may delete the types of both its ends,
+// and one that names a candidate and stays keeps that candidate. An eval row
+// past the map retention whose ends are live goes only when the cycle may
+// delete eval requests and responses.
+func TestPlanDeletes_MapRowTypes(t *testing.T) {
+	require := require.New(t)
+	f := newStepFixture(t, 4)
+	h := testHashes(6)
+	old := f.now.Add(-1000 * time.Hour)
+	// Both ends are candidates.
+	req, resp := h[0], h[1]
+	f.object(req, "eval-request", nil)
+	f.object(resp, "eval-response", nil)
+	f.mapRow(req, resp, old)
+	// The request is outside the list, the response a candidate.
+	outReq, outResp := h[2], h[3]
+	f.objectWith(outReq, "eval-request", nil, nil, true)
+	f.object(outResp, "eval-response", nil)
+	f.keys = slices.DeleteFunc(f.keys, func(k Hash) bool { return k == outReq })
+	f.mapRow(outReq, outResp, old)
+	// Both ends live.
+	liveReq, liveResp := h[4], h[5]
+	f.object(liveReq, "eval-request", nil)
+	f.object(liveResp, "eval-response", nil)
+	f.mapRow(liveReq, liveResp, old)
+
+	res := f.mark(nil)
+	for _, k := range []Hash{liveReq, liveResp} {
+		res.live.set(res.graph.find(k))
+	}
+	keys := slices.Clone(f.keys)
+	slices.SortFunc(keys, compareHash)
+	l := &condemnedList{header: &listHeader{cycle: stepListCycle}, keys: keys}
+	plan := func(allows func(string) bool) *deletePlan {
+		return planDeletes(res, l, f.now.Add(-DefaultMapRetention).UnixMicro(), allows)
+	}
+	rows := func(p *deletePlan) []string {
+		var keys []string
+		for _, r := range p.mapRows {
+			keys = append(keys, r.key)
+		}
+		return keys
+	}
+	row := func(from, to Hash) string { return from.String() + "#" + to.String() }
+
+	p := plan(func(string) bool { return true })
+	require.ElementsMatch([]string{row(req, resp), row(outReq, outResp), row(liveReq, liveResp)}, rows(p))
+	require.Equal(int64(2), p.report.MapRows)
+	require.Equal(int64(1), p.report.ExpiredEvalMapRows)
+	require.Zero(p.report.MapRowsKeptForTypes)
+	require.Equal(int64(3), p.report.WouldDelete)
+
+	p = plan(func(t string) bool { return t == "eval-request" })
+	require.Empty(rows(p))
+	require.Equal(int64(2), p.report.MapRowsKeptForTypes)
+	require.Zero(p.report.ExpiredEvalMapRows)
+	outcome := func(k Hash) keyOutcome { return p.outcome[p.index(res.graph.find(k))] }
+	require.Equal(outcomeBlocked, outcome(req))
+	require.Equal(outcomeTypeNotAllowed, outcome(resp))
+	require.Equal(outcomeTypeNotAllowed, outcome(outResp))
+	require.Zero(p.report.WouldDelete)
+}
+
 // A delete record reads back as written, and keeps the content descriptor
 // only of an object with a chunk outside the inline depot.
 func TestDeleteRecord_WriteRead(t *testing.T) {
