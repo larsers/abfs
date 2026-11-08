@@ -300,7 +300,8 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 // GcState row and deletes the GcReplicas rows not seen for a day. objs reads
 // the workspace snapshots, mount details and pinned manifests of live mounts
 // and workspaces. With bucket, which holds the condemned lists, the report
-// also counts what a delete cycle would remove from the last list.
+// also counts what a delete cycle would remove from the last list, or says
+// in Report.Delete why it could not read it.
 func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
@@ -340,12 +341,21 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, buck
 	d := &dryRun{opts: o, lease: lease, sp: sp, bt: bt, objs: objs, start: start, phase: phase, keepUnreachable: c != nil}
 	var res *Result
 	var prev previousList
+	var planErr error
 	switch {
 	case c != nil:
 		err = c.readPrevious(runCtx, lease, d)
 		prev = c.prev
 	case bucket != nil:
-		prev, err = readPreviousList(runCtx, lease, bucket)
+		// A dry run reads the list only for the counts of what a delete
+		// would remove, so it reports a failed read and runs on.
+		if prev, planErr = readPreviousList(runCtx, lease, bucket); planErr != nil {
+			if runCtx.Err() != nil {
+				err = planErr
+			} else {
+				log.Printf("Warning: the GC dry run does not count what a delete would remove: %v", planErr)
+			}
+		}
 		d.keepUnreachable = prev.list != nil
 	}
 	if err == nil {
@@ -355,6 +365,9 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, buck
 		res.plan = planDeletes(res, prev.list, res.Report.SnapshotTime.Add(-o.MapRetention).UnixMicro(), allows)
 		res.plan.report.List = prev.state.Location
 		res.Report.Delete = &DeleteReport{Plan: res.plan.report}
+	}
+	if err == nil && planErr != nil {
+		res.Report.Delete = &DeleteReport{PlanError: planErr.Error()}
 	}
 	if err == nil && c != nil {
 		err = c.run(runCtx, lease, res)

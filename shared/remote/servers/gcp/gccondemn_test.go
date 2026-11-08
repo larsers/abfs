@@ -314,6 +314,35 @@ func TestCondemnGC_MissingPreviousList(t *testing.T) {
 	require.Equal("gc/condemned/default/2", location.StringVal)
 }
 
+// A dry run reads the list of the last condemn cycle only to count what a
+// delete would remove: one it cannot read leaves out the counts and says why,
+// while a condemn cycle, which needs the list, fails.
+func TestDryRunGC_UnreadablePreviousList(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	f.blob("unreachable file", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	o := gc.DefaultDryRunOpts()
+	o.Shards = 3
+	res, err := f.s.DryRunGC(ctx, f.bucket, &o)
+	require.NoError(err)
+	require.Equal(int64(1), res.Report.Delete.Plan.Candidates)
+
+	w := f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/1").NewWriter(ctx)
+	_, err = w.Write([]byte("not a list"))
+	require.NoError(err)
+	require.NoError(w.Close())
+	res, err = f.s.DryRunGC(ctx, f.bucket, &o)
+	require.NoError(err)
+	require.Nil(res.Report.Delete.Plan)
+	require.Contains(res.Report.Delete.PlanError, "gc/condemned/default/1")
+	_, err = f.condemn(nil)
+	require.Error(err)
+}
+
 // liveLine is a line of a live list.
 type liveLine struct {
 	Key       string     `json:"key"`

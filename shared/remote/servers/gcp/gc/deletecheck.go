@@ -137,8 +137,10 @@ type DeleteReport struct {
 	// because they were written during it.
 	TooNew *TooNewReport `json:"too_new,omitempty"`
 	// Plan reports what the cycle would delete from the list before; dry runs
-	// and condemn cycles report only it.
-	Plan *DeletePlanReport `json:"plan,omitempty"`
+	// and condemn cycles report only it. PlanError is why a dry run could not
+	// read that list, so it reports no plan.
+	Plan      *DeletePlanReport `json:"plan,omitempty"`
+	PlanError string            `json:"plan_error,omitempty"`
 	// Step reports the delete step, when it ran.
 	Step *DeleteStepReport `json:"step,omitempty"`
 	// Chunks reports the chunk step, which runs in every delete cycle.
