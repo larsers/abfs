@@ -39,6 +39,10 @@ import (
 
 const (
 	DefaultChunkRate = 500
+	// chunkRecordWorkers is the number of delete records the chunk step works
+	// on at once. The records are independent; the calls in flight of all of
+	// them are bounded by the delete workers.
+	chunkRecordWorkers = 16
 	// chunksDoneMetadata flags a delete record whose chunks are deleted,
 	// with the cycle that deleted them.
 	chunksDoneMetadata = "chunks-done"
@@ -117,6 +121,8 @@ type chunkStep struct {
 	objects        *bigtable.Table
 	chunks         *bigtable.Table
 	gcTable        *bigtable.Table
+	// calls bounds the keys worked on at once over all records.
+	calls chan struct{}
 	// mu guards the counts of rep.
 	mu sync.Mutex
 }
@@ -136,6 +142,7 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 		objects: d.bt.Open(objectsTable),
 		chunks:  d.bt.Open(chunksTableName),
 		gcTable: d.bt.Open(TableName),
+		calls:   make(chan struct{}, d.opts.DeleteWorkers),
 	}
 	d.rep.Chunks = s.rep
 	defer func() { s.rep.Seconds = time.Since(start).Seconds() }()
@@ -150,16 +157,23 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 	done := make(map[string]bool)
 	if len(s.rep.Skipped) == 0 {
 		now := wallNow()
+		eg, ectx := errgroup.WithContext(ctx)
+		eg.SetLimit(chunkRecordWorkers)
 		for _, attrs := range unflagged {
 			if attrs.Created.Add(d.opts.ChunkDelay).After(now) {
 				s.rep.RecordsWaiting++
 				continue
 			}
-			ok, err := s.record(ctx, attrs)
-			if err != nil {
+			eg.Go(func() error {
+				ok, err := s.record(ectx, attrs)
+				s.mu.Lock()
+				done[attrs.Name] = ok
+				s.mu.Unlock()
 				return err
-			}
-			done[attrs.Name] = ok
+			})
+		}
+		if err := eg.Wait(); err != nil {
+			return err
 		}
 	}
 	for _, reason := range s.rep.Skipped {
@@ -272,9 +286,9 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 		s.fail(&s.rep.RecordErrors, err)
 		return false, ctx.Err()
 	}
-	s.rep.Records++
+	s.count(&s.rep.Records)
 	if !s.hasBackupAfter(h.listComplete) {
-		s.rep.RecordsWithoutBackup++
+		s.count(&s.rep.RecordsWithoutBackup)
 		return false, nil
 	}
 	var keys []*recordEntry
@@ -285,7 +299,9 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 			rows = append(rows, e.key.String())
 		}
 	}
+	s.mu.Lock()
 	s.rep.Keys += int64(len(keys))
+	s.mu.Unlock()
 	states, err := readObjectRows(ctx, s.objects, s.reads, rows)
 	if err != nil {
 		s.fail(&s.rep.Errors, fmt.Errorf("failed to read the objects of the delete record %s: %w", attrs.Name, err))
@@ -295,11 +311,16 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 	chunkRowDelete := conditionalDelete(bigtable.TimestampRangeFilter(attrs.Created, time.Time{}), false)
 	gcRowDelete := conditionalDelete(newerCellPredicate(EdgesFamily, LinksColumn, h.gcRowsAfter), false)
 	var eg errgroup.Group
-	eg.SetLimit(s.d.opts.DeleteWorkers)
 	var mu sync.Mutex
 	allDone := true
 	for _, e := range keys {
 		eg.Go(func() error {
+			select {
+			case s.calls <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			defer func() { <-s.calls }()
 			ok, err := s.key(ctx, e, states[e.key.String()], attrs.Created, chunkRowDelete, gcRowDelete)
 			mu.Lock()
 			allDone = allDone && ok
@@ -320,7 +341,7 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 		s.fail(&s.rep.Errors, fmt.Errorf("failed to flag the delete record %s: %w", attrs.Name, err))
 		return false, nil
 	}
-	s.rep.RecordsDone++
+	s.count(&s.rep.RecordsDone)
 	return true, nil
 }
 
