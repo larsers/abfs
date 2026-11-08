@@ -880,6 +880,7 @@ func (s *pusher) putDeepTree(ctx context.Context, entries []*entities.DeepEntry)
 		return entities.Hash{}, err
 	}
 	if err := s.store.PutObject(ctx, deepTree.Hash, deepTree.Encoded); err != nil {
+		s.forgetMissingDeepTrees(err)
 		return entities.Hash{}, err
 	}
 
