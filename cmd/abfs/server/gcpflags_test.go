@@ -62,7 +62,8 @@ func TestGCPInitFlags_GC(t *testing.T) {
 }
 
 // gc run takes exactly one mode, and --condemn and --delete need the expected
-// number or range of server hosts and the consistency check.
+// number or range of server hosts and the consistency check. The other modes
+// reject the flags only delete mode reads.
 func TestGCPGCRunFlags_Modes(t *testing.T) {
 	tests := []struct {
 		args    []string
@@ -86,12 +87,16 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--condemn", "--expected-replicas=3", "--min-replicas=2"}, "expected replicas excludes min and max replicas"},
 		{[]string{"--condemn", "--expected-replicas=3", "--max-replicas=4"}, "expected replicas excludes min and max replicas"},
 		{[]string{"--condemn", "--min-replicas=-1"}, "cannot be negative"},
-		// The checks of delete mode have no effect in the other modes.
-		{[]string{"--condemn", "--min-replicas=2", "--no-backup-check"}, "apply only to delete mode"},
-		{[]string{"--dry-run", "--accept-mounts-without-keepalive"}, "apply only to delete mode"},
-		{[]string{"--dry-run", "--delete-types=commit"}, "apply only to delete mode"},
-		{[]string{"--condemn", "--min-replicas=2", "--delete-start-delay=5m"}, "apply only to delete mode"},
-		{[]string{"--condemn", "--min-replicas=2", "--allow-no-soft-delete"}, "apply only to delete mode"},
+		// The flags of delete mode have no effect in the other modes.
+		{[]string{"--condemn", "--min-replicas=2", "--no-backup-check"}, "only delete mode takes --no-backup-check"},
+		{[]string{"--dry-run", "--accept-mounts-without-keepalive"}, "only delete mode takes --accept-mounts-without-keepalive"},
+		{[]string{"--dry-run", "--delete-types=commit"}, "only delete mode takes --delete-types"},
+		{[]string{"--condemn", "--min-replicas=2", "--delete-start-delay=5m"}, "only delete mode takes --delete-start-delay"},
+		{[]string{"--condemn", "--min-replicas=2", "--allow-no-soft-delete"}, "only delete mode takes --allow-no-soft-delete"},
+		{[]string{"--condemn", "--min-replicas=2", "--delete-rate=100", "--delete-workers=16"}, "only delete mode takes --delete-rate, --delete-workers"},
+		{[]string{"--dry-run", "--chunk-delay=2h"}, "only delete mode takes --chunk-delay"},
+		{[]string{"--condemn", "--min-replicas=2", "--chunk-rate=0"}, "only delete mode takes --chunk-rate"},
+		{[]string{"--condemn", "--min-replicas=2", "--delete-rate=2000"}, "only delete mode takes --delete-rate"},
 		// Delete mode implies the condemn and takes its checks.
 		{[]string{"--delete"}, "invalid expected replicas 0"},
 		{[]string{"--delete", "--condemn", "--min-replicas=2"}, "pass one of --dry-run, --condemn and --delete"},
@@ -101,6 +106,8 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--delete", "--min-replicas=2", "--delete-types=commits"}, `invalid object type "commits"`},
 		{[]string{"--delete", "--min-replicas=2", "--chunk-delay=10m"}, "not longer than the 10m0s lifetime of the signed URLs"},
 		{[]string{"--delete", "--min-replicas=2", "--delete-workers=0"}, "invalid number of delete workers 0"},
+		{[]string{"--delete", "--min-replicas=2", "--delete-workers=8"}, "8 delete workers are fewer than the 16 key ranges"},
+		{[]string{"--delete", "--min-replicas=2", "--delete-workers=8", "--shards=8"}, ""},
 		{[]string{"--delete", "--min-replicas=2", "--delete-rate=-1"}, "invalid delete rate"},
 		{[]string{"--delete", "--min-replicas=2", "--chunk-rate=-1"}, "invalid chunk delete rate"},
 		{[]string{"--delete", "--min-replicas=2", "--chunk-rate=0", "--allow-no-soft-delete"}, ""},
@@ -111,7 +118,7 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		fl := pflag.NewFlagSet("run", pflag.ContinueOnError)
 		c.RegisterFlags(fl)
 		require.NoError(t, fl.Parse(tt.args))
-		err := c.checkOpts()
+		err := c.checkOpts(fl)
 		if tt.wantErr != "" {
 			require.ErrorContains(t, err, tt.wantErr, tt.args)
 			continue
@@ -131,6 +138,9 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 	require.Equal(t, float64(500), c.opts.ChunkRate)
 	require.False(t, c.opts.AllowNoSoftDelete)
 	require.Zero(t, c.opts.StartDelay)
+	// The pause before the delete step is for tests and not in the help.
+	require.True(t, fl.Lookup("delete-start-delay").Hidden)
+	require.NotContains(t, fl.FlagUsages(), "delete-start-delay")
 }
 
 // The GC commands export the client library metrics by default, which show

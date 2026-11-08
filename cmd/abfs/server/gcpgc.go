@@ -221,11 +221,14 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.opts.AcceptMountsWithoutKeepAlive, "accept-mounts-without-keepalive", false, "In delete mode, delete blobs, trees and eval objects while live mounts run without gc-keepalive, whose caches may hold the only copy of content they wrote; the check then only warns")
 	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the list was complete")
 	fl.Float64Var(&c.opts.DeleteRate, "delete-rate", gc.DefaultDeleteRate, "In delete mode, the maximum number of objects deleted per second (0 means no limit)")
-	fl.IntVar(&c.opts.DeleteWorkers, "delete-workers", gc.DefaultDeleteWorkers, "In delete mode, the number of conditional deletes in flight, split evenly over the --shards key ranges")
+	fl.IntVar(&c.opts.DeleteWorkers, "delete-workers", gc.DefaultDeleteWorkers, "In delete mode, the number of conditional deletes in flight, split evenly over the --shards key ranges; at least --shards")
 	fl.DurationVar(&c.opts.ChunkDelay, "chunk-delay", gc.DefaultChunkDelay, "In delete mode, how long after the record of a deleted object its chunks are deleted, at the earliest in the next cycle; at least 12 min, the 10 min lifetime of signed chunk URLs plus 1 min of clock skew on each side")
 	fl.Float64Var(&c.opts.ChunkRate, "chunk-rate", gc.DefaultChunkRate, "In delete mode, the maximum number of chunks of deleted objects deleted per second (0 means no limit)")
 	fl.BoolVar(&c.opts.AllowNoSoftDelete, "allow-no-soft-delete", false, "In delete mode, delete the bucket chunks of deleted objects although the bucket keeps deleted objects for less than 7 days, so that they cannot be restored")
 	fl.DurationVar(&c.opts.StartDelay, "delete-start-delay", 0, "In delete mode, a pause before the delete step, for tests")
+	if err := fl.MarkHidden("delete-start-delay"); err != nil {
+		panic(err)
+	}
 	fl.Float64Var(&c.opts.Rate, "condemn-rate", gc.DefaultCondemnRate, "With --condemn or --delete, the maximum number of objects marked per second (0 means no limit)")
 	fl.IntVar(&c.opts.KeepLists, "keep-lists", gc.DefaultKeepLists, "With --condemn or --delete, the number of condemned lists of the newest cycles kept in the bucket")
 	fl.StringVar(&c.report, "report", "", "Write the JSON report to this file instead of stdout")
@@ -243,8 +246,14 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringSliceVar(&c.explain, "explain", nil, "Object keys, separated by commas, whose gc row, reachability, first root, times and condemn marker the report explains")
 }
 
-// checkOpts checks the mode flags and fills the keys to explain.
-func (c *gcpGCRunCmd) checkOpts() error {
+// deleteOnlyFlags are the flags that only delete mode reads.
+var deleteOnlyFlags = []string{
+	"delete-types", "accept-mounts-without-keepalive", "no-backup-check", "delete-rate", "delete-workers",
+	"chunk-delay", "chunk-rate", "allow-no-soft-delete", "delete-start-delay",
+}
+
+// checkOpts checks the mode flags set in fl and fills the keys to explain.
+func (c *gcpGCRunCmd) checkOpts(fl *pflag.FlagSet) error {
 	modes := 0
 	for _, m := range []bool{c.dryRun, c.condemn, c.delete} {
 		if m {
@@ -254,8 +263,16 @@ func (c *gcpGCRunCmd) checkOpts() error {
 	if modes != 1 {
 		return errors.New("pass one of --dry-run, --condemn and --delete")
 	}
-	if !c.delete && (len(c.opts.Types) > 0 || c.opts.AcceptMountsWithoutKeepAlive || c.opts.NoBackupCheck || c.opts.AllowNoSoftDelete || c.opts.StartDelay != 0) {
-		return errors.New("--delete-types, --accept-mounts-without-keepalive, --no-backup-check, --allow-no-soft-delete and --delete-start-delay apply only to delete mode")
+	if !c.delete {
+		var set []string
+		for _, name := range deleteOnlyFlags {
+			if fl.Changed(name) {
+				set = append(set, "--"+name)
+			}
+		}
+		if len(set) > 0 {
+			return fmt.Errorf("only delete mode takes %s", strings.Join(set, ", "))
+		}
 	}
 	var err error
 	switch {
@@ -281,7 +298,7 @@ func (c *gcpGCRunCmd) checkOpts() error {
 
 func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
-	if err := c.checkOpts(); err != nil {
+	if err := c.checkOpts(fl); err != nil {
 		return err
 	}
 	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {

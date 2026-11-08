@@ -371,7 +371,8 @@ func TestLiveBlockers_MixedFleet(t *testing.T) {
 }
 
 // The types to delete must be known, there is at least one delete in
-// flight, and the chunks of a deleted object outlive the signed URLs of its
+// flight per key range, so that the calls in flight do not exceed the
+// workers, and the chunks of a deleted object outlive the signed URLs of its
 // chunks that a server handed out before the delete.
 func TestDeleteOpts_Validate(t *testing.T) {
 	tests := []struct {
@@ -382,6 +383,8 @@ func TestDeleteOpts_Validate(t *testing.T) {
 		{func(o *DeleteOpts) { o.Types = []string{"commit", "blob"} }, ""},
 		{func(o *DeleteOpts) { o.Types = []string{"commits"} }, `invalid object type "commits"`},
 		{func(o *DeleteOpts) { o.DeleteWorkers = 0 }, "invalid number of delete workers 0"},
+		{func(o *DeleteOpts) { o.DeleteWorkers = DefaultScanShards - 1 }, "fewer than the 16 key ranges"},
+		{func(o *DeleteOpts) { o.DeleteWorkers = DefaultScanShards }, ""},
 		{func(o *DeleteOpts) { o.DeleteRate = -1 }, "invalid delete rate"},
 		{func(o *DeleteOpts) { o.ChunkDelay = 10 * time.Minute }, "not longer than the 10m0s lifetime"},
 		{func(o *DeleteOpts) { o.ChunkDelay = 12 * time.Minute }, ""},

@@ -62,7 +62,7 @@ type DeleteOpts struct {
 	// means no limit.
 	DeleteRate float64
 	// DeleteWorkers is the number of conditional deletes in flight, split
-	// evenly over the key ranges of the scan.
+	// evenly over the key ranges of the scan; at least one per range.
 	DeleteWorkers int
 	// ChunkDelay is how long after its record the chunks of a deleted object
 	// are deleted. It must exceed the lifetime of the signed URLs of chunks
@@ -103,6 +103,8 @@ func (o *DeleteOpts) Validate() error {
 		return fmt.Errorf("invalid chunk delete rate %g", o.ChunkRate)
 	case o.DeleteWorkers <= 0:
 		return fmt.Errorf("invalid number of delete workers %d", o.DeleteWorkers)
+	case o.DeleteWorkers < o.Shards:
+		return fmt.Errorf("%d delete workers are fewer than the %d key ranges, each of which keeps at least one delete in flight", o.DeleteWorkers, o.Shards)
 	case o.ChunkDelay < signedURLLifetime+2*clockSkewMargin:
 		// The servers date the URLs by their clocks, the step the records by
 		// its own.
