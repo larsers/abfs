@@ -38,7 +38,7 @@ type ReplicaReport struct {
 	// run deleted.
 	Removed int64 `json:"removed"`
 	// Stopped counts the rows of GcServers of processes that stopped without
-	// losing touches. They are not checked here and stay.
+	// losing touches at the stop. They are not checked here and stay.
 	Stopped int64 `json:"stopped"`
 	// Hosts counts the distinct host names among the live replicas, and
 	// RowsPerHost the live rows of each host. A host has more than one live
@@ -66,14 +66,16 @@ func ReplicaHost(id string) string {
 }
 
 // serverReplicas returns the rows of GcServers that checkReplicas checks,
-// all but those of processes that stopped without losing touches, and how
-// many it left out. A process that stopped after losing touches counts until
-// its row is stale, as a row that a server keeps in GcReplicas then.
+// all but those of processes that stopped without losing touches at the
+// stop, and how many it left out. A process whose stop recorded a loss counts
+// until its row is stale, as a row that a server keeps in GcReplicas then. A
+// loss recorded by an earlier heartbeat does not keep a stopped row live:
+// such a row of GcReplicas went away at the stop.
 func serverReplicas(servers []Server) ([]Replica, int64) {
 	var replicas []Replica
 	var stopped int64
 	for _, s := range servers {
-		if !s.StoppedAt.IsZero() && s.TouchLossTime.IsZero() {
+		if !s.StoppedAt.IsZero() && !s.TouchLossTime.Equal(s.StoppedAt) {
 			stopped++
 			continue
 		}

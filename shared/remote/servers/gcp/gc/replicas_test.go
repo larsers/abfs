@@ -61,23 +61,25 @@ func TestCheckReplicas(t *testing.T) {
 }
 
 // The rows of GcServers count in the replica checks, except those of
-// processes that stopped without losing touches.
+// processes that stopped without losing touches at the stop. A loss recorded
+// before the stop does not make a restart count twice on its host.
 func TestServerReplicas(t *testing.T) {
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
-	row := func(id string, stopped, lost bool) Server {
-		s := Server{ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now.Add(-time.Minute)}
+	row := func(id string, stopped bool, lost time.Time) Server {
+		s := Server{ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now.Add(-time.Minute), TouchLossTime: lost}
 		if stopped {
 			s.StoppedAt = now.Add(-time.Minute)
 		}
-		if lost {
-			s.TouchLossTime = now.Add(-time.Minute)
-		}
 		return s
 	}
-	replicas, stopped := serverReplicas([]Server{row("srv-0-aa", false, false), row("srv-1-bb", true, false), row("srv-1-cc", false, false), row("srv-2-dd", true, true)})
-	require.Equal(t, int64(1), stopped)
+	atStop, earlier := now.Add(-time.Minute), now.Add(-24*time.Hour)
+	replicas, stopped := serverReplicas([]Server{
+		row("srv-0-aa", false, time.Time{}), row("srv-1-bb", true, time.Time{}), row("srv-1-cc", false, time.Time{}),
+		row("srv-2-dd", true, atStop), row("srv-3-ee", true, earlier), row("srv-3-ff", false, time.Time{}),
+	})
+	require.Equal(t, int64(2), stopped)
 	o := DefaultDryRunOpts()
 	rep := checkReplicas(replicas, now, &o)
-	require.Equal(t, int64(3), rep.Live)
-	require.Equal(t, map[string]int64{"srv-0": 1, "srv-1": 1, "srv-2": 1}, rep.RowsPerHost)
+	require.Equal(t, int64(4), rep.Live)
+	require.Equal(t, map[string]int64{"srv-0": 1, "srv-1": 1, "srv-2": 1, "srv-3": 1}, rep.RowsPerHost)
 }
