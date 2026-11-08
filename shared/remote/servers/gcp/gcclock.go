@@ -28,13 +28,18 @@ import (
 const maxPause = 10 * time.Second
 
 // stopFreeClock counts the seconds since its epoch on a clock that does not
-// stop while the process is suspended: the larger of the monotonic and the
-// wall-clock time since the epoch. The monotonic clock stops in a suspend on
-// some systems, the wall clock does not; a backward step of the wall clock
-// does not make the count go back.
+// stop while the process is suspended: the monotonic time since the epoch plus
+// the largest lead of the wall clock over it seen so far. The monotonic clock
+// stops in a suspend on some systems, the wall clock does not. A backward step
+// of the wall clock neither moves the count back nor stops it, and a forward
+// step that is undone later leaves the count ahead, which only makes cache
+// entries expire early.
 type stopFreeClock struct {
 	epoch time.Time
-	last  atomic.Uint32
+	// lead is the largest lead of the wall clock over the monotonic clock,
+	// in nanoseconds.
+	lead atomic.Int64
+	last atomic.Uint32
 }
 
 // elapsed returns the monotonic and the wall-clock time since the epoch.
@@ -43,10 +48,22 @@ func (c *stopFreeClock) elapsed() (mono, wall time.Duration) {
 	return now.Sub(c.epoch), now.Round(0).Sub(c.epoch.Round(0))
 }
 
+// maxLead records the lead of wall over mono and returns the largest lead
+// seen so far.
+func (c *stopFreeClock) maxLead(mono, wall time.Duration) time.Duration {
+	v := int64(wall - mono)
+	for {
+		lead := c.lead.Load()
+		if v <= lead || c.lead.CompareAndSwap(lead, v) {
+			return time.Duration(max(lead, v))
+		}
+	}
+}
+
 // seconds returns the count for the given times since the epoch, plus one so
 // that zero means unset, and never less than a count it returned before.
 func (c *stopFreeClock) seconds(mono, wall time.Duration) uint32 {
-	v := uint32(max(mono, wall, 0)/time.Second) + 1
+	v := uint32(max(mono+c.maxLead(mono, wall), 0)/time.Second) + 1
 	for {
 		last := c.last.Load()
 		if v <= last {
@@ -59,26 +76,34 @@ func (c *stopFreeClock) seconds(mono, wall time.Duration) uint32 {
 }
 
 // cacheClock gives cache entries their load and touch times, and the
-// heartbeat its pause check. Tests replace cacheNow and clockElapsed.
+// heartbeat its pause check. Tests replace cacheClock, cacheNow and
+// clockElapsed.
 var (
 	cacheClock   = &stopFreeClock{epoch: time.Now()}
 	clockElapsed = cacheClock.elapsed
 	cacheNow     = func() uint32 { return cacheClock.seconds(clockElapsed()) }
 )
 
-// pauseDetector tells from the growth of the wall clock and of the monotonic
-// clock between two calls of check whether the process was paused in between,
-// for example while its VM was suspended.
-type pauseDetector struct {
-	started    bool
-	mono, wall time.Duration
+// pausedSince reports whether the process was paused since the last call of
+// pausedSince.
+func (g *gcHooks) pausedSince() bool {
+	mono, wall := clockElapsed()
+	return g.pause.check(cacheClock.maxLead(mono, wall))
 }
 
-// check records the times since the clock epoch and reports a pause since the
-// last call.
-func (p *pauseDetector) check(mono, wall time.Duration) bool {
-	paused := p.started && (wall-p.wall)-(mono-p.mono) > maxPause
-	p.started, p.mono, p.wall = true, mono, wall
+// pauseDetector tells from the growth of the largest lead of the wall clock
+// over the monotonic clock between two calls of check whether the process was
+// paused in between, for example while its VM was suspended. The largest lead
+// keeps a pause that a backward step of the wall clock undid before the check.
+type pauseDetector struct {
+	started bool
+	lead    time.Duration
+}
+
+// check records the largest lead and reports a pause since the last call.
+func (p *pauseDetector) check(lead time.Duration) bool {
+	paused := p.started && lead-p.lead > maxPause
+	p.started, p.lead = true, lead
 	return paused
 }
 

@@ -31,8 +31,8 @@ import (
 )
 
 // A cache entry expires when the wall clock jumps ahead of the monotonic
-// clock, as after a suspend, and the clock never goes back when the wall
-// clock steps back.
+// clock, as after a suspend, and the clock neither goes back nor stands still
+// when the wall clock steps back, so that no entry lives longer than the TTL.
 func TestStopFreeClock(t *testing.T) {
 	require := require.New(t)
 	c := &stopFreeClock{epoch: time.Now()}
@@ -49,9 +49,12 @@ func TestStopFreeClock(t *testing.T) {
 	require.Equal(uint32(3611), cacheNow())
 	require.True(g.expired(loaded), "a suspend of an hour")
 	mono, wall = 30*time.Second, 30*time.Second
-	require.Equal(uint32(3611), cacheNow(), "the wall clock stepped back")
+	require.Equal(uint32(3621), cacheNow(), "the wall clock stepped back")
+	loaded = cacheNow()
+	mono, wall = time.Hour+30*time.Second, time.Hour+30*time.Second
+	require.True(g.expired(loaded), "an hour on the monotonic clock after the step back")
 	mono, wall = 2*time.Hour, 2*time.Hour
-	require.Equal(uint32(7201), cacheNow())
+	require.Equal(uint32(10791), cacheNow())
 }
 
 // readClock is a cacheNow clock that a Bigtable read of the in-process
@@ -128,7 +131,6 @@ func TestCacheAge_FromReadStart(t *testing.T) {
 // clock records a touch loss: the process was paused, and touches and cache
 // ages are not to be trusted across the pause.
 func TestGCHooks_HeartbeatRecordsPause(t *testing.T) {
-	require := require.New(t)
 	ctx := context.Background()
 	var mu sync.Mutex
 	mono, wall := time.Hour, time.Hour
@@ -146,14 +148,39 @@ func TestGCHooks_HeartbeatRecordsPause(t *testing.T) {
 		defer mu.Unlock()
 		mono, wall = mono+m, wall+w
 	}
-	s, _ := newHeartbeatServer(t, time.Hour)
+	newServer := func(t *testing.T) *GCPServer {
+		origClock := cacheClock
+		cacheClock = &stopFreeClock{}
+		t.Cleanup(func() { cacheClock = origClock })
+		s, _ := newHeartbeatServer(t, time.Hour)
+		return s
+	}
 
-	advance(time.Minute, time.Minute+maxPause)
-	require.NoError(s.heartbeat(ctx))
-	require.Zero(readServer(t, s).TouchLossTime)
+	t.Run("heartbeat", func(t *testing.T) {
+		require := require.New(t)
+		s := newServer(t)
+		advance(time.Minute, time.Minute+maxPause)
+		require.NoError(s.heartbeat(ctx))
+		require.Zero(readServer(t, s).TouchLossTime)
 
-	advance(time.Minute, time.Minute+maxPause+time.Second)
-	require.NoError(s.heartbeat(ctx))
-	r := readServer(t, s)
-	require.Equal(r.LastSeen, r.TouchLossTime)
+		advance(time.Minute, time.Minute+maxPause+time.Second)
+		require.NoError(s.heartbeat(ctx))
+		r := readServer(t, s)
+		require.Equal(r.LastSeen, r.TouchLossTime)
+	})
+
+	// A wall clock that stepped back after the pause, before the heartbeat,
+	// does not hide it.
+	t.Run("stepped back", func(t *testing.T) {
+		require := require.New(t)
+		s := newServer(t)
+		advance(time.Minute, time.Hour)
+		// A cache lookup during the pause.
+		cacheClock.seconds(clockElapsed())
+		advance(time.Minute, -time.Hour)
+		require.NoError(s.heartbeat(ctx))
+		r := readServer(t, s)
+		require.Equal(r.LastSeen, r.TouchLossTime)
+	})
 }
+

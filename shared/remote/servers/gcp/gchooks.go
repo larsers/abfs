@@ -663,7 +663,7 @@ func (s *GCPServer) heartbeat(ctx context.Context) error {
 	sp := s.casdb.SpannerClient()
 	statsTime, err := gc.ReadServerTime(hctx, sp, g.server.ID)
 	if err == nil {
-		if g.pause.check(clockElapsed()) {
+		if g.pausedSince() {
 			log.Printf("Warning: the wall clock advanced more than the monotonic clock by over %s since the last GC heartbeat; recording the pause as a touch loss", maxPause)
 			g.pausePending = true
 		}
