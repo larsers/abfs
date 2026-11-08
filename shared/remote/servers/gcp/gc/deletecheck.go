@@ -139,6 +139,9 @@ type DeleteReport struct {
 	Step *DeleteStepReport `json:"step,omitempty"`
 	// Chunks reports the chunk step, which runs in every delete cycle.
 	Chunks *ChunkStepReport `json:"chunks,omitempty"`
+	// Refs reports the removal of the refs past their retention, which runs
+	// in every delete cycle that may condemn.
+	Refs *RefRemovalReport `json:"refs,omitempty"`
 	// RecordsRemoved counts the flagged delete records of older cycles
 	// deleted.
 	RecordsRemoved int64 `json:"records_removed"`

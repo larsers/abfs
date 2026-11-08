@@ -71,7 +71,7 @@ func Delete(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket
 		o.BatchSize = DefaultCondemnBatch
 	}
 	c := &condemner{opts: &o.CondemnOpts, bt: bt, bucket: bucket}
-	c.del = &deleter{opts: &o, bt: bt, bucket: bucket, checks: checks}
+	c.del = &deleter{opts: &o, sp: sp, bt: bt, bucket: bucket, checks: checks}
 	return runCycle(ctx, sp, bt, bucket, objs, &o.DryRunOpts, c)
 }
 
@@ -135,6 +135,7 @@ type LevelReport struct {
 // deleter runs the steps of a delete cycle.
 type deleter struct {
 	opts   *DeleteOpts
+	sp     *spanner.Client
 	bt     *bigtable.Client
 	bucket *storage.BucketHandle
 	checks InstanceChecks
@@ -144,9 +145,10 @@ type deleter struct {
 	listComplete time.Time
 }
 
-// check runs the checks of deleteBlockers but the second server read, right
-// after condemnBlockers, and records in the report why the cycle must not
-// delete. The cycle condemns either way.
+// check removes the refs past their retention and runs the checks of
+// deleteBlockers but the second server read, right after condemnBlockers,
+// and records in the report why the cycle must not delete. The cycle
+// condemns either way.
 func (d *deleter) check(ctx context.Context, lease *Lease, c *condemner, res *Result) error {
 	r := res.Report
 	d.rep = &DeleteReport{}
@@ -157,6 +159,10 @@ func (d *deleter) check(ctx context.Context, lease *Lease, c *condemner, res *Re
 	d.budget = c.budget
 	d.listComplete = c.prev.state.CompleteTime
 	ev := newDeleteEvidence(lease, c, res)
+	d.rep.Refs, ev.refRemovalErr = d.removeExpiredRefs(ctx, lease, res)
+	if stops(ctx, ev.refRemovalErr) {
+		return ev.refRemovalErr
+	}
 	ev.instance = readInstanceEvidence(ctx, d.checks, d.budget, d.opts)
 	if n := r.Consistency.TooNew; n > 0 && n <= maxTooNew {
 		ev.tooNew, ev.tooNewErr = checkTooNew(ctx, d.bt, res.tooNew)

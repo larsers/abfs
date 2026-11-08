@@ -297,6 +297,9 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		if c.del.rep.RecordsRemoved, err = pruneRecords(ctx, c.budget, c.bucket, c.opts.StateName, c.opts.KeepLists); err != nil {
 			log.Printf("Warning: failed to remove old delete records: %v", err)
 		}
+		if c.del.rep.Refs.RecordsRemoved, err = pruneRefRecords(ctx, c.budget, c.bucket, c.opts.StateName, c.opts.KeepLists); err != nil {
+			log.Printf("Warning: failed to remove old ref records: %v", err)
+		}
 	}
 	log.Printf("GC cycle %d condemned %d objects of %d bytes, listed in %s", r.Cycle, rep.Condemned, rep.CondemnedBytes, name)
 	return nil

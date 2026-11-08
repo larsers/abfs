@@ -30,6 +30,7 @@ import (
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -40,6 +41,13 @@ import (
 // newTestSpanner creates a database with the garbage collector tables on the
 // Spanner emulator (SPANNER_EMULATOR_HOST) and returns a client for it.
 func newTestSpanner(t *testing.T) *spanner.Client {
+	t.Helper()
+	return newTestSpannerWith(t, casdb.GCSchemaStatements())
+}
+
+// newTestSpannerWith creates a database of the statements on the Spanner
+// emulator and returns a client for it with the options opts.
+func newTestSpannerWith(t *testing.T, statements []string, opts ...option.ClientOption) *spanner.Client {
 	t.Helper()
 	if os.Getenv("SPANNER_EMULATOR_HOST") == "" {
 		t.Skip("SPANNER_EMULATOR_HOST is not set")
@@ -74,14 +82,14 @@ func newTestSpanner(t *testing.T) *spanner.Client {
 	dop, err := dc.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          fmt.Sprintf("projects/%s/instances/%s", project, inst),
 		CreateStatement: "CREATE DATABASE `" + dbID + "`",
-		ExtraStatements: casdb.GCSchemaStatements(),
+		ExtraStatements: statements,
 	})
 	require.NoError(t, err)
 	_, err = dop.Wait(ctx)
 	require.NoError(t, err)
 	name := fmt.Sprintf("projects/%s/instances/%s/databases/%s", project, inst, dbID)
 	t.Cleanup(func() { _ = dc.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: name}) })
-	client, err := spanner.NewClient(ctx, name)
+	client, err := spanner.NewClient(ctx, name, opts...)
 	require.NoError(t, err)
 	t.Cleanup(client.Close)
 	return client

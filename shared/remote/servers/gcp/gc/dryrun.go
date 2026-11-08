@@ -140,7 +140,7 @@ type Report struct {
 	Settings     Settings  `json:"settings"`
 	// Refs counts the refs per class at the snapshot.
 	Refs map[RefClass]*RefCounts `json:"refs"`
-	// RefsToTombstone counts the refs that retention would tombstone.
+	// RefsToTombstone counts the refs past their retention.
 	RefsToTombstone int64       `json:"refs_to_tombstone"`
 	LiveMounts      MountCounts `json:"live_mounts"`
 	// Workspaces reports the pinned manifests of the mounts that the
@@ -270,6 +270,8 @@ type Result struct {
 	// plan is the plan of a delete from the list of the cycle before, nil
 	// when there is none.
 	plan *deletePlan
+	// expiredRefs are the refs past their retention at the snapshot.
+	expiredRefs []expiredRef
 }
 
 // firstRoot returns the root whose walk first reached the tracked node id, or
@@ -551,7 +553,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	r.Objects.Unreachable = r.Objects.Rows - r.Objects.Reachable
 	d.countTypes(g, m.live)
 
-	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}, servers: servers, bounds: bounds, maps: maps}
+	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}, servers: servers, bounds: bounds, maps: maps, expiredRefs: refs.expired}
 	if o.Consistency {
 		step = time.Now()
 		scan, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin), d.keepUnreachable)

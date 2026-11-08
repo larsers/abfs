@@ -98,7 +98,8 @@ type RefCounts struct {
 	Null int64 `json:"null"`
 	// Roots counts the refs whose targets are roots.
 	Roots int64 `json:"roots"`
-	// Expired counts the refs that retention would tombstone.
+	// Expired counts the refs past their retention, which a delete cycle
+	// removes.
 	Expired int64 `json:"expired"`
 	// Malformed counts targets that are not hashes.
 	Malformed int64 `json:"malformed,omitempty"`
@@ -112,6 +113,9 @@ type refSnapshot struct {
 	// the workspace refs.
 	mounts     []Hash
 	workspaces []Hash
+	// expired holds the refs past their retention, which a delete cycle
+	// removes.
+	expired []expiredRef
 }
 
 type refRoot struct {
@@ -125,13 +129,14 @@ type refRoot struct {
 func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapshot time.Time) (*refSnapshot, error) {
 	txn := client.ReadOnlyTransaction().WithTimestampBound(spanner.ReadTimestamp(snapshot))
 	defer txn.Close()
-	stmt := spanner.Statement{SQL: `SELECT p.Project, r.Ref, r.UpdateTime, r.Target FROM Refs AS r JOIN Projects AS p ON p.ProjectId = r.ProjectId`}
+	stmt := spanner.Statement{SQL: `SELECT r.ProjectId, p.Host, p.Project, r.Ref, r.UpdateTime, r.Target FROM Refs AS r JOIN Projects AS p ON p.ProjectId = r.ProjectId`}
 	snap := &refSnapshot{counts: make(map[RefClass]*RefCounts)}
 	err := txn.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: spannerpb.RequestOptions_PRIORITY_LOW}).Do(func(row *spanner.Row) error {
-		var project, ref string
+		var projectID int64
+		var host, project, ref string
 		var updated time.Time
 		var target spanner.NullString
-		if err := row.Columns(&project, &ref, &updated, &target); err != nil {
+		if err := row.Columns(&projectID, &host, &project, &ref, &updated, &target); err != nil {
 			return err
 		}
 		class := classifyRef(project, ref)
@@ -147,6 +152,7 @@ func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapsh
 		}
 		if o.refRetention(class, updated, snapshot) {
 			c.Expired++
+			snap.expired = append(snap.expired, expiredRef{class: class, projectID: projectID, host: host, project: project, ref: ref, updated: updated, target: target.StringVal})
 			return nil
 		}
 		if !entities.IsHash(target.StringVal) {
