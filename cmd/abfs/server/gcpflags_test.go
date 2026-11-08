@@ -61,8 +61,8 @@ func TestGCPInitFlags_GC(t *testing.T) {
 	}
 }
 
-// gc run takes exactly one mode, and --condemn needs the expected number of
-// server hosts and the consistency check.
+// gc run takes exactly one mode, and --condemn needs the expected number or
+// range of server hosts and the consistency check.
 func TestGCPGCRunFlags_Modes(t *testing.T) {
 	tests := []struct {
 		args    []string
@@ -78,6 +78,18 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--dry-run", "--write-deadline=38s"}, "two attempts must fit into a quarter of it"},
 		{[]string{"--dry-run", "--write-deadline=37s"}, ""},
 		{[]string{"--condemn", "--expected-replicas=3", "--condemn-rate=100", "--explain=" + strings.Repeat("ab", 20)}, ""},
+		// An autoscaled fleet gives a range instead of the exact count.
+		{[]string{"--condemn", "--min-replicas=2"}, ""},
+		{[]string{"--condemn", "--min-replicas=2", "--max-replicas=11"}, ""},
+		{[]string{"--condemn", "--max-replicas=11"}, "invalid expected replicas 0"},
+		{[]string{"--condemn", "--min-replicas=3", "--max-replicas=2"}, "is below min replicas 3"},
+		{[]string{"--condemn", "--expected-replicas=3", "--min-replicas=2"}, "expected replicas excludes min and max replicas"},
+		{[]string{"--condemn", "--expected-replicas=3", "--max-replicas=4"}, "expected replicas excludes min and max replicas"},
+		{[]string{"--condemn", "--min-replicas=-1"}, "cannot be negative"},
+		// The checks of delete mode have no effect in the other modes.
+		{[]string{"--condemn", "--min-replicas=2", "--no-backup-check"}, "apply only to delete mode"},
+		{[]string{"--dry-run", "--accept-mounts-without-keepalive"}, "apply only to delete mode"},
+		{[]string{"--dry-run", "--delete-types=commit"}, "apply only to delete mode"},
 	}
 	for _, tt := range tests {
 		c := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}

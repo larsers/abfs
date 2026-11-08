@@ -48,6 +48,13 @@ type ReplicaReport struct {
 	// Warnings lists the live replicas whose settings break the timing rules
 	// of the collector. A condemn mode would refuse to run with any of them.
 	Warnings []string `json:"warnings,omitempty"`
+	// ServersRemoved counts the rows of GcServers that the run deleted, those
+	// older than any grace a delete could still need them for.
+	ServersRemoved int64 `json:"servers_removed"`
+	// LegacyServersGoneTime is when a cycle first found GcReplicas empty, so
+	// that no server of an older version, which keeps no row after it stops,
+	// can have run since; nil while GcReplicas holds a row.
+	LegacyServersGoneTime *time.Time `json:"legacy_servers_gone_time,omitempty"`
 }
 
 // ReplicaHost returns the host name of a replica ID made by NewReplicaID.
@@ -76,14 +83,9 @@ func serverReplicas(servers []Server) ([]Replica, int64) {
 }
 
 // checkReplicas checks the settings of the replicas seen within
-// liveReplicaAge before now against the timing rules: a used object must be
-// touched at least once per half grace, and a replica must read a cached
-// entry again within one cycle and within the TTL the grace allows for.
+// liveReplicaAge before now against the timing rules of replicaProblems.
 func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaReport {
 	var rep ReplicaReport
-	warn := func(r *Replica, format string, args ...any) {
-		rep.Warnings = append(rep.Warnings, fmt.Sprintf("replica %s: ", r.ID)+fmt.Sprintf(format, args...))
-	}
 	for i := range replicas {
 		r := &replicas[i]
 		if now.Sub(r.LastSeen) > liveReplicaAge {
@@ -99,27 +101,41 @@ func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaRepo
 			rep.Hosts++
 		}
 		rep.RowsPerHost[host]++
-		if !r.GC {
-			warn(r, "runs without the garbage collector hooks")
-			continue
-		}
-		if r.Version < ExtractorVersion {
-			warn(r, "writes gc rows of edge rules version %d, older than version %d of this collector", r.Version, ExtractorVersion)
-		}
-		switch {
-		case r.TouchInterval <= 0:
-			warn(r, "writes no touches, so objects that mounts and builds use are not recorded")
-		case r.TouchInterval > o.Grace/2:
-			warn(r, "touch interval %s is longer than half the grace (%s)", r.TouchInterval, o.Grace/2)
-		}
-		switch {
-		case r.CacheTTL <= 0:
-			warn(r, "keeps cache entries without a TTL, so it can answer for an object long after a condemn")
-		case r.CacheTTL >= o.Cycle:
-			warn(r, "cache TTL %s is not shorter than the cycle (%s)", r.CacheTTL, o.Cycle)
-		case r.CacheTTL > o.CacheTTL:
-			warn(r, "cache TTL %s is longer than the cache TTL of the grace check (%s)", r.CacheTTL, o.CacheTTL)
+		for _, p := range replicaProblems(r, o) {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("replica %s: %s", r.ID, p))
 		}
 	}
 	return rep
+}
+
+// replicaProblems returns how the settings of r break the timing rules: a
+// used object must be touched at least once per half grace, and a replica
+// must read a cached entry again within one cycle and within the TTL the
+// grace allows for.
+func replicaProblems(r *Replica, o *DryRunOpts) []string {
+	if !r.GC {
+		return []string{"runs without the garbage collector hooks"}
+	}
+	var problems []string
+	add := func(format string, args ...any) {
+		problems = append(problems, fmt.Sprintf(format, args...))
+	}
+	if r.Version < ExtractorVersion {
+		add("writes gc rows of edge rules version %d, older than version %d of this collector", r.Version, ExtractorVersion)
+	}
+	switch {
+	case r.TouchInterval <= 0:
+		add("writes no touches, so objects that mounts and builds use are not recorded")
+	case r.TouchInterval > o.Grace/2:
+		add("touch interval %s is longer than half the grace (%s)", r.TouchInterval, o.Grace/2)
+	}
+	switch {
+	case r.CacheTTL <= 0:
+		add("keeps cache entries without a TTL, so it can answer for an object long after a condemn")
+	case r.CacheTTL >= o.Cycle:
+		add("cache TTL %s is not shorter than the cycle (%s)", r.CacheTTL, o.Cycle)
+	case r.CacheTTL > o.CacheTTL:
+		add("cache TTL %s is longer than the cache TTL of the grace check (%s)", r.CacheTTL, o.CacheTTL)
+	}
+	return problems
 }

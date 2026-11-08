@@ -118,8 +118,17 @@ func StopServer(ctx context.Context, client *spanner.Client, id string, lost boo
 
 // ReadServers returns the rows of GcServers.
 func ReadServers(ctx context.Context, client *spanner.Client) ([]Server, error) {
+	servers, _, err := readServers(ctx, client)
+	return servers, err
+}
+
+// readServers returns the rows of GcServers and the time of the read, a
+// Spanner time like the times in the rows.
+func readServers(ctx context.Context, client *spanner.Client) ([]Server, time.Time, error) {
 	var servers []Server
-	err := client.Single().Read(ctx, serversTable, spanner.AllKeys(), serverColumns).Do(func(row *spanner.Row) error {
+	ro := client.Single()
+	defer ro.Close()
+	err := ro.Read(ctx, serversTable, spanner.AllKeys(), serverColumns).Do(func(row *spanner.Row) error {
 		var s Server
 		var touch, ttl, heartbeat int64
 		var loss, stopped spanner.NullTime
@@ -133,8 +142,31 @@ func ReadServers(ctx context.Context, client *spanner.Client) ([]Server, error) 
 		servers = append(servers, s)
 		return nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to read the GC servers: %w", err)
+	var read time.Time
+	if err == nil {
+		read, err = ro.Timestamp()
 	}
-	return servers, nil
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("failed to read the GC servers: %w", err)
+	}
+	return servers, read, nil
+}
+
+// PruneServers deletes the rows of GcServers whose process neither wrote a
+// heartbeat nor stopped since before, crashed ones included, and returns how
+// many it deleted.
+func PruneServers(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {
+	var n int64
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		var err error
+		n, err = txn.Update(ctx, spanner.Statement{
+			SQL:    "DELETE FROM " + serversTable + " WHERE LastSeen < @before AND (StoppedAt IS NULL OR StoppedAt < @before)",
+			Params: map[string]any{"before": before},
+		})
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete the old GC servers: %w", err)
+	}
+	return n, nil
 }

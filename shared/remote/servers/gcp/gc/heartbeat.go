@@ -82,8 +82,12 @@ func DeleteReplica(ctx context.Context, client *spanner.Client, id string) error
 
 // ReadReplicas returns the rows of GcReplicas.
 func ReadReplicas(ctx context.Context, client *spanner.Client) ([]Replica, error) {
+	return scanReplicas(client.Single().Read(ctx, replicasTable, spanner.AllKeys(), replicaColumns))
+}
+
+func scanReplicas(it *spanner.RowIterator) ([]Replica, error) {
 	var replicas []Replica
-	err := client.Single().Read(ctx, replicasTable, spanner.AllKeys(), replicaColumns).Do(func(row *spanner.Row) error {
+	err := it.Do(func(row *spanner.Row) error {
 		var r Replica
 		var touch, ttl int64
 		if err := row.Columns(&r.ID, &r.Version, &r.GC, &touch, &ttl, &r.LastSeen); err != nil {

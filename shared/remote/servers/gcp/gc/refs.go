@@ -195,6 +195,16 @@ type MountCounts struct {
 	// WithoutKeepAlive counts mount details of clients that ran without the GC
 	// keep-alive or with one of its intervals zero.
 	WithoutKeepAlive int64 `json:"without_keepalive"`
+	// WithoutLocalWriteCheck counts mount details with the keep-alive whose
+	// cacheman does not keep locally written content until a server confirms
+	// it, so that it may evict the only copy of an object a delete removes.
+	WithoutLocalWriteCheck int64 `json:"without_local_write_check"`
+	// TouchIntervalTooLong counts mount details with the keep-alive whose
+	// touch interval, plus the tenth the keep-alive may be late, is not below
+	// the grace less the longest server touch interval and the clock skew
+	// margin: an object the mount touched may stop being recent before the
+	// next touch.
+	TouchIntervalTooLong int64 `json:"touch_interval_too_long"`
 	// PinnedManifests counts the distinct pinned manifests parsed.
 	PinnedManifests int64 `json:"pinned_manifests"`
 	// Revisions counts the distinct project revisions that are object keys,
@@ -214,6 +224,10 @@ type MountCounts struct {
 	// Samples lists up to maxSamples mount details for each count above, by
 	// the count's name.
 	Samples map[string][]MountSample `json:"samples,omitempty"`
+	// longestTouch is the longest touch interval of the mount details with
+	// the keep-alive, which a delete checks again against the servers that
+	// run just before it.
+	longestTouch time.Duration
 }
 
 // MountSample names the mount details, and the workspace snapshot, behind a
@@ -272,19 +286,26 @@ type pinReader struct {
 	ignored   map[Hash]int
 	seen      map[Hash]bool
 	revisions []pinnedRevision
+
+	// touchLimit is the bound of TouchIntervalTooLong.
+	touchLimit time.Duration
 }
 
 // pinnedRevisions reads the mount details of each live mount and of the mount
 // behind each workspace snapshot, and the pinned manifests they name. It
 // returns the project revisions that are object keys: the commits the mounts
-// and workspaces are based on, which neither links.
-func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, mounts, workspaces []Hash) ([]pinnedRevision, MountCounts, MountCounts, error) {
+// and workspaces are based on, which neither links. A mount with the
+// keep-alive whose touch interval is not safely below touchLimit is counted
+// in TouchIntervalTooLong.
+func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, mounts, workspaces []Hash, touchLimit time.Duration) ([]pinnedRevision, MountCounts, MountCounts, error) {
 	p := &pinReader{
 		objs:      objs,
 		details:   make(map[Hash]*binding.MountDetails),
 		manifests: make(map[Hash][]Hash),
 		ignored:   make(map[Hash]int),
 		seen:      make(map[Hash]bool),
+
+		touchLimit: touchLimit,
 	}
 	mountCounts := MountCounts{Live: int64(len(mounts))}
 	seenDetails := make(map[Hash]bool, len(mounts))
@@ -370,6 +391,16 @@ func (p *pinReader) mount(ctx context.Context, c *MountCounts, seenDetails, seen
 	if cfg := md.Config; cfg == nil || !cfg.GCKeepAlive || cfg.GCKeepAliveRefInterval <= 0 || cfg.GCKeepAliveTouchInterval <= 0 {
 		c.WithoutKeepAlive++
 		c.sample("without_keepalive", src)
+	} else {
+		if !md.GCLocalWriteCheck {
+			c.WithoutLocalWriteCheck++
+			c.sample("without_local_write_check", src)
+		}
+		c.longestTouch = max(c.longestTouch, cfg.GCKeepAliveTouchInterval)
+		if !keepAliveTouchFits(cfg.GCKeepAliveTouchInterval, p.touchLimit) {
+			c.TouchIntervalTooLong++
+			c.sample("touch_interval_too_long", src)
+		}
 	}
 	pinned := md.PinnedManifestHash
 	if pinned.IsZero() {
@@ -401,6 +432,13 @@ func (p *pinReader) mount(ctx context.Context, c *MountCounts, seenDetails, seen
 		}
 	}
 	return nil
+}
+
+// keepAliveTouchFits reports whether the keep-alive of a mount that touches
+// every interval, up to a tenth late, touches its objects again before the
+// last touch stops keeping them recent, which it does for limit.
+func keepAliveTouchFits(interval, limit time.Duration) bool {
+	return interval+interval/10 < limit
 }
 
 func (p *pinReader) mountDetails(ctx context.Context, h Hash) (*binding.MountDetails, error) {

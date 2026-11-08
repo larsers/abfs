@@ -42,8 +42,13 @@ const (
 type CondemnOpts struct {
 	DryRunOpts
 	// ExpectedReplicas is the number of distinct server hosts that must
-	// write a GC heartbeat.
+	// write a GC heartbeat. A fleet whose size changes, such as an autoscaled
+	// one, sets MinReplicas instead, and MaxReplicas when it has a bound; zero
+	// means no upper bound. The evidence of each server comes from its own
+	// heartbeat rows, so the count only notices servers that write none.
 	ExpectedReplicas int
+	MinReplicas      int
+	MaxReplicas      int
 	// Rate is the maximum number of rows marked per second; zero means no
 	// limit.
 	Rate float64
@@ -54,7 +59,7 @@ type CondemnOpts struct {
 	BatchSize int
 }
 
-// DefaultCondemnOpts returns the default options; ExpectedReplicas has no
+// DefaultCondemnOpts returns the default options; the replica counts have no
 // default.
 func DefaultCondemnOpts() CondemnOpts {
 	return CondemnOpts{DryRunOpts: DefaultDryRunOpts(), Rate: DefaultCondemnRate, KeepLists: DefaultKeepLists}
@@ -68,8 +73,14 @@ func (o *CondemnOpts) Validate() error {
 	switch {
 	case !o.Consistency:
 		return errors.New("a condemn cycle needs the consistency check")
-	case o.ExpectedReplicas <= 0:
-		return fmt.Errorf("invalid expected replicas %d: a condemn cycle needs the number of server hosts that run with GC", o.ExpectedReplicas)
+	case o.ExpectedReplicas < 0 || o.MinReplicas < 0 || o.MaxReplicas < 0:
+		return fmt.Errorf("invalid expected replicas %d, min replicas %d or max replicas %d: they cannot be negative", o.ExpectedReplicas, o.MinReplicas, o.MaxReplicas)
+	case o.ExpectedReplicas == 0 && o.MinReplicas == 0:
+		return fmt.Errorf("invalid expected replicas %d: a condemn cycle needs the number of server hosts that run with GC, or the smallest number with min replicas", o.ExpectedReplicas)
+	case o.ExpectedReplicas > 0 && (o.MinReplicas > 0 || o.MaxReplicas > 0):
+		return errors.New("expected replicas excludes min and max replicas")
+	case o.MaxReplicas > 0 && o.MaxReplicas < o.MinReplicas:
+		return fmt.Errorf("invalid max replicas %d: it is below min replicas %d", o.MaxReplicas, o.MinReplicas)
 	case o.KeepLists <= 0:
 		return fmt.Errorf("invalid number of kept lists %d", o.KeepLists)
 	case o.Rate < 0 || o.BatchSize < 0:
@@ -80,7 +91,9 @@ func (o *CondemnOpts) Validate() error {
 
 // CondemnReport reports the condemn step of a cycle.
 type CondemnReport struct {
-	ExpectedReplicas int `json:"expected_replicas"`
+	ExpectedReplicas int `json:"expected_replicas,omitempty"`
+	MinReplicas      int `json:"min_replicas,omitempty"`
+	MaxReplicas      int `json:"max_replicas,omitempty"`
 	// Refused lists the reasons why the cycle did not condemn. It then wrote
 	// no marker and no list.
 	Refused []string `json:"refused,omitempty"`
@@ -141,14 +154,7 @@ func condemnBlockers(r *Report, o *CondemnOpts) []string {
 	for _, w := range r.Replicas.Warnings {
 		add("%s", w)
 	}
-	if r.Replicas.Hosts != int64(o.ExpectedReplicas) {
-		add("%d server hosts write a GC heartbeat, but %d are expected", r.Replicas.Hosts, o.ExpectedReplicas)
-	}
-	for _, host := range slices.Sorted(maps.Keys(r.Replicas.RowsPerHost)) {
-		if n := r.Replicas.RowsPerHost[host]; n > 1 {
-			add("host %s has %d live GC heartbeat rows: a server there stopped without removing its row, and the touches it held may be lost", host, n)
-		}
-	}
+	reasons = append(reasons, replicaCountProblems(&r.Replicas, o)...)
 	switch {
 	case !r.Consistency.Ran:
 		add("the consistency check did not run")
@@ -175,6 +181,29 @@ func condemnBlockers(r *Report, o *CondemnOpts) []string {
 	return reasons
 }
 
+// replicaCountProblems checks the number of hosts with a live heartbeat row
+// against the expected number or range, and that each has one live row.
+func replicaCountProblems(rep *ReplicaReport, o *CondemnOpts) []string {
+	var problems []string
+	add := func(format string, args ...any) {
+		problems = append(problems, fmt.Sprintf(format, args...))
+	}
+	switch {
+	case o.ExpectedReplicas > 0 && rep.Hosts != int64(o.ExpectedReplicas):
+		add("%d server hosts write a GC heartbeat, but %d are expected", rep.Hosts, o.ExpectedReplicas)
+	case o.ExpectedReplicas == 0 && rep.Hosts < int64(o.MinReplicas):
+		add("%d server hosts write a GC heartbeat, but at least %d are expected", rep.Hosts, o.MinReplicas)
+	case o.ExpectedReplicas == 0 && o.MaxReplicas > 0 && rep.Hosts > int64(o.MaxReplicas):
+		add("%d server hosts write a GC heartbeat, but at most %d are expected", rep.Hosts, o.MaxReplicas)
+	}
+	for _, host := range slices.Sorted(maps.Keys(rep.RowsPerHost)) {
+		if n := rep.RowsPerHost[host]; n > 1 {
+			add("host %s has %d live GC heartbeat rows: a server there stopped without removing its row, and the touches it held may be lost", host, n)
+		}
+	}
+	return problems
+}
+
 // condemner runs the condemn step of a cycle.
 type condemner struct {
 	opts   *CondemnOpts
@@ -191,7 +220,7 @@ type condemner struct {
 func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 	start := time.Now()
 	r := res.Report
-	rep := &CondemnReport{ExpectedReplicas: c.opts.ExpectedReplicas}
+	rep := &CondemnReport{ExpectedReplicas: c.opts.ExpectedReplicas, MinReplicas: c.opts.MinReplicas, MaxReplicas: c.opts.MaxReplicas}
 	r.Condemn = rep
 	c.budget = writeBudget{deadline: c.opts.WriteDeadline, lease: lease}
 	defer func() {

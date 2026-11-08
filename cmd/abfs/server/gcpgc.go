@@ -153,7 +153,7 @@ func printBackfillStats(stats *gc.BackfillStats, dryRun bool) {
 type gcpGCRunCmd struct {
 	*root.RootCmd
 	server  gcp.NewServerOpts
-	opts    gc.CondemnOpts
+	opts    gc.DeleteOpts
 	dryRun  bool
 	condemn bool
 	report  string
@@ -163,7 +163,7 @@ type gcpGCRunCmd struct {
 func (c *gcpGCRunCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "run",
-		Usage: "(--dry-run | --condemn --expected-replicas <n>) --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
+		Usage: "(--dry-run | --condemn (--expected-replicas <n> | --min-replicas <n> [--max-replicas <n>])) --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
 		Desc: `Run one garbage collection cycle and report it as JSON. Both modes take the GC lease,
 read the refs at one snapshot, scan the gc and maps tables and mark what the roots, the
 retention rules and the grace keep. With --consistency (required for --condemn) the cycle
@@ -173,15 +173,16 @@ also scans the meta family of the objects table to check that every object has a
 collector state in Spanner. --condemn also marks the unreachable objects with the cycle
 number, after it wrote their list to the bucket; it deletes nothing, and servers with --gc
 clear the marker of any marked object they read. It refuses, and writes nothing, unless
-every check of the cycle passed: --expected-replicas distinct server hosts write a GC
-heartbeat, one live row each, with settings that fit the timing rules; no object lacks a gc
-row; and no pin or root could not be read. --explain adds, per key, the root that keeps it.
+every check of the cycle passed: --expected-replicas distinct server hosts, or at least
+--min-replicas and at most --max-replicas, write a GC heartbeat, one live row each, with
+settings that fit the timing rules; no object lacks a gc row; and no pin or root could not
+be read. --explain adds, per key, the root that keeps it.
 Needs the resources of 'abfs server gcp init --gc'.`,
 	}
 }
 
 func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
-	c.opts = gc.DefaultCondemnOpts()
+	c.opts = gc.DeleteOpts{CondemnOpts: gc.DefaultCondemnOpts()}
 	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
 	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
@@ -191,7 +192,12 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing")
 	fl.BoolVar(&c.condemn, "condemn", false, "Mark the unreachable objects as condemned and delete nothing")
-	fl.IntVar(&c.opts.ExpectedReplicas, "expected-replicas", 0, "With --condemn, the number of distinct server hosts that must run with --gc (required)")
+	fl.IntVar(&c.opts.ExpectedReplicas, "expected-replicas", 0, "With --condemn, the number of distinct server hosts that must run with --gc, for a fleet of fixed size (this or --min-replicas is required)")
+	fl.IntVar(&c.opts.MinReplicas, "min-replicas", 0, "With --condemn, the smallest number of distinct server hosts that must run with --gc, for a fleet whose size changes: the autoscaler minimum less the servers a disruption budget lets stop at once")
+	fl.IntVar(&c.opts.MaxReplicas, "max-replicas", 0, "With --min-replicas, the largest number of distinct server hosts with --gc (0 means no limit)")
+	fl.StringSliceVar(&c.opts.Types, "delete-types", nil, "In delete mode, the object types, separated by commas, that the cycle may delete (default: every type)")
+	fl.BoolVar(&c.opts.AcceptMountsWithoutKeepAlive, "accept-mounts-without-keepalive", false, "In delete mode, delete blobs, trees and eval objects while live mounts run without gc-keepalive, whose caches may hold the only copy of content they wrote; the check then only warns")
+	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the list was complete")
 	fl.Float64Var(&c.opts.Rate, "condemn-rate", gc.DefaultCondemnRate, "With --condemn, the maximum number of objects marked per second (0 means no limit)")
 	fl.IntVar(&c.opts.KeepLists, "keep-lists", gc.DefaultKeepLists, "With --condemn, the number of condemned lists of the newest cycles kept in the bucket")
 	fl.StringVar(&c.report, "report", "", "Write the JSON report to this file instead of stdout")
@@ -214,9 +220,12 @@ func (c *gcpGCRunCmd) checkOpts() error {
 	if c.dryRun == c.condemn {
 		return errors.New("pass one of --dry-run and --condemn")
 	}
+	if len(c.opts.Types) > 0 || c.opts.AcceptMountsWithoutKeepAlive || c.opts.NoBackupCheck {
+		return errors.New("--delete-types, --accept-mounts-without-keepalive and --no-backup-check apply only to delete mode")
+	}
 	var err error
 	if c.condemn {
-		err = c.opts.Validate()
+		err = c.opts.CondemnOpts.Validate()
 	} else {
 		err = c.opts.DryRunOpts.Validate()
 	}
@@ -259,7 +268,7 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	}()
 	var res *gc.Result
 	if c.condemn {
-		res, err = server.CondemnGC(ctx, c.server.BucketName, &c.opts)
+		res, err = server.CondemnGC(ctx, c.server.BucketName, &c.opts.CondemnOpts)
 	} else {
 		res, err = server.DryRunGC(ctx, &c.opts.DryRunOpts)
 	}

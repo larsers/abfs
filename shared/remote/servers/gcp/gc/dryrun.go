@@ -161,6 +161,8 @@ type Report struct {
 	// what it found of the keys of the list before.
 	Condemn      *CondemnReport      `json:"condemn,omitempty"`
 	PreviousList *PreviousListReport `json:"previous_list,omitempty"`
+	// Delete reports the delete step of a delete cycle.
+	Delete *DeleteReport `json:"delete,omitempty"`
 	// Explain explains the keys of DryRunOpts.Explain.
 	Explain []KeyReport  `json:"explain,omitempty"`
 	Memory  MemoryReport `json:"memory"`
@@ -250,7 +252,12 @@ type Result struct {
 	roots *rootTable
 	// unreachable lists, in key order, the unreachable nodes that the
 	// consistency scan found an objects row for: the ones a condemn marks.
+	// tooNew holds keys of objects that scan found without a gc row because
+	// they were written during it.
 	unreachable []sizedNode
+	tooNew      []string
+	// servers is the server evidence read at the start of the cycle.
+	servers *serverEvidence
 }
 
 // firstRoot returns the root whose walk first reached the tracked node id, or
@@ -373,21 +380,26 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	if err := d.lease.RecordSnapshot(ctx, snapshot); err != nil {
 		return nil, err
 	}
-	replicas, err := ReadReplicas(ctx, d.sp)
+	servers, err := readServerEvidence(ctx, d.sp, o.StateName)
 	if err != nil {
 		return nil, err
 	}
-	servers, err := ReadServers(ctx, d.sp)
-	if err != nil {
-		return nil, err
-	}
-	fromServers, stopped := serverReplicas(servers)
-	r.Replicas = checkReplicas(append(replicas, fromServers...), snapshot, o)
+	fromServers, stopped := serverReplicas(servers.servers)
+	r.Replicas = checkReplicas(slices.Concat(servers.replicas, fromServers), snapshot, o)
 	r.Replicas.Stopped = stopped
+	if !servers.legacyGone.IsZero() {
+		r.Replicas.LegacyServersGoneTime = &servers.legacyGone
+	}
 	for _, w := range r.Replicas.Warnings {
 		log.Printf("Warning: %s", w)
 	}
 	if r.Replicas.Removed, err = DeleteStaleReplicas(ctx, d.sp, snapshot.Add(-staleReplicaAge)); err != nil {
+		return nil, err
+	}
+	// A row of GcServers is evidence for every delete whose window holds it,
+	// so it stays for the largest grace of any condemn or delete cycle.
+	keep := max(staleReplicaAge, d.lease.MaxGrace+time.Hour, o.Grace+time.Hour)
+	if r.Replicas.ServersRemoved, err = PruneServers(ctx, d.sp, snapshot.Add(-keep)); err != nil {
 		return nil, err
 	}
 
@@ -404,7 +416,8 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
-	revisions, mounts, workspaces, err := pinnedRevisions(ctx, d.objs, refs.mounts, refs.workspaces)
+	touchLimit := o.Grace - servers.longestTouchInterval(windowStart(snapshot, o.Grace)) - clockSkewMargin
+	revisions, mounts, workspaces, err := pinnedRevisions(ctx, d.objs, refs.mounts, refs.workspaces, touchLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +522,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	r.Objects.Unreachable = r.Objects.Rows - r.Objects.Reachable
 	d.countTypes(g, m.live)
 
-	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}}
+	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}, servers: servers}
 	if o.Consistency {
 		step = time.Now()
 		scan, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin), d.keepUnreachable)
@@ -519,7 +532,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		r.Consistency = *scan.report
 		r.Objects.ReachableBytes = &scan.sizes.reachable
 		r.Objects.UnreachableBytes = &scan.sizes.unreachable
-		res.unreachable = scan.unreachable
+		res.unreachable, res.tooNew = scan.unreachable, scan.tooNew
 		r.Seconds.Consistency = time.Since(step).Seconds()
 	}
 	if len(o.Explain) > 0 {
