@@ -217,33 +217,39 @@ func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
 		return orig(ctx, c, sv, statsTime, lost)
 	}
 	// Every call that reads or writes the store, each with the code it got.
+	// The calls run in this order: PutRefs creates the server and project
+	// that the later ref reads look up.
 	var n atomic.Int32
-	calls := map[string]func() error{
-		"Headers":   func() error { _, err := s.Headers(ctx, []entities.Hash{key}); return err },
-		"GetObject": func() error { return readObject(s, key) },
-		"PutObject": func() error {
+	type namedCall struct {
+		name string
+		call func() error
+	}
+	calls := []namedCall{
+		{"Headers", func() error { _, err := s.Headers(ctx, []entities.Hash{key}); return err }},
+		{"GetObject", func() error { return readObject(s, key) }},
+		{"PutObject", func() error {
 			content := fmt.Sprintf("put %d", n.Add(1))
 			return putRaw(s, objects.HashBlobBytes([]byte(content)), fmt.Appendf(nil, "blob %d\x00%s", len(content), content))
-		},
-		"MapResults":   func() error { _, err := s.MapResults(ctx, key); return err },
-		"AddMapResult": func() error { return s.AddMapResult(ctx, key, key) },
-		"PutRefs": func() error {
+		}},
+		{"MapResults", func() error { _, err := s.MapResults(ctx, key); return err }},
+		{"AddMapResult", func() error { return s.AddMapResult(ctx, key, key) }},
+		{"PutRefs", func() error {
 			return s.PutRefs(ctx, "example.com", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: key}})
-		},
-		"XchgRefs": func() error {
+		}},
+		{"XchgRefs", func() error {
 			return s.XchgRefs(ctx, "example.com", "p", []remote.RefXchg{{Ref: fmt.Sprintf("refs/heads/x%d", n.Add(1)), Desired: key}})
-		},
-		"GetRefs": func() error { _, err := s.GetRefs(ctx, "example.com", "p", []string{"refs/heads/main"}); return err },
-		"SearchRefs": func() error {
+		}},
+		{"GetRefs", func() error { _, err := s.GetRefs(ctx, "example.com", "p", []string{"refs/heads/main"}); return err }},
+		{"SearchRefs", func() error {
 			_, err := s.SearchRefs(ctx, "example.com", "p", "refs/heads/", 10)
 			return err
-		},
+		}},
 	}
 	serving := func() error {
-		herr := calls["Headers"]()
-		for name, call := range calls {
-			err := call()
-			require.Equal(status.Code(herr), status.Code(err), "%s: %v", name, err)
+		herr := calls[0].call()
+		for _, c := range calls[1:] {
+			err := c.call()
+			require.Equal(status.Code(herr), status.Code(err), "%s: %v", c.name, err)
 		}
 		require.Equal(status.Code(herr), status.Code(s.CheckGCHeartbeat(ctx)))
 		return herr
