@@ -22,6 +22,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -318,4 +319,35 @@ func TestPruneRefRecords(t *testing.T) {
 			require.NoError(err, name)
 		}
 	}
+}
+
+// No ref removal transaction starts once the wall clock is within two write
+// deadlines and the clock skew margin of the expiry of the lease, also after
+// the record was written, and the cycle then stops.
+func TestRemoveExpiredRefs_StopsBeforeLeaseExpiry(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newRefsFixture(t)
+	snapshot := f.write(buildRefs("b", 3), f.old, entities.NewHash("1111111111111111111111111111111111111111"))
+	res := f.snapshot(4, snapshot)
+	d := f.deleter()
+	lease := farLease()
+	d.budget.lease = lease
+	// The clock passes the lease after the check of the record write, the
+	// first write of the removal.
+	var calls atomic.Int64
+	orig := wallNow
+	wallNow = func() time.Time {
+		if calls.Add(1) > 1 {
+			return orig().Add(2 * time.Hour)
+		}
+		return orig()
+	}
+	t.Cleanup(func() { wallNow = orig })
+
+	rep, err := d.removeExpiredRefs(ctx, lease, res)
+	require.ErrorIs(err, errLeaseExpiring)
+	require.Equal(refRecordName(DefaultStateName, 4), rep.Record)
+	require.Empty(f.commits.deletes)
+	require.Len(f.refs(), 3)
 }
