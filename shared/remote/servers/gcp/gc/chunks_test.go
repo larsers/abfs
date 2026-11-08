@@ -590,18 +590,83 @@ func TestChunkStep_HeldChunks(t *testing.T) {
 				require.NoError(err)
 			}
 
+			// The release of a hold changed the chunk after its record, which
+			// is no restore.
 			refuse.Store(false)
 			rep = step()
 			require.Equal(int64(1), rep.RecordsDone)
-			if name == "temporary hold" {
-				// The release of the hold changed the chunk after its record.
-				require.Equal(int64(1), rep.RestoredAfterRecord)
-				return
-			}
+			require.Zero(rep.RestoredAfterRecord)
 			require.Equal(int64(1), rep.BucketObjectsDeleted)
 			require.False(f.objectExists(obj))
 		})
 	}
+}
+
+// Only a new write, a restore from soft delete or the mark of an undo keeps
+// a bucket chunk for good. Another change of its metadata after the record,
+// as a label or a hold placed between the read and the delete, is no
+// restore: the chunk stays while it is held, and a later step deletes it.
+func TestChunkStep_MetadataChangesAreNoRestore(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	h := testHashes(3)
+	undone, labeled, raced := h[0], h[1], h[2]
+	_, undoneObj := chunkNames(undone, "u")
+	_, labeledObj := chunkNames(labeled, "u")
+	_, racedObj := chunkNames(raced, "u")
+	var f *chunkFixture
+	var once atomic.Bool
+	var holdErr error
+	type deleteRequest interface{ GetObject() string }
+	intercept := grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if r, ok := req.(deleteRequest); ok && strings.HasSuffix(method, "/DeleteObject") && r.GetObject() == racedObj && !once.Swap(true) {
+			_, holdErr = f.bucket.Object(racedObj).Update(ctx, storage.ObjectAttrsToUpdate{TemporaryHold: true})
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
+	f = newChunkFixture(t)
+	client, err := storage.NewGRPCClient(ctx, option.WithGRPCDialOption(intercept))
+	require.NoError(err)
+	t.Cleanup(func() { _ = client.Close() })
+	descs := make(map[Hash][]byte)
+	for _, k := range h {
+		_, obj := chunkNames(k, "u")
+		f.object(k, "blob", nil)
+		f.bucketObject(obj)
+		descs[k] = f.descriptor(k, fmt.Appendf(nil, `[{"size":3,"depot":"bucket","id":"%s"}]`, obj))
+		f.deleteRow(objectsTable, k)
+	}
+	record := f.record(0, time.Time{}, h, descs)
+	for obj, metadata := range map[string]map[string]string{undoneObj: {undoMetadata: "5"}, labeledObj: {"label": "x"}} {
+		_, err := f.bucket.Object(obj).Update(ctx, storage.ObjectAttrsToUpdate{Metadata: metadata})
+		require.NoError(err)
+	}
+	f.later()
+	step := func() *ChunkStepReport {
+		d := f.deleter(f.lease, noBackupCheck)
+		d.bucket = client.Bucket(f.bucket.BucketName())
+		require.NoError(d.deleteChunks(ctx, stepCycle+1))
+		return d.rep.Chunks
+	}
+
+	rep := step()
+	require.NoError(holdErr)
+	require.Equal(int64(1), rep.RestoredAfterRecord)
+	require.Equal(int64(1), rep.BucketObjectsDeleted)
+	require.Equal(int64(1), rep.DeleteRefused)
+	require.Empty(f.flagOf(record))
+	require.True(f.objectExists(undoneObj))
+	require.False(f.objectExists(labeledObj))
+	require.True(f.objectExists(racedObj))
+
+	_, err = f.bucket.Object(racedObj).Update(ctx, storage.ObjectAttrsToUpdate{TemporaryHold: false})
+	require.NoError(err)
+	rep = step()
+	require.Equal(int64(1), rep.RecordsDone)
+	require.Equal(int64(1), rep.RestoredAfterRecord)
+	require.Equal(int64(1), rep.BucketObjectsDeleted)
+	require.True(f.objectExists(undoneObj))
+	require.False(f.objectExists(racedObj))
 }
 
 // The chunk step after a delete step deletes the chunks of the deleted keys

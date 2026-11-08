@@ -463,10 +463,10 @@ const (
 	bucketFailed
 )
 
-// bucketChunk deletes the bucket object id unless it was written or changed
-// at or after recordCreated, or is held, under the generation and
-// metageneration it read, so that an object restored or changed in between
-// stays.
+// bucketChunk deletes the bucket object id unless it was written, restored
+// or kept by an undo at or after recordCreated, or is held, under the
+// generation and metageneration it read, so that an object restored or
+// changed in between stays.
 func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated time.Time) (bool, error) {
 	obj := s.d.bucket.Object(id)
 	attrs, err := s.chunkAttrs(ctx, obj)
@@ -480,7 +480,7 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 		}
 		s.fail(&s.rep.Errors, fmt.Errorf("failed to read the bucket chunk %s: %w", id, err))
 		return false, nil
-	case !attrs.Created.Before(recordCreated) || !attrs.Updated.Before(recordCreated):
+	case restoredSince(attrs, recordCreated):
 		s.count(&s.rep.RestoredAfterRecord)
 		return true, nil
 	case held(attrs, wallNow()):
@@ -502,9 +502,11 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 	case bucketGone:
 		s.count(&s.rep.ChunksGone)
 	case bucketPreconditionFailed:
-		// Only a new generation or metageneration, as of a restore from soft
-		// delete or an undo, keeps the chunk for good; the same ones mean a
-		// refusal, as an object hold may answer.
+		// Only a new generation, as of a restore from soft delete, or the
+		// mark of an undo keeps the chunk for good. Any other change, such
+		// as a hold placed in between, or the same generation and
+		// metageneration, as an object hold may answer, is a refusal, and a
+		// later step reads the chunk again.
 		now, err := s.chunkAttrs(ctx, obj)
 		switch {
 		case errors.Is(err, storage.ErrObjectNotExist):
@@ -515,7 +517,7 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 			}
 			s.fail(&s.rep.Errors, fmt.Errorf("failed to read the bucket chunk %s after a refused delete: %w", id, err))
 			return false, nil
-		case now.Generation != attrs.Generation || now.Metageneration != attrs.Metageneration:
+		case now.Generation != attrs.Generation || restoredSince(now, recordCreated):
 			s.count(&s.rep.RestoredAfterRecord)
 		default:
 			s.count(&s.rep.DeleteRefused)
@@ -540,6 +542,19 @@ func (s *chunkStep) chunkAttrs(ctx context.Context, obj *storage.ObjectHandle) (
 		return err
 	})
 	return attrs, err
+}
+
+// restoredSince reports whether the bucket chunk with attrs was written or
+// restored from soft delete, which gives it a new creation time, or kept by
+// an undo, at or after recordCreated. An undo marks each chunk it keeps,
+// after the record. A change of the metadata alone, as when a hold is placed
+// or released, is no restore.
+func restoredSince(attrs *storage.ObjectAttrs, recordCreated time.Time) bool {
+	if !attrs.Created.Before(recordCreated) {
+		return true
+	}
+	_, undone := attrs.Metadata[undoMetadata]
+	return undone && !attrs.Updated.Before(recordCreated)
 }
 
 // held reports whether the object with attrs refuses a delete at now: it has
