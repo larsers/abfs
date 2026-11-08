@@ -300,7 +300,19 @@ func TestGCHooks_LostRescueLogsTheCall(t *testing.T) {
 	var linkErr *remote.ErrObjectLinkValidation
 	require.ErrorAs(s.PutObject(ctx, tree, remote.NewContentReader(io.NopCloser(bytes.NewReader(data)), remote.EncodingRaw)), &linkErr)
 	require.Equal([]entities.Hash{linked}, linkErr.MissingLinks)
-	require.Contains(logged.String(), fmt.Sprintf("Condemned object %s was deleted before it could be rescued in validation: request %s", linked, traceID)+client)
+	// Each call has its own request id, also when the calls share a trace.
+	linked2 := putBlob(t, s, "linked 2")
+	condemnObject(t, s, linked2, 3)
+	tree2, data2 := treeOf(linked2)
+	require.ErrorAs(s.PutObject(ctx, tree2, remote.NewContentReader(io.NopCloser(bytes.NewReader(data2)), remote.EncodingRaw)), &linkErr)
+	var reqs []string
+	for _, key := range []entities.Hash{linked, linked2} {
+		lostLine := regexp.MustCompile(fmt.Sprintf(`Condemned object %s was deleted before it could be rescued in validation: request ([0-9a-f]{16}), trace %s`, key, traceID) + regexp.QuoteMeta(client))
+		m := lostLine.FindStringSubmatch(logged.String())
+		require.NotNil(m, key)
+		reqs = append(reqs, m[1])
+	}
+	require.NotEqual(reqs[0], reqs[1])
 
 	from := putBlob(t, s, "request")
 	result := putBlob(t, s, "result")

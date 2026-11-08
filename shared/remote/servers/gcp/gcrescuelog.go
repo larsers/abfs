@@ -156,13 +156,16 @@ func markerCycle(condemned []byte) string {
 	return fmt.Sprintf("%x", condemned)
 }
 
-// newRequestID returns the id that the rescue log lines of one call share: the
-// trace ID of the call when it is traced, else a random one.
+// newRequestID returns the id that the rescue log lines of one call share, a
+// random one, followed by the trace ID of the call when it is traced. The
+// calls of one client operation can share a trace, so the trace ID alone does
+// not name the call.
 func newRequestID(ctx context.Context) string {
+	id := fmt.Sprintf("%016x", rand.Uint64())
 	if sc := trace.SpanContextFromContext(ctx); sc.HasTraceID() {
-		return sc.TraceID().String()
+		return id + ", trace " + sc.TraceID().String()
 	}
-	return fmt.Sprintf("%016x", rand.Uint64())
+	return id
 }
 
 // rescueClient returns what identifies the client of ctx: the peer address,
