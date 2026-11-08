@@ -218,6 +218,13 @@ func bucketProblems(attrs *storage.BucketAttrs, allowNoSoftDelete bool) []string
 	if p := attrs.RetentionPolicy; p != nil && p.RetentionPeriod > 0 {
 		reasons = append(reasons, fmt.Sprintf("the bucket has a retention policy of %s, which refuses deletes of younger objects", p.RetentionPeriod))
 	}
+	if attrs.DefaultEventBasedHold {
+		reasons = append(reasons, "the bucket puts an event-based hold on each new object, which refuses its delete")
+	}
+	if attrs.ObjectRetentionMode != "" {
+		// The JSON API reports it as "Enabled"; the gRPC API does not report it.
+		reasons = append(reasons, fmt.Sprintf("the bucket has object retention %s, under which an object can refuse its delete", attrs.ObjectRetentionMode))
+	}
 	var retention time.Duration
 	if p := attrs.SoftDeletePolicy; p != nil {
 		retention = p.RetentionDuration
@@ -430,22 +437,18 @@ type bucketOutcome int
 const (
 	bucketDeleted bucketOutcome = iota
 	bucketGone
-	bucketRestored
+	bucketPreconditionFailed
 	bucketRefused
 	bucketFailed
 )
 
 // bucketChunk deletes the bucket object id unless it was written or changed
-// at or after recordCreated, under the generation and metageneration it read,
-// so that an object restored or changed in between stays.
+// at or after recordCreated, or is held, under the generation and
+// metageneration it read, so that an object restored or changed in between
+// stays.
 func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated time.Time) (bool, error) {
 	obj := s.d.bucket.Object(id)
-	var attrs *storage.ObjectAttrs
-	err := retryWith(ctx, firstRetryWait, s.reads, func(actx context.Context) error {
-		var err error
-		attrs, err = obj.Attrs(actx)
-		return err
-	})
+	attrs, err := s.chunkAttrs(ctx, obj)
 	switch {
 	case errors.Is(err, storage.ErrObjectNotExist):
 		s.count(&s.rep.ChunksGone)
@@ -459,6 +462,9 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 	case !attrs.Created.Before(recordCreated) || !attrs.Updated.Before(recordCreated):
 		s.count(&s.rep.RestoredAfterRecord)
 		return true, nil
+	case held(attrs, wallNow()):
+		s.count(&s.rep.DeleteRefused)
+		return false, nil
 	}
 	if err := s.lim.wait(ctx, 1); err != nil {
 		return false, err
@@ -474,8 +480,26 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 		s.count(&s.rep.BucketObjectsDeleted)
 	case bucketGone:
 		s.count(&s.rep.ChunksGone)
-	case bucketRestored:
-		s.count(&s.rep.RestoredAfterRecord)
+	case bucketPreconditionFailed:
+		// Only a new generation or metageneration, as of a restore from soft
+		// delete or an undo, keeps the chunk for good; the same ones mean a
+		// refusal, as an object hold may answer.
+		now, err := s.chunkAttrs(ctx, obj)
+		switch {
+		case errors.Is(err, storage.ErrObjectNotExist):
+			s.count(&s.rep.ChunksGone)
+		case err != nil:
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			s.fail(&s.rep.Errors, fmt.Errorf("failed to read the bucket chunk %s after a refused delete: %w", id, err))
+			return false, nil
+		case now.Generation != attrs.Generation || now.Metageneration != attrs.Metageneration:
+			s.count(&s.rep.RestoredAfterRecord)
+		default:
+			s.count(&s.rep.DeleteRefused)
+			return false, nil
+		}
 	case bucketRefused:
 		s.count(&s.rep.DeleteRefused)
 		return false, nil
@@ -486,10 +510,30 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 	return true, nil
 }
 
+// chunkAttrs reads the attributes of the bucket chunk obj.
+func (s *chunkStep) chunkAttrs(ctx context.Context, obj *storage.ObjectHandle) (*storage.ObjectAttrs, error) {
+	var attrs *storage.ObjectAttrs
+	err := retryWith(ctx, firstRetryWait, s.reads, func(actx context.Context) error {
+		var err error
+		attrs, err = obj.Attrs(actx)
+		return err
+	})
+	return attrs, err
+}
+
+// held reports whether the object with attrs refuses a delete at now: it has
+// a hold, or a retention that has not expired.
+func held(attrs *storage.ObjectAttrs, now time.Time) bool {
+	return attrs.EventBasedHold || attrs.TemporaryHold ||
+		(attrs.Retention != nil && attrs.Retention.RetainUntil.After(now)) ||
+		attrs.RetentionExpirationTime.After(now)
+}
+
 // bucketDeleteOutcome classifies the error of a conditional delete of a
 // bucket chunk. A failed precondition means the object got a new generation
-// or metageneration since it was read, as by a restore from soft delete; a
-// refusal comes from an object hold or a retention policy.
+// or metageneration since it was read, as by a restore from soft delete, or
+// may be the answer to an object hold; a refusal comes from an object hold
+// or a retention policy.
 func bucketDeleteOutcome(err error) bucketOutcome {
 	var gerr *googleapi.Error
 	switch {
@@ -498,7 +542,7 @@ func bucketDeleteOutcome(err error) bucketOutcome {
 	case errors.Is(err, storage.ErrObjectNotExist):
 		return bucketGone
 	case preconditionFailed(err):
-		return bucketRestored
+		return bucketPreconditionFailed
 	case errors.As(err, &gerr) && gerr.Code == http.StatusForbidden, status.Code(err) == codes.PermissionDenied:
 		return bucketRefused
 	}

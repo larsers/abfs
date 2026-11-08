@@ -355,6 +355,8 @@ func TestChunkStep_BucketSettings(t *testing.T) {
 		{"no soft delete, allowed", storage.BucketAttrs{}, true, ""},
 		{"versioning", storage.BucketAttrs{SoftDeletePolicy: week, VersioningEnabled: true}, true, "Object Versioning on"},
 		{"retention policy", storage.BucketAttrs{SoftDeletePolicy: week, RetentionPolicy: &storage.RetentionPolicy{RetentionPeriod: time.Hour}}, true, "retention policy of 1h0m0s"},
+		{"default event-based hold", storage.BucketAttrs{SoftDeletePolicy: week, DefaultEventBasedHold: true}, true, "event-based hold on each new object"},
+		{"object retention", storage.BucketAttrs{SoftDeletePolicy: week, ObjectRetentionMode: "Enabled"}, true, "object retention Enabled"},
 	}
 	for _, tt := range tests {
 		got := bucketProblems(&tt.attrs, tt.allow)
@@ -455,8 +457,8 @@ func TestChunkStep_KeepsUnfinishedRecords(t *testing.T) {
 	}{
 		{nil, bucketDeleted},
 		{storage.ErrObjectNotExist, bucketGone},
-		{status.Error(codes.FailedPrecondition, "generation"), bucketRestored},
-		{&googleapi.Error{Code: http.StatusPreconditionFailed}, bucketRestored},
+		{status.Error(codes.FailedPrecondition, "generation"), bucketPreconditionFailed},
+		{&googleapi.Error{Code: http.StatusPreconditionFailed}, bucketPreconditionFailed},
 		{&googleapi.Error{Code: http.StatusForbidden, Message: "retentionPolicyNotMet"}, bucketRefused},
 		{status.Error(codes.PermissionDenied, "object hold"), bucketRefused},
 		{status.Error(codes.Internal, "injected"), bucketFailed},
@@ -484,22 +486,122 @@ func TestChunkStep_KeepsUnfinishedRecords(t *testing.T) {
 
 // No chunk delete starts once the wall clock is within two write deadlines
 // and the clock skew margin of the expiry of the lease, and the step then
-// stops the cycle.
+// stops the cycle: neither a chunk row delete nor a bucket chunk delete.
 func TestChunkStep_StopsBeforeLeaseExpiry(t *testing.T) {
-	require := require.New(t)
-	f := newChunkFixture(t)
-	key := testHashes(1)[0]
-	descs := map[Hash][]byte{key: f.chunked(key, "u")}
-	f.deleteRow(objectsTable, key)
-	name := f.record(0, time.Time{}, []Hash{key}, descs)
-	f.later()
-	f.lease.expiry.Store(f.clock.Load() + int64(2*DefaultWriteDeadline+clockSkewMargin-time.Second))
-	_, err := f.chunkStep(noBackupCheck)
-	require.ErrorIs(err, errLeaseExpiring)
-	row, obj := chunkNames(key, "u")
-	require.True(f.rowExists(chunksTableName, row))
-	require.True(f.objectExists(obj))
-	require.Empty(f.flagOf(name))
+	for _, bucketOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bucket only %v", bucketOnly), func(t *testing.T) {
+			require := require.New(t)
+			f := newChunkFixture(t)
+			key := testHashes(1)[0]
+			descs := map[Hash][]byte{key: f.chunked(key, "u")}
+			row, obj := chunkNames(key, "u")
+			if bucketOnly {
+				descs[key] = f.descriptor(key, fmt.Appendf(nil, `[{"size":3,"depot":"bucket","id":"%s"}]`, obj))
+			}
+			f.deleteRow(objectsTable, key)
+			name := f.record(0, time.Time{}, []Hash{key}, descs)
+			f.later()
+			f.lease.expiry.Store(f.clock.Load() + int64(2*DefaultWriteDeadline+clockSkewMargin-time.Second))
+			_, err := f.chunkStep(noBackupCheck)
+			require.ErrorIs(err, errLeaseExpiring)
+			require.True(f.rowExists(chunksTableName, row))
+			require.True(f.objectExists(obj))
+			require.Empty(f.flagOf(name))
+		})
+	}
+}
+
+// A bucket chunk under a hold or a retention is not deleted, and one whose
+// delete the bucket refuses stays: a refusal answered as a failed
+// precondition while the generation and metageneration are the ones read,
+// or as a permission error. Each counts as refused and leaves its record
+// without the flag, so that the next step tries it again; once the refusal
+// is gone, the chunk is deleted and the record flagged. The release of a
+// hold changes the object after its record, which keeps it.
+func TestChunkStep_HeldChunks(t *testing.T) {
+	now := time.Now()
+	for _, tt := range []struct {
+		attrs storage.ObjectAttrs
+		want  bool
+	}{
+		{storage.ObjectAttrs{}, false},
+		{storage.ObjectAttrs{EventBasedHold: true}, true},
+		{storage.ObjectAttrs{TemporaryHold: true}, true},
+		{storage.ObjectAttrs{Retention: &storage.ObjectRetention{RetainUntil: now.Add(time.Hour)}}, true},
+		{storage.ObjectAttrs{Retention: &storage.ObjectRetention{RetainUntil: now.Add(-time.Hour)}}, false},
+		{storage.ObjectAttrs{RetentionExpirationTime: now.Add(time.Hour)}, true},
+		{storage.ObjectAttrs{RetentionExpirationTime: now.Add(-time.Hour)}, false},
+	} {
+		require.Equal(t, tt.want, held(&tt.attrs, now), "%+v", tt.attrs)
+	}
+
+	answers := map[string]error{
+		"failed precondition": status.Error(codes.FailedPrecondition, "object under hold"),
+		"permission denied":   status.Error(codes.PermissionDenied, "object under hold"),
+	}
+	for _, name := range []string{"temporary hold", "failed precondition", "permission denied"} {
+		t.Run(name, func(t *testing.T) {
+			require := require.New(t)
+			ctx := context.Background()
+			var refuse atomic.Bool
+			var deletes atomic.Int64
+			intercept := grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+				if strings.HasSuffix(method, "/DeleteObject") {
+					deletes.Add(1)
+					if refuse.Load() && answers[name] != nil {
+						return answers[name]
+					}
+				}
+				return invoker(ctx, method, req, reply, cc, opts...)
+			})
+			f := newChunkFixture(t)
+			client, err := storage.NewGRPCClient(ctx, option.WithGRPCDialOption(intercept))
+			require.NoError(err)
+			t.Cleanup(func() { _ = client.Close() })
+			key := testHashes(1)[0]
+			_, obj := chunkNames(key, "u")
+			f.object(key, "blob", nil)
+			f.bucketObject(obj)
+			descs := map[Hash][]byte{key: f.descriptor(key, fmt.Appendf(nil, `[{"size":3,"depot":"bucket","id":"%s"}]`, obj))}
+			f.deleteRow(objectsTable, key)
+			if name == "temporary hold" {
+				_, err := f.bucket.Object(obj).Update(ctx, storage.ObjectAttrsToUpdate{TemporaryHold: true})
+				require.NoError(err)
+			}
+			record := f.record(0, time.Time{}, []Hash{key}, descs)
+			f.later()
+			step := func() *ChunkStepReport {
+				d := f.deleter(f.lease, noBackupCheck)
+				d.bucket = client.Bucket(f.bucket.BucketName())
+				require.NoError(d.deleteChunks(ctx, stepCycle+1))
+				return d.rep.Chunks
+			}
+
+			refuse.Store(true)
+			rep := step()
+			require.Equal(int64(1), rep.DeleteRefused)
+			require.Zero(rep.RestoredAfterRecord + rep.BucketObjectsDeleted + rep.RecordsDone)
+			require.Equal(int64(1), rep.Unflagged)
+			require.Empty(f.flagOf(record))
+			require.True(f.objectExists(obj))
+			if name == "temporary hold" {
+				require.Zero(deletes.Load())
+				_, err := f.bucket.Object(obj).Update(ctx, storage.ObjectAttrsToUpdate{TemporaryHold: false})
+				require.NoError(err)
+			}
+
+			refuse.Store(false)
+			rep = step()
+			require.Equal(int64(1), rep.RecordsDone)
+			if name == "temporary hold" {
+				// The release of the hold changed the chunk after its record.
+				require.Equal(int64(1), rep.RestoredAfterRecord)
+				return
+			}
+			require.Equal(int64(1), rep.BucketObjectsDeleted)
+			require.False(f.objectExists(obj))
+		})
+	}
 }
 
 // The chunk step after a delete step deletes the chunks of the deleted keys
