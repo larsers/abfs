@@ -405,17 +405,19 @@ func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *O
 	if hdr.Condemned == nil || s.gcHooks.rescue == nil {
 		return nil
 	}
-	err := s.rescueOne(ctx, path, hdr)
+	req := newRequestID(ctx)
+	err := s.rescueOne(ctx, path, req, hdr)
 	if err == nil {
-		s.gcHooks.rescueLog.call(ctx, path, 1, 1, 0)
+		s.gcHooks.rescueLog.call(ctx, path, req, 1, 1, 0)
 	} else if !errors.Is(err, casdb.ErrNotFound) {
-		s.gcHooks.rescueLog.call(ctx, path, 1, 0, 1)
+		s.gcHooks.rescueLog.call(ctx, path, req, 1, 0, 1)
 	}
 	return err
 }
 
 // rescueOne rescues hdr, which the collector condemned, and counts the result.
-func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, hdr *ObjectHeader) error {
+// The log lines name the request req of the call.
+func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, req string, hdr *ObjectHeader) error {
 	g := &s.gcHooks
 	condemned := hdr.Condemned
 	live, err := g.rescue(ctx, hdr.Id, condemned)
@@ -425,11 +427,11 @@ func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, hdr *ObjectH
 	}
 	if !live {
 		g.rescuesLost[path].Add(1)
-		log.Printf("Condemned object %s was deleted before it could be rescued", hdr.Id)
+		g.rescueLog.lost(ctx, path, req, hdr)
 		return casdb.ErrNotFound
 	}
 	g.rescues[path][rescueType(hdr.Type)].Add(1)
-	g.rescueLog.object(path, hdr, condemned)
+	g.rescueLog.object(path, req, hdr, condemned)
 	hdr.Condemned = nil
 	return nil
 }
@@ -448,12 +450,16 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 	var rescued, failed atomic.Int64
 	var g errgroup.Group
 	g.SetLimit(rescueWorkers)
+	var req string
 	for i, h := range hdrs {
 		if h.Condemned == nil {
 			continue
 		}
+		if req == "" {
+			req = newRequestID(ctx)
+		}
 		g.Go(func() error {
-			err := s.rescueOne(ctx, path, h)
+			err := s.rescueOne(ctx, path, req, h)
 			switch {
 			case err == nil:
 				rescued.Add(1)
@@ -467,7 +473,7 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 		})
 	}
 	err := g.Wait()
-	s.gcHooks.rescueLog.call(ctx, path, len(hdrs), int(rescued.Load()), int(failed.Load()))
+	s.gcHooks.rescueLog.call(ctx, path, req, len(hdrs), int(rescued.Load()), int(failed.Load()))
 	if err != nil {
 		return nil, err
 	}
