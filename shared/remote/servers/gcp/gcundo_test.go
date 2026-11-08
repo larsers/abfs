@@ -34,6 +34,20 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
+// copiedAt holds, per fixture, when copyTables last copied the tables.
+var copiedAt sync.Map
+
+// copiedSources tells that each table <table><suffix> was restored from a
+// backup of <table> that ended when copyTables copied it.
+type copiedSources struct {
+	suffix string
+	end    time.Time
+}
+
+func (s copiedSources) RestoredFrom(_ context.Context, table string) (*gc.RestoredBackup, error) {
+	return &gc.RestoredBackup{Backup: "copy", SourceTable: strings.TrimSuffix(table, s.suffix), Start: s.end, End: s.end}, nil
+}
+
 // copyTables copies every row of the server tables to <table><suffix>, cell
 // times included, as a restore of backups taken now would.
 func (f *deleteFixture) copyTables(suffix string) {
@@ -59,6 +73,8 @@ func (f *deleteFixture) copyTables(suffix string) {
 			return true
 		}))
 	}
+	// Before the records written after it, whose times Cloud Storage sets.
+	copiedAt.Store(f, time.Now().Add(-time.Second))
 }
 
 // staleLease records in GcState a lease of another holder that expired ten
@@ -89,7 +105,9 @@ func (f *deleteFixture) undo(first, last int64) (*gc.UndoReport, []string) {
 	o := gc.DefaultUndoOpts()
 	o.Cycle, o.Through, o.FromSuffix = first, last, "-r"
 	f.staleLease()
-	rep, err := gc.Undo(context.Background(), f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), &o)
+	end, ok := copiedAt.Load(f)
+	require.True(f.t, ok)
+	rep, err := gc.Undo(context.Background(), f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), copiedSources{suffix: "-r", end: end.(time.Time)}, &o)
 	require.NoError(f.t, err)
 	return rep, rows
 }

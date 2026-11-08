@@ -16,6 +16,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -53,8 +54,30 @@ type undoFixture struct {
 	*chunkFixture
 	// bucket is the bucket of the undo, whose metadata updates are recorded.
 	bucket *storage.BucketHandle
-	mu     sync.Mutex
-	events []undoEvent
+	// backupEnd is when the last backup ended.
+	backupEnd time.Time
+	mu        sync.Mutex
+	events    []undoEvent
+}
+
+// fakeSources tells that each table <table><undoSuffix> was restored from a
+// backup of <table> that ended at end, unless restored names it otherwise.
+type fakeSources struct {
+	end      time.Time
+	restored map[string]*RestoredBackup
+	err      error
+}
+
+var _ TableSources = (*fakeSources)(nil)
+
+func (s *fakeSources) RestoredFrom(_ context.Context, table string) (*RestoredBackup, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if b, ok := s.restored[table]; ok {
+		return b, nil
+	}
+	return &RestoredBackup{Backup: "backup-" + table, SourceTable: strings.TrimSuffix(table, undoSuffix), Start: s.end.Add(-time.Minute), End: s.end}, nil
 }
 
 func newUndoFixture(t *testing.T) *undoFixture {
@@ -200,17 +223,27 @@ func undoLease() *Lease {
 	return l
 }
 
-// undo runs an undo of the cycles first to last under lease.
+// undo runs an undo of the cycles first to last under lease, from tables
+// restored from the last backup.
 func (f *undoFixture) undo(lease *Lease, first, last int64) *UndoReport {
+	f.t.Helper()
+	rep, err := f.undoWith(lease, first, last, &fakeSources{end: f.backupEnd})
+	require.NoError(f.t, err)
+	return rep
+}
+
+// undoWith runs an undo of the cycles first to last under lease, with the
+// sources of the restored tables.
+func (f *undoFixture) undoWith(lease *Lease, first, last int64, sources TableSources) (*UndoReport, error) {
 	f.t.Helper()
 	o := DefaultUndoOpts()
 	o.Cycle, o.Through, o.FromSuffix, o.StateName = first, last, undoSuffix, DefaultStateName
 	require.NoError(f.t, o.Validate())
 	u := newUndoer(f.client, f.bucket, &o)
-	require.NoError(f.t, u.checkTables(context.Background()))
-	rep, err := u.run(context.Background(), lease)
-	require.NoError(f.t, err)
-	return rep
+	if err := u.prepare(context.Background(), sources); err != nil {
+		return nil, err
+	}
+	return u.run(context.Background(), lease)
 }
 
 func (f *undoFixture) cells(table, row string) bigtable.Row {
@@ -234,9 +267,10 @@ func cellTimes(row bigtable.Row) map[string]bigtable.Timestamp {
 // An undo restores the newest cycle of its range first and in each cycle
 // the deepest level first, so that every child is back before its parent
 // and a map row after its ends. Per key it keeps the bucket chunk, writes
-// the chunk row with a new time, the gc row with the times of the backup
-// and a touch, and the objects row last, without the condemn marker. A map
-// row comes back with a new time. A cycle after the range is not undone.
+// the chunk row and the gc row with a new time, the gc row with a touch, and
+// the objects row last, with the times of the backup and without the condemn
+// marker. A map row comes back with a new time. A cycle after the range is
+// not undone.
 func TestUndo_RestoresInOrder(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -300,8 +334,8 @@ func TestUndo_RestoresInOrder(t *testing.T) {
 	require.Equal(int64(1), rep.MapRowsRestored)
 	require.Zero(rep.NotRestored())
 
-	// The objects row and the gc row keep the times of the backup; the
-	// marker is gone and the touch is new.
+	// The objects row keeps the times of the backup and loses the marker;
+	// the gc row is new, as after a put, and so is its touch.
 	object := f.cells(objectsTableName, d.String())
 	require.Empty(object[ObjectsFamily])
 	require.NotEmpty(backupObject[ObjectsFamily])
@@ -309,8 +343,10 @@ func TestUndo_RestoresInOrder(t *testing.T) {
 	require.Equal(cellTimes(backupObject), cellTimes(object))
 	gcRow := f.cells(TableName, d.String())
 	times := cellTimes(gcRow)
+	require.Contains(cellTimes(backupGC), EdgesFamily+":"+LinksColumn)
 	for col, ts := range cellTimes(backupGC) {
-		require.Equal(ts, times[col], col)
+		require.Less(ts, before, col)
+		require.GreaterOrEqual(times[col], before, col)
 	}
 	require.GreaterOrEqual(times[TouchFamily+":"+TouchColumn], before)
 	// The chunk row and the map row are new, the bucket chunk carries the
@@ -468,8 +504,9 @@ func TestUndo_MissingBucketChunkStopsTheKey(t *testing.T) {
 // A chunk step that read the attributes of a bucket chunk and found the row
 // of its object absent before an undo wrote them back deletes neither the
 // bucket chunk, whose metageneration the undo raised, nor the chunk row,
-// which the undo wrote after the record. A chunk step after a finished undo
-// finds the row and keeps every chunk.
+// which the undo wrote after the record, nor the gc row, whose edges the
+// undo wrote after the grace start of the record. A chunk step after a
+// finished undo finds the row and keeps every chunk.
 func TestUndo_ChunkStepKeepsRestoredChunks(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -522,4 +559,221 @@ func TestUndo_ChunkStepKeepsRestoredChunks(t *testing.T) {
 		require.True(f.objectExists(name), name)
 	}
 	require.True(f.rowExists(objectsTableName, raced.String()))
+	require.True(f.rowExists(TableName, raced.String()))
+	require.Equal(int64(1), rep.GCRowsKept)
+	require.Zero(rep.GCRowsDeleted)
+}
+
+// A parent whose child is absent from the live table but present in the
+// restored one, deleted since the backup by a cycle the run does not undo, is
+// not restored, so that no restored object links a missing one. A child
+// absent from both, missing when the parent was backed up, and a present
+// child block nothing. Undoing the cycle of the child too restores both.
+func TestUndo_BlocksAParentOfAGoneChild(t *testing.T) {
+	require := require.New(t)
+	f := newUndoFixture(t)
+	h := testHashes(6)
+	parent, child, other, missing, withPresent, present := h[0], h[1], h[2], h[3], h[4], h[5]
+	f.object(present, "blob", nil)
+	f.deleted(child)
+	f.deleted(parent, child)
+	f.deleted(other, missing)
+	f.deleted(withPresent, present)
+	f.recordOf(5, 1, []Hash{parent, other, withPresent})
+	f.recordOf(6, 2, []Hash{child})
+
+	rep := f.undo(undoLease(), 5, 5)
+	require.Equal(int64(1), rep.BlockedByChild)
+	require.Equal(int64(2), rep.Restored)
+	require.Len(rep.NotRestoredSample, 1)
+	require.Contains(rep.NotRestoredSample[0], parent.String()+": links "+child.String()+", which is absent but in "+objectsTableName+undoSuffix)
+	require.False(f.rowExists(objectsTableName, parent.String()))
+	require.True(f.rowExists(objectsTableName, other.String()))
+	require.True(f.rowExists(objectsTableName, withPresent.String()))
+
+	rep = f.undo(undoLease(), 5, 6)
+	require.Equal(int64(2), rep.Restored)
+	require.Equal(int64(2), rep.Present)
+	require.Zero(rep.NotRestored())
+	require.True(f.rowExists(objectsTableName, parent.String()))
+}
+
+// An objects row that holds only a condemn marker, as a stale condemn leaves
+// in a row deleted in the same window, comes back without the marker.
+func TestUndo_ClearsAStaleMarker(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newUndoFixture(t)
+	key := testHashes(1)[0]
+	f.deleted(key)
+	marker := bigtable.NewMutation()
+	marker.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), markerValue(stepCycle))
+	require.NoError(f.client.Open(objectsTableName).Apply(ctx, key.String(), marker))
+	f.recordOf(5, 1, []Hash{key})
+
+	rep := f.undo(undoLease(), 5, 5)
+	require.Equal(int64(1), rep.Restored)
+	row := f.cells(objectsTableName, key.String())
+	require.NotEmpty(row[objectsMetaFamily])
+	require.Empty(row[ObjectsFamily])
+}
+
+// An object whose restored row holds another descriptor than its delete
+// record was written again after the backup, and the chunk step may have
+// deleted the chunks of the backup's descriptor: it is not restored.
+func TestUndo_RecordedDescriptorOnly(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newUndoFixture(t)
+	key := testHashes(1)[0]
+	f.deleted(key)
+	row, obj := chunkNames(key, "v")
+	desc := fmt.Appendf(nil, `[{"size":3,"depot":"bigtable","id":"%s"},{"size":3,"depot":"bucket","id":"%s"}]`, row, obj)
+	h := &recordHeader{cycle: 5, runID: runID("collector", 3), gcRowsAfter: f.now.Add(-DefaultGrace)}
+	require.NoError(writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, f.stepFixture.bucket, recordObjectName(DefaultStateName, 5, 1, 0, 0), h, []recordEntry{{kind: recordObject, key: key, content: desc}}))
+	f.takeEvents()
+
+	rep := f.undo(undoLease(), 5, 5)
+	require.Equal(int64(1), rep.MissingFromBackup)
+	require.Zero(rep.Restored)
+	require.Contains(rep.NotRestoredSample[0], "another content descriptor than the delete record")
+	require.Empty(f.takeEvents())
+	require.False(f.rowExists(objectsTableName, key.String()))
+}
+
+// The undo writes nothing unless each restored table was restored from a
+// backup of its live table that ended before the first delete record of the
+// cycles was written: a table that was not restored, a backup of another
+// table, a backup that ended later and a failed read refuse the run.
+func TestUndo_ChecksTheSourcesOfTheTables(t *testing.T) {
+	f := newUndoFixture(t)
+	key := testHashes(1)[0]
+	f.deleted(key)
+	f.recordOf(5, 1, []Hash{key})
+	f.recordOf(6, 1, nil)
+	f.takeEvents()
+	gcTable := TableName + undoSuffix
+	tests := []struct {
+		name    string
+		sources *fakeSources
+		want    string
+	}{
+		{"not restored", &fakeSources{end: f.backupEnd, restored: map[string]*RestoredBackup{gcTable: nil}}, "was not restored from a backup"},
+		{"another table", &fakeSources{end: f.backupEnd, restored: map[string]*RestoredBackup{gcTable: {Backup: "b", SourceTable: objectsTableName}}}, "of the table objects, not of gc"},
+		{"later backup", &fakeSources{end: time.Now().Add(time.Hour)}, "not before the first delete record of cycle 5"},
+		{"read fails", &fakeSources{err: errors.New("injected")}, "injected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := f.undoWith(undoLease(), 5, 6, tt.sources)
+			require.ErrorContains(t, err, tt.want)
+			require.Empty(t, f.takeEvents())
+		})
+	}
+	_, err := Undo(context.Background(), nil, f.client, f.bucket, nil, &UndoOpts{Cycle: 5, FromSuffix: undoSuffix, Workers: 1, LeaseDuration: time.Hour, WriteDeadline: time.Second})
+	require.ErrorContains(t, err, "needs the sources of the restored tables")
+	rep, err := f.undoWith(undoLease(), 5, 6, &fakeSources{end: f.backupEnd})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), rep.Restored)
+}
+
+// An undo of a cycle whose records were pruned fails before it writes, and
+// so does an undo of cycles that left no record; a cycle of the range
+// without records and without the marker deleted nothing and is skipped.
+func TestUndo_FailsWithoutRecords(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newUndoFixture(t)
+	key := testHashes(1)[0]
+	f.deleted(key)
+	f.recordOf(5, 1, []Hash{key})
+	b := writeBudget{deadline: DefaultWriteDeadline}
+	require.NoError(writePrunedMarker(ctx, b, f.stepFixture.bucket, DefaultStateName, 3))
+	f.takeEvents()
+	sources := &fakeSources{end: f.backupEnd}
+
+	_, err := f.undoWith(undoLease(), 3, 5, sources)
+	require.ErrorContains(err, "the delete records of cycle 3 were removed")
+	_, err = f.undoWith(undoLease(), 6, 7, sources)
+	require.ErrorContains(err, "found no delete records of the cycles 6 to 7")
+	require.Empty(f.takeEvents())
+	rep, err := f.undoWith(undoLease(), 4, 6, sources)
+	require.NoError(err)
+	require.Equal(int64(1), rep.Restored)
+}
+
+// No undo write starts once the wall clock is within two write deadlines and
+// the clock skew margin of the expiry of the lease, and the undo then stops:
+// neither the stamp of a bucket chunk nor a row write.
+func TestUndo_StopsBeforeLeaseExpiry(t *testing.T) {
+	for _, inline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inline %v", inline), func(t *testing.T) {
+			require := require.New(t)
+			f := newUndoFixture(t)
+			key := testHashes(1)[0]
+			if inline {
+				f.object(key, "blob", nil)
+				f.descriptor(key, []byte(`[{"size":3,"depot":"inline","id":"YWJj"}]`))
+				f.backup()
+				f.deleteRow(objectsTable, key)
+				f.deleteRow(TableName, key)
+			} else {
+				row, obj := f.deleted(key)
+				mut := bigtable.NewMutation()
+				mut.DeleteRow()
+				require.NoError(f.client.Open(chunksTableName).Apply(context.Background(), row, mut))
+				t.Cleanup(func() {
+					attrs, err := f.bucket.Object(obj).Attrs(context.Background())
+					require.NoError(err)
+					require.Empty(attrs.Metadata[undoMetadata])
+				})
+			}
+			f.recordOf(5, 1, []Hash{key})
+			f.takeEvents()
+			lease := undoLease()
+			lease.expiry.Store(wallNow().Add(2*DefaultWriteDeadline + clockSkewMargin - time.Second).UnixNano())
+
+			_, err := f.undoWith(lease, 5, 5, &fakeSources{end: f.backupEnd})
+			require.ErrorIs(err, errLeaseExpiring)
+			require.Empty(f.takeEvents())
+			require.False(f.rowExists(TableName, key.String()))
+			require.False(f.rowExists(objectsTableName, key.String()))
+		})
+	}
+}
+
+// A record that holds the deletes of another cycle than its name stops the
+// undo before it restores its keys.
+func TestUndo_RecordOfAnotherCycle(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newUndoFixture(t)
+	key := testHashes(1)[0]
+	f.deleted(key)
+	h := &recordHeader{cycle: 6, runID: runID("collector", 3), gcRowsAfter: f.now.Add(-DefaultGrace)}
+	require.NoError(writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, f.stepFixture.bucket, recordObjectName(DefaultStateName, 5, 1, 0, 0), h, []recordEntry{{kind: recordObject, key: key}}))
+	f.takeEvents()
+
+	_, err := f.undoWith(undoLease(), 5, 5, &fakeSources{end: f.backupEnd})
+	require.ErrorContains(err, "holds the deletes of cycle 6")
+	require.Empty(f.takeEvents())
+	require.False(f.rowExists(objectsTableName, key.String()))
+}
+
+// The undo restores no refs, and names the ref records of the cycle before
+// its range to its last cycle, which list the refs whose removal let those
+// cycles delete.
+func TestUndo_NamesTheRefRecords(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newUndoFixture(t)
+	key := testHashes(1)[0]
+	f.deleted(key)
+	f.recordOf(5, 1, []Hash{key})
+	for _, cycle := range []int64{3, 4, 6, 7} {
+		w := f.stepFixture.bucket.Object(refRecordName(DefaultStateName, cycle)).NewWriter(ctx)
+		require.NoError(w.Close())
+	}
+	rep := f.undo(undoLease(), 5, 6)
+	require.Equal([]string{refRecordName(DefaultStateName, 4), refRecordName(DefaultStateName, 6)}, rep.RefRecords)
 }

@@ -18,9 +18,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigtable"
+	admin "cloud.google.com/go/bigtable/admin/apiv2"
+	"cloud.google.com/go/bigtable/admin/apiv2/adminpb"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -122,6 +125,63 @@ func (c *instanceChecks) ProbeConditionalWrite(ctx context.Context) error {
 	del.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
 	mut := bigtable.NewCondMutation(predicate, del, nil)
 	return c.bt.Open(objectsTable).Apply(ctx, "abfs-setup-check", mut)
+}
+
+// TableSources tells where the tables of a Bigtable instance were restored
+// from.
+type TableSources interface {
+	// RestoredFrom returns the backup that table was restored from, nil when
+	// it was not restored from a backup.
+	RestoredFrom(ctx context.Context, table string) (*RestoredBackup, error)
+}
+
+// RestoredBackup is the backup a table was restored from.
+type RestoredBackup struct {
+	Backup string
+	// SourceTable is the table the backup was taken of: its ID when it is a
+	// table of the instance of the restored table, else its full name.
+	SourceTable string
+	// Start and End bound the time of the data the backup holds.
+	Start, End time.Time
+}
+
+// NewTableSources returns the TableSources of the Bigtable instance of
+// project.
+func NewTableSources(project, instance string) TableSources {
+	return &tableSources{project: project, instance: instance}
+}
+
+type tableSources struct {
+	project, instance string
+}
+
+var _ TableSources = (*tableSources)(nil)
+
+// RestoredFrom implements TableSources.
+func (s *tableSources) RestoredFrom(ctx context.Context, table string) (*RestoredBackup, error) {
+	ctx, cancel := context.WithTimeout(ctx, adminCallTimeout)
+	defer cancel()
+	client, err := admin.NewBigtableTableAdminClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	prefix := "projects/" + s.project + "/instances/" + s.instance + "/tables/"
+	// Only the full view holds the restore info.
+	t, err := client.GetTable(ctx, &adminpb.GetTableRequest{Name: prefix + table, View: adminpb.Table_FULL})
+	if err != nil {
+		return nil, err
+	}
+	info := t.GetRestoreInfo().GetBackupInfo()
+	if info == nil {
+		return nil, nil
+	}
+	return &RestoredBackup{
+		Backup:      info.GetBackup(),
+		SourceTable: strings.TrimPrefix(info.GetSourceTable(), prefix),
+		Start:       info.GetStartTime().AsTime(),
+		End:         info.GetEndTime().AsTime(),
+	}, nil
 }
 
 // instanceEvidence is what the checks of the instance found.

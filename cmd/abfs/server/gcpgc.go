@@ -362,6 +362,7 @@ func (c *gcpGCUndoCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.Int64Var(&c.opts.Through, "through", 0, "The last delete cycle whose deletes are undone (default: --cycle)")
 	fl.StringVar(&c.opts.FromSuffix, "from-suffix", "", "The suffix of the names of the restored tables, as -r for objects-r, gc-r, maps-r and chunks-r (required)")
 	fl.IntVar(&c.opts.Workers, "workers", gc.DefaultUndoWorkers, "The number of objects of one delete record restored in parallel")
+	fl.BoolVar(&c.opts.NoSourceCheck, "no-source-check", false, "Restore from tables that are not restored from backups of the live tables taken before --cycle")
 	fl.DurationVar(&c.opts.LeaseDuration, "lease", gc.DefaultLeaseDuration, "The duration of the GC lease, renewed while the undo runs")
 	fl.DurationVar(&c.opts.WriteDeadline, "write-deadline", gc.DefaultWriteDeadline, "The deadline of one attempt of a write, the client library's retries included. At most an eighth of --lease")
 }
@@ -393,7 +394,7 @@ func (c *gcpGCUndoCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 			log.Printf("Warning: error closing ABFS server: %v", err)
 		}
 	}()
-	rep, err := server.UndoGC(ctx, c.server.BucketName, &c.opts)
+	rep, err := server.UndoGC(ctx, c.server.BucketName, server.GCTableSources(c.server.ProjectID, c.server.BtInstance), &c.opts)
 	if rep != nil {
 		printUndo(rep, c.server.BucketName)
 	}
