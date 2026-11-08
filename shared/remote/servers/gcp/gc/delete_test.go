@@ -229,13 +229,14 @@ func TestPlanDeletes(t *testing.T) {
 }
 
 // A map row goes only when the cycle may delete the types of both its ends,
-// and one that names a candidate and stays keeps that candidate. An eval row
+// where an end without an object has no type and allows it, and one that
+// names a candidate and stays keeps that candidate. An eval row
 // past the map retention whose ends are live goes only when the cycle may
 // delete eval requests and responses.
 func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	require := require.New(t)
 	f := newStepFixture(t, 4)
-	h := testHashes(6)
+	h := testHashes(8)
 	old := f.now.Add(-1000 * time.Hour)
 	// Both ends are candidates.
 	req, resp := h[0], h[1]
@@ -253,6 +254,10 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	f.object(liveReq, "eval-request", nil)
 	f.object(liveResp, "eval-response", nil)
 	f.mapRow(liveReq, liveResp, old)
+	// The response has no object, so the row's end has no node.
+	absReq, absResp := h[6], h[7]
+	f.object(absReq, "eval-request", nil)
+	f.mapRow(absReq, absResp, old)
 
 	res := f.mark(nil)
 	for _, k := range []Hash{liveReq, liveResp} {
@@ -274,21 +279,22 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	row := func(from, to Hash) string { return from.String() + "#" + to.String() }
 
 	p := plan(func(string) bool { return true })
-	require.ElementsMatch([]string{row(req, resp), row(outReq, outResp), row(liveReq, liveResp)}, rows(p))
-	require.Equal(int64(2), p.report.MapRows)
+	require.ElementsMatch([]string{row(req, resp), row(outReq, outResp), row(liveReq, liveResp), row(absReq, absResp)}, rows(p))
+	require.Equal(int64(3), p.report.MapRows)
 	require.Equal(int64(1), p.report.ExpiredEvalMapRows)
 	require.Zero(p.report.MapRowsKeptForTypes)
-	require.Equal(int64(3), p.report.WouldDelete)
+	require.Equal(int64(4), p.report.WouldDelete)
 
+	// An end without a node has no type and allows the row.
 	p = plan(func(t string) bool { return t == "eval-request" })
-	require.Empty(rows(p))
+	require.Equal([]string{row(absReq, absResp)}, rows(p))
 	require.Equal(int64(2), p.report.MapRowsKeptForTypes)
 	require.Zero(p.report.ExpiredEvalMapRows)
 	outcome := func(k Hash) keyOutcome { return p.outcome[p.index(res.graph.find(k))] }
 	require.Equal(outcomeBlocked, outcome(req))
 	require.Equal(outcomeTypeNotAllowed, outcome(resp))
 	require.Equal(outcomeTypeNotAllowed, outcome(outResp))
-	require.Zero(p.report.WouldDelete)
+	require.Equal(int64(1), p.report.WouldDelete)
 }
 
 // A delete record reads back as written, and keeps the content descriptor

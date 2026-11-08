@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -667,6 +668,80 @@ func TestChunkStep_MetadataChangesAreNoRestore(t *testing.T) {
 	require.Equal(int64(1), rep.BucketObjectsDeleted)
 	require.True(f.objectExists(undoneObj))
 	require.False(f.objectExists(racedObj))
+}
+
+// The step works on several records at once, and the delete workers bound
+// the keys in flight of all of them together.
+func TestChunkStep_RecordsShareTheKeyBound(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	const workers = 4
+	h := testHashes(6)
+	recordOf := make(map[string]int)
+	for i, k := range h {
+		_, obj := chunkNames(k, "u")
+		recordOf[obj] = i / 3
+	}
+	var mu sync.Mutex
+	inFlight := make(map[int]int)
+	var maxInFlight int
+	overlapped := false
+	reached := make(chan struct{})
+	var reachedOnce sync.Once
+	type deleteRequest interface{ GetObject() string }
+	intercept := grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		r, ok := req.(deleteRequest)
+		if !ok || !strings.HasSuffix(method, "/DeleteObject") {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+		rec := recordOf[r.GetObject()]
+		mu.Lock()
+		inFlight[rec]++
+		total := inFlight[0] + inFlight[1]
+		maxInFlight = max(maxInFlight, total)
+		overlapped = overlapped || (inFlight[0] > 0 && inFlight[1] > 0)
+		mu.Unlock()
+		if total >= workers {
+			reachedOnce.Do(func() { close(reached) })
+		}
+		// Hold every call until the bound is reached, so that a missing
+		// bound or a step that works on one record at a time shows.
+		select {
+		case <-reached:
+			time.Sleep(100 * time.Millisecond)
+		case <-time.After(2 * time.Second):
+		}
+		mu.Lock()
+		inFlight[rec]--
+		mu.Unlock()
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
+	f := newChunkFixture(t)
+	client, err := storage.NewGRPCClient(ctx, option.WithGRPCDialOption(intercept))
+	require.NoError(err)
+	t.Cleanup(func() { _ = client.Close() })
+	descs := make(map[Hash][]byte)
+	for _, k := range h {
+		_, obj := chunkNames(k, "u")
+		f.object(k, "blob", nil)
+		f.bucketObject(obj)
+		descs[k] = f.descriptor(k, fmt.Appendf(nil, `[{"size":3,"depot":"bucket","id":"%s"}]`, obj))
+		f.deleteRow(objectsTable, k)
+	}
+	f.record(0, time.Time{}, h[:3], descs)
+	f.record(1, time.Time{}, h[3:], descs)
+	f.later()
+
+	d := f.deleter(f.lease, func(o *DeleteOpts) {
+		noBackupCheck(o)
+		o.DeleteWorkers = workers
+	})
+	d.bucket = client.Bucket(f.bucket.BucketName())
+	require.NoError(d.deleteChunks(ctx, stepCycle+1))
+	require.Equal(int64(2), d.rep.Chunks.RecordsDone)
+	require.Equal(int64(len(h)), d.rep.Chunks.BucketObjectsDeleted)
+	require.True(overlapped, "the records ran one after the other")
+	require.Equal(workers, maxInFlight)
 }
 
 // The chunk step after a delete step deletes the chunks of the deleted keys
