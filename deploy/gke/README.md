@@ -33,6 +33,7 @@ This folder deploys the open-source ABFS GCP server, the git-pushers and the CI 
 
 ```
 deploy/gke/
+  AGENTS.md          orientation for anyone working in this tree: layout, checks, rules
   README.md          this file
   Makefile           lint, template, kustomize, ddl, ddl-check, images, bundle
   chart/abfs/        Helm chart; values.yaml, values-example.yaml, ci/ test values
@@ -105,7 +106,7 @@ make images CASFS=<abfs-casfs repo> COMMIT=<commit>   # local build, no push; ne
 make bundle CASFS=<abfs-casfs repo> COMMIT=<commit>  # after make images; needs docker
 ```
 
-The release bundle (`scripts/bundle.sh`) holds this README, the Makefile, `chart/`, `kcc/`, `docs/`, `scripts/`, the four images as OCI archives, `images.txt`, the source of the ABFS and abfs-casfs commits in `source/`, `SHA256SUMS` and the commit id ([runbook](docs/runbook.md#bundle-and-source-tree)).
+The release bundle (`scripts/bundle.sh`) holds this README, `AGENTS.md`, the Makefile, `chart/`, `kcc/`, `docs/`, `scripts/`, the four images as OCI archives, `images.txt`, the source of the ABFS and abfs-casfs commits in `source/`, `SHA256SUMS` and the commit id ([runbook](docs/runbook.md#bundle-and-source-tree)).
 
 ## Limits
 

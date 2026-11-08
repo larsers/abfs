@@ -17,7 +17,7 @@
 # Writes the release bundle abfs-gke-<version>.tar.gz of an ABFS commit:
 #   abfs-gke-<version>/
 #     COMMIT          the commit id
-#     README.md, Makefile, chart/, kcc/, docs/, scripts/   deploy/gke of that commit
+#     AGENTS.md, README.md, Makefile, chart/, kcc/, docs/, scripts/   deploy/gke of that commit
 #     images.txt      name, reference and digest of each image
 #     images/<name>.oci.tar            the images as OCI archives
 #     source/abfs-<version>.tar.gz     the ABFS tree of the commit
@@ -93,7 +93,7 @@ else
   echo "$0: $commit has no deploy/gke; pass --deploy-dir" >&2
   exit 1
 fi
-for part in README.md Makefile chart kcc docs scripts; do
+for part in AGENTS.md README.md Makefile chart kcc docs scripts; do
   if [[ -e $tmp/deploy/$part ]]; then
     cp -a "$tmp/deploy/$part" "$dir/"
   else

@@ -435,7 +435,7 @@ Never delete the `ConfigConnectorContext` while KCC objects exist in the namespa
 
 ## Bundle and source tree
 
-The release bundle holds this folder's `README.md`, `Makefile`, `chart/`, `kcc/`, `docs/` and `scripts/`, the four images as OCI archives, `images.txt`, `source/` and `SHA256SUMS`. `source/` holds the ABFS tree of the bundle's commit and the abfs-casfs tree of the loader image; unpack both to build the images yourself. The `abfs-client` image carries the source packages of the static `ps` and `fuser` it ships, in `/usr/share/abfs/source`. Check the bundle with `sha256sum -c SHA256SUMS` in its root. From the bundle root, these run as they do in `deploy/gke`:
+The release bundle holds this folder's `AGENTS.md`, `README.md`, `Makefile`, `chart/`, `kcc/`, `docs/` and `scripts/`, the four images as OCI archives, `images.txt`, `source/` and `SHA256SUMS`. `source/` holds the ABFS tree of the bundle's commit and the abfs-casfs tree of the loader image; unpack both to build the images yourself. The `abfs-client` image carries the source packages of the static `ps` and `fuser` it ships, in `/usr/share/abfs/source`. Check the bundle with `sha256sum -c SHA256SUMS` in its root. From the bundle root, these run as they do in `deploy/gke`:
 
 - every `kubectl` and `helm` command of this runbook, and `scripts/load-images.sh`;
 - `make check` (lint, template, kustomize, and `ddl-check` against the hash in the ddl file) and `scripts/check-ddl.sh` without a schema source.
