@@ -293,6 +293,11 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 	if rep.ListsRemoved, err = pruneLists(ctx, c.budget, c.bucket, c.opts.StateName, c.opts.KeepLists); err != nil {
 		log.Printf("Warning: failed to remove old condemned lists: %v", err)
 	}
+	if c.del != nil {
+		if c.del.rep.RecordsRemoved, err = pruneRecords(ctx, c.budget, c.bucket, c.opts.StateName, c.opts.KeepLists); err != nil {
+			log.Printf("Warning: failed to remove old delete records: %v", err)
+		}
+	}
 	log.Printf("GC cycle %d condemned %d objects of %d bytes, listed in %s", r.Cycle, rep.Condemned, rep.CondemnedBytes, name)
 	return nil
 }

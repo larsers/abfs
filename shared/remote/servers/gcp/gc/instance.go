@@ -30,7 +30,7 @@ const adminCallTimeout = time.Minute
 
 // backupTables are the Bigtable tables a delete changes, which need a backup
 // taken after the list it deletes from was complete.
-var backupTables = []string{objectsTable, TableName, mapsTableName, "chunks"}
+var backupTables = []string{objectsTable, TableName, mapsTableName, chunksTableName}
 
 // InstanceChecks reads what a delete cycle needs to know about the Bigtable
 // instance beyond its tables.
@@ -52,7 +52,9 @@ type Backup struct {
 	// Start is the time the backup started; it holds no data older than
 	// that.
 	Start time.Time
-	Ready bool
+	// Expire is the time Bigtable deletes the backup.
+	Expire time.Time
+	Ready  bool
 }
 
 // NewInstanceChecks returns the checks of the Bigtable instance of project
@@ -108,7 +110,7 @@ func (c *instanceChecks) Backups(ctx context.Context) ([]Backup, error) {
 		if err != nil {
 			return nil, err
 		}
-		backups = append(backups, Backup{Name: b.Name, Table: b.SourceTable, Start: b.StartTime, Ready: b.State == "READY"})
+		backups = append(backups, Backup{Name: b.Name, Table: b.SourceTable, Start: b.StartTime, Expire: b.ExpireTime, Ready: b.State == "READY"})
 	}
 }
 

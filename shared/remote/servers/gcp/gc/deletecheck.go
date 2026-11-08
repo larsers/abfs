@@ -68,6 +68,13 @@ type DeleteOpts struct {
 	// are deleted. It must exceed the lifetime of the signed URLs of chunks
 	// that a server hands out.
 	ChunkDelay time.Duration
+	// ChunkRate is the maximum number of chunks deleted per second; zero
+	// means no limit.
+	ChunkRate float64
+	// AllowNoSoftDelete deletes bucket chunks although the bucket keeps
+	// deleted objects for less than seven days, or not at all, so that they
+	// cannot be restored.
+	AllowNoSoftDelete bool
 	// StartDelay pauses the cycle before the delete step, for tests that use
 	// an object in between.
 	StartDelay time.Duration
@@ -76,7 +83,7 @@ type DeleteOpts struct {
 // DefaultDeleteOpts returns the default options; the replica counts have no
 // default.
 func DefaultDeleteOpts() DeleteOpts {
-	return DeleteOpts{CondemnOpts: DefaultCondemnOpts(), DeleteRate: DefaultDeleteRate, DeleteWorkers: DefaultDeleteWorkers, ChunkDelay: DefaultChunkDelay}
+	return DeleteOpts{CondemnOpts: DefaultCondemnOpts(), DeleteRate: DefaultDeleteRate, DeleteWorkers: DefaultDeleteWorkers, ChunkDelay: DefaultChunkDelay, ChunkRate: DefaultChunkRate}
 }
 
 // Validate checks the options.
@@ -92,6 +99,8 @@ func (o *DeleteOpts) Validate() error {
 	switch {
 	case o.DeleteRate < 0:
 		return fmt.Errorf("invalid delete rate %g", o.DeleteRate)
+	case o.ChunkRate < 0:
+		return fmt.Errorf("invalid chunk delete rate %g", o.ChunkRate)
 	case o.DeleteWorkers <= 0:
 		return fmt.Errorf("invalid number of delete workers %d", o.DeleteWorkers)
 	case o.ChunkDelay <= signedURLLifetime:
@@ -128,6 +137,11 @@ type DeleteReport struct {
 	Plan *DeletePlanReport `json:"plan,omitempty"`
 	// Step reports the delete step, when it ran.
 	Step *DeleteStepReport `json:"step,omitempty"`
+	// Chunks reports the chunk step, which runs in every delete cycle.
+	Chunks *ChunkStepReport `json:"chunks,omitempty"`
+	// RecordsRemoved counts the flagged delete records of older cycles
+	// deleted.
+	RecordsRemoved int64 `json:"records_removed"`
 }
 
 // deleteEvidence is what deleteBlockers judges, gathered by the cycle before

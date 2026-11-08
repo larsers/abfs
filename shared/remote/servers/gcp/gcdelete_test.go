@@ -515,6 +515,8 @@ func TestDeleteGC_RefusedCycleCondemns(t *testing.T) {
 		}
 		require.True(slices.ContainsFunc(r.Delete.Refused, func(s string) bool { return strings.Contains(s, tt.want) }), "%s: %q", tt.name, r.Delete.Refused)
 		require.Nil(r.Delete.Step, tt.name)
+		// The chunk step of older records runs in a refused cycle too.
+		require.NotNil(r.Delete.Chunks, tt.name)
 		require.Equal(int64(1), r.Condemn.Condemned, tt.name)
 		require.Equal([][]byte{marker(byte(i + 1))}, f.markerCells(key), tt.name)
 		location, complete := f.listState()

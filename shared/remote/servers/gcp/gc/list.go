@@ -315,6 +315,46 @@ func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle
 	return n, nil
 }
 
+// pruneRecords deletes the flagged delete records of the state beyond the
+// newest keep cycles and returns how many it deleted, each delete within the
+// budget b. A record without the flag stays whatever its age, because the
+// chunks it names may still be to delete.
+func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
+	prefix := recordPrefixOf(state)
+	cycles := make(map[int64]bool)
+	flagged := make(map[int64][]string)
+	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("failed to list the delete records under %s: %w", prefix, err)
+		}
+		c, _, ok := strings.Cut(strings.TrimPrefix(attrs.Name, prefix), "/")
+		cycle, err := strconv.ParseInt(c, 10, 64)
+		if !ok || err != nil {
+			continue
+		}
+		cycles[cycle] = true
+		if attrs.Metadata[chunksDoneMetadata] != "" {
+			flagged[cycle] = append(flagged[cycle], attrs.Name)
+		}
+	}
+	sorted := slices.Sorted(maps.Keys(cycles))
+	var n int64
+	for _, c := range sorted[:max(0, len(sorted)-keep)] {
+		for _, name := range flagged[c] {
+			if err := deleteObject(ctx, b, bucket.Object(name)); err != nil {
+				return n, fmt.Errorf("failed to delete the delete record %s: %w", name, err)
+			}
+			n++
+		}
+	}
+	return n, nil
+}
+
 // deleteObject deletes obj with the retries of the collector, each attempt
 // within the budget b, so that a listing that ran long cannot delete after
 // the lease is lost. An object already gone counts as deleted.

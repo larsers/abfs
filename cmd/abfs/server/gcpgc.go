@@ -190,7 +190,12 @@ server that may have run within the grace crashed, lost touches or ran without l
 validation; the Bigtable instance has one cluster and the app profile accepts conditional
 writes; ready backups of the tables exist (unless --no-backup-check); and no live mount can
 hold the only copy of content it wrote. A dry run and a condemn cycle report what a delete
-would remove. The chunks of deleted objects are removed one cycle later.
+would remove. The chunks of deleted objects are removed one cycle later, at least
+--chunk-delay after the record of their batch, unless the row of the object is back; that
+step deletes nothing while the bucket keeps deleted objects for less than 7 days (unless
+--allow-no-soft-delete), has Object Versioning on or a retention policy, and it keeps a
+record until a ready backup of the chunks table started after its list (unless
+--no-backup-check).
 Needs the resources of 'abfs server gcp init --gc'.`,
 	}
 }
@@ -216,6 +221,8 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.Float64Var(&c.opts.DeleteRate, "delete-rate", gc.DefaultDeleteRate, "In delete mode, the maximum number of objects deleted per second (0 means no limit)")
 	fl.IntVar(&c.opts.DeleteWorkers, "delete-workers", gc.DefaultDeleteWorkers, "In delete mode, the number of conditional deletes in flight, split evenly over the --shards key ranges")
 	fl.DurationVar(&c.opts.ChunkDelay, "chunk-delay", gc.DefaultChunkDelay, "In delete mode, how long after the record of a deleted object its chunks are deleted, at the earliest in the next cycle; longer than the 10 min lifetime of signed chunk URLs")
+	fl.Float64Var(&c.opts.ChunkRate, "chunk-rate", gc.DefaultChunkRate, "In delete mode, the maximum number of chunks of deleted objects deleted per second (0 means no limit)")
+	fl.BoolVar(&c.opts.AllowNoSoftDelete, "allow-no-soft-delete", false, "In delete mode, delete the bucket chunks of deleted objects although the bucket keeps deleted objects for less than 7 days, so that they cannot be restored")
 	fl.DurationVar(&c.opts.StartDelay, "delete-start-delay", 0, "In delete mode, a pause before the delete step, for tests")
 	fl.Float64Var(&c.opts.Rate, "condemn-rate", gc.DefaultCondemnRate, "With --condemn or --delete, the maximum number of objects marked per second (0 means no limit)")
 	fl.IntVar(&c.opts.KeepLists, "keep-lists", gc.DefaultKeepLists, "With --condemn or --delete, the number of condemned lists of the newest cycles kept in the bucket")
@@ -245,8 +252,8 @@ func (c *gcpGCRunCmd) checkOpts() error {
 	if modes != 1 {
 		return errors.New("pass one of --dry-run, --condemn and --delete")
 	}
-	if !c.delete && (len(c.opts.Types) > 0 || c.opts.AcceptMountsWithoutKeepAlive || c.opts.NoBackupCheck || c.opts.StartDelay != 0) {
-		return errors.New("--delete-types, --accept-mounts-without-keepalive, --no-backup-check and --delete-start-delay apply only to delete mode")
+	if !c.delete && (len(c.opts.Types) > 0 || c.opts.AcceptMountsWithoutKeepAlive || c.opts.NoBackupCheck || c.opts.AllowNoSoftDelete || c.opts.StartDelay != 0) {
+		return errors.New("--delete-types, --accept-mounts-without-keepalive, --no-backup-check, --allow-no-soft-delete and --delete-start-delay apply only to delete mode")
 	}
 	var err error
 	switch {

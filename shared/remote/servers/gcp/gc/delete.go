@@ -188,7 +188,7 @@ func (d *deleter) logRefused(cycle int64) {
 // step. It returns the nodes it deleted or found without a row, which the
 // cycle must not condemn.
 func (d *deleter) run(ctx context.Context, lease *Lease, res *Result) (bitmap, error) {
-	if err := d.deleteChunks(ctx); err != nil {
+	if err := d.deleteChunks(ctx, res.Report.Cycle); err != nil {
 		return nil, err
 	}
 	if len(d.rep.Refused) > 0 {
@@ -211,13 +211,6 @@ func (d *deleter) run(ctx context.Context, lease *Lease, res *Result) (bitmap, e
 		return nil, nil
 	}
 	return d.deleteStep(ctx, lease, res)
-}
-
-// deleteChunks is the chunk step: it deletes the chunks of the objects that
-// the records of earlier cycles name.
-func (d *deleter) deleteChunks(context.Context) error {
-	// TODO: delete the chunks of the records older than the chunk delay.
-	return nil
 }
 
 // step is one delete step.
@@ -567,9 +560,15 @@ type rowState struct {
 	content []byte
 }
 
-// readRows reads the meta, condemn marker and content descriptor of rows, in
-// reads of deleteReadBatch keys, a few at a time.
+// readRows reads the meta, condemn marker and content descriptor of rows.
 func (s *step) readRows(ctx context.Context, rows []string) (map[string]rowState, error) {
+	return readObjectRows(ctx, s.objects, s.reads, rows)
+}
+
+// readObjectRows reads the meta, condemn marker and content descriptor of rows
+// of the objects table, in reads of deleteReadBatch keys, a few at a time,
+// each attempt within the budget b.
+func readObjectRows(ctx context.Context, objects *bigtable.Table, b writeBudget, rows []string) (map[string]rowState, error) {
 	filter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.LatestNFilter(1), bigtable.InterleaveFilters(
 		bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.StripValueFilter()),
 		bigtable.ChainFilters(bigtable.FamilyFilter(ObjectsFamily), bigtable.ColumnFilter(CondemnedColumn)),
@@ -582,8 +581,8 @@ func (s *step) readRows(ctx context.Context, rows []string) (map[string]rowState
 	for lo := 0; lo < len(rows); lo += deleteReadBatch {
 		chunk := rows[lo:min(lo+deleteReadBatch, len(rows))]
 		eg.Go(func() error {
-			return retryWith(ctx, firstRetryWait, s.reads, func(actx context.Context) error {
-				return s.objects.ReadRows(actx, bigtable.RowList(chunk), func(row bigtable.Row) bool {
+			return retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
+				return objects.ReadRows(actx, bigtable.RowList(chunk), func(row bigtable.Row) bool {
 					var st rowState
 					st.present = len(row[objectsMetaFamily]) > 0
 					for _, item := range row[ObjectsFamily] {

@@ -91,6 +91,7 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--dry-run", "--accept-mounts-without-keepalive"}, "apply only to delete mode"},
 		{[]string{"--dry-run", "--delete-types=commit"}, "apply only to delete mode"},
 		{[]string{"--condemn", "--min-replicas=2", "--delete-start-delay=5m"}, "apply only to delete mode"},
+		{[]string{"--condemn", "--min-replicas=2", "--allow-no-soft-delete"}, "apply only to delete mode"},
 		// Delete mode implies the condemn and takes its checks.
 		{[]string{"--delete"}, "invalid expected replicas 0"},
 		{[]string{"--delete", "--condemn", "--min-replicas=2"}, "pass one of --dry-run, --condemn and --delete"},
@@ -101,6 +102,8 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--delete", "--min-replicas=2", "--chunk-delay=10m"}, "not longer than the 10m0s lifetime of the signed URLs"},
 		{[]string{"--delete", "--min-replicas=2", "--delete-workers=0"}, "invalid number of delete workers 0"},
 		{[]string{"--delete", "--min-replicas=2", "--delete-rate=-1"}, "invalid delete rate"},
+		{[]string{"--delete", "--min-replicas=2", "--chunk-rate=-1"}, "invalid chunk delete rate"},
+		{[]string{"--delete", "--min-replicas=2", "--chunk-rate=0", "--allow-no-soft-delete"}, ""},
 		{[]string{"--delete", "--expected-replicas=3", "--consistency=false"}, "needs the consistency check"},
 	}
 	for _, tt := range tests {
@@ -125,6 +128,8 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 	require.Equal(t, float64(2000), c.opts.DeleteRate)
 	require.Equal(t, 32, c.opts.DeleteWorkers)
 	require.Equal(t, time.Hour, c.opts.ChunkDelay)
+	require.Equal(t, float64(500), c.opts.ChunkRate)
+	require.False(t, c.opts.AllowNoSoftDelete)
 	require.Zero(t, c.opts.StartDelay)
 }
 
