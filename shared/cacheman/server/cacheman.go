@@ -424,6 +424,7 @@ func (c *CacheMan) setupDAGSync(ctx context.Context, config *instance.Config, fo
 		PeekOffline:      peekOffline,
 		Logger:           log.New(&printerLogWriter{c: c}, "", 0),
 	})
+	c.localWrites.useSync(sync, config.OfflineThreshold)
 
 	syncCtx, syncCancel := context.WithCancel(ctx)
 	c.cancelSync = syncCancel
@@ -2560,7 +2561,7 @@ func (c *CacheMan) Phony(priority dagsync.RequestPriority, objects []entities.Ha
 	}
 
 	if sync := c.getSync(); sync != nil && !c.noRemotePush() { // calling this function with localOnly=true doesn't make much sense, but we check just in case
-		go sync.Phony(priority, misses, c.confirmAfterPhony(misses, callback))
+		go sync.Phony(priority, misses, c.confirmAfterPhony(sync, misses, callback))
 	} else {
 		callback(nil)
 	}

@@ -61,6 +61,11 @@ type localWriteCheck struct {
 	queue  map[entities.Hash]EntryType
 	full   chan struct{}
 
+	// phonySync is the dagsync whose phony callbacks report an answer of the server. A
+	// dagsync with an offline threshold skips requests and then calls back without an
+	// error and without a server call, so phony requests sent to it confirm nothing.
+	phonySync atomic.Pointer[dagsync.DAGSync]
+
 	sent            atomic.Int64
 	present         atomic.Int64
 	missing         atomic.Int64
@@ -454,11 +459,19 @@ func (c *CacheMan) reindexLocalWrite(hash entities.Hash, entry *IndexEntry) bool
 	return true
 }
 
-// confirmAfterPhony wraps the callback of a phony request: on success every hash it sent is
-// on the server, so entries waiting for a check are confirmed.
-func (c *CacheMan) confirmAfterPhony(hashes []entities.Hash, callback dagsync.Callback) dagsync.Callback {
+// useSync records the dagsync that setupDAGSync created for offlineThreshold.
+func (lw *localWriteCheck) useSync(sync *dagsync.DAGSync, offlineThreshold uint64) {
+	if offlineThreshold > 0 {
+		sync = nil
+	}
+	lw.phonySync.Store(sync)
+}
+
+// confirmAfterPhony wraps the callback of a phony request sent to sync: on success every hash
+// it sent is on the server, so entries waiting for a check are confirmed.
+func (c *CacheMan) confirmAfterPhony(sync *dagsync.DAGSync, hashes []entities.Hash, callback dagsync.Callback) dagsync.Callback {
 	idx, ok := c.checkedIndex()
-	if !ok {
+	if !ok || c.localWrites.phonySync.Load() != sync {
 		return callback
 	}
 	return func(err error) {

@@ -604,6 +604,36 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		require.True(t, inLRU(t, c, h))
 		require.Equal(t, int64(1), c.Stats().RemoteChecks.PhonyConfirmed)
 	})
+
+	// With an offline threshold, dagsync skips a phony request whose link it skipped, and
+	// every later one, and calls back without an error and without asking the server.
+	t.Run("phony with an offline threshold", func(t *testing.T) {
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, period: time.Hour, offlineThreshold: 4})
+		c.startLocalWriteCheck(ctx)
+		large := fetchedBlob(t, c, "larger than the offline threshold")
+		small := fetchedBlob(t, c, "abc")
+		c.NewObject(large, protocol.TypeBlob)
+		c.NewObject(small, protocol.TypeBlob)
+
+		for _, h := range []entities.Hash{large, small} {
+			done := make(chan struct{})
+			var once sync.Once
+			c.Phony(0, []entities.Hash{h}, func(err error) {
+				if err == nil {
+					once.Do(func() { close(done) })
+				}
+			})
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("no successful callback for the phony request of %s", h)
+			}
+			require.False(t, r.has(t, h))
+			requireUnconfirmed(t, c, h)
+		}
+		require.Zero(t, c.Stats().RemoteChecks.PhonyConfirmed)
+	})
 }
 
 func TestCacheman_RemoteHeadersFixesFlags(t *testing.T) {
