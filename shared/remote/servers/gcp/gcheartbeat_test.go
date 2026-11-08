@@ -39,7 +39,10 @@ type statsToucher struct {
 	mu      sync.Mutex
 	stats   gc.TouchStats
 	onStats func()
+	late    atomic.Bool
 }
+
+func (f *statsToucher) Late() bool { return f.late.Load() }
 
 func (f *statsToucher) Stats() gc.TouchStats {
 	if f.onStats != nil {
@@ -149,6 +152,50 @@ func TestGCHooks_HeartbeatRecordsLostTouches(t *testing.T) {
 	r = readServer(t, s)
 	require.Equal(r.LastSeen, r.TouchLossTime)
 	require.True(r.TouchLossTime.After(first))
+}
+
+// A heartbeat records a loss while the toucher holds touches that it will
+// count as failed once it writes them, as after a freeze of the process.
+func TestGCHooks_HeartbeatRecordsLateTouches(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, st := newHeartbeatServer(t, time.Hour)
+	require.NoError(s.heartbeat(ctx))
+	require.Zero(readServer(t, s).TouchLossTime)
+	st.late.Store(true)
+	require.NoError(s.heartbeat(ctx))
+	r := readServer(t, s)
+	require.Equal(r.LastSeen, r.TouchLossTime)
+}
+
+// A heartbeat attempt that starts more than the interval plus the touch
+// drain bound after the last one records a loss: the process was frozen with
+// its monotonic clock running, and touches of that time may land late.
+func TestGCHooks_HeartbeatRecordsAGap(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	now := uint32(1000)
+	setCacheNow(t, &now)
+	s, _ := newHeartbeatServer(t, time.Hour)
+	bound := uint32((time.Hour + gc.TouchDrainBound) / time.Second)
+	now += bound
+	require.NoError(s.heartbeat(ctx))
+	require.Zero(readServer(t, s).TouchLossTime)
+
+	// A failed attempt counts as an attempt, and the gap stays recorded
+	// until a heartbeat is written.
+	orig := writeServer
+	t.Cleanup(func() { writeServer = orig })
+	writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool) error {
+		return status.Error(codes.Unavailable, "injected")
+	}
+	now += bound + 1
+	require.Error(s.heartbeat(ctx))
+	writeServer = orig
+	now++
+	require.NoError(s.heartbeat(ctx))
+	r := readServer(t, s)
+	require.Equal(r.LastSeen, r.TouchLossTime)
 }
 
 // A server that stops keeps its row and records the stop, and the touches it

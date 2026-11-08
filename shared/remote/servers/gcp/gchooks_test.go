@@ -439,6 +439,8 @@ func (f *fakeToucher) TouchMapRow(row string) bool {
 
 func (f *fakeToucher) Stats() gc.TouchStats { return gc.TouchStats{} }
 
+func (f *fakeToucher) Late() bool { return false }
+
 func (f *fakeToucher) Close() {}
 
 // Headers and MapResults, the calls of the client keep-alive and of builds,

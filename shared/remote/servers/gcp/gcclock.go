@@ -20,6 +20,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
 // maxPause is the largest gap between the growth of the wall clock and of the
@@ -105,6 +107,17 @@ func (p *pauseDetector) check(lead time.Duration) bool {
 	paused := p.started && lead-p.lead > maxPause
 	p.started, p.lead = true, lead
 	return paused
+}
+
+// heartbeatLate records start, the start of a heartbeat attempt, and reports
+// whether the last attempt started more than the heartbeat interval plus the
+// touch drain bound before it. The process was then frozen or starved for
+// longer than the drain bound, with the monotonic clock running, and touches
+// may land later than the collector allows.
+func (g *gcHooks) heartbeatLate(start uint32) bool {
+	last := g.lastAttempt
+	g.lastAttempt = start
+	return last != 0 && start > last && time.Duration(start-last)*time.Second > g.server.HeartbeatInterval+gc.TouchDrainBound
 }
 
 // checkReadAge fails with Unavailable when a read that started at start on

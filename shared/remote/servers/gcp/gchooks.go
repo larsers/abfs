@@ -90,6 +90,7 @@ type toucher interface {
 	TryTouchObject(key gc.Hash) bool
 	TouchMapRow(row string) bool
 	Stats() gc.TouchStats
+	Late() bool
 	Close()
 }
 
@@ -120,6 +121,9 @@ type gcHooks struct {
 	// heartbeat records as a touch loss.
 	pause        pauseDetector
 	pausePending bool
+	// lastAttempt is the start of the last heartbeat attempt on the cacheNow
+	// clock.
+	lastAttempt uint32
 	metrics      metric.Registration
 	rescueLog    *rescueLog
 	stopped      bool
@@ -277,6 +281,12 @@ func (g *gcHooks) losses() int64 {
 	}
 	st := g.toucher.Stats()
 	return st.Dropped + st.Failed
+}
+
+// touchesLate reports whether the toucher holds touches it will count as
+// failed once it writes them.
+func (g *gcHooks) touchesLate() bool {
+	return g.toucher != nil && g.toucher.Late()
 }
 
 // checkHeartbeat fails with Unavailable once the last successful heartbeat
@@ -628,6 +638,7 @@ func (s *GCPServer) chunkMissing(ctx context.Context, key entities.Hash, content
 func (s *GCPServer) startHeartbeat(interval time.Duration) error {
 	g := &s.gcHooks
 	log.Printf("GC server ID %s, heartbeat every %s", g.server.ID, interval)
+	g.lastAttempt = 0
 	first, cancelFirst := context.WithTimeout(context.Background(), firstHeartbeatTimeout)
 	defer cancelFirst()
 	for {
@@ -670,6 +681,10 @@ func (s *GCPServer) startHeartbeat(interval time.Duration) error {
 func (s *GCPServer) heartbeat(ctx context.Context) error {
 	g := &s.gcHooks
 	start := cacheNow()
+	if g.heartbeatLate(start) {
+		log.Printf("Warning: no GC heartbeat attempt for over the heartbeat interval plus %s; recording the gap as a touch loss", gc.TouchDrainBound)
+		g.pausePending = true
+	}
 	hctx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
 	defer cancel()
 	sp := s.casdb.SpannerClient()
@@ -680,7 +695,7 @@ func (s *GCPServer) heartbeat(ctx context.Context) error {
 			g.pausePending = true
 		}
 		losses := g.losses()
-		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || losses > g.reportedLosses); err == nil {
+		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || losses > g.reportedLosses || g.touchesLate()); err == nil {
 			g.reportedLosses = losses
 			g.pausePending = false
 			g.hasRow = true
