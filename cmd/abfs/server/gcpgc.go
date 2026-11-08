@@ -529,10 +529,7 @@ func (c *gcpGCWalkCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return err
 	}
 	printWalk(res)
-	if res.Incomplete > 0 {
-		return fmt.Errorf("the walk is incomplete: %d mount details, revisions or objects could not be read or followed", res.Incomplete)
-	}
-	return nil
+	return res.Err()
 }
 
 func printWalk(res *gc.WalkResult) {

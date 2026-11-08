@@ -88,6 +88,7 @@ func TestGCWalk_FindsKeysByContent(t *testing.T) {
 		{Key: pinned, Reached: true, Type: gc.WalkPinnedManifest, MountDetails: details},
 	}, got.Keys)
 	require.Equal(int64(0), got.Incomplete, got.IncompleteSamples)
+	require.NoError(got.Err())
 	require.Equal(int64(2), got.Revisions)
 	require.Equal(int64(3), got.Trees)
 	require.Equal(int64(3), got.Entries)
@@ -118,6 +119,36 @@ func TestGCWalk_CountsWhatItCannotFollow(t *testing.T) {
 	require.Contains(got.IncompleteSamples[0], `project p1 has revision "main"`)
 	require.Contains(got.IncompleteSamples[1], "name no pinned manifest")
 	require.Contains(got.IncompleteSamples[2], fmt.Sprintf("tree %s at p0/sub of commit %s", sub, commit))
+	require.EqualError(got.Err(), "the walk is incomplete: 3 mount details, revisions or objects could not be read or followed")
+}
+
+// A mount whose workspace differs from its commit pins the workspace's tree
+// in an annotation and mounts that tree. The walk follows it too and tells
+// what it found there by type.
+func TestGCWalk_FollowsTheAnnotatedTree(t *testing.T) {
+	require := require.New(t)
+	f := newGCFixture(t)
+	committed := f.blob("committed", f.old)
+	edited := f.blob("edited in the parent workspace", f.old)
+	commit := f.commit(f.namedTree(treeEntry{"100644", "f", committed}), "pinned", f.old)
+	sub := f.namedTree(treeEntry{"100644", "f", edited})
+	wsTree := f.namedTree(treeEntry{"100644", "f", committed}, treeEntry{"40000", "sub", sub})
+	manifest := "<manifest>\n<remote name=\"origin\" fetch=\"https://example.com\"/>\n<default revision=\"main\" remote=\"origin\"/>\n" +
+		fmt.Sprintf("<project name=\"p0\" path=\"p0\" revision=\"%s\">\n<annotaion name=\"abfs.dir.hash.tag\" value=\"%s\"/>\n</project>\n", commit, wsTree) +
+		fmt.Sprintf("<project name=\"p1\" path=\"p1\" revision=\"%s\">\n<annotaion name=\"abfs.dir.hash.tag\" value=\"main\"/>\n</project>\n</manifest>\n", commit)
+	pinned := f.blob(manifest, f.old)
+	details := f.object(&binding.MountDetails{Version: binding.CurrentMountDetailsVersion, MetaRefPrefix: "user/u", PinnedManifestHash: pinned}, f.old)
+
+	got, err := f.s.WalkGC(context.Background(), &gc.WalkOpts{MountDetails: []entities.Hash{details}, Keys: []entities.Hash{committed, edited, wsTree}, Workers: 1})
+	require.NoError(err)
+	require.Equal([]gc.WalkKey{
+		{Key: committed, Reached: true, Type: gc.WalkBlob, MountDetails: details, Commit: commit, Path: "p0/f"},
+		{Key: edited, Reached: true, Type: gc.WalkDirHash + gc.WalkBlob, MountDetails: details, Commit: commit, Path: "p0/sub/f"},
+		{Key: wsTree, Reached: true, Type: gc.WalkDirHash + gc.WalkTree, MountDetails: details, Commit: commit, Path: "p0"},
+	}, got.Keys)
+	require.Equal(int64(2), got.Revisions)
+	require.Equal(int64(1), got.Incomplete, got.IncompleteSamples)
+	require.Contains(got.IncompleteSamples[0], `project p1 has abfs.dir.hash.tag "main", which is not a hash`)
 }
 
 // The walk refuses a server whose reads rescue or touch, which would keep

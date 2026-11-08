@@ -40,6 +40,13 @@ const (
 	WalkTree           = "tree"
 	WalkBlob           = "blob"
 	WalkSubmodule      = "submodule"
+	// WalkDirHash prefixes the type of what the walk found below the tree a
+	// pinned manifest names for a project in place of its commit's tree.
+	WalkDirHash = "dir-hash-"
+	// dirHashAnnotation is repo.ABFSDirHashTag: a pinned manifest of a mount
+	// whose workspace differs from its commit names the workspace's tree in
+	// this project annotation, and the mount uses that tree.
+	dirHashAnnotation = "abfs.dir.hash.tag"
 )
 
 // WalkOpts are the options of Walk.
@@ -88,10 +95,12 @@ type WalkResult struct {
 	IncompleteSamples []string
 }
 
-// walkRevision is a project revision of a pinned manifest.
+// walkRevision is a project revision of a pinned manifest, or the tree its
+// annotation names in place of the commit's tree.
 type walkRevision struct {
 	details, commit Hash
 	path            string
+	dirHash         Hash
 }
 
 // walkHit is the first path of a revision's walk to a key.
@@ -161,6 +170,15 @@ func Walk(ctx context.Context, objs remote.RemoteProvider, o *WalkOpts) (*WalkRe
 	return w.res, nil
 }
 
+// Err fails when the walk is incomplete: a key it did not reach may then be in
+// the closure.
+func (r *WalkResult) Err() error {
+	if r.Incomplete > 0 {
+		return fmt.Errorf("the walk is incomplete: %d mount details, revisions or objects could not be read or followed", r.Incomplete)
+	}
+	return nil
+}
+
 func (w *walker) incomplete(s string) {
 	w.res.Incomplete++
 	if len(w.res.IncompleteSamples) < maxSamples {
@@ -190,6 +208,7 @@ func (w *walker) pinnedRevisions(ctx context.Context, mounts []Hash) ([]walkRevi
 	seenDetails := make(map[Hash]bool, len(mounts))
 	seenManifests := make(map[Hash]bool)
 	seenRevs := make(map[Hash]bool)
+	seenDirHashes := make(map[Hash]bool)
 	for _, h := range mounts {
 		if seenDetails[h] {
 			continue
@@ -242,6 +261,17 @@ func (w *walker) pinnedRevisions(ctx context.Context, mounts []Hash) ([]walkRevi
 				seenRevs[rev] = true
 				revs = append(revs, walkRevision{details: h, commit: rev, path: p.path})
 			}
+			if p.dirHash == "" {
+				continue
+			}
+			if !entities.IsHash(p.dirHash) {
+				w.incomplete(fmt.Sprintf("pinned manifest %s: project %s has %s %q, which is not a hash", pinned, p.path, dirHashAnnotation, p.dirHash))
+				continue
+			}
+			if dh := entities.NewHash(p.dirHash); !seenDirHashes[dh] {
+				seenDirHashes[dh] = true
+				revs = append(revs, walkRevision{details: h, commit: rev, path: p.path, dirHash: dh})
+			}
 		}
 	}
 	w.res.Revisions = int64(len(revs))
@@ -249,7 +279,7 @@ func (w *walker) pinnedRevisions(ctx context.Context, mounts []Hash) ([]walkRevi
 }
 
 type manifestProject struct {
-	path, revision string
+	path, revision, dirHash string
 }
 
 // manifestProjects returns the projects of a manifest with their revisions,
@@ -265,7 +295,14 @@ func manifestProjects(ctx context.Context, objs remote.RemoteProvider, h Hash) (
 	}
 	var projects []manifestProject
 	for _, p := range m.Project {
-		projects = append(projects, manifestProject{path: p.GetPath(), revision: m.ProjectRevision(p)})
+		mp := manifestProject{path: p.GetPath(), revision: m.ProjectRevision(p)}
+		for _, a := range p.Annotation {
+			if a.Name == dirHashAnnotation {
+				mp.dirHash = a.Value
+				break
+			}
+		}
+		projects = append(projects, mp)
 	}
 	for _, p := range m.ExtendProject {
 		if p.Revision != "" {
@@ -283,6 +320,9 @@ func manifestProjects(ctx context.Context, objs remote.RemoteProvider, h Hash) (
 }
 
 func (rw *revisionWalk) hit(w *walker, key Hash, typ, path string) {
+	if !rw.rev.dirHash.IsZero() {
+		typ = WalkDirHash + typ
+	}
 	if i, ok := w.want[key]; ok {
 		if _, found := rw.hits[i]; !found {
 			rw.hits[i] = walkHit{typ: typ, path: path}
@@ -302,6 +342,9 @@ func (rw *revisionWalk) failed(ctx context.Context, what string, h Hash, path st
 
 func (w *walker) walkCommit(ctx context.Context, rw *revisionWalk) error {
 	rev := rw.rev
+	if !rev.dirHash.IsZero() {
+		return w.walkTree(ctx, rw, rev.dirHash, rev.path, make(map[Hash]bool))
+	}
 	rw.hit(w, rev.commit, WalkCommit, rev.path)
 	_, obj, err := remote.DecodeObject(ctx, w.objs, rev.commit)
 	if err != nil {
