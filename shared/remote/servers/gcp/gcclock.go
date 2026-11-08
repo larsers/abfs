@@ -35,19 +35,38 @@ const maxPause = 10 * time.Second
 // stops in a suspend on some systems, the wall clock does not. A backward step
 // of the wall clock neither moves the count back nor stops it, and a forward
 // step that is undone later leaves the count ahead, which only makes cache
-// entries expire early.
+// entries expire early. Where the system has a boot clock, which counts
+// suspends and is never stepped, the wall clock counts as at least the boot
+// clock, so a suspend shows even when a step of the wall clock undid it
+// before any read.
 type stopFreeClock struct {
 	epoch time.Time
+	// boot is the boot clock at the epoch, when hasBoot.
+	boot    time.Duration
+	hasBoot bool
 	// lead is the largest lead of the wall clock over the monotonic clock,
 	// in nanoseconds.
 	lead atomic.Int64
 	last atomic.Uint32
 }
 
-// elapsed returns the monotonic and the wall-clock time since the epoch.
+func newStopFreeClock() *stopFreeClock {
+	c := &stopFreeClock{epoch: time.Now()}
+	c.boot, c.hasBoot = bootClock()
+	return c
+}
+
+// elapsed returns the monotonic and the wall-clock time since the epoch, the
+// latter at least the boot clock time since the epoch.
 func (c *stopFreeClock) elapsed() (mono, wall time.Duration) {
 	now := time.Now()
-	return now.Sub(c.epoch), now.Round(0).Sub(c.epoch.Round(0))
+	mono, wall = now.Sub(c.epoch), now.Round(0).Sub(c.epoch.Round(0))
+	if c.hasBoot {
+		if boot, ok := bootClock(); ok {
+			wall = max(wall, boot-c.boot)
+		}
+	}
+	return mono, wall
 }
 
 // maxLead records the lead of wall over mono and returns the largest lead
@@ -81,7 +100,7 @@ func (c *stopFreeClock) seconds(mono, wall time.Duration) uint32 {
 // heartbeat its pause check. Tests replace cacheClock, cacheNow and
 // clockElapsed.
 var (
-	cacheClock   = &stopFreeClock{epoch: time.Now()}
+	cacheClock   = newStopFreeClock()
 	clockElapsed = cacheClock.elapsed
 	cacheNow     = func() uint32 { return cacheClock.seconds(clockElapsed()) }
 )

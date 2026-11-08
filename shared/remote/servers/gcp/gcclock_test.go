@@ -60,6 +60,26 @@ func TestStopFreeClock(t *testing.T) {
 	require.Equal(uint32(10791), cacheNow())
 }
 
+// A suspend shows on the boot clock even when the wall clock was stepped back
+// by as much before any read, so the pause is recorded and entries expire.
+func TestStopFreeClock_BootClock(t *testing.T) {
+	require := require.New(t)
+	var boot atomic.Int64
+	orig := bootClock
+	bootClock = func() (time.Duration, bool) { return time.Duration(boot.Load()), true }
+	t.Cleanup(func() { bootClock = orig })
+	c := newStopFreeClock()
+	var p pauseDetector
+	require.False(p.check(c.maxLead(c.elapsed())))
+	loaded := c.seconds(c.elapsed())
+
+	// An hour of suspend: the boot clock advanced, the monotonic clock did not,
+	// and the wall clock was stepped back to where it was.
+	boot.Add(int64(time.Hour))
+	require.True(p.check(c.maxLead(c.elapsed())))
+	require.GreaterOrEqual(c.seconds(c.elapsed())-loaded, uint32(3600))
+}
+
 // readClock is a cacheNow clock that a Bigtable read of the in-process
 // server advances by delay seconds while armed.
 type readClock struct {
