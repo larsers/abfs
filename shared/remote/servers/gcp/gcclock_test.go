@@ -16,18 +16,21 @@ package gcp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/spanner"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
 // A cache entry expires when the wall clock jumps ahead of the monotonic
@@ -182,5 +185,27 @@ func TestGCHooks_HeartbeatRecordsPause(t *testing.T) {
 		r := readServer(t, s)
 		require.Equal(r.LastSeen, r.TouchLossTime)
 	})
-}
 
+	// A pause after the last heartbeat, or one that a failed heartbeat saw, is
+	// recorded by a clean stop.
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stop after a pause, heartbeat failed %v", failed), func(t *testing.T) {
+			require := require.New(t)
+			s := newServer(t)
+			advance(time.Minute, time.Hour)
+			if failed {
+				orig := writeServer
+				t.Cleanup(func() { writeServer = orig })
+				writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool) error {
+					return status.Error(codes.Unavailable, "injected")
+				}
+				require.Error(s.heartbeat(ctx))
+				writeServer = orig
+			}
+			s.stopGCHooks()
+			r := readServer(t, s)
+			require.NotZero(r.StoppedAt)
+			require.Equal(r.StoppedAt, r.TouchLossTime)
+		})
+	}
+}

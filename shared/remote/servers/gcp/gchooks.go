@@ -220,8 +220,9 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 
 // stopGCHooks stops the heartbeat, writes the buffered touches and records in
 // the heartbeat row of this server that it stopped, and whether it lost
-// touches since its last heartbeat. The row stays: a row without the stop
-// tells the collector that the process crashed and its touches may be lost.
+// touches or was paused since its last heartbeat. The row stays: a row
+// without the stop tells the collector that the process crashed and its
+// touches may be lost.
 func (s *GCPServer) stopGCHooks() {
 	g := &s.gcHooks
 	if g.stopped {
@@ -252,7 +253,12 @@ func (s *GCPServer) stopGCHooks() {
 		return
 	}
 	g.hasRow = false
-	lost := g.losses() > g.reportedLosses
+	// A pause after the last heartbeat, or one whose heartbeat failed, is
+	// recorded by the stop.
+	if g.pausedSince() {
+		g.pausePending = true
+	}
+	lost := g.pausePending || g.losses() > g.reportedLosses
 	if lost {
 		log.Printf("Warning: recorded lost touches in the GC heartbeat row %s", g.server.ID)
 	}
