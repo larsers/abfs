@@ -139,6 +139,7 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 func TestGCPGCFlags_ClientMetrics(t *testing.T) {
 	run := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
 	backfill := &gcpGCBackfillCmd{RootCmd: root.NewRootCommand()}
+	undo := &gcpGCUndoCmd{RootCmd: root.NewRootCommand()}
 	server := NewStandaloneGCPServerCmd(root.NewRootCommand())
 	for _, tt := range []struct {
 		register func(*pflag.FlagSet)
@@ -147,11 +148,45 @@ func TestGCPGCFlags_ClientMetrics(t *testing.T) {
 	}{
 		{run.RegisterFlags, &run.server.ClientMetrics, true},
 		{backfill.RegisterFlags, &backfill.server.ClientMetrics, true},
+		{undo.RegisterFlags, &undo.server.ClientMetrics, true},
 		{server.RegisterFlags, &server.gcpCmd.clientMetrics, false},
 	} {
 		fl := pflag.NewFlagSet("gc", pflag.ContinueOnError)
 		tt.register(fl)
 		require.NoError(t, fl.Parse(nil))
 		require.Equal(t, tt.want, *tt.got)
+	}
+}
+
+// gc undo needs the first cycle and the suffix of the restored tables, takes
+// a range of cycles in order, and bounds its write attempts by the lease as
+// gc run does.
+func TestGCPGCUndoFlags(t *testing.T) {
+	tests := []struct {
+		args    []string
+		wantErr string
+	}{
+		{nil, "pass --cycle and --from-suffix"},
+		{[]string{"--cycle=2"}, "pass --cycle and --from-suffix"},
+		{[]string{"--from-suffix=-r"}, "pass --cycle and --from-suffix"},
+		{[]string{"--cycle=2", "--from-suffix=-r"}, ""},
+		{[]string{"--cycle=2", "--through=4", "--from-suffix=-r"}, ""},
+		{[]string{"--cycle=3", "--through=2", "--from-suffix=-r"}, "the last cycle to undo, 2, is before the first, 3"},
+		{[]string{"--cycle=-1", "--from-suffix=-r"}, "invalid cycle -1"},
+		{[]string{"--cycle=2", "--from-suffix=a/b"}, `invalid suffix "a/b"`},
+		{[]string{"--cycle=2", "--from-suffix=-r", "--workers=0"}, "invalid number of workers 0"},
+		{[]string{"--cycle=2", "--from-suffix=-r", "--write-deadline=40s"}, "write deadline 40s is too long for the lease 5m0s"},
+	}
+	for _, tt := range tests {
+		c := &gcpGCUndoCmd{RootCmd: root.NewRootCommand()}
+		fl := pflag.NewFlagSet("undo", pflag.ContinueOnError)
+		c.RegisterFlags(fl)
+		require.NoError(t, fl.Parse(tt.args))
+		err := c.checkOpts()
+		if tt.wantErr != "" {
+			require.ErrorContains(t, err, tt.wantErr, tt.args)
+			continue
+		}
+		require.NoError(t, err, tt.args)
 	}
 }

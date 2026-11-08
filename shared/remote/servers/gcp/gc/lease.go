@@ -34,6 +34,7 @@ const (
 	PhaseDryRun          = "dry-run"
 	PhaseCondemn         = "condemn"
 	PhaseDelete          = "delete"
+	PhaseUndo            = "undo"
 	minLeaseDuration     = 3 * time.Second
 	releaseTimeout       = 10 * time.Second
 )

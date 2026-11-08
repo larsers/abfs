@@ -55,6 +55,7 @@ func (c *gcpGCCmd) Spec() cmd.CmdSpec {
 		Subcommands: []cmd.ABFSCmd{
 			&gcpGCBackfillCmd{RootCmd: c.RootCmd},
 			&gcpGCRunCmd{RootCmd: c.RootCmd},
+			&gcpGCUndoCmd{RootCmd: c.RootCmd},
 			&gcpGCWalkCmd{RootCmd: c.RootCmd},
 		},
 	}
@@ -321,6 +322,106 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		}
 	}
 	return err
+}
+
+type gcpGCUndoCmd struct {
+	*root.RootCmd
+	server gcp.NewServerOpts
+	opts   gc.UndoOpts
+}
+
+func (c *gcpGCUndoCmd) Spec() cmd.CmdSpec {
+	return cmd.CmdSpec{
+		Name:  "undo",
+		Usage: "--cycle <n> [--through <m>] --from-suffix <suffix> --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
+		Desc: `Write back the objects and map rows that the delete cycles n to m deleted, from the
+tables objects, gc, maps and chunks restored as <table><suffix> from backups taken before
+cycle n, and the delete records of those cycles in the bucket. Restores the newest cycle
+first and the children of an object before it. For each object whose row is absent: its
+chunks in the bucket must exist and get the metadata abfs-undo, its chunk rows and its gc
+row are written again with a touch, so that it is recent for the grace, and its objects
+row comes last, without the condemn marker. Map rows come back with a new time. Objects
+and map rows that are present stay as they are. An object whose chunks are gone from the
+bucket is not restored, nor is anything that links it: the command prints the chunk
+names; restore them from soft delete and run the command again. Takes the GC lease, in
+the phase undo, and waits before its first write until a collector that lost the lease
+has stopped writing. Fails when something was not restored.`,
+	}
+}
+
+func (c *gcpGCUndoCmd) RegisterFlags(fl *pflag.FlagSet) {
+	c.opts = gc.DefaultUndoOpts()
+	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
+	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
+	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
+	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
+	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
+	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", true, clientMetricsUsage)
+	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	fl.Int64Var(&c.opts.Cycle, "cycle", 0, "The first delete cycle whose deletes are undone (required)")
+	fl.Int64Var(&c.opts.Through, "through", 0, "The last delete cycle whose deletes are undone (default: --cycle)")
+	fl.StringVar(&c.opts.FromSuffix, "from-suffix", "", "The suffix of the names of the restored tables, as -r for objects-r, gc-r, maps-r and chunks-r (required)")
+	fl.IntVar(&c.opts.Workers, "workers", gc.DefaultUndoWorkers, "The number of objects of one delete record restored in parallel")
+	fl.DurationVar(&c.opts.LeaseDuration, "lease", gc.DefaultLeaseDuration, "The duration of the GC lease, renewed while the undo runs")
+	fl.DurationVar(&c.opts.WriteDeadline, "write-deadline", gc.DefaultWriteDeadline, "The deadline of one attempt of a write, the client library's retries included. At most an eighth of --lease")
+}
+
+func (c *gcpGCUndoCmd) checkOpts() error {
+	if c.opts.Cycle == 0 || c.opts.FromSuffix == "" {
+		return errors.New("pass --cycle and --from-suffix")
+	}
+	return c.opts.Validate()
+}
+
+func (c *gcpGCUndoCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
+	args.EnsureNoArgs(fl)
+	if err := c.checkOpts(); err != nil {
+		return err
+	}
+	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+		return err
+	}
+	c.server.GC = true
+	c.server.GCReadOnly = true
+	checkAppProfile(ctx, &c.server)
+	server, err := gcp.New(ctx, &c.server)
+	if err != nil {
+		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Printf("Warning: error closing ABFS server: %v", err)
+		}
+	}()
+	rep, err := server.UndoGC(ctx, c.server.BucketName, &c.opts)
+	if rep != nil {
+		printUndo(rep, c.server.BucketName)
+	}
+	if err != nil {
+		return err
+	}
+	if n := rep.NotRestored(); n > 0 {
+		return fmt.Errorf("%d objects and map rows were not restored", n)
+	}
+	return nil
+}
+
+func printUndo(rep *gc.UndoReport, bucket string) {
+	if len(rep.MissingBucketObjects) > 0 {
+		fmt.Printf("Waiting for %d bucket chunks of %d objects; restore them from soft delete and run gc undo again:\n", len(rep.MissingBucketObjects), rep.WaitingForBucketObjects)
+		for _, name := range rep.MissingBucketObjects {
+			fmt.Printf("  gs://%s/%s\n", bucket, name)
+		}
+	}
+	fmt.Printf("Read %d delete records of cycles %d to %d after a wait of %.0f s.\n", rep.Records, rep.FirstCycle, rep.LastCycle, rep.FenceWaitSeconds)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "\tRESTORED\tPRESENT\tMISSING FROM BACKUP\tWAITING FOR CHUNKS\tINVALID\tBLOCKED")
+	fmt.Fprintf(w, "objects\t%d\t%d\t%d\t%d\t%d\t%d\n", rep.Restored, rep.Present, rep.MissingFromBackup, rep.WaitingForBucketObjects, rep.InvalidContent, rep.BlockedByChild)
+	fmt.Fprintf(w, "map rows\t%d\t%d\t%d\t-\t-\t%d\n", rep.MapRowsRestored, rep.MapRowsPresent, rep.MapRowsMissing, rep.MapRowsBlocked)
+	_ = w.Flush()
+	for _, s := range rep.NotRestoredSample {
+		fmt.Printf("  not restored: %s\n", s)
+	}
 }
 
 type gcpGCWalkCmd struct {
