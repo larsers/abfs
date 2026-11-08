@@ -335,12 +335,8 @@ func pollServerStats(ctx context.Context, read func(ctx context.Context) (*serve
 				continue
 			}
 			waiting = true
-			interval := s.HeartbeatInterval
-			if interval <= 0 {
-				interval = MaxHeartbeatInterval
-			}
-			if time.Since(start) > interval+statsWaitMargin {
-				late = append(late, fmt.Sprintf("server %s wrote no heartbeat with touch stats read after the snapshot within %s", s.ID, interval+statsWaitMargin))
+			if wait := statsWait(&s); time.Since(start) > wait {
+				late = append(late, fmt.Sprintf("server %s wrote no heartbeat with touch stats read after the snapshot within %s", s.ID, wait))
 			}
 		}
 		if len(late) > 0 || !waiting {
@@ -352,6 +348,19 @@ func pollServerStats(ctx context.Context, read func(ctx context.Context) (*serve
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// statsWait returns how long the collector waits for a heartbeat of s with
+// touch stats read after the snapshot: its heartbeat interval, at most the
+// largest one a server may run with, plus statsWaitMargin. A row written by
+// hand or by another build may hold a longer interval, and the collector
+// holds the lease while it waits.
+func statsWait(s *Server) time.Duration {
+	interval := s.HeartbeatInterval
+	if interval <= 0 || interval > MaxHeartbeatInterval {
+		interval = MaxHeartbeatInterval
+	}
+	return interval + statsWaitMargin
 }
 
 // TooNewReport reports the objects that the consistency scan found without a
@@ -370,7 +379,8 @@ type TooNewReport struct {
 
 // checkTooNew reads the objects row and then the gc row of each key, so that
 // an object written in between, gc row first, is never found without one.
-func checkTooNew(ctx context.Context, bt *bigtable.Client, keys []string) (*TooNewReport, error) {
+// Each read is retried, each attempt within the budget b.
+func checkTooNew(ctx context.Context, bt *bigtable.Client, b writeBudget, keys []string) (*TooNewReport, error) {
 	rep := &TooNewReport{Keys: int64(len(keys))}
 	objects, gcTable := bt.Open(objectsTable), bt.Open(TableName)
 	objectsFilter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.LatestNFilter(1), bigtable.StripValueFilter()))
@@ -385,11 +395,14 @@ func checkTooNew(ctx context.Context, bt *bigtable.Client, keys []string) (*TooN
 	}
 	for lo := 0; lo < len(hashes); lo += tooNewBatch {
 		batch := hashes[lo:min(lo+tooNewBatch, len(hashes))]
-		present := make(map[string]bool, len(batch))
-		err := objects.ReadRows(ctx, bigtable.RowList(batch), func(row bigtable.Row) bool {
-			present[row.Key()] = len(row[objectsMetaFamily]) > 0
-			return true
-		}, objectsFilter)
+		var present map[string]bool
+		err := retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
+			present = make(map[string]bool, len(batch))
+			return objects.ReadRows(actx, bigtable.RowList(batch), func(row bigtable.Row) bool {
+				present[row.Key()] = len(row[objectsMetaFamily]) > 0
+				return true
+			}, objectsFilter)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to read the objects written during the scan: %w", err)
 		}
@@ -404,11 +417,14 @@ func checkTooNew(ctx context.Context, bt *bigtable.Client, keys []string) (*TooN
 		if len(still) == 0 {
 			continue
 		}
-		linked := make(map[string]bool, len(still))
-		err = gcTable.ReadRows(ctx, bigtable.RowList(still), func(row bigtable.Row) bool {
-			linked[row.Key()] = true
-			return true
-		}, gcFilter)
+		var linked map[string]bool
+		err = retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
+			linked = make(map[string]bool, len(still))
+			return gcTable.ReadRows(actx, bigtable.RowList(still), func(row bigtable.Row) bool {
+				linked[row.Key()] = true
+				return true
+			}, gcFilter)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to read the gc rows of the objects written during the scan: %w", err)
 		}

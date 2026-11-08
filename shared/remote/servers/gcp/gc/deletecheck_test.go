@@ -17,11 +17,14 @@ package gc
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/bigtable"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -506,12 +509,41 @@ func TestPollServerStats(t *testing.T) {
 	require.Empty(t, reasons)
 }
 
+// The collector waits for a server's heartbeat at most the largest heartbeat
+// interval a server may run with, whatever interval its row holds.
+func TestStatsWait(t *testing.T) {
+	for _, tt := range []struct {
+		interval, want time.Duration
+	}{
+		{5 * time.Minute, 5*time.Minute + statsWaitMargin},
+		{MaxHeartbeatInterval, MaxHeartbeatInterval + statsWaitMargin},
+		{time.Hour, MaxHeartbeatInterval + statsWaitMargin},
+		{0, MaxHeartbeatInterval + statsWaitMargin},
+	} {
+		require.Equal(t, tt.want, statsWait(&Server{HeartbeatInterval: tt.interval}), tt.interval)
+	}
+}
+
 // The objects written during the consistency scan are read again: one that
-// still has no gc row was written by a server without --gc.
+// still has no gc row was written by a server without --gc. A read that
+// stalls ends at the deadline of its attempt and is tried again.
 func TestCheckTooNew(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
-	client := newHooksTestBigtable(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var reads atomic.Int32
+	stall := grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		if strings.HasSuffix(method, "/ReadRows") {
+			// The first read of the objects rows and the first of the gc
+			// rows, after the retry of the first.
+			if n := reads.Add(1); n == 1 || n == 3 {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	})
+	client := newHooksTestBigtable(t, stall)
 	put := func(table, key, family, column string) {
 		mut := bigtable.NewMutation()
 		mut.Set(family, column, bigtable.Now(), []byte("x"))
@@ -533,7 +565,8 @@ func TestCheckTooNew(t *testing.T) {
 	put(TableName, keys[7].String(), TouchFamily, TouchColumn)
 	all = append(all, "abfs-setup-check")
 
-	rep, err := checkTooNew(ctx, client, all)
+	reads.Store(0)
+	rep, err := checkTooNew(ctx, client, writeBudget{deadline: 200 * time.Millisecond}, all)
 	require.NoError(err)
 	require.Equal(&TooNewReport{Keys: 251, NotHashes: 1, Gone: 50, WithoutGCRow: 2, Samples: []string{keys[7].String(), keys[201].String()}}, rep)
 }

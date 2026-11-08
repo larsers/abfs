@@ -165,7 +165,7 @@ func (d *deleter) check(ctx context.Context, lease *Lease, c *condemner, res *Re
 	}
 	ev.instance = readInstanceEvidence(ctx, d.checks, d.budget, d.opts)
 	if n := r.Consistency.TooNew; n > 0 && n <= maxTooNew {
-		ev.tooNew, ev.tooNewErr = checkTooNew(ctx, d.bt, res.tooNew)
+		ev.tooNew, ev.tooNewErr = checkTooNew(ctx, d.bt, writeBudget{deadline: d.opts.WriteDeadline}, res.tooNew)
 		if ev.tooNewErr != nil && ctx.Err() != nil {
 			return ev.tooNewErr
 		}
