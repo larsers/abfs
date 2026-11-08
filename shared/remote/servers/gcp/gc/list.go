@@ -282,9 +282,9 @@ func readList(ctx context.Context, bucket *storage.BucketHandle, name string) (_
 }
 
 // pruneLists deletes the list objects of the state beyond the newest keep
-// cycles, with their companions, and returns how many it deleted. It leaves
-// other names under the prefix alone.
-func pruneLists(ctx context.Context, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
+// cycles, with their companions, and returns how many it deleted, each delete
+// within the budget b. It leaves other names under the prefix alone.
+func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
 	prefix := listPrefix + state + "/"
 	byCycle := make(map[int64][]string)
 	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
@@ -306,11 +306,22 @@ func pruneLists(ctx context.Context, bucket *storage.BucketHandle, state string,
 	var n int64
 	for _, c := range cycles[:max(0, len(cycles)-keep)] {
 		for _, name := range byCycle[c] {
-			if err := bucket.Object(name).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+			if err := deleteObject(ctx, b, bucket.Object(name)); err != nil {
 				return n, fmt.Errorf("failed to delete the old condemned list %s: %w", name, err)
 			}
 			n++
 		}
 	}
 	return n, nil
+}
+
+// deleteObject deletes obj with the retries of the collector, each attempt
+// within the budget b, so that a listing that ran long cannot delete after
+// the lease is lost. An object already gone counts as deleted.
+func deleteObject(ctx context.Context, b writeBudget, obj *storage.ObjectHandle) error {
+	err := retryWith(ctx, firstRetryWait, b, obj.Delete)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil
+	}
+	return err
 }

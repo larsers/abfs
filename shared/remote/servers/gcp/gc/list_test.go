@@ -97,7 +97,9 @@ func TestList_WriteReadAndCreateOnce(t *testing.T) {
 }
 
 // Pruning keeps the newest cycles' lists and their companions and leaves
-// other objects alone.
+// other objects alone. It deletes nothing once the lease could expire before
+// two write deadlines and the clock skew margin have passed, as every other
+// write of the collector.
 func TestPruneLists(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -107,7 +109,17 @@ func TestPruneLists(t *testing.T) {
 		w := bucket.Object(n).NewWriter(ctx)
 		require.NoError(w.Close())
 	}
-	removed, err := pruneLists(ctx, bucket, "default", 2)
+	expiring := &Lease{}
+	expiring.expiry.Store(time.Now().Add(2*DefaultWriteDeadline + clockSkewMargin - time.Second).UnixNano())
+	removed, err := pruneLists(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: expiring}, bucket, "default", 2)
+	require.ErrorIs(err, errLeaseExpiring)
+	require.Zero(removed)
+	for _, n := range names {
+		_, err := bucket.Object(n).Attrs(ctx)
+		require.NoError(err, n)
+	}
+
+	removed, err = pruneLists(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: farLease()}, bucket, "default", 2)
 	require.NoError(err)
 	require.Equal(int64(2), removed)
 	for i, n := range names {
