@@ -157,7 +157,8 @@ func (f *gcFixture) keepAliveMount(ref string, touch time.Duration, localWriteCh
 // The pin reader counts the live mounts whose cache may lose content a
 // delete removes: no keep-alive, a cacheman without the local write check,
 // or a touch interval too long for the grace less the longest touch interval
-// of the servers that ran in the window of the cycle.
+// and the longest cache TTL of the servers that ran in the window of the
+// cycle.
 func TestDryRunGC_CountsKeepAliveMounts(t *testing.T) {
 	require := require.New(t)
 	f := newGCFixture(t)
@@ -166,20 +167,22 @@ func TestDryRunGC_CountsKeepAliveMounts(t *testing.T) {
 	noCheck := f.keepAliveMount("refs/abfs/mount/user/u/b", 18*time.Hour, false)
 	slow := f.keepAliveMount("refs/abfs/mount/user/u/c", 33*time.Hour, true)
 	none := f.keepAliveMount("refs/abfs/mount/user/u/d", 0, true)
+	ttl := f.keepAliveMount("refs/abfs/mount/user/u/e", 30*time.Hour, true)
 
 	m := f.run(nil).Report.LiveMounts
-	require.Equal(int64(4), m.Live)
+	require.Equal(int64(5), m.Live)
 	require.Equal(int64(1), m.WithoutKeepAlive)
 	require.Equal(int64(1), m.WithoutLocalWriteCheck)
 	require.Zero(m.TouchIntervalTooLong)
 	require.Equal([]gc.MountSample{{Details: none.String(), Host: "host-d", User: "u"}}, m.Samples["without_keepalive"])
 	require.Equal([]gc.MountSample{{Details: noCheck.String(), Host: "host-b", User: "u"}}, m.Samples["without_local_write_check"])
 
-	// 1.1 x 33 h is past 72 h less a stopped server's 36 h and the margin.
+	// 1.1 x 33 h is past 72 h less a stopped server's 36 h and the margin,
+	// and 1.1 x 30 h past that less the 6 h cache TTL of the servers.
 	f.serverRow("srv-1-bb", 36*time.Hour, f.now.Add(-2*time.Hour), f.now.Add(-time.Hour), time.Time{})
 	m = f.run(nil).Report.LiveMounts
-	require.Equal(int64(1), m.TouchIntervalTooLong)
-	require.Equal([]gc.MountSample{{Details: slow.String(), Host: "host-c", User: "u"}}, m.Samples["touch_interval_too_long"])
+	require.Equal(int64(2), m.TouchIntervalTooLong)
+	require.ElementsMatch([]gc.MountSample{{Details: slow.String(), Host: "host-c", User: "u"}, {Details: ttl.String(), Host: "host-e", User: "u"}}, m.Samples["touch_interval_too_long"])
 }
 
 // In a rolling upgrade the live hosts of both heartbeat tables count toward

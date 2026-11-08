@@ -150,6 +150,18 @@ func (e *serverEvidence) longestCacheTTL(start time.Time) time.Duration {
 	return d
 }
 
+// keepAliveTouchLimit returns how soon after a server answered that a mount's
+// object is present the keep-alive must touch it again, so that the object is
+// recent at the mark of every cycle until then, for a cycle whose snapshot is
+// snapshot: the grace less the longest touch interval and the longest cache
+// TTL of the processes that may have run in its window, and the clock skew
+// margin. An answer from the header cache rests on a touch made when the
+// entry was looked up, up to the TTL before the answer.
+func (e *serverEvidence) keepAliveTouchLimit(snapshot time.Time, grace time.Duration) time.Duration {
+	start := windowStart(snapshot, grace)
+	return grace - e.longestTouchInterval(start) - e.longestCacheTTL(start) - clockSkewMargin
+}
+
 // windowBlockers returns the reasons in e why a cycle whose snapshot is
 // snapshot must not delete: a process that may have run in the window and
 // crashed, lost touches, ran without link validation or with settings that

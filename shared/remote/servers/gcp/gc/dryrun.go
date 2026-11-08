@@ -448,8 +448,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
-	touchLimit := o.Grace - servers.longestTouchInterval(windowStart(snapshot, o.Grace)) - clockSkewMargin
-	revisions, mounts, workspaces, err := pinnedRevisions(ctx, d.objs, refs.mounts, refs.workspaces, touchLimit)
+	revisions, mounts, workspaces, err := pinnedRevisions(ctx, d.objs, refs.mounts, refs.workspaces, servers.keepAliveTouchLimit(snapshot, o.Grace))
 	if err != nil {
 		return nil, err
 	}

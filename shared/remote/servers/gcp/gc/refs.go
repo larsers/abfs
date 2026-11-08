@@ -207,9 +207,9 @@ type MountCounts struct {
 	WithoutLocalWriteCheck int64 `json:"without_local_write_check"`
 	// TouchIntervalTooLong counts mount details with the keep-alive whose
 	// touch interval, plus the tenth the keep-alive may be late, is not below
-	// the grace less the longest server touch interval and the clock skew
-	// margin: an object the mount touched may stop being recent before the
-	// next touch.
+	// the grace less the longest server touch interval and cache TTL and the
+	// clock skew margin: an object the mount touched may stop being recent
+	// before the next touch.
 	TouchIntervalTooLong int64 `json:"touch_interval_too_long"`
 	// PinnedManifests counts the distinct pinned manifests parsed.
 	PinnedManifests int64 `json:"pinned_manifests"`

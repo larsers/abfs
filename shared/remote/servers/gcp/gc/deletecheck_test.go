@@ -483,22 +483,26 @@ func TestPollServerStats(t *testing.T) {
 
 	// The touch interval of the live mounts is checked against the servers
 	// of this read: a server with a longer touch interval leaves a mount less
-	// time between its touches.
+	// time between its touches, and so does one with a longer cache TTL,
+	// whose answer may rest on a touch that old.
 	c.r.LiveMounts.longestTouch = 35 * time.Hour
-	touch := func(d time.Duration) func(e *serverEvidence) {
+	settings := func(touch, ttl time.Duration) func(e *serverEvidence) {
 		return func(e *serverEvidence) {
 			for i := range e.servers {
-				e.servers[i].TouchInterval = 30 * time.Hour
+				e.servers[i].TouchInterval, e.servers[i].CacheTTL = 30*time.Hour, time.Hour
 			}
-			e.servers[2].TouchInterval = d
+			e.servers[2].TouchInterval, e.servers[2].CacheTTL = touch, ttl
 		}
 	}
-	reasons, _ = poll(evidence(touch(30 * time.Hour)))
+	reasons, _ = poll(evidence(settings(30*time.Hour, time.Hour)))
 	require.Empty(t, reasons)
-	reasons, _ = poll(evidence(touch(36 * time.Hour)))
-	require.Equal(t, []string{"live mounts touch their objects every 35h0m0s, too seldom for the grace 72h0m0s less the longest touch interval of the servers that run now"}, reasons)
+	tooSeldom := []string{"live mounts touch their objects every 35h0m0s, too seldom for the grace 72h0m0s less the longest touch interval and cache TTL of the servers that run now"}
+	reasons, _ = poll(evidence(settings(36*time.Hour, time.Hour)))
+	require.Equal(t, tooSeldom, reasons)
+	reasons, _ = poll(evidence(settings(30*time.Hour, 6*time.Hour)))
+	require.Equal(t, tooSeldom, reasons)
 	c.o.Types = []string{"commit"}
-	reasons, _ = poll(evidence(touch(36 * time.Hour)))
+	reasons, _ = poll(evidence(settings(36*time.Hour, time.Hour)))
 	require.Empty(t, reasons)
 }
 

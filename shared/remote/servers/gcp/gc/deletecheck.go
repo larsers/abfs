@@ -321,9 +321,8 @@ func pollServerStats(ctx context.Context, read func(ctx context.Context) (*serve
 		}
 		reasons := slices.Concat(windowBlockers(e, r.SnapshotTime, &o.DryRunOpts), liveBlockers(e, &o.CondemnOpts))
 		if o.allowsClientWrittenTypes() && r.LiveMounts.longestTouch > 0 {
-			limit := o.Grace - e.longestTouchInterval(windowStart(r.SnapshotTime, o.Grace)) - clockSkewMargin
-			if !keepAliveTouchFits(r.LiveMounts.longestTouch, limit) {
-				reasons = append(reasons, fmt.Sprintf("live mounts touch their objects every %s, too seldom for the grace %s less the longest touch interval of the servers that run now", r.LiveMounts.longestTouch, o.Grace))
+			if !keepAliveTouchFits(r.LiveMounts.longestTouch, e.keepAliveTouchLimit(r.SnapshotTime, o.Grace)) {
+				reasons = append(reasons, fmt.Sprintf("live mounts touch their objects every %s, too seldom for the grace %s less the longest touch interval and cache TTL of the servers that run now", r.LiveMounts.longestTouch, o.Grace))
 			}
 		}
 		if len(reasons) > 0 {
