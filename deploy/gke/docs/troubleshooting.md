@@ -76,6 +76,17 @@ repo init failed: exit status 1
 
 The store has no patched `repo` tool. A new store has none until it is seeded. The bootstrap Job seeds it with `bootstrap.repoSetup.enabled`; read its log (`kubectl -n abfs logs job/abfs-bootstrap` right after the install or upgrade, later the Cloud Logging query of [runbook step 5](runbook.md#5-install-the-chart)) for the `git-repo` lines. A seed that fails on the clone needs egress from the Job's node to `gerrit.googlesource.com`. Check and seed by hand as in the [runbook](runbook.md#6-check-the-patched-repo-tool).
 
+## KCC objects created before the webhook
+
+Right after a new Config Connector install, every object of the overlay stays not Ready with errors such as `cannot resolve project`, `no value found for annotation cnrm.cloud.google.com/project-id` or `no annotation found that matches one of the required containers`, and the others report `DependencyNotReady`, although the namespace carries the project annotation. The overlay was applied before the Config Connector webhook existed, so the objects were admitted without their project. The webhook handles only creates, so applying again does not repair them. No Google Cloud resource was created. Delete the objects and apply the overlay again:
+
+```sh
+kubectl -n abfs delete gcp --all
+kubectl apply -k kcc/overlays/<name>
+```
+
+Wait for the webhook before the first apply ([prerequisites](prerequisites.md#install-the-operator)).
+
 ## Pods in ImagePullBackOff with 403 Forbidden
 
 A pod stays in `ImagePullBackOff`, and its events show `failed to fetch oauth token: unexpected status from GET request to https://<region>-docker.pkg.dev/v2/token?... 403 Forbidden`. The pod runs on a node whose node account has no `roles/artifactregistry.reader` on the repository, usually the system pool. Check the node with `kubectl -n <namespace> get pod <pod> -o wide`. Every chart pod selects a class whose nodes use `computeClasses.nodeServiceAccount`; with `bootstrap.computeClass` or `tests.computeClass` set to empty, grant the reader role to the account of the node the pod lands on ([prerequisites](prerequisites.md#node-service-account)).

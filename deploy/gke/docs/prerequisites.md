@@ -138,12 +138,17 @@ spec:
 EOF
 ```
 
-The operator then installs the resource CRDs. Wait until they exist before the KCC apply, then check the version:
+The operator then installs the resource CRDs and the Config Connector webhook. Wait for both before the first KCC apply, then check the version:
 
 ```sh
 until kubectl get crd spannerinstances.spanner.cnrm.cloud.google.com >/dev/null 2>&1; do sleep 10; done
+until kubectl -n cnrm-system get deployment cnrm-webhook-manager >/dev/null 2>&1; do sleep 10; done
+kubectl -n cnrm-system wait --for=condition=Available deployment/cnrm-webhook-manager --timeout=10m
+until kubectl get mutatingwebhookconfiguration mutating-webhook.cnrm.cloud.google.com >/dev/null 2>&1; do sleep 10; done
 kubectl get ns cnrm-system -o jsonpath='{.metadata.annotations.cnrm\.cloud\.google\.com/version}{"\n"}'
 ```
+
+The webhook sets the project of each object when it is created. An object created before the webhook exists never gets it, and a later update does not add it; see [troubleshooting](troubleshooting.md#kcc-objects-created-before-the-webhook).
 
 ### Service account of the namespace
 
