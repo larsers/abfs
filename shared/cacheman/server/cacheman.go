@@ -2957,7 +2957,7 @@ func (c *CacheMan) reconcileDiskObject(hash entities.Hash, objType protocol.Requ
 		c.NewObject(hash, resolveObjType())
 	} else if entry.Local && entry.Remote {
 		// 4. Object is fully synced but might be missing from LRU tracking.
-		if _, tracked := trackedInLRU[hash]; !tracked {
+		if _, tracked := trackedInLRU[hash]; !tracked && !c.checkUntrackedEntry(hash, entry) {
 			if err := c.index.Use(hash); err != nil {
 				c.printer.Printf("Failed to restore LRU tracking for %q: %v\n", hash.String(), err)
 			}

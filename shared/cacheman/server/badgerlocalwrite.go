@@ -77,7 +77,9 @@ func (b *BadgerIndexStore) ClearRemote(hash entities.Hash, entry *IndexEntry) (p
 		var hasActiveTTL bool
 		prevEnt, hasActiveTTL = b.get(txn, hash)
 		if b.clearRemoteHook != nil {
-			b.clearRemoteHook(hash)
+			if err := b.clearRemoteHook(hash); err != nil {
+				return err
+			}
 		}
 
 		var newEnt *IndexEntry

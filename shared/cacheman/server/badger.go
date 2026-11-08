@@ -126,8 +126,9 @@ type BadgerIndexStore struct {
 	// With localWriteCheck, eviction keeps local writes the server has not confirmed.
 	localWriteCheck         atomic.Bool
 	evictSkippedUnconfirmed atomic.Int64
-	// clearRemoteHook, if set, runs inside each ClearRemote transaction.
-	clearRemoteHook func(hash entities.Hash)
+	// clearRemoteHook, if set, runs inside each ClearRemote transaction, which fails with its
+	// error.
+	clearRemoteHook func(hash entities.Hash) error
 }
 
 // NewBadgerIndexStore creates a BadgerIndexStore.

@@ -30,6 +30,9 @@ type RemoteCheckStats struct {
 	// ClearRetries counts the retries of index transactions that took a local write out of
 	// the LRU after a conflict.
 	ClearRetries int64 `json:"clear_retries"`
+	// ClearFailures counts local writes whose index transaction failed with an error other
+	// than a conflict; their check takes the entry out of the LRU when the server lacks it.
+	ClearFailures int64 `json:"clear_failures"`
 	// EvictSkippedUnconfirmed counts the entries eviction kept because no check confirmed them.
 	EvictSkippedUnconfirmed int64 `json:"evict_skipped_unconfirmed"`
 	// StartPass counts the hashes the check after a start sent.

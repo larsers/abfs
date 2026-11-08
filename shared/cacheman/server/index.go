@@ -877,7 +877,9 @@ func (i *badgerIndex) Sweep(timestampThreshold int64) (deletedCount int, err err
 		if entry.EntryType != EntryTypeBlob {
 			continue
 		}
-		if entry.Local && !entry.Remote && entry.LastAliveTime.Unix() < timestampThreshold {
+		// A local write that waits for the server to confirm it is the only copy.
+		if entry.Local && !entry.Remote && entry.LastAliveTime.Unix() < timestampThreshold &&
+			!(i.localWriteCheck.Load() && i.indexStore.HasCheckMarker(keyEntry.Key)) {
 			toDeleteKeys = append(toDeleteKeys, keyEntry.Key)
 			toDeleteEntries = append(toDeleteEntries, keyEntry)
 		}

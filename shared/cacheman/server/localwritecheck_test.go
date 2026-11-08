@@ -403,11 +403,11 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		h := fetchedBlob(t, c, "evicted concurrently")
 		store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
 		var conflicts atomic.Int64
-		store.clearRemoteHook = func(hash entities.Hash) {
+		store.clearRemoteHook = func(hash entities.Hash) error {
 			if conflicts.Add(1) > 3 {
-				return
+				return nil
 			}
-			require.NoError(t, store.db.Update(func(txn *badger.Txn) error {
+			return store.db.Update(func(txn *badger.Txn) error {
 				item, err := txn.Get(entryKey(hash))
 				if err != nil {
 					return err
@@ -417,7 +417,7 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 					return err
 				}
 				return txn.Set(entryKey(hash), val)
-			}))
+			})
 		}
 
 		release := r.holdHeaders()
@@ -528,6 +528,67 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		defer release()
 		c.reconcileDiskObject(h, protocol.TypeBlob, map[entities.Hash]struct{}{})
 		requireUnconfirmed(t, c, h)
+	})
+
+	// A Local and Remote entry outside the LRU, which the start pass did not check, can be a
+	// local write whose notification was lost: maintenance holds it until the server answers.
+	t.Run("maintenance finds an entry outside the LRU", func(t *testing.T) {
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+		c.startLocalWriteCheck(ctx)
+		h := fetchedBlob(t, c, "not in the LRU")
+		putOnServer(t, r, "not in the LRU")
+
+		release := r.holdHeaders()
+		c.reconcileDiskObject(h, protocol.TypeBlob, map[entities.Hash]struct{}{})
+		requireUnconfirmed(t, c, h)
+		release()
+		require.Eventually(t, func() bool { return confirmed(c, h) && inLRU(t, c, h) }, 5*time.Second, 10*time.Millisecond)
+	})
+
+	// A clear that fails with an error other than a conflict leaves the old entry Remote; the
+	// check finds the server lacks it and takes the entry out of the LRU.
+	t.Run("clear fails", func(t *testing.T) {
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+		c.startLocalWriteCheck(ctx)
+		h := fetchedBlob(t, c, "clear failed")
+		store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+		var failed atomic.Bool
+		store.clearRemoteHook = func(entities.Hash) error {
+			if failed.Swap(true) {
+				return nil
+			}
+			return errors.New("injected")
+		}
+
+		release := r.holdPuts()
+		defer release()
+		c.NewObject(h, protocol.TypeBlob)
+		require.Equal(t, int64(1), c.Stats().RemoteChecks.ClearFailures)
+		require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Pushed == 1 }, 5*time.Second, 10*time.Millisecond)
+		requireUnconfirmed(t, c, h)
+	})
+
+	// Sweep, the local GC of remote read-only mounts, keeps a local write that waits for the
+	// server, since it is the only copy.
+	t.Run("sweep", func(t *testing.T) {
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+		c.startLocalWriteCheck(ctx)
+		marked := fetchedBlob(t, c, "waits for the server")
+		localOnly := writeBlob(t, c, "local only")
+		_, err := c.addLocalObjectToIndex(localOnly, EntryTypeBlob)
+		require.NoError(t, err)
+		release := r.holdHeaders()
+		defer release()
+		c.NewObject(marked, protocol.TypeBlob)
+
+		swept, err := c.index.Sweep(time.Now().Add(time.Hour).Unix())
+		require.NoError(t, err)
+		require.Equal(t, 1, swept)
+		require.False(t, hasBlob(t, c, localOnly))
+		requireUnconfirmed(t, c, marked)
 	})
 
 	// A cleared entry whose check had no answer before a restart keeps its marker, and the
@@ -685,4 +746,21 @@ func TestCacheman_RemoteHeadersFixesFlags(t *testing.T) {
 		require.False(t, r.has(t, localOnly))
 		require.False(t, c.index.Get(localOnly).Remote)
 	}
+}
+
+// A keep-alive answer can be older than a local write that cleared the entry while the call
+// was in flight, so a marked entry is confirmed by a check sent after the answer.
+func TestCacheman_RemoteHeadersLeavesMarkersToTheCheck(t *testing.T) {
+	ctx := context.Background()
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, period: time.Hour})
+	c.startLocalWriteCheck(ctx)
+	h := fetchedBlob(t, c, "cleared during the call")
+	putOnServer(t, r, "cleared during the call")
+	c.NewObject(h, protocol.TypeBlob)
+	c.localWrites.take(localWriteCheckBatchSize)
+
+	c.checkRemoteHeaders(ctx, []entities.Hash{h}, []bool{true})
+	requireUnconfirmed(t, c, h)
+	require.Equal(t, int64(1), c.Stats().RemoteChecks.Queued)
 }

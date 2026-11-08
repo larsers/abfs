@@ -72,6 +72,7 @@ type localWriteCheck struct {
 	pushed          atomic.Int64
 	unpushable      atomic.Int64
 	clearRetries    atomic.Int64
+	clearFailures   atomic.Int64
 	startPass       atomic.Int64
 	lostBeforeIndex atomic.Int64
 	phonyConfirmed  atomic.Int64
@@ -262,9 +263,12 @@ func (c *CacheMan) localWriteCheckWorker(ctx context.Context, full <-chan struct
 				return
 			}
 			for i, h := range hashes {
-				if found[i] {
+				switch {
+				case found[i]:
 					c.confirmLocalWrite(h, types[i])
-				} else {
+				case c.isCachedRemote(h):
+					c.recheckCachedObject(ctx, h, types[i])
+				default:
 					c.pushUnconfirmed(ctx, h, types[i])
 				}
 			}
@@ -343,9 +347,19 @@ func (c *CacheMan) overOfflineThreshold(ctx context.Context, hash entities.Hash)
 	return err == nil && uint64(hdr.Size) > threshold
 }
 
+// isCachedRemote reports whether hash has a Local and Remote entry, which eviction may take.
+func (c *CacheMan) isCachedRemote(hash entities.Hash) bool {
+	entry := c.index.Get(hash)
+	return entry != nil && entry.Local && entry.Remote
+}
+
 // recheckCachedObject handles a cached entry the server lacks: it takes the entry out of the
 // LRU with a check marker and pushes it.
-func (c *CacheMan) recheckCachedObject(ctx context.Context, idx localWriteIndex, hash entities.Hash, entryType EntryType) {
+func (c *CacheMan) recheckCachedObject(ctx context.Context, hash entities.Hash, entryType EntryType) {
+	idx, ok := c.checkedIndex()
+	if !ok {
+		return
+	}
 	_, cleared, retries, err := idx.clearRemote(hash, nil, c.closeChan)
 	c.localWrites.clearRetries.Add(int64(retries))
 	if err != nil {
@@ -386,7 +400,7 @@ func (c *CacheMan) localWriteStartPass(ctx context.Context, idx localWriteIndex,
 				if ok {
 					c.localWrites.present.Add(1)
 				} else {
-					c.recheckCachedObject(ctx, idx, keys[j], EntryTypeBlob)
+					c.recheckCachedObject(ctx, keys[j], EntryTypeBlob)
 				}
 			}
 
@@ -423,6 +437,10 @@ func (c *CacheMan) putIndexEntry(ke *IndexKeyEntry, remote bool) (*IndexEntry, e
 	prevEnt, cleared, retries, err := idx.clearRemote(ke.Key, ke.IndexEntry, c.closeChan)
 	c.localWrites.clearRetries.Add(int64(retries))
 	if err != nil {
+		// The old entry can still be Remote and evictable: the check takes it out of the LRU
+		// when the server lacks it.
+		c.localWrites.clearFailures.Add(1)
+		c.localWrites.enqueue(ke.Key, ke.EntryType)
 		return nil, err
 	}
 	if cleared {
@@ -467,6 +485,26 @@ func (lw *localWriteCheck) useSync(sync *dagsync.DAGSync, offlineThreshold uint6
 	lw.phonySync.Store(sync)
 }
 
+// checkUntrackedEntry handles a Local and Remote entry that maintenance found outside the
+// LRU. The start pass checked only the LRU entries, and the entry can be a local write whose
+// notification was lost, so it stays out of eviction until the server confirms it.
+func (c *CacheMan) checkUntrackedEntry(hash entities.Hash, entry *IndexEntry) bool {
+	idx, ok := c.checkedIndex()
+	if !ok || !localWriteChecked(entry.EntryType) {
+		return false
+	}
+	_, cleared, retries, err := idx.clearRemote(hash, nil, c.closeChan)
+	c.localWrites.clearRetries.Add(int64(retries))
+	if err != nil {
+		c.printer.Printf("maintenance: failed to keep %s in the cache until the server confirms it: %v\n", hash, err)
+		return false
+	}
+	if cleared {
+		c.localWrites.enqueue(hash, entry.EntryType)
+	}
+	return true
+}
+
 // confirmAfterPhony wraps the callback of a phony request sent to sync: on success every hash
 // it sent is on the server, so entries waiting for a check are confirmed.
 func (c *CacheMan) confirmAfterPhony(sync *dagsync.DAGSync, hashes []entities.Hash, callback dagsync.Callback) dagsync.Callback {
@@ -503,18 +541,17 @@ func (c *CacheMan) checkRemoteHeaders(ctx context.Context, keys []entities.Hash,
 			continue
 		}
 		switch {
+		case found[i] && idx.hasCheckMarker(key):
+			// The answer can be older than a local write that cleared the entry while the
+			// call was in flight, so the check worker asks again.
+			c.localWrites.enqueue(key, entry.EntryType)
 		case found[i] && !entry.Remote:
 			if err := c.index.markObjectRemote(key); err != nil {
 				c.printer.Printf("Failed to mark %s remote after the server confirmed it: %v\n", key, err)
 			}
 		case found[i]:
-			if idx.hasCheckMarker(key) {
-				if _, err := idx.confirmRemote(key); err != nil {
-					c.printer.Printf("Failed to mark %s remote after the server confirmed it: %v\n", key, err)
-				}
-			}
 		case entry.Remote:
-			c.recheckCachedObject(ctx, idx, key, entry.EntryType)
+			c.recheckCachedObject(ctx, key, entry.EntryType)
 		case idx.hasCheckMarker(key):
 			c.pushUnconfirmed(ctx, key, entry.EntryType)
 		}
@@ -535,6 +572,7 @@ func (c *CacheMan) localWriteStats() *protocol.RemoteCheckStats {
 		Pushed:                  lw.pushed.Load(),
 		Unpushable:              lw.unpushable.Load(),
 		ClearRetries:            lw.clearRetries.Load(),
+		ClearFailures:           lw.clearFailures.Load(),
 		EvictSkippedUnconfirmed: idx.evictSkippedUnconfirmed(),
 		StartPass:               lw.startPass.Load(),
 		EvictedUnchecked:        idx.evictedUnchecked(),
