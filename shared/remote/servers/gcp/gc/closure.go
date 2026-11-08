@@ -106,9 +106,9 @@ type DeletePlanReport struct {
 	// TypeNotAllowed counts candidates of types the cycle may not delete.
 	TypeNotAllowed int64 `json:"type_not_allowed,omitempty"`
 	// BlockedByNoncandidateParent counts candidates with a parent that is
-	// unreachable, has an objects row and is not a candidate. It is zero
-	// unless an object was written without the gc row first; Samples lists
-	// such edges as "parent>child".
+	// unreachable, has an objects row and is not a candidate, each once. It
+	// is zero unless an object was written without the gc row first;
+	// BlockedSamples lists such edges as "parent>child".
 	BlockedByNoncandidateParent int64    `json:"blocked_by_noncandidate_parent"`
 	BlockedSamples              []string `json:"blocked_samples,omitempty"`
 	// Blocked counts candidates below a key the step would not try.
@@ -258,6 +258,7 @@ func (p *deletePlan) layer() {
 // parent is a candidate failed for it, so it stays.
 func (p *deletePlan) blockNoncandidateParents(res *Result) {
 	rep := p.report
+	counted := newBitmap(p.g.size())
 	for id := range uint32(p.g.size()) {
 		if res.live.has(id) || p.isCand.has(id) || !res.seen.has(id) {
 			continue
@@ -267,7 +268,9 @@ func (p *deletePlan) blockNoncandidateParents(res *Result) {
 			if j < 0 {
 				continue
 			}
-			rep.BlockedByNoncandidateParent++
+			if counted.set(e) {
+				rep.BlockedByNoncandidateParent++
+			}
 			if len(rep.BlockedSamples) < maxSamples {
 				rep.BlockedSamples = append(rep.BlockedSamples, p.g.key(id).String()+">"+p.g.key(e).String())
 			}

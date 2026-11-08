@@ -159,7 +159,7 @@ func (f *stepFixture) rowExists(table string, key string) bool {
 func TestPlanDeletes(t *testing.T) {
 	require := require.New(t)
 	f := newStepFixture(t, 4)
-	h := testHashes(12)
+	h := testHashes(13)
 	blob, tree, commit, deep := h[0], h[1], h[2], h[3]
 	f.object(blob, "blob", nil)
 	f.object(tree, "tree", []Hash{blob})
@@ -168,11 +168,13 @@ func TestPlanDeletes(t *testing.T) {
 	f.object(deep, "tree", []Hash{blob})
 	f.object(h[4], "tree", []Hash{deep})
 	f.object(h[5], "commit", []Hash{h[4]})
-	// A parent outside the list with an objects row blocks its child.
-	outside, child := h[6], h[7]
+	// A parent outside the list with an objects row blocks its child, which
+	// counts once for two such parents.
+	outside, outside2, child := h[6], h[12], h[7]
 	f.object(child, "blob", nil)
 	f.objectWith(outside, "tree", []Hash{child}, nil, true)
-	f.keys = slices.DeleteFunc(f.keys, func(k Hash) bool { return k == outside })
+	f.objectWith(outside2, "tree", []Hash{child}, nil, true)
+	f.keys = slices.DeleteFunc(f.keys, func(k Hash) bool { return k == outside || k == outside2 })
 	// A parent in the list without an objects row is no candidate and blocks
 	// nothing.
 	ghost, ghostChild := h[8], h[9]
@@ -210,7 +212,7 @@ func TestPlanDeletes(t *testing.T) {
 	rep := p.report
 	require.Equal(int64(10), rep.Candidates)
 	require.Equal(int64(1), rep.BlockedByNoncandidateParent)
-	require.Equal([]string{outside.String() + ">" + child.String()}, rep.BlockedSamples)
+	require.ElementsMatch([]string{outside.String() + ">" + child.String(), outside2.String() + ">" + child.String()}, rep.BlockedSamples)
 	require.Equal(int64(2), rep.Unplaced)
 	require.Equal(int64(7), rep.WouldDelete)
 	require.Equal(int64(7*7), rep.WouldDeleteBytes)
