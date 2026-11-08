@@ -112,6 +112,7 @@ type pusher struct {
 	newBlobs        []entities.Hash
 	newObjects      []entities.Hash
 	newCommits      map[entities.Hash]string
+	helperRetry     map[entities.Hash]string // commits whose helper objects failed, to their ref
 	deepTreeMapLock sync.Mutex
 	deepTreeMap     map[entities.Hash]entities.Hash // from tree hash to its deeptree hash
 
@@ -305,8 +306,10 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 	}
 
 	if err := s.saveTreeHelperObjects(ctx); err != nil {
+		s.retryHelperObjects()
 		return err
 	}
+	s.helperRetry = nil
 
 	if time.Since(s.lastPackPushed) > s.config.PackPushInterval {
 		s.state = PushStatePushPacks
@@ -738,7 +741,7 @@ func (s *pusher) SyncValidate(ctx context.Context, w io.Writer, nodeStaleTimeout
 func (s *pusher) saveTreeHelperObjects(ctx context.Context) error {
 	commits := make([]entities.Hash, 0, len(s.newRefs))
 	refs := make([]string, 0, len(s.newRefs))
-	for h, ref := range s.newCommits {
+	for h, ref := range s.helperCommits() {
 		if h == entities.ZeroHash || !strings.HasPrefix(string(ref), "refs/heads/") {
 			continue
 		}
