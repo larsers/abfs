@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Written by scripts/gen-ddl.sh from the GCP server schema files
-# casdb/schema.sql and casdb/gcschema.sql of the release that first created
-# the database. Never edit or remove an entry: Config Connector sends only
-# the entries past the old list length and refuses a changed one. A later
-# schema change is a new ALTER or CREATE ... IF NOT EXISTS entry appended at
-# the end, in the same "- |-" form. The base line is the sha256 of the
-# first entries; scripts/check-ddl.sh checks the list against it.
-# ddl-base: sha256:3fc1c22e623fd8683ec1874531bb8f1b6f41ccd3d1e73913732d2f2eac3fef4e 7 entries
+# Written by scripts/gen-ddl.sh from the GCP server schema file
+# casdb/schema.sql of the release that first created the database. The
+# garbage collector tables are not in the list: `abfs server gcp init --gc`
+# adds them when GC is turned on (docs/runbook.md, Garbage collection). Never
+# edit or remove an entry: Config Connector sends only the entries past the
+# old list length and refuses a changed one. A later schema change is a new
+# ALTER or CREATE ... IF NOT EXISTS entry appended at the end, in the same
+# "- |-" form. The base line is the sha256 of the first entries;
+# scripts/check-ddl.sh checks the list against it.
+# ddl-base: sha256:438c4accfbca92785578b6c04a1f7b4180234cfee2ab39f2bbe3f5ff4bbb2484 5 entries
 apiVersion: spanner.cnrm.cloud.google.com/v1beta1
 kind: SpannerDatabase
 metadata:
@@ -47,28 +49,3 @@ spec:
       ) PRIMARY KEY (ProjectId, Ref)
     - |-
       CREATE INDEX IF NOT EXISTS RefsRefIndex ON Refs(Ref)
-    - |-
-      CREATE TABLE IF NOT EXISTS GcState (
-          Name STRING(64) NOT NULL,
-          Cycle INT64 NOT NULL,
-          Phase STRING(64),
-          LeaseHolder STRING(MAX),
-          LeaseEpoch INT64 NOT NULL,
-          LeaseExpiry TIMESTAMP,
-          PreviousLeaseExpiry TIMESTAMP,
-          CycleStartTime TIMESTAMP,
-          PreviousCycleStartTime TIMESTAMP,
-          SnapshotTime TIMESTAMP,
-          GraceSeconds INT64,
-          ListLocation STRING(MAX),
-          UpdateTime TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
-      ) PRIMARY KEY (Name)
-    - |-
-      CREATE TABLE IF NOT EXISTS GcReplicas (
-          ReplicaId STRING(MAX) NOT NULL,
-          Version INT64 NOT NULL,
-          GcEnabled BOOL NOT NULL,
-          TouchIntervalSeconds INT64 NOT NULL,
-          CacheTTLSeconds INT64 NOT NULL,
-          LastSeen TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
-      ) PRIMARY KEY (ReplicaId)

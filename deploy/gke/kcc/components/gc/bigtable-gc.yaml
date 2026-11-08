@@ -1,0 +1,84 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The Bigtable parts of the garbage collector, as `abfs server gcp init --gc`
+# creates them: the table gc and the family g of the table objects, each
+# family keeping one version. The Spanner tables of the garbage collector are
+# not here; `init --gc` adds them (docs/runbook.md, Garbage collection).
+---
+apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
+kind: BigtableTable
+metadata:
+  name: abfs-table-gc
+  namespace: abfs
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  resourceID: gc
+  instanceRef:
+    name: abfs-objects
+  columnFamily:
+    - family: e
+    - family: t
+---
+apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
+kind: BigtableGCPolicy
+metadata:
+  name: abfs-gc-policy-objects-g
+  namespace: abfs
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  instanceRef:
+    name: abfs-objects
+  tableRef:
+    name: abfs-table-objects
+  columnFamily: g
+  maxVersion:
+    - number: 1
+  deletionPolicy: ABANDON
+---
+apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
+kind: BigtableGCPolicy
+metadata:
+  name: abfs-gc-policy-gc-e
+  namespace: abfs
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  instanceRef:
+    name: abfs-objects
+  tableRef:
+    name: abfs-table-gc
+  columnFamily: e
+  maxVersion:
+    - number: 1
+  deletionPolicy: ABANDON
+---
+apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
+kind: BigtableGCPolicy
+metadata:
+  name: abfs-gc-policy-gc-t
+  namespace: abfs
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  instanceRef:
+    name: abfs-objects
+  tableRef:
+    name: abfs-table-gc
+  columnFamily: t
+  maxVersion:
+    - number: 1
+  deletionPolicy: ABANDON

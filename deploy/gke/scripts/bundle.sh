@@ -17,9 +17,11 @@
 # Writes the release bundle abfs-gke-<version>.tar.gz of an ABFS commit:
 #   abfs-gke-<version>/
 #     COMMIT          the commit id
-#     README.md, Makefile, chart/, kcc/, docs/, scripts/   deploy/gke of that commit
+#     AGENTS.md, README.md, Makefile, chart/, kcc/, docs/, scripts/   deploy/gke of that commit
 #     images.txt      name, reference and digest of each image
 #     images/<name>.oci.tar            the images as OCI archives
+#     source/abfs-<version>.tar.gz     the ABFS tree of the commit
+#     source/abfs-casfs-<commit>.tar.gz   the abfs-casfs tree of the loader image
 #     SHA256SUMS      of every other file
 # The images are those of the images.txt that build-images.sh wrote for the
 # same commit. By default they are copied from the registry by digest with
@@ -28,6 +30,8 @@
 # Usage: bundle.sh [options] <commit>
 #   -C <repo>            ABFS repository (default: the one holding this script)
 #   --images <file>      images.txt of build-images.sh (required)
+#   --casfs <repo>       abfs-casfs repository (required)
+#   --casfs-commit <c>   the casfs commit of the loader image (default c946f8e)
 #   --from-docker        take the images from the local docker engine
 #   --deploy-dir <dir>   take deploy/gke from <dir>, not from the commit
 #   --out <dir>          where to write the bundle (default: .)
@@ -42,6 +46,8 @@ usage() {
 here=$(cd "$(dirname "$0")" && pwd)
 repo=
 images=
+casfs_repo=
+casfs_commit=c946f8e
 from_docker=false
 deploy_dir=
 out=.
@@ -50,6 +56,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -C) repo=$2; shift 2 ;;
     --images) images=$2; shift 2 ;;
+    --casfs) casfs_repo=$2; shift 2 ;;
+    --casfs-commit) casfs_commit=$2; shift 2 ;;
     --from-docker) from_docker=true; shift ;;
     --deploy-dir) deploy_dir=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
@@ -62,11 +70,12 @@ if [[ -z $repo ]]; then
   repo=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) ||
     { echo "$0: $here is not in a git checkout; pass -C <ABFS repository>" >&2; exit 2; }
 fi
-[[ ${#args[@]} -eq 1 && -n $images ]] || usage
+[[ ${#args[@]} -eq 1 && -n $images && -n $casfs_repo ]] || usage
 [[ -f $images ]] || { echo "$0: $images not found" >&2; exit 1; }
 commit=$(git -C "$repo" rev-parse --verify "${args[0]}^{commit}")
 version=$(git -C "$repo" describe --match 'v*' "$commit")
 version=${version#v}
+casfs_commit=$(git -C "$casfs_repo" rev-parse --verify "$casfs_commit^{commit}")
 
 name=abfs-gke-$version
 tmp=$(mktemp -d)
@@ -84,7 +93,7 @@ else
   echo "$0: $commit has no deploy/gke; pass --deploy-dir" >&2
   exit 1
 fi
-for part in README.md Makefile chart kcc docs scripts; do
+for part in AGENTS.md README.md Makefile chart kcc docs scripts; do
   if [[ -e $tmp/deploy/$part ]]; then
     cp -a "$tmp/deploy/$part" "$dir/"
   else
@@ -92,6 +101,13 @@ for part in README.md Makefile chart kcc docs scripts; do
   fi
 done
 echo "$commit" >"$dir/COMMIT"
+
+# The source of the release: what the images were built from.
+mkdir -p "$dir/source"
+git -C "$repo" archive --format=tar.gz --prefix="abfs-$version/" \
+  -o "$dir/source/abfs-$version.tar.gz" "$commit"
+git -C "$casfs_repo" archive --format=tar.gz --prefix="abfs-casfs-${casfs_commit:0:7}/" \
+  -o "$dir/source/abfs-casfs-${casfs_commit:0:7}.tar.gz" "$casfs_commit"
 cp "$images" "$dir/images.txt"
 
 # Each line of images.txt: <name> <reference> <digest>.

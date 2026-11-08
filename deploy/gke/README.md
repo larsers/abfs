@@ -33,6 +33,7 @@ This folder deploys the open-source ABFS GCP server, the git-pushers and the CI 
 
 ```
 deploy/gke/
+  AGENTS.md          orientation for anyone working in this tree: layout, checks, rules
   README.md          this file
   Makefile           lint, template, kustomize, ddl, ddl-check, images, bundle
   chart/abfs/        Helm chart; values.yaml, values-example.yaml, ci/ test values
@@ -41,18 +42,25 @@ deploy/gke/
     components/
       backend-new/       Spanner, Bigtable, tables, bucket and the server's roles
       backend-existing/  the server's roles on a backend that already exists
+      gc/                the garbage collector's Bigtable parts, with backend-new, only when GC is on
       network/proxy-subnet/  the proxy-only subnet, for a network without one
       settings/          fills the base from the overlay's settings.yaml
     overlays/example/  a worked example
   images/            Dockerfiles of abfs-server, abfs-pusher, abfs-client, casfs-loader
-  scripts/           gen-ddl.sh, check-ddl.sh (with ddl-lib.sh), build-images.sh, bundle.sh
+  scripts/           gen-ddl.sh, check-ddl.sh (with ddl-lib.sh), build-images.sh, bundle.sh, load-images.sh
   docs/              usage, prerequisites, runbook, configuration, troubleshooting, ci-job
 ```
 
 ## Quick start
 
 1. Prepare the cluster, the network, Config Connector (installed by hand from its operator bundle at a pinned version, 1.130.1 or later, not the GKE add-on) and its identity: [prerequisites](docs/prerequisites.md).
-2. Build and push the images, and keep `images.txt`:
+2. Put the images into your Artifact Registry. From a release bundle, copy its image archives and keep the printed digest values:
+
+   ```sh
+   scripts/load-images.sh europe-west4-docker.pkg.dev/<project>/abfs >values-images.yaml
+   ```
+
+   From a source tree, build and push them instead, and keep `images.txt`:
 
    ```sh
    scripts/build-images.sh --casfs <abfs-casfs repo> --push \
@@ -66,7 +74,7 @@ deploy/gke/
    kubectl -n abfs wait --for=condition=Ready --all gcp --timeout=30m
    ```
 
-4. Copy `chart/abfs/values-example.yaml`, set the digests, `gateway.vip` and the Gerrit manifest, create the Gerrit Secret, and install without `--wait`:
+4. Copy `chart/abfs/values-example.yaml`, set the digests (or pass `-f values-images.yaml` after your values file), `gateway.vip` and the Gerrit manifest, create the Gerrit Secret, and install without `--wait`:
 
    ```sh
    helm install abfs chart/abfs -n abfs -f <values.yaml> --timeout 30m
@@ -83,7 +91,7 @@ The [runbook](docs/runbook.md) has every step with its checks, and the seed, ste
 - [prerequisites.md](docs/prerequisites.md): cluster settings, network, identities, the IOPS fallback node pool.
 - [runbook.md](docs/runbook.md): install order, seed and steady phase, upgrades, cache reset, backend replacement, teardown, security.
 - [configuration.md](docs/configuration.md): every chart value with its default, the KCC to chart name table, right-sizing.
-- [ci-job.md](docs/ci-job.md): the build pod contract for any CI system, the example Job, node sizing.
+- [ci-job.md](docs/ci-job.md): the build pod contract for any CI system, the example Job, Airflow, node sizing.
 - [troubleshooting.md](docs/troubleshooting.md): known failures and their causes.
 
 ## Checks
@@ -95,14 +103,14 @@ make check        # lint, template, kustomize, ddl-check against the hash in the
 make check DDL_REPO=<abfs repo> DDL_SOURCE=<commit>   # ddl-check also against the GCP server schema
 make ddl DDL_REPO=<abfs repo> DDL_SOURCE=<commit>     # regenerate the ddl list into out/ and compare it
 make images CASFS=<abfs-casfs repo> COMMIT=<commit>   # local build, no push; needs docker
-make bundle COMMIT=<commit>                           # after make images; needs docker
+make bundle CASFS=<abfs-casfs repo> COMMIT=<commit>  # after make images; needs docker
 ```
 
-The release bundle (`scripts/bundle.sh`) holds this README, the Makefile, `chart/`, `kcc/`, `docs/`, `scripts/`, the four images as OCI archives, `images.txt`, `SHA256SUMS` and the commit id. It does not hold `images/`: the image build needs the source tree ([runbook](docs/runbook.md#bundle-and-source-tree)).
+The release bundle (`scripts/bundle.sh`) holds this README, `AGENTS.md`, the Makefile, `chart/`, `kcc/`, `docs/`, `scripts/`, the four images as OCI archives, `images.txt`, the source of the ABFS and abfs-casfs commits in `source/`, `SHA256SUMS` and the commit id ([runbook](docs/runbook.md#bundle-and-source-tree)).
 
 ## Limits
 
 - GKE Standard only. Autopilot does not allow the privileged CI pods.
 - CI nodes run Ubuntu and build casfs on each node. The casfs commit in the image does not build on kernel series 6.14 and 6.19.
-- No TLS, no authentication, no garbage collection by default (the server's `--gc` is off).
+- No TLS, no authentication, no garbage collection by default: the server's `--gc` is off, and the backend gets no garbage collector tables until it is turned on ([runbook](docs/runbook.md#garbage-collection)).
 - Terraform for Compute Engine VMs, Cloud Workstations and local SSD caches are not part of this folder.

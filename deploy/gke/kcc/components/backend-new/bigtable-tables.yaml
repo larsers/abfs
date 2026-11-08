@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The tables and column families of `abfs server gcp init --gc`. The gc table
-# and the family objects:g are created always; a server without --gc ignores
-# them. Each family keeps one version, as init sets it.
+# The tables and column families of `abfs server gcp init`. The garbage
+# collector's table gc and family objects:g are in components/gc, listed only
+# when GC is turned on. Each family keeps one version, as init sets it.
 ---
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableTable
@@ -30,7 +30,6 @@ spec:
   columnFamily:
     - family: meta
     - family: data
-    - family: g
 ---
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableTable
@@ -59,21 +58,6 @@ spec:
     name: abfs-objects
   columnFamily:
     - family: data
----
-apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
-kind: BigtableTable
-metadata:
-  name: abfs-table-gc
-  namespace: abfs
-  annotations:
-    cnrm.cloud.google.com/deletion-policy: abandon
-spec:
-  resourceID: gc
-  instanceRef:
-    name: abfs-objects
-  columnFamily:
-    - family: e
-    - family: t
 ---
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableGCPolicy
@@ -112,23 +96,6 @@ spec:
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableGCPolicy
 metadata:
-  name: abfs-gc-policy-objects-g
-  namespace: abfs
-  annotations:
-    cnrm.cloud.google.com/deletion-policy: abandon
-spec:
-  instanceRef:
-    name: abfs-objects
-  tableRef:
-    name: abfs-table-objects
-  columnFamily: g
-  maxVersion:
-    - number: 1
-  deletionPolicy: ABANDON
----
-apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
-kind: BigtableGCPolicy
-metadata:
   name: abfs-gc-policy-maps-cf
   namespace: abfs
   annotations:
@@ -156,40 +123,6 @@ spec:
   tableRef:
     name: abfs-table-chunks
   columnFamily: data
-  maxVersion:
-    - number: 1
-  deletionPolicy: ABANDON
----
-apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
-kind: BigtableGCPolicy
-metadata:
-  name: abfs-gc-policy-gc-e
-  namespace: abfs
-  annotations:
-    cnrm.cloud.google.com/deletion-policy: abandon
-spec:
-  instanceRef:
-    name: abfs-objects
-  tableRef:
-    name: abfs-table-gc
-  columnFamily: e
-  maxVersion:
-    - number: 1
-  deletionPolicy: ABANDON
----
-apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
-kind: BigtableGCPolicy
-metadata:
-  name: abfs-gc-policy-gc-t
-  namespace: abfs
-  annotations:
-    cnrm.cloud.google.com/deletion-policy: abandon
-spec:
-  instanceRef:
-    name: abfs-objects
-  tableRef:
-    name: abfs-table-gc
-  columnFamily: t
   maxVersion:
     - number: 1
   deletionPolicy: ABANDON

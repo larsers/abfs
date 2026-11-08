@@ -19,7 +19,14 @@ scripts/build-images.sh --casfs <abfs-casfs repo> --push \
   europe-west4-docker.pkg.dev/example-project/abfs <commit>
 ```
 
-`<commit>` is the ABFS commit to deploy. The script prints `images.txt` with the name, reference and registry digest of each image. The chart takes the digests. The build needs the ABFS and abfs-casfs repositories; with a release bundle, push its image archives instead.
+`<commit>` is the ABFS commit to deploy. The script prints `images.txt` with the name, reference and registry digest of each image. The chart takes the digests. The build needs the ABFS and abfs-casfs repositories. With a release bundle, copy its image archives instead; the script prints the chart's image values with the digests of your registry:
+
+```sh
+gcloud auth configure-docker europe-west4-docker.pkg.dev
+scripts/load-images.sh europe-west4-docker.pkg.dev/example-project/abfs >values-images.yaml
+```
+
+Pass `-f values-images.yaml` after your values file in every `helm install` and `helm upgrade`, or copy the digests into it.
 
 ### 2. Configure and apply the KCC overlay
 
@@ -132,24 +139,23 @@ To update the tool later, run the same commands by hand; the Job never replaces 
 
 The overlay lists one of two components:
 
-- `backend-new`: Config Connector creates the Spanner instance and database (schema included), the Bigtable instance with one cluster, the four tables and their garbage collection policies, the bucket, and the server's three roles. Use it only for resources that do not exist yet.
+- `backend-new`: Config Connector creates the Spanner instance and database (schema included), the Bigtable instance with one cluster, the tables `objects`, `maps` and `chunks` with their Bigtable garbage collection policies, the bucket, and the server's three roles. Use it only for resources that do not exist yet. It creates no resource of the ABFS garbage collector; see [Garbage collection](#garbage-collection).
 - `backend-existing`: the backend exists. Config Connector creates no object for it, so nothing in the overlay can change or delete it, and only grants the server's roles on the named resources. Adopting a live Bigtable instance or table into Config Connector can delete clusters and column families, and the Spanner `ddl` list is sent again, so an existing backend is never put into `backend-new`.
 
 ### What an existing backend must have
 
-What `abfs server gcp init --gc` creates:
+What `abfs server gcp init` creates:
 
 | Resource | Content |
 | --- | --- |
-| Spanner database (`cas` by default) | sequence `ProjectIdSequence`; tables `Projects`, `Refs` (with index `RefsRefIndex`, unique index `ProjectsIndex` on `Projects`), `GcState`, `GcReplicas` |
-| Bigtable table `objects` | families `meta`, `data`, `g` |
+| Spanner database (`cas` by default) | sequence `ProjectIdSequence`; tables `Projects`, `Refs` (with index `RefsRefIndex`, unique index `ProjectsIndex` on `Projects`) |
+| Bigtable table `objects` | families `meta`, `data` |
 | Bigtable table `maps` | family `cf` |
 | Bigtable table `chunks` | family `data` |
-| Bigtable table `gc` | families `e`, `t` |
 | Bigtable instance | one cluster, or an app profile with single-cluster routing (`backend.bigtableAppProfile`) |
 | Cloud Storage bucket | in the region |
 
-Every family keeps one version. A backend created by `init` without `--gc` lacks `GcState`, `GcReplicas`, the table `gc` and the family `objects:g`; run `init --gc` once to add them, then run the check.
+Every family keeps one version. With garbage collection on, the backend also has what `init --gc` adds ([Garbage collection](#garbage-collection)); run the check with `--gc` then.
 
 ### Conformance check
 
@@ -164,17 +170,18 @@ abfs_admin() {
     -v "$HOME/.config/gcloud/application_default_credentials.json:/adc.json:ro" \
     --entrypoint /usr/local/bin/abfs "$IMG" "$@"
 }
+GC=                 # GC=--gc when garbage collection is on
 gcloud spanner databases ddl describe cas --instance abfs --project $P >ddl-before.sql
-for t in objects maps chunks gc; do
+for t in objects maps chunks ${GC:+gc}; do
   gcloud bigtable instances tables describe $t --instance abfs-objects --project $P \
     --format 'yaml(columnFamilies)'
 done >families-before.yaml
 
-abfs_admin server gcp init --gc --project $P --instance abfs --db cas \
+abfs_admin server gcp init $GC --project $P --instance abfs --db cas \
   --bt-instance abfs-objects --bucket example-project-abfs-blobs
 
 gcloud spanner databases ddl describe cas --instance abfs --project $P >ddl-after.sql
-for t in objects maps chunks gc; do
+for t in objects maps chunks ${GC:+gc}; do
   gcloud bigtable instances tables describe $t --instance abfs-objects --project $P \
     --format 'yaml(columnFamilies)'
 done >families-after.yaml
@@ -204,6 +211,28 @@ The directory from `mktemp -d` is 0700, so other host users cannot reach the cop
 `init` prints `The GCP server resources are ready.` Its schema update consists of `CREATE ... IF NOT EXISTS` statements, a no-op on a conforming database. Any difference in the two files means the backend did not match; find out why before the servers start.
 
 A one-off pod in the cluster with the Kubernetes service account `abfs-server` can run the same binary, but that account holds only the runtime roles (`roles/spanner.databaseUser`, `roles/bigtable.user`, `roles/storage.objectUser`). `init` needs the admin roles to update the schema and the tables, so it fails there; run it from the workstation.
+
+## Garbage collection
+
+Garbage collection is off by default. Neither backend mode creates its resources, and the chart starts the server without `--gc` (`server.gc.enabled: false`), so the backend has only the schema in [What an existing backend must have](#what-an-existing-backend-must-have). Turned on, garbage collection adds resources of its own, apart from the server's tables:
+
+| Resource | Created by |
+| --- | --- |
+| Bigtable table `gc` (families `e`, `t`) and the family `g` of `objects` | `components/gc` with `backend-new`, `init --gc` with `backend-existing` |
+| the Spanner tables of `casdb/gcschema.sql` of the deployed commit (`GcState`, `GcReplicas`, and more in later releases) | `init --gc`, in both modes |
+| objects under `gc/` in the bucket: the condemned lists, and in later releases the records of deletes and removed refs | `abfs server gcp gc run` |
+
+The Spanner tables are never entries of the Config Connector `ddl` list. That list is ordered and append-only, so garbage collector entries in it would collide with the base schema entries of later releases. Config Connector does not read the schema back from Spanner, so tables that `init` adds do not change the `SpannerDatabase`.
+
+To turn it on, follow "Enable or disable garbage collection" in `doc/sysadmin/GCP_SERVER.md` of the deployed commit (in `source/` of the bundle). In this deployment, its steps 1 and 2 become these three:
+
+1. With `backend-new`, list `components/gc` after `backend-new` in the overlay, apply it, and wait until every object is Ready. Do this before `init --gc`: Config Connector deletes a column family of `objects` that the object does not list, so a family `g` that `init` created would be removed again.
+2. Run `init --gc` from the workstation as in [Conformance check](#conformance-check), with `GC=--gc`. It adds the Spanner tables, and with `backend-existing` also the Bigtable parts, so on this run the before and after files differ (with `backend-existing` the describe of the table `gc` before `init` also fails, because the table does not exist yet). Then run the check again with `GC=--gc`; that run must print `conformant`.
+3. `helm upgrade` with `server.gc.enabled=true`. A server with `--gc` stops at startup when a garbage collector resource is missing and names it; it also stops when the Bigtable app profile refuses single-row transactions, and prints the `gcloud` command that allows them.
+
+Then continue with the backfill, the client option `gc-keepalive` and the dry runs, as the server documentation describes. On every upgrade while garbage collection is on, run `init --gc` of the new release before the servers: it adds the garbage collector's Spanner tables and columns that the release needs, in both modes. With `backend-new`, Config Connector owns the Bigtable tables and their families, so a Bigtable change of a release comes in `components/gc` or `backend-new` and is applied before `init --gc`; a table or family that `init` created alone would be deleted at the next reconcile.
+
+To turn it off, `helm upgrade` with `server.gc.enabled=false` and turn `gc-keepalive` off on the clients. The resources can stay in place: a server without `--gc` neither reads nor writes them. Keep `components/gc` in the overlay while they exist. Without it, Config Connector deletes the family `objects:g` with the condemn markers in it, and `kubectl apply -k` leaves the component's four objects in the cluster (it does not prune), where the policy of the deleted family fails on every reconcile. Removing the garbage collector resources is not part of this runbook.
 
 ## Seed and steady phase
 
@@ -334,7 +363,9 @@ make ddl-check
 
 The file's `# ddl-base:` line holds the sha256 and the count of the entries of the first release, so the check needs no schema source. That line can be changed together with an entry, so the release check compares the list with the GCP server schema of the ABFS commit that first created the database: `make ddl-check DDL_REPO=<abfs repo> DDL_SOURCE=<commit>`.
 
-The check guards only the base. Appended migrations are reviewed by hand: in the review of each change to the file, an entry that was already applied must show no change, and a new migration may only add lines at the end of the list. A missed edit of an applied entry does not reach the database: Config Connector refuses the changed list, and the `SpannerDatabase` reports an update error until the entry is restored. `scripts/gen-ddl.sh` writes the list once from that schema (`casdb/schema.sql` and `casdb/gcschema.sql` of a source tree or a commit that has the GCP server), for the release that first creates the database; never run it over the file again. With `backend-existing`, schema changes come from running `abfs server gcp init --gc` of the new release.
+The check guards only the base. Appended migrations are reviewed by hand: in the review of each change to the file, an entry that was already applied must show no change, and a new migration may only add lines at the end of the list. A missed edit of an applied entry does not reach the database: Config Connector refuses the changed list, and the `SpannerDatabase` reports an update error until the entry is restored. `scripts/gen-ddl.sh` writes the list once from that schema (`casdb/schema.sql` of a source tree or a commit that has the GCP server), for the release that first creates the database; never run it over the file again. With `backend-existing`, schema changes come from running `abfs server gcp init` of the new release. The garbage collector's Spanner tables are in neither: with garbage collection on, `init --gc` of the new release adds their changes in both modes ([Garbage collection](#garbage-collection)).
+
+A `backend-new` database created from an earlier tree whose `spanner-database-ddl.yaml` has 7 entries (the base and `GcState`, `GcReplicas`) keeps that list: entries are never removed, and a shorter list makes Config Connector refuse the `SpannerDatabase` update. Copy the earlier file over `kcc/components/backend-new/spanner-database-ddl.yaml` of the new release before applying, and list `components/gc` too, because that backend's table `objects` has the family `g`, which Config Connector would otherwise delete.
 
 ## Config Connector upgrade and rollback
 
@@ -404,16 +435,33 @@ Never delete the `ConfigConnectorContext` while KCC objects exist in the namespa
 
 ## Bundle and source tree
 
-The release bundle holds this folder's `README.md`, `Makefile`, `chart/`, `kcc/`, `docs/` and `scripts/`, the four images as OCI archives, `images.txt` and `SHA256SUMS`. From the bundle root, these run as they do in `deploy/gke`:
+The release bundle holds this folder's `AGENTS.md`, `README.md`, `Makefile`, `chart/`, `kcc/`, `docs/` and `scripts/`, the four images as OCI archives, `images.txt`, `source/` and `SHA256SUMS`. `source/` holds the ABFS tree of the bundle's commit and the abfs-casfs tree of the loader image; unpack both to build the images yourself. The `abfs-client` image carries the source packages of the static `ps` and `fuser` it ships, in `/usr/share/abfs/source`. Check the bundle with `sha256sum -c SHA256SUMS` in its root. From the bundle root, these run as they do in `deploy/gke`:
 
-- every `kubectl` and `helm` command of this runbook;
+- every `kubectl` and `helm` command of this runbook, and `scripts/load-images.sh`;
 - `make check` (lint, template, kustomize, and `ddl-check` against the hash in the ddl file) and `scripts/check-ddl.sh` without a schema source.
 
 These need the ABFS source tree, a clone of the repository at the deployed commit:
 
-- `scripts/build-images.sh` and `make images`: they build from the repository and the abfs-casfs repository, with the Dockerfiles in `images/`, which the bundle does not carry, so run the copy in `deploy/gke` of the clone; `-C` only names another ABFS repository to build from. With a bundle, push the archives of `images/` to the registry instead, for example with `skopeo copy oci-archive:images/abfs-server.oci.tar docker://<registry>/abfs-server:<tag>`;
+- `scripts/build-images.sh` and `make images`: they build from the repository and the abfs-casfs repository, with the Dockerfiles in `images/`, so run the copy in `deploy/gke` of the clone; `-C` only names another ABFS repository to build from. With a bundle, load the archives of `images/` with `scripts/load-images.sh` instead, or build from `source/` as below;
 - `scripts/bundle.sh` and `make bundle`; the copy in the bundle runs with `-C <clone>`, which supplies the commit and its `deploy/gke`;
 - `scripts/gen-ddl.sh`, `make ddl`, and `make ddl-check` with `DDL_SOURCE`: they read the GCP server schema files.
+
+The trees in `source/` carry no git history, and the scripts take the version from a git tag. To build the images from them, make each tree a repository and tag the ABFS one with the bundle's version:
+
+```sh
+V=<version>                       # the bundle's name without abfs-gke-
+tar -xzf source/abfs-$V.tar.gz && tar -xzf source/abfs-casfs-*.tar.gz
+C=$(ls -d abfs-casfs-*/)
+for d in abfs-$V "$C"; do
+  git -C "$d" init -q && git -C "$d" add -A &&
+    git -C "$d" -c user.name=build -c user.email=build@localhost commit -qm source
+done
+git -C abfs-$V -c user.name=build -c user.email=build@localhost tag -a -m "abfs $V" v$V
+abfs-$V/deploy/gke/scripts/build-images.sh --casfs "$C" --casfs-commit HEAD --push \
+  europe-west4-docker.pkg.dev/example-project/abfs HEAD
+```
+
+The images then report the same version as the bundle's.
 
 ## Security
 

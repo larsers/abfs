@@ -38,8 +38,10 @@ RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.s
     rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 # The current trixie sources of procps and psmisc, not pinned, like the packages
-# of the final stage.
-RUN apt-get update && apt-get source procps psmisc && rm -rf /var/lib/apt/lists/*
+# of the final stage. The source files go into the final image with the two
+# GPL binaries built from them.
+RUN apt-get update && apt-get source procps psmisc && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /out-src && cp -a ./*.dsc ./*.tar.* /out-src/ && ls -l /out-src
 RUN cd procps-* && autoreconf -fi && \
     ./configure CC=musl-gcc --disable-shared --enable-static --disable-nls \
       --without-ncurses --without-systemd --without-elogind \
@@ -102,6 +104,7 @@ RUN apt-get update && \
       bash ca-certificates git libcap2-bin && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /opt/abfs/bin/
+COPY --from=procs /out-src/ /usr/share/abfs/source/
 # The capabilities of the Makefile targets.
 RUN setcap CAP_SYS_ADMIN,CAP_SYS_MODULE+ep /opt/abfs/bin/casfs-mounter && \
     setcap CAP_SYS_RESOURCE+ep /opt/abfs/bin/casfuse-mounter && \
