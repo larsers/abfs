@@ -133,6 +133,21 @@ func TestBackfill_AttemptDeadline(t *testing.T) {
 	require.GreaterOrEqual(stalls.calls.Load(), int32(3))
 }
 
+// A touch written later than TouchDrainBound after it was queued, as after a
+// freeze of the process, counts as failed, so that the next heartbeat records
+// a loss: the collector counts on touches landing within the bound.
+func TestToucher_LateTouchFails(t *testing.T) {
+	require := require.New(t)
+	tc := newToucher(newHooksTestBigtable(t), 10)
+	tc.lateAfter = 100 * time.Millisecond
+	keys := testHashes(2)
+	require.True(tc.TouchObject(keys[0]))
+	time.Sleep(150 * time.Millisecond)
+	require.True(tc.TouchObject(keys[1]))
+	tc.flush(context.Background(), []touch{<-tc.queue, <-tc.queue})
+	require.Equal(TouchStats{Written: 2, Failed: 1}, tc.Stats())
+}
+
 // Two attempts of the write deadline must fit into a quarter of the lease,
 // the margin at which the watchdog stops the run.
 func TestDryRunOpts_WriteDeadlineFitsLease(t *testing.T) {

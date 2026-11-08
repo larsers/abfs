@@ -49,7 +49,8 @@ const (
 	// TouchDrainBound bounds the time from a use to the write of its touch,
 	// or to its count as lost: a full buffer drains in batches that each
 	// worker writes within touchWriteTimeout, and a batch waits at most
-	// touchFlushInterval to fill.
+	// touchFlushInterval to fill. A touch that waited longer, because the
+	// process was frozen or starved, is written and also counted as failed.
 	TouchDrainBound = TouchBufferSize/touchBatchSize/touchWorkers*touchWriteTimeout + touchFlushInterval
 )
 
@@ -59,13 +60,15 @@ type TouchStats struct {
 	Written int64
 	// Dropped counts the touches dropped because the buffer stayed full.
 	Dropped int64
-	// Failed counts the touches that could not be written.
+	// Failed counts the touches that could not be written, and those written
+	// later than TouchDrainBound after they were queued.
 	Failed int64
 }
 
 type touch struct {
 	mapRow bool
 	row    string
+	queued time.Time
 }
 
 // Toucher writes touches in the background: the touch cell of an object's gc
@@ -82,6 +85,7 @@ type Toucher struct {
 	queue       chan touch
 	retryWait   time.Duration
 	enqueueWait time.Duration
+	lateAfter   time.Duration
 	stalled     atomic.Bool
 	stop        chan struct{}
 	stopOnce    sync.Once
@@ -106,6 +110,7 @@ func newToucher(client *bigtable.Client, size int) *Toucher {
 		queue:       make(chan touch, size),
 		retryWait:   firstRetryWait,
 		enqueueWait: touchEnqueueWait,
+		lateAfter:   TouchDrainBound,
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 	}
@@ -130,6 +135,7 @@ func (t *Toucher) TouchMapRow(row string) bool {
 }
 
 func (t *Toucher) add(tc touch, wait bool) bool {
+	tc.queued = time.Now()
 	select {
 	case <-t.stop:
 		t.dropped.Add(1)
@@ -231,7 +237,11 @@ func (t *Toucher) drain(batch []touch) {
 
 func (t *Toucher) flush(ctx context.Context, batch []touch) {
 	var objectRows, mapRows []string
+	var late int64
 	for _, tc := range batch {
+		if time.Since(tc.queued) > t.lateAfter {
+			late++
+		}
 		if tc.mapRow {
 			mapRows = append(mapRows, tc.row)
 		} else {
@@ -244,6 +254,8 @@ func (t *Toucher) flush(ctx context.Context, batch []touch) {
 	mapTouch.Set(mapsFamily, "", bigtable.ServerTime, []byte("1"))
 	t.write(ctx, t.gcTable, TableName, objectRows, objectTouch)
 	t.write(ctx, t.mapsTable, mapsTableName, mapRows, mapTouch)
+	// The collector counts on a touch landing within TouchDrainBound of its use.
+	t.failed.Add(late)
 }
 
 // write applies mut to rows and retries the rows that fail with a transient
