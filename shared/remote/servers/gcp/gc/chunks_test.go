@@ -769,3 +769,26 @@ func TestPruneRecords(t *testing.T) {
 	require.Zero(removed)
 	requireRecords(true)
 }
+
+// The chunk delay must exceed the lifetime of a signed URL of a chunk by
+// twice the clock skew margin: the servers date the URLs by their clocks and
+// the step judges the age of a record by its own.
+func TestDeleteOpts_ChunkDelayCoversClockSkew(t *testing.T) {
+	for _, tt := range []struct {
+		delay time.Duration
+		ok    bool
+	}{
+		{signedURLLifetime + time.Second, false},
+		{signedURLLifetime + 2*clockSkewMargin - time.Second, false},
+		{signedURLLifetime + 2*clockSkewMargin, true},
+	} {
+		o := DefaultDeleteOpts()
+		o.MinReplicas, o.ChunkDelay = 2, tt.delay
+		err := o.Validate()
+		if tt.ok {
+			require.NoError(t, err, tt.delay)
+		} else {
+			require.ErrorContains(t, err, "by twice the clock skew margin", tt.delay)
+		}
+	}
+}

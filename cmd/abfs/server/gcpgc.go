@@ -222,7 +222,7 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the list was complete")
 	fl.Float64Var(&c.opts.DeleteRate, "delete-rate", gc.DefaultDeleteRate, "In delete mode, the maximum number of objects deleted per second (0 means no limit)")
 	fl.IntVar(&c.opts.DeleteWorkers, "delete-workers", gc.DefaultDeleteWorkers, "In delete mode, the number of conditional deletes in flight, split evenly over the --shards key ranges")
-	fl.DurationVar(&c.opts.ChunkDelay, "chunk-delay", gc.DefaultChunkDelay, "In delete mode, how long after the record of a deleted object its chunks are deleted, at the earliest in the next cycle; longer than the 10 min lifetime of signed chunk URLs")
+	fl.DurationVar(&c.opts.ChunkDelay, "chunk-delay", gc.DefaultChunkDelay, "In delete mode, how long after the record of a deleted object its chunks are deleted, at the earliest in the next cycle; at least 12 min, the 10 min lifetime of signed chunk URLs plus 1 min of clock skew on each side")
 	fl.Float64Var(&c.opts.ChunkRate, "chunk-rate", gc.DefaultChunkRate, "In delete mode, the maximum number of chunks of deleted objects deleted per second (0 means no limit)")
 	fl.BoolVar(&c.opts.AllowNoSoftDelete, "allow-no-soft-delete", false, "In delete mode, delete the bucket chunks of deleted objects although the bucket keeps deleted objects for less than 7 days, so that they cannot be restored")
 	fl.DurationVar(&c.opts.StartDelay, "delete-start-delay", 0, "In delete mode, a pause before the delete step, for tests")

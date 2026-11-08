@@ -66,7 +66,7 @@ type DeleteOpts struct {
 	DeleteWorkers int
 	// ChunkDelay is how long after its record the chunks of a deleted object
 	// are deleted. It must exceed the lifetime of the signed URLs of chunks
-	// that a server hands out.
+	// that a server hands out by twice the clock skew margin.
 	ChunkDelay time.Duration
 	// ChunkRate is the maximum number of chunks deleted per second; zero
 	// means no limit.
@@ -103,8 +103,10 @@ func (o *DeleteOpts) Validate() error {
 		return fmt.Errorf("invalid chunk delete rate %g", o.ChunkRate)
 	case o.DeleteWorkers <= 0:
 		return fmt.Errorf("invalid number of delete workers %d", o.DeleteWorkers)
-	case o.ChunkDelay <= signedURLLifetime:
-		return fmt.Errorf("chunk delay %s is not longer than the %s lifetime of the signed URLs of chunks", o.ChunkDelay, signedURLLifetime)
+	case o.ChunkDelay < signedURLLifetime+2*clockSkewMargin:
+		// The servers date the URLs by their clocks, the step the records by
+		// its own.
+		return fmt.Errorf("chunk delay %s is not longer than the %s lifetime of the signed URLs of chunks by twice the clock skew margin %s", o.ChunkDelay, signedURLLifetime, clockSkewMargin)
 	case o.StartDelay < 0:
 		return fmt.Errorf("invalid delete start delay %s", o.StartDelay)
 	}
