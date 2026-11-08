@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,6 +66,9 @@ type localWriteCheck struct {
 	// dagsync with an offline threshold skips requests and then calls back without an
 	// error and without a server call, so phony requests sent to it confirm nothing.
 	phonySync atomic.Pointer[dagsync.DAGSync]
+	// phonies counts the phony requests in flight per list of hashes. dagsync joins a phony
+	// request to a running identical one, whose answer can predate the joining request.
+	phonies map[string]int
 
 	sent            atomic.Int64
 	present         atomic.Int64
@@ -507,16 +511,29 @@ func (c *CacheMan) checkUntrackedEntry(hash entities.Hash, entry *IndexEntry) bo
 	return true
 }
 
-// confirmAfterPhony wraps the callback of a phony request sent to sync: on success every hash
-// it sent is on the server, so entries waiting for a check are confirmed.
-func (c *CacheMan) confirmAfterPhony(sync *dagsync.DAGSync, hashes []entities.Hash, callback dagsync.Callback) dagsync.Callback {
+// confirmAfterPhony wraps the callback of a phony request sent to ds: on success every hash
+// it sent is on the server, so entries waiting for a check are confirmed. Only the entries that
+// waited when the request was sent are confirmed, since the answer can predate a later local
+// write, and a request that joins an identical one in flight confirms nothing.
+func (c *CacheMan) confirmAfterPhony(ds *dagsync.DAGSync, hashes []entities.Hash, callback dagsync.Callback) dagsync.Callback {
 	idx, ok := c.checkedIndex()
-	if !ok || c.localWrites.phonySync.Load() != sync {
+	if !ok || c.localWrites.phonySync.Load() != ds {
 		return callback
 	}
+	var marked []entities.Hash
+	key, joined := c.localWrites.startPhony(hashes)
+	if !joined {
+		for _, h := range hashes {
+			if idx.hasCheckMarker(h) {
+				marked = append(marked, h)
+			}
+		}
+	}
+	var once sync.Once
 	return func(err error) {
+		once.Do(func() { c.localWrites.endPhony(key) })
 		if err == nil {
-			for _, h := range hashes {
+			for _, h := range marked {
 				confirmed, cerr := idx.confirmRemote(h)
 				if cerr != nil {
 					c.printer.Printf("Failed to mark %s remote after a phony request: %v\n", h, cerr)
@@ -526,6 +543,31 @@ func (c *CacheMan) confirmAfterPhony(sync *dagsync.DAGSync, hashes []entities.Ha
 			}
 		}
 		callback(err)
+	}
+}
+
+// startPhony records a phony request for hashes in flight and reports whether an identical one
+// was in flight already.
+func (lw *localWriteCheck) startPhony(hashes []entities.Hash) (string, bool) {
+	var b strings.Builder
+	for _, h := range hashes {
+		b.Write(h[:])
+	}
+	key := b.String()
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	if lw.phonies == nil {
+		lw.phonies = make(map[string]int)
+	}
+	lw.phonies[key]++
+	return key, lw.phonies[key] > 1
+}
+
+func (lw *localWriteCheck) endPhony(key string) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	if lw.phonies[key]--; lw.phonies[key] <= 0 {
+		delete(lw.phonies, key)
 	}
 }
 

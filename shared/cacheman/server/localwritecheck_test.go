@@ -51,6 +51,8 @@ type checkRemote struct {
 	hidden   map[entities.Hash]bool
 	fail     bool
 	putHold  chan struct{}
+	// answerHold holds the answers of Headers calls after the server read them.
+	answerHold chan struct{}
 
 	calls atomic.Int64
 	keys  atomic.Int64
@@ -107,6 +109,21 @@ func (r *checkRemote) holdPuts() func() {
 	}
 }
 
+// holdAnswers makes Headers calls read the server and then wait with the answer until the
+// returned function is called.
+func (r *checkRemote) holdAnswers() func() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ch := make(chan struct{})
+	r.answerHold = ch
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.answerHold = nil
+		close(ch)
+	}
+}
+
 func (r *checkRemote) setFail(fail bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -123,6 +140,7 @@ func (r *checkRemote) Headers(ctx context.Context, keys []remote.Hash) ([]entiti
 		waits = append(waits, r.holdKeys[k])
 	}
 	fail := r.fail
+	answerHold := r.answerHold
 	r.mu.Unlock()
 	for _, ch := range waits {
 		if ch == nil {
@@ -140,6 +158,9 @@ func (r *checkRemote) Headers(ctx context.Context, keys []remote.Hash) ([]entiti
 	hdrs, err := r.ABFSClient.Headers(ctx, keys)
 	if err != nil {
 		return nil, err
+	}
+	if answerHold != nil {
+		<-answerHold
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -736,6 +757,42 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		require.True(t, confirmed(c, h))
 		require.True(t, inLRU(t, c, h))
 		require.Equal(t, int64(1), c.Stats().RemoteChecks.PhonyConfirmed)
+	})
+
+	// A local write while a phony request is in flight can come after the server answered it.
+	// Neither that request nor an identical one that dagsync joins to it confirms the write.
+	t.Run("phony in flight during a local write", func(t *testing.T) {
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, period: time.Hour})
+		c.startLocalWriteCheck(ctx)
+		h := writeBlob(t, c, "written during a phony")
+		_, err := c.addLocalObjectToIndex(h, EntryTypeBlob)
+		require.NoError(t, err)
+		putOnServer(t, r, "written during a phony")
+
+		release := r.holdAnswers()
+		calls := r.calls.Load()
+		results := make(chan error, 2)
+		c.Phony(0, []entities.Hash{h}, func(err error) { results <- err })
+		require.Eventually(t, func() bool { return r.calls.Load() > calls }, 5*time.Second, 10*time.Millisecond)
+
+		// The keep-alive found the entry on the server, then the content is written again.
+		require.NoError(t, c.index.markObjectRemote(h))
+		c.NewObject(h, protocol.TypeBlob)
+		require.Eventually(t, func() bool { return hasMarker(c, h) }, 5*time.Second, 10*time.Millisecond)
+		calls = r.calls.Load()
+		// Phony sends from a goroutine; sending here puts the request into the dagsync
+		// mailbox before the first request's answer is released.
+		hashes := []entities.Hash{h}
+		ds := c.getSync()
+		ds.Phony(0, hashes, c.confirmAfterPhony(ds, hashes, func(err error) { results <- err }))
+
+		release()
+		require.NoError(t, <-results)
+		require.NoError(t, <-results)
+		require.Equal(t, calls, r.calls.Load(), "the second request was not joined to the first")
+		requireUnconfirmed(t, c, h)
+		require.Zero(t, c.Stats().RemoteChecks.PhonyConfirmed)
 	})
 
 	// With an offline threshold, dagsync skips a phony request whose link it skipped, and
