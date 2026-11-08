@@ -23,6 +23,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/pflag"
@@ -156,6 +157,7 @@ type gcpGCRunCmd struct {
 	opts    gc.DeleteOpts
 	dryRun  bool
 	condemn bool
+	delete  bool
 	report  string
 	explain []string
 }
@@ -163,7 +165,7 @@ type gcpGCRunCmd struct {
 func (c *gcpGCRunCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "run",
-		Usage: "(--dry-run | --condemn (--expected-replicas <n> | --min-replicas <n> [--max-replicas <n>])) --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
+		Usage: "(--dry-run | (--condemn | --delete) (--expected-replicas <n> | --min-replicas <n> [--max-replicas <n>])) --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
 		Desc: `Run one garbage collection cycle and report it as JSON. Both modes take the GC lease,
 read the refs at one snapshot, scan the gc and maps tables and mark what the roots, the
 retention rules and the grace keep. With --consistency (required for --condemn) the cycle
@@ -177,12 +179,24 @@ every check of the cycle passed: --expected-replicas distinct server hosts, or a
 --min-replicas and at most --max-replicas, write a GC heartbeat, one live row each, with
 settings that fit the timing rules; no object lacks a gc row; and no pin or root could not
 be read. --explain adds, per key, the root that keeps it.
+
+--delete runs a condemn cycle that first deletes the objects of the list of the condemn or
+delete cycle before that are still unreachable and still hold its marker: the map rows that
+name them first, then each object after every parent of it, each batch recorded in the
+bucket under gc/deleted/ before its deletes, each delete conditional on the marker. It
+deletes only when every delete check passed, and else only condemns and lists the reasons
+in the report: the list is complete and the cycle runs in the window its timings allow; no
+server that may have run within the grace crashed, lost touches or ran without link
+validation; the Bigtable instance has one cluster and the app profile accepts conditional
+writes; ready backups of the tables exist (unless --no-backup-check); and no live mount can
+hold the only copy of content it wrote. A dry run and a condemn cycle report what a delete
+would remove. The chunks of deleted objects are removed one cycle later.
 Needs the resources of 'abfs server gcp init --gc'.`,
 	}
 }
 
 func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
-	c.opts = gc.DeleteOpts{CondemnOpts: gc.DefaultCondemnOpts()}
+	c.opts = gc.DefaultDeleteOpts()
 	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
 	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
@@ -192,14 +206,19 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing")
 	fl.BoolVar(&c.condemn, "condemn", false, "Mark the unreachable objects as condemned and delete nothing")
-	fl.IntVar(&c.opts.ExpectedReplicas, "expected-replicas", 0, "With --condemn, the number of distinct server hosts that must run with --gc, for a fleet of fixed size (this or --min-replicas is required)")
-	fl.IntVar(&c.opts.MinReplicas, "min-replicas", 0, "With --condemn, the smallest number of distinct server hosts that must run with --gc, for a fleet whose size changes: the autoscaler minimum less the servers a disruption budget lets stop at once")
+	fl.BoolVar(&c.delete, "delete", false, "Delete the objects condemned by the cycle before that are still unreachable, then condemn as --condemn does")
+	fl.IntVar(&c.opts.ExpectedReplicas, "expected-replicas", 0, "With --condemn or --delete, the number of distinct server hosts that must run with --gc, for a fleet of fixed size (this or --min-replicas is required)")
+	fl.IntVar(&c.opts.MinReplicas, "min-replicas", 0, "With --condemn or --delete, the smallest number of distinct server hosts that must run with --gc, for a fleet whose size changes: the autoscaler minimum less the servers a disruption budget lets stop at once")
 	fl.IntVar(&c.opts.MaxReplicas, "max-replicas", 0, "With --min-replicas, the largest number of distinct server hosts with --gc (0 means no limit)")
 	fl.StringSliceVar(&c.opts.Types, "delete-types", nil, "In delete mode, the object types, separated by commas, that the cycle may delete (default: every type)")
 	fl.BoolVar(&c.opts.AcceptMountsWithoutKeepAlive, "accept-mounts-without-keepalive", false, "In delete mode, delete blobs, trees and eval objects while live mounts run without gc-keepalive, whose caches may hold the only copy of content they wrote; the check then only warns")
 	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the list was complete")
-	fl.Float64Var(&c.opts.Rate, "condemn-rate", gc.DefaultCondemnRate, "With --condemn, the maximum number of objects marked per second (0 means no limit)")
-	fl.IntVar(&c.opts.KeepLists, "keep-lists", gc.DefaultKeepLists, "With --condemn, the number of condemned lists of the newest cycles kept in the bucket")
+	fl.Float64Var(&c.opts.DeleteRate, "delete-rate", gc.DefaultDeleteRate, "In delete mode, the maximum number of objects deleted per second (0 means no limit)")
+	fl.IntVar(&c.opts.DeleteWorkers, "delete-workers", gc.DefaultDeleteWorkers, "In delete mode, the number of conditional deletes in flight, split evenly over the --shards key ranges")
+	fl.DurationVar(&c.opts.ChunkDelay, "chunk-delay", gc.DefaultChunkDelay, "In delete mode, how long after the record of a deleted object its chunks are deleted, at the earliest in the next cycle; longer than the 10 min lifetime of signed chunk URLs")
+	fl.DurationVar(&c.opts.StartDelay, "delete-start-delay", 0, "In delete mode, a pause before the delete step, for tests")
+	fl.Float64Var(&c.opts.Rate, "condemn-rate", gc.DefaultCondemnRate, "With --condemn or --delete, the maximum number of objects marked per second (0 means no limit)")
+	fl.IntVar(&c.opts.KeepLists, "keep-lists", gc.DefaultKeepLists, "With --condemn or --delete, the number of condemned lists of the newest cycles kept in the bucket")
 	fl.StringVar(&c.report, "report", "", "Write the JSON report to this file instead of stdout")
 	fl.DurationVar(&c.opts.Grace, "grace", gc.DefaultGrace, "Keep objects written or touched within this time before the snapshot, and what they reach")
 	fl.DurationVar(&c.opts.MountIdle, "mount-idle", gc.DefaultMountIdle, "Keep what a mount ref reaches while the mount wrote its ref within this time")
@@ -217,16 +236,25 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 
 // checkOpts checks the mode flags and fills the keys to explain.
 func (c *gcpGCRunCmd) checkOpts() error {
-	if c.dryRun == c.condemn {
-		return errors.New("pass one of --dry-run and --condemn")
+	modes := 0
+	for _, m := range []bool{c.dryRun, c.condemn, c.delete} {
+		if m {
+			modes++
+		}
 	}
-	if len(c.opts.Types) > 0 || c.opts.AcceptMountsWithoutKeepAlive || c.opts.NoBackupCheck {
-		return errors.New("--delete-types, --accept-mounts-without-keepalive and --no-backup-check apply only to delete mode")
+	if modes != 1 {
+		return errors.New("pass one of --dry-run, --condemn and --delete")
+	}
+	if !c.delete && (len(c.opts.Types) > 0 || c.opts.AcceptMountsWithoutKeepAlive || c.opts.NoBackupCheck || c.opts.StartDelay != 0) {
+		return errors.New("--delete-types, --accept-mounts-without-keepalive, --no-backup-check and --delete-start-delay apply only to delete mode")
 	}
 	var err error
-	if c.condemn {
+	switch {
+	case c.delete:
+		err = c.opts.Validate()
+	case c.condemn:
 		err = c.opts.CondemnOpts.Validate()
-	} else {
+	default:
 		err = c.opts.DryRunOpts.Validate()
 	}
 	if err != nil {
@@ -257,6 +285,9 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	c.server.MaxCachedHeaders = 1
 	c.server.MaxCachedContents = 1
 	profile := checkAppProfile(ctx, &c.server)
+	if c.delete && len(profile.Problems) > 0 {
+		return fmt.Errorf("the Bigtable app profile %s does not fit a delete cycle: %s", profile.ID, strings.Join(profile.Problems, "; "))
+	}
 	server, err := gcp.New(ctx, &c.server)
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
@@ -267,10 +298,13 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		}
 	}()
 	var res *gc.Result
-	if c.condemn {
+	switch {
+	case c.delete:
+		res, err = server.DeleteGC(ctx, c.server.BucketName, server.GCInstanceChecks(c.server.ProjectID, c.server.BtInstance), &c.opts)
+	case c.condemn:
 		res, err = server.CondemnGC(ctx, c.server.BucketName, &c.opts.CondemnOpts)
-	} else {
-		res, err = server.DryRunGC(ctx, &c.opts.DryRunOpts)
+	default:
+		res, err = server.DryRunGC(ctx, c.server.BucketName, &c.opts.DryRunOpts)
 	}
 	if res != nil {
 		res.Report.AppProfile = profile

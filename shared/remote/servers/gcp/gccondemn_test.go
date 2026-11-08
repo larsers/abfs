@@ -61,6 +61,7 @@ func newCondemnFixture(t *testing.T) *condemnFixture {
 	f.s.storage = client
 	f.put(entities.EmptyFileHash, []byte("blob 0\x00"), f.old)
 	f.put(entities.EmptyDirHash, []byte("tree 0\x00"), f.old)
+	f.bucket = bucket
 	return &condemnFixture{gcFixture: f, bucket: bucket}
 }
 

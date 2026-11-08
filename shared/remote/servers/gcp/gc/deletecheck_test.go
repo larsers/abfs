@@ -367,12 +367,35 @@ func TestLiveBlockers_MixedFleet(t *testing.T) {
 	require.Contains(got[0], "replica old-1-bb: cache TTL 30h0m0s is not shorter than the cycle")
 }
 
-func TestDeleteOpts_ValidateTypes(t *testing.T) {
-	o := DeleteOpts{CondemnOpts: DefaultCondemnOpts(), Types: []string{"commit", "blob"}}
-	o.MinReplicas = 2
-	require.NoError(t, o.Validate())
-	o.Types = []string{"commits"}
-	require.ErrorContains(t, o.Validate(), `invalid object type "commits"`)
+// The types to delete must be known, there is at least one delete in
+// flight, and the chunks of a deleted object outlive the signed URLs of its
+// chunks that a server handed out before the delete.
+func TestDeleteOpts_Validate(t *testing.T) {
+	tests := []struct {
+		change  func(o *DeleteOpts)
+		wantErr string
+	}{
+		{func(o *DeleteOpts) {}, ""},
+		{func(o *DeleteOpts) { o.Types = []string{"commit", "blob"} }, ""},
+		{func(o *DeleteOpts) { o.Types = []string{"commits"} }, `invalid object type "commits"`},
+		{func(o *DeleteOpts) { o.DeleteWorkers = 0 }, "invalid number of delete workers 0"},
+		{func(o *DeleteOpts) { o.DeleteRate = -1 }, "invalid delete rate"},
+		{func(o *DeleteOpts) { o.ChunkDelay = 10 * time.Minute }, "not longer than the 10m0s lifetime"},
+		{func(o *DeleteOpts) { o.ChunkDelay = 12 * time.Minute }, ""},
+		{func(o *DeleteOpts) { o.StartDelay = -time.Second }, "invalid delete start delay"},
+		{func(o *DeleteOpts) { o.MinReplicas = 0 }, "invalid expected replicas 0"},
+	}
+	for _, tt := range tests {
+		o := DefaultDeleteOpts()
+		o.MinReplicas = 2
+		tt.change(&o)
+		err := o.Validate()
+		if tt.wantErr == "" {
+			require.NoError(t, err)
+			continue
+		}
+		require.ErrorContains(t, err, tt.wantErr)
+	}
 }
 
 // fakeServers serves the reads of pollServerStats from a list, one per read,
@@ -514,6 +537,7 @@ func TestCheckTooNew(t *testing.T) {
 type fakeInstance struct {
 	clusters      []string
 	probeErr      error
+	probes        int
 	backups       []Backup
 	backupsCalled bool
 }
@@ -525,7 +549,10 @@ func (f *fakeInstance) Backups(context.Context) ([]Backup, error) {
 	return f.backups, nil
 }
 
-func (f *fakeInstance) ProbeConditionalWrite(context.Context) error { return f.probeErr }
+func (f *fakeInstance) ProbeConditionalWrite(context.Context) error {
+	f.probes++
+	return f.probeErr
+}
 
 // The checks of the instance are read for every delete, and the backups only
 // unless the operator skips them.
@@ -534,7 +561,7 @@ func TestReadInstanceEvidence(t *testing.T) {
 	ctx := context.Background()
 	f := &fakeInstance{clusters: []string{"c1"}, probeErr: status.Error(codes.FailedPrecondition, "no transactions")}
 	o := &DeleteOpts{}
-	e := readInstanceEvidence(ctx, f, o)
+	e := readInstanceEvidence(ctx, f, writeBudget{}, o)
 	require.True(f.backupsCalled)
 	require.True(e.backupsChecked)
 	require.Equal([]string{"c1"}, e.clusters)
@@ -544,9 +571,21 @@ func TestReadInstanceEvidence(t *testing.T) {
 
 	f.backupsCalled = false
 	o.NoBackupCheck = true
-	e = readInstanceEvidence(ctx, f, o)
+	e = readInstanceEvidence(ctx, f, writeBudget{}, o)
 	require.False(f.backupsCalled)
 	require.Len(instanceBlockers(&e, time.Now()), 1)
+
+	// The probe is a write of the collector: it is retried on transient
+	// errors and not sent once the lease could expire.
+	f.probes, f.probeErr = 0, status.Error(codes.Unavailable, "busy")
+	e = readInstanceEvidence(ctx, f, writeBudget{deadline: time.Second}, o)
+	require.Equal(writeAttempts, f.probes)
+	f.probes, f.probeErr = 0, nil
+	expiring := &Lease{}
+	expiring.expiry.Store(time.Now().Add(time.Minute).UnixNano())
+	e = readInstanceEvidence(ctx, f, writeBudget{deadline: DefaultWriteDeadline, lease: expiring}, o)
+	require.Zero(f.probes)
+	require.ErrorIs(e.probeErr, errLeaseExpiring)
 }
 
 // The probe of the collector's own app profile is a conditional write that
@@ -618,10 +657,10 @@ func TestNewDeleteEvidence(t *testing.T) {
 	state := ListState{Location: "gc/default/list-5", SnapshotTime: start.Add(-time.Hour), Complete: true, CompleteTime: start.Add(-50 * time.Minute)}
 	header := &listHeader{cycle: 5, snapshot: state.SnapshotTime}
 	servers := &serverEvidence{readTime: start}
-	ev := newDeleteEvidence(lease, &condemner{prevState: state, prev: &condemnedList{header: header}}, &Result{servers: servers})
+	ev := newDeleteEvidence(lease, &condemner{prev: previousList{state: state, list: &condemnedList{header: header}}}, &Result{servers: servers})
 	require.Equal(&deleteEvidence{snapshot: start, previousCondemnCycle: 5, list: state, listHeader: header, servers: servers}, ev)
 
-	ev = newDeleteEvidence(lease, &condemner{prevState: state, prevErr: "not found"}, &Result{servers: servers})
+	ev = newDeleteEvidence(lease, &condemner{prev: previousList{state: state, err: "not found"}}, &Result{servers: servers})
 	require.Nil(ev.listHeader)
 	require.Equal("not found", ev.listErr)
 }

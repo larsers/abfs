@@ -58,6 +58,25 @@ type DeleteOpts struct {
 	// NoBackupCheck deletes without a backup of the tables taken after the
 	// list was complete.
 	NoBackupCheck bool
+	// DeleteRate is the maximum number of objects deleted per second; zero
+	// means no limit.
+	DeleteRate float64
+	// DeleteWorkers is the number of conditional deletes in flight, split
+	// evenly over the key ranges of the scan.
+	DeleteWorkers int
+	// ChunkDelay is how long after its record the chunks of a deleted object
+	// are deleted. It must exceed the lifetime of the signed URLs of chunks
+	// that a server hands out.
+	ChunkDelay time.Duration
+	// StartDelay pauses the cycle before the delete step, for tests that use
+	// an object in between.
+	StartDelay time.Duration
+}
+
+// DefaultDeleteOpts returns the default options; the replica counts have no
+// default.
+func DefaultDeleteOpts() DeleteOpts {
+	return DeleteOpts{CondemnOpts: DefaultCondemnOpts(), DeleteRate: DefaultDeleteRate, DeleteWorkers: DefaultDeleteWorkers, ChunkDelay: DefaultChunkDelay}
 }
 
 // Validate checks the options.
@@ -69,6 +88,16 @@ func (o *DeleteOpts) Validate() error {
 		if _, ok := typeIndex[t]; !ok {
 			return fmt.Errorf("invalid object type %q to delete: the known types are %s", t, strings.Join(typeNames, ", "))
 		}
+	}
+	switch {
+	case o.DeleteRate < 0:
+		return fmt.Errorf("invalid delete rate %g", o.DeleteRate)
+	case o.DeleteWorkers <= 0:
+		return fmt.Errorf("invalid number of delete workers %d", o.DeleteWorkers)
+	case o.ChunkDelay <= signedURLLifetime:
+		return fmt.Errorf("chunk delay %s is not longer than the %s lifetime of the signed URLs of chunks", o.ChunkDelay, signedURLLifetime)
+	case o.StartDelay < 0:
+		return fmt.Errorf("invalid delete start delay %s", o.StartDelay)
 	}
 	return nil
 }
@@ -94,6 +123,11 @@ type DeleteReport struct {
 	// TooNew reports the objects the consistency scan found without a gc row
 	// because they were written during it.
 	TooNew *TooNewReport `json:"too_new,omitempty"`
+	// Plan reports what the cycle would delete from the list before; dry runs
+	// and condemn cycles report only it.
+	Plan *DeletePlanReport `json:"plan,omitempty"`
+	// Step reports the delete step, when it ran.
+	Step *DeleteStepReport `json:"step,omitempty"`
 }
 
 // deleteEvidence is what deleteBlockers judges, gathered by the cycle before
@@ -123,12 +157,12 @@ func newDeleteEvidence(lease *Lease, c *condemner, res *Result) *deleteEvidence 
 	ev := &deleteEvidence{
 		snapshot:             lease.Start,
 		previousCondemnCycle: lease.PreviousCondemnCycle,
-		list:                 c.prevState,
-		listErr:              c.prevErr,
+		list:                 c.prev.state,
+		listErr:              c.prev.err,
 		servers:              res.servers,
 	}
-	if c.prev != nil {
-		ev.listHeader = c.prev.header
+	if c.prev.list != nil {
+		ev.listHeader = c.prev.list.header
 	}
 	return ev
 }
@@ -249,7 +283,7 @@ func mountSamples(m *MountCounts, count string) string {
 // evidence of the first read must hold again on this read, and the touch
 // interval of the live mounts in r must still fit the servers that run now
 // when o allows types that clients write. It fails only when ctx ends.
-func waitForServerStats(ctx context.Context, lease *Lease, r *Report, o *DeleteOpts) ([]string, error) { //nolint:unused // called by the delete step of a cycle; pollServerStats is tested
+func waitForServerStats(ctx context.Context, lease *Lease, r *Report, o *DeleteOpts) ([]string, error) {
 	return pollServerStats(ctx, func(ctx context.Context) (*serverEvidence, error) {
 		return readServerEvidence(ctx, lease.client, lease.name)
 	}, r, o)

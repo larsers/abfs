@@ -40,8 +40,8 @@ type InstanceChecks interface {
 	// Backups returns the backups of the tables of the instance in every
 	// cluster.
 	Backups(ctx context.Context) ([]Backup, error)
-	// ProbeConditionalWrite sends a conditional write that changes nothing
-	// with the app profile of the collector.
+	// ProbeConditionalWrite sends one conditional write that changes nothing
+	// with the app profile of the collector; the caller retries it.
 	ProbeConditionalWrite(ctx context.Context) error
 }
 
@@ -113,15 +113,13 @@ func (c *instanceChecks) Backups(ctx context.Context) ([]Backup, error) {
 }
 
 // ProbeConditionalWrite implements InstanceChecks. It deletes a cell of a row
-// that does not exist, under a condition, as the server does at start; the
-// client does not retry conditional writes, so the probe retries transient
-// errors itself.
+// that does not exist, under a condition, as the server does at start.
 func (c *instanceChecks) ProbeConditionalWrite(ctx context.Context) error {
 	predicate := bigtable.ChainFilters(bigtable.FamilyFilter(ObjectsFamily), bigtable.ColumnFilter(CondemnedColumn))
 	del := bigtable.NewMutation()
 	del.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
 	mut := bigtable.NewCondMutation(predicate, del, nil)
-	return Retry(ctx, func() error { return c.bt.Open(objectsTable).Apply(ctx, "abfs-setup-check", mut) })
+	return c.bt.Open(objectsTable).Apply(ctx, "abfs-setup-check", mut)
 }
 
 // instanceEvidence is what the checks of the instance found.
@@ -136,11 +134,13 @@ type instanceEvidence struct {
 }
 
 // readInstanceEvidence runs the checks of the instance that a delete needs:
-// the cluster count, the probe and, unless o skips it, the backups.
-func readInstanceEvidence(ctx context.Context, checks InstanceChecks, o *DeleteOpts) instanceEvidence {
+// the cluster count, the probe and, unless o skips it, the backups. The
+// client does not retry conditional writes, so the probe is retried here,
+// each attempt within the budget b like every other write of the collector.
+func readInstanceEvidence(ctx context.Context, checks InstanceChecks, b writeBudget, o *DeleteOpts) instanceEvidence {
 	var e instanceEvidence
 	e.clusters, e.clustersErr = checks.Clusters(ctx)
-	e.probeErr = checks.ProbeConditionalWrite(ctx)
+	e.probeErr = retryWith(ctx, firstRetryWait, b, checks.ProbeConditionalWrite)
 	if !o.NoBackupCheck {
 		e.backupsChecked = true
 		e.backups, e.backupsErr = checks.Backups(ctx)
@@ -173,7 +173,14 @@ func instanceBlockers(e *instanceEvidence, listComplete time.Time) []string {
 		return reasons
 	}
 	if e.backupsErr != nil {
-		add("cannot list the backups of the Bigtable instance%s: %v", permissionHint(e.backupsErr, "bigtable.backups.list"), e.backupsErr)
+		hint := permissionHint(e.backupsErr, "bigtable.backups.list")
+		if status.Code(e.backupsErr) == codes.Unknown {
+			// The client library fails the whole listing on a backup it
+			// cannot parse, such as one still being created, which has no
+			// end time yet.
+			hint = " (a backup that is still being created fails the listing until it is ready)"
+		}
+		add("cannot list the backups of the Bigtable instance%s: %v", hint, e.backupsErr)
 		return reasons
 	}
 	for _, table := range backupTables {

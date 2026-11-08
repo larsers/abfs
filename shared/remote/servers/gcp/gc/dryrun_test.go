@@ -29,7 +29,7 @@ func TestDryRunOpts_TimingCheck(t *testing.T) {
 	o.Grace = 56 * time.Hour
 	require.ErrorContains(t, o.Validate(), "grace 56h0m0s is shorter than 2 x cycle (24h0m0s) + cache TTL (6h0m0s) + longest push (3h0m0s) = 57h0m0s")
 	// The check runs before anything is read or written.
-	_, err := DryRun(context.Background(), nil, nil, nil, &o)
+	_, err := DryRun(context.Background(), nil, nil, nil, nil, &o)
 	require.ErrorContains(t, err, "is shorter than")
 
 	o.Grace = 57 * time.Hour

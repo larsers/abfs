@@ -61,15 +61,15 @@ func TestGCPInitFlags_GC(t *testing.T) {
 	}
 }
 
-// gc run takes exactly one mode, and --condemn needs the expected number or
-// range of server hosts and the consistency check.
+// gc run takes exactly one mode, and --condemn and --delete need the expected
+// number or range of server hosts and the consistency check.
 func TestGCPGCRunFlags_Modes(t *testing.T) {
 	tests := []struct {
 		args    []string
 		wantErr string
 	}{
-		{nil, "pass one of --dry-run and --condemn"},
-		{[]string{"--dry-run", "--condemn", "--expected-replicas=3"}, "pass one of --dry-run and --condemn"},
+		{nil, "pass one of --dry-run, --condemn and --delete"},
+		{[]string{"--dry-run", "--condemn", "--expected-replicas=3"}, "pass one of --dry-run, --condemn and --delete"},
 		{[]string{"--dry-run"}, ""},
 		{[]string{"--condemn"}, "invalid expected replicas 0"},
 		{[]string{"--condemn", "--expected-replicas=3", "--consistency=false"}, "needs the consistency check"},
@@ -90,6 +90,18 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--condemn", "--min-replicas=2", "--no-backup-check"}, "apply only to delete mode"},
 		{[]string{"--dry-run", "--accept-mounts-without-keepalive"}, "apply only to delete mode"},
 		{[]string{"--dry-run", "--delete-types=commit"}, "apply only to delete mode"},
+		{[]string{"--condemn", "--min-replicas=2", "--delete-start-delay=5m"}, "apply only to delete mode"},
+		// Delete mode implies the condemn and takes its checks.
+		{[]string{"--delete"}, "invalid expected replicas 0"},
+		{[]string{"--delete", "--condemn", "--min-replicas=2"}, "pass one of --dry-run, --condemn and --delete"},
+		{[]string{"--delete", "--dry-run", "--min-replicas=2"}, "pass one of --dry-run, --condemn and --delete"},
+		{[]string{"--delete", "--min-replicas=2"}, ""},
+		{[]string{"--delete", "--min-replicas=2", "--delete-types=commit,blob", "--no-backup-check", "--accept-mounts-without-keepalive", "--delete-start-delay=5m"}, ""},
+		{[]string{"--delete", "--min-replicas=2", "--delete-types=commits"}, `invalid object type "commits"`},
+		{[]string{"--delete", "--min-replicas=2", "--chunk-delay=10m"}, "not longer than the 10m0s lifetime of the signed URLs"},
+		{[]string{"--delete", "--min-replicas=2", "--delete-workers=0"}, "invalid number of delete workers 0"},
+		{[]string{"--delete", "--min-replicas=2", "--delete-rate=-1"}, "invalid delete rate"},
+		{[]string{"--delete", "--expected-replicas=3", "--consistency=false"}, "needs the consistency check"},
 	}
 	for _, tt := range tests {
 		c := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
@@ -110,6 +122,10 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 	require.Equal(t, 3, c.opts.ExpectedReplicas)
 	require.Equal(t, float64(gc.DefaultCondemnRate), c.opts.Rate)
 	require.Equal(t, gc.DefaultKeepLists, c.opts.KeepLists)
+	require.Equal(t, float64(2000), c.opts.DeleteRate)
+	require.Equal(t, 32, c.opts.DeleteWorkers)
+	require.Equal(t, time.Hour, c.opts.ChunkDelay)
+	require.Zero(t, c.opts.StartDelay)
 }
 
 // The GC commands export the client library metrics by default, which show

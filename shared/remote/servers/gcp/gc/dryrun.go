@@ -24,6 +24,7 @@ import (
 
 	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/spanner"
+	"cloud.google.com/go/storage"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/abfs/shared/entities"
@@ -161,7 +162,8 @@ type Report struct {
 	// what it found of the keys of the list before.
 	Condemn      *CondemnReport      `json:"condemn,omitempty"`
 	PreviousList *PreviousListReport `json:"previous_list,omitempty"`
-	// Delete reports the delete step of a delete cycle.
+	// Delete reports the delete step of a delete cycle, and in the other
+	// modes what one would delete from the list of the cycle before.
 	Delete *DeleteReport `json:"delete,omitempty"`
 	// Explain explains the keys of DryRunOpts.Explain.
 	Explain []KeyReport  `json:"explain,omitempty"`
@@ -256,8 +258,18 @@ type Result struct {
 	// they were written during it.
 	unreachable []sizedNode
 	tooNew      []string
+	// seen holds the nodes that the consistency scan found an objects row
+	// for.
+	seen bitmap
 	// servers is the server evidence read at the start of the cycle.
 	servers *serverEvidence
+	// bounds are the key ranges of the scans, and maps the rows of the table
+	// maps.
+	bounds []string
+	maps   *mapScan
+	// plan is the plan of a delete from the list of the cycle before, nil
+	// when there is none.
+	plan *deletePlan
 }
 
 // firstRoot returns the root whose walk first reached the tracked node id, or
@@ -285,18 +297,20 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 // and counts what a collection would remove. It writes nothing but the
 // GcState row and deletes the GcReplicas rows not seen for a day. objs reads
 // the workspace snapshots, mount details and pinned manifests of live mounts
-// and workspaces.
-func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
+// and workspaces. With bucket, which holds the condemned lists, the report
+// also counts what a delete cycle would remove from the last list.
+func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
-	return runCycle(ctx, sp, bt, objs, &o, nil)
+	return runCycle(ctx, sp, bt, bucket, objs, &o, nil)
 }
 
 // runCycle runs one cycle: a dry run when c is nil, else a condemn cycle
-// whose steps c runs on the mark, under the same lease.
-func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, o *DryRunOpts, c *condemner) (*Result, error) {
+// whose steps c runs on the mark, under the same lease, and a delete cycle
+// when c has a deleter.
+func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, o *DryRunOpts, c *condemner) (*Result, error) {
 	if o.Holder == "" {
 		o.Holder = DefaultHolder()
 	}
@@ -304,7 +318,12 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs
 		o.StateName = DefaultStateName
 	}
 	phase := PhaseDryRun
-	if c != nil {
+	allows := func(string) bool { return true }
+	switch {
+	case c != nil && c.del != nil:
+		phase = PhaseDelete
+		allows = c.del.opts.allows
+	case c != nil:
 		phase = PhaseCondemn
 	}
 	start := time.Now()
@@ -318,11 +337,22 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs
 
 	d := &dryRun{opts: o, lease: lease, sp: sp, bt: bt, objs: objs, start: start, phase: phase, keepUnreachable: c != nil}
 	var res *Result
-	if c != nil {
+	var prev previousList
+	switch {
+	case c != nil:
 		err = c.readPrevious(runCtx, lease, d)
+		prev = c.prev
+	case bucket != nil:
+		prev, err = readPreviousList(runCtx, lease, bucket)
+		d.keepUnreachable = prev.list != nil
 	}
 	if err == nil {
 		res, err = d.run(runCtx)
+	}
+	if err == nil && prev.list != nil && res.seen != nil {
+		res.plan = planDeletes(res, prev.list, res.Report.SnapshotTime.Add(-o.MapRetention).UnixMicro(), allows)
+		res.plan.report.List = prev.state.Location
+		res.Report.Delete = &DeleteReport{Plan: res.plan.report}
 	}
 	if err == nil && c != nil {
 		err = c.run(runCtx, lease, res)
@@ -438,8 +468,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	}
 	d.outdated = nodes.OutdatedTypes
 	d.sampleMemory()
-	var mapRows [][]mapRow
-	var malformedMaps int64
+	var maps *mapScan
 	eg, ectx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
 		var err error
@@ -448,7 +477,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	})
 	eg.Go(func() error {
 		var err error
-		mapRows, malformedMaps, err = scanMaps(ectx, d.bt.Open(mapsTableName), bounds, g)
+		maps, err = scanMaps(ectx, d.bt.Open(mapsTableName), bounds, g)
 		return err
 	})
 	if err := eg.Wait(); err != nil {
@@ -501,12 +530,12 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 			recent.Roots++
 		}
 	}
-	r.Maps = m.markMaps(g, mapRows, snapshot.Add(-o.MapRetention).UnixMicro())
+	r.Maps = m.markMaps(g, maps.rows, snapshot.Add(-o.MapRetention).UnixMicro())
 	for class, mc := range r.Maps {
 		d.root(rootMapPrefix + string(class)).Roots = mc.Live
 	}
-	if malformedMaps > 0 {
-		r.Maps[MapMalformed] = &MapCounts{Rows: malformedMaps}
+	if maps.malformed > 0 {
+		r.Maps[MapMalformed] = &MapCounts{Rows: maps.malformed}
 	}
 	r.Seconds.Mark = time.Since(step).Seconds()
 	d.sampleMemory()
@@ -522,7 +551,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	r.Objects.Unreachable = r.Objects.Rows - r.Objects.Reachable
 	d.countTypes(g, m.live)
 
-	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}, servers: servers}
+	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}, servers: servers, bounds: bounds, maps: maps}
 	if o.Consistency {
 		step = time.Now()
 		scan, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin), d.keepUnreachable)
@@ -532,7 +561,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		r.Consistency = *scan.report
 		r.Objects.ReachableBytes = &scan.sizes.reachable
 		r.Objects.UnreachableBytes = &scan.sizes.unreachable
-		res.unreachable, res.tooNew = scan.unreachable, scan.tooNew
+		res.unreachable, res.tooNew, res.seen = scan.unreachable, scan.tooNew, scan.seen
 		r.Seconds.Consistency = time.Since(step).Seconds()
 	}
 	if len(o.Explain) > 0 {
@@ -545,7 +574,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	for _, s := range g.segs {
 		r.Memory.EdgesBytes += s.bytes()
 	}
-	for _, rows := range mapRows {
+	for _, rows := range maps.rows {
 		r.Memory.MapRowsBytes += int64(cap(rows)) * 16
 	}
 	r.Seconds.Total = time.Since(d.start).Seconds()

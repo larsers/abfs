@@ -134,7 +134,7 @@ func Condemn(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucke
 		o.BatchSize = DefaultCondemnBatch
 	}
 	c := &condemner{opts: &o, bt: bt, bucket: bucket}
-	return runCycle(ctx, sp, bt, objs, &o.DryRunOpts, c)
+	return runCycle(ctx, sp, bt, bucket, objs, &o.DryRunOpts, c)
 }
 
 // blockingRootClasses are the root classes in which a root without a gc row
@@ -210,11 +210,10 @@ type condemner struct {
 	bt     *bigtable.Client
 	bucket *storage.BucketHandle
 	budget writeBudget
-	// prev is the list of the last condemn cycle, prevState its state in
-	// GcState and prevErr why it could not be read.
-	prev      *condemnedList
-	prevState ListState
-	prevErr   string
+	// prev is the list of the last condemn cycle.
+	prev previousList
+	// del runs the delete steps of a delete cycle, nil in a condemn cycle.
+	del *deleter
 }
 
 func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
@@ -233,6 +232,11 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		}
 		return &ErrCondemnRefused{Reasons: rep.Refused}
 	}
+	if c.del != nil {
+		if err := c.del.check(ctx, lease, c, res); err != nil {
+			return err
+		}
+	}
 
 	// The markers of the previous list's live keys are cleared before this
 	// cycle's list replaces it in GcState, so that a crash in between leaves
@@ -241,10 +245,20 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 	if r.PreviousList, err = c.clearLive(ctx, lease, res); err != nil {
 		return err
 	}
+	nodes := res.unreachable
+	if c.del != nil {
+		deleted, err := c.del.run(ctx, lease, res)
+		if err != nil {
+			return err
+		}
+		// A marker written to a deleted row would make a row of its own.
+		if deleted != nil {
+			nodes = slices.DeleteFunc(slices.Clone(nodes), func(n sizedNode) bool { return deleted.has(n.id) })
+		}
+	}
 
 	// The list comes before any marker, so that every marker a crashed run
 	// leaves is in a list the next cycle reads.
-	nodes := res.unreachable
 	name := listObjectName(c.opts.StateName, r.Cycle)
 	h := &listHeader{cycle: r.Cycle, snapshot: r.SnapshotTime, holder: c.opts.Holder, epoch: lease.Epoch, count: int64(len(nodes)), types: typeNames}
 	next := 0
@@ -268,7 +282,7 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		rep.CondemnedBytes += n.size
 		rep.Types[typeNames[res.graph.types[n.id]]]++
 	}
-	if err := c.mark(ctx, res, r.Cycle); err != nil {
+	if err := c.mark(ctx, res.graph, nodes, r.Cycle); err != nil {
 		return err
 	}
 	rep.Condemned = int64(len(nodes))
@@ -287,21 +301,20 @@ func markerValue(cycle int64) []byte {
 	return binary.BigEndian.AppendUint64(nil, uint64(cycle))
 }
 
-// mark sets the condemn marker of the objects res.unreachable to cycle, in
-// key order. Only rows the consistency scan saw are written, so the write
-// never creates an objects row. The mutation deletes the cells of the
-// column first, so the row holds exactly the new number whatever cells an
-// earlier cycle left.
-func (c *condemner) mark(ctx context.Context, res *Result, cycle int64) error {
+// mark sets the condemn marker of the objects nodes of g to cycle, in key
+// order. Only rows the consistency scan saw are written, so the write never
+// creates an objects row, unless the row was deleted since. The mutation
+// deletes the cells of the column first, so the row holds exactly the new
+// number whatever cells an earlier cycle left.
+func (c *condemner) mark(ctx context.Context, g *graph, nodes []sizedNode, cycle int64) error {
 	table := c.bt.Open(objectsTable)
 	lim := newLimiter(c.opts.Rate)
 	value := markerValue(cycle)
-	nodes := res.unreachable
 	rows := make([]string, 0, c.opts.BatchSize)
 	for lo := 0; lo < len(nodes); lo += c.opts.BatchSize {
 		rows = rows[:0]
 		for _, n := range nodes[lo:min(lo+c.opts.BatchSize, len(nodes))] {
-			rows = append(rows, res.graph.key(n.id).String())
+			rows = append(rows, g.key(n.id).String())
 		}
 		if err := lim.wait(ctx, len(rows)); err != nil {
 			return err

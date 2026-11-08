@@ -44,6 +44,8 @@ type gcFixture struct {
 	now time.Time
 	// old is older than every retention of the default options.
 	old time.Time
+	// bucket holds the condemned lists, which a dry run reads when it is set.
+	bucket string
 }
 
 func newGCFixture(t *testing.T) *gcFixture {
@@ -144,7 +146,7 @@ func (f *gcFixture) run(opts *gc.DryRunOpts) *gc.Result {
 		o.Shards = 3
 		opts = &o
 	}
-	res, err := f.s.DryRunGC(context.Background(), opts)
+	res, err := f.s.DryRunGC(context.Background(), f.bucket, opts)
 	require.NoError(f.t, err)
 	return res
 }
@@ -419,7 +421,7 @@ func TestDryRunGC_UnknownTypeFailsClosed(t *testing.T) {
 	f.gcRow(objects.HashBlobBytes([]byte("from a newer server")), "future-type", nil, f.old)
 
 	o := gc.DefaultDryRunOpts()
-	_, err := f.s.DryRunGC(context.Background(), &o)
+	_, err := f.s.DryRunGC(context.Background(), f.bucket, &o)
 	require.ErrorContains(t, err, `unknown object type "future-type"`)
 }
 
@@ -461,13 +463,13 @@ func TestDryRunGC_LeaseRefusesSecondRun(t *testing.T) {
 
 	o := gc.DefaultDryRunOpts()
 	o.Holder = "second"
-	_, err = f.s.DryRunGC(ctx, &o)
+	_, err = f.s.DryRunGC(ctx, f.bucket, &o)
 	var held *gc.ErrLeaseHeld
 	require.ErrorAs(err, &held)
 	require.Equal("first", held.Holder)
 
 	lease.Release()
-	res, err := f.s.DryRunGC(ctx, &o)
+	res, err := f.s.DryRunGC(ctx, f.bucket, &o)
 	require.NoError(err)
 	require.Equal(int64(2), res.Report.Cycle)
 	require.Equal("second", res.Report.Holder)
