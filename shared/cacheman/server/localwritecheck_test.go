@@ -496,6 +496,39 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		require.ElementsMatch(t, []entities.Hash{waiting, used}, evictAll(t, c))
 	})
 
+	// An entry used after the start waits for the end of the pass even when its new LRU time
+	// is below that of an answered batch, as with LRU times ahead of the clock.
+	t.Run("start pass watermark below the start", func(t *testing.T) {
+		old := localWriteStartPassBatch
+		localWriteStartPassBatch = 1
+		defer func() { localWriteStartPassBatch = old }()
+
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+		bi := c.index.(*badgerIndex)
+		store := bi.indexStore.(*BadgerIndexStore)
+		since := bi.gate.since.Load()
+		used := fetchedBlob(t, c, "used after the start")
+		answered := fetchedBlob(t, c, "answered")
+		waiting := fetchedBlob(t, c, "not answered")
+		for _, content := range []string{"used after the start", "answered", "not answered"} {
+			putOnServer(t, r, content)
+		}
+		setLRUTime(t, store, used, since+50)
+		setLRUTime(t, store, answered, since+100)
+		setLRUTime(t, store, waiting, since+200)
+
+		releaseWaiting := r.holdKey(waiting)
+		c.startLocalWriteCheck(ctx)
+		require.NoError(t, store.Use(used))
+		require.Eventually(t, func() bool { return c.Stats().RemoteChecks.StartPass == 2 }, 5*time.Second, 10*time.Millisecond)
+		require.Empty(t, evictAll(t, c))
+
+		releaseWaiting()
+		require.Eventually(t, func() bool { return !bi.gate.held.Load() }, 5*time.Second, 10*time.Millisecond)
+		require.ElementsMatch(t, []entities.Hash{used, answered, waiting}, evictAll(t, c))
+	})
+
 	// The server cannot be reached and the cache is full: eviction runs without the check
 	// and says so.
 	t.Run("start pass at the threshold", func(t *testing.T) {
@@ -589,6 +622,30 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		require.Equal(t, 1, swept)
 		require.False(t, hasBlob(t, c, localOnly))
 		requireUnconfirmed(t, c, marked)
+	})
+
+	// An entry that is not Remote is kept by eviction even without a marker, as when its LRU
+	// key is stale.
+	t.Run("not remote with an LRU key", func(t *testing.T) {
+		r := newCheckRemote()
+		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+		c.startLocalWriteCheck(ctx)
+		h := fetchedBlob(t, c, "stale LRU key")
+		store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+		require.NoError(t, store.db.Update(func(txn *badger.Txn) error {
+			entry, _ := store.get(txn, h)
+			entry.Remote = false
+			data, err := json.Marshal(entry)
+			if err != nil {
+				return err
+			}
+			return txn.Set(entryKey(h), data)
+		}))
+		require.True(t, inLRU(t, c, h))
+		require.False(t, hasMarker(c, h))
+		require.Empty(t, evictAll(t, c))
+		require.True(t, hasBlob(t, c, h))
+		require.Equal(t, int64(1), c.Stats().RemoteChecks.EvictSkippedUnconfirmed)
 	})
 
 	// A cleared entry whose check had no answer before a restart keeps its marker, and the
