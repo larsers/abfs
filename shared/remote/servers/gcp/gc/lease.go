@@ -33,6 +33,7 @@ const (
 	DefaultLeaseDuration = 5 * time.Minute
 	PhaseDryRun          = "dry-run"
 	PhaseCondemn         = "condemn"
+	PhaseDelete          = "delete"
 	minLeaseDuration     = 3 * time.Second
 	releaseTimeout       = 10 * time.Second
 )
@@ -83,6 +84,13 @@ type Lease struct {
 	// that lease had been released. A holder that stalled may still act until
 	// then.
 	PreviousExpiry time.Time
+	// PreviousCondemnCycle is the cycle of the last condemn or delete lease
+	// before this one, zero when there was none. Leases of the other phases
+	// do not change it.
+	PreviousCondemnCycle int64
+	// MaxGrace is the largest grace of any condemn or delete lease, this one
+	// included.
+	MaxGrace time.Duration
 	// taken is the local time just before the lease was taken, the base of the
 	// watchdog.
 	taken time.Time
@@ -103,8 +111,9 @@ func DefaultHolder() string {
 // AcquireLease takes the lease of the garbage collector name for duration and
 // starts a new cycle in the given phase: it increments the cycle number and
 // the lease epoch and records the start time, the grace and the expiry of the
-// lease it takes over. It fails with *ErrLeaseHeld while another holder's
-// lease is valid.
+// lease it takes over. A condemn or delete lease also records its cycle as
+// the last condemn cycle and raises the largest grace to its own. It fails
+// with *ErrLeaseHeld while another holder's lease is valid.
 func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, phase string, duration, grace time.Duration) (*Lease, error) {
 	if duration < minLeaseDuration {
 		return nil, fmt.Errorf("lease duration %s is shorter than %s", duration, minLeaseDuration)
@@ -119,14 +128,15 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		leaseExpiry = now.Add(duration)
 		var cycle, epoch int64
 		var prevStart, expiry spanner.NullTime
-		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime"})
+		var condemnCycle, maxGrace spanner.NullInt64
+		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime", "CondemnCycle", "MaxGraceSeconds"})
 		switch {
 		case spanner.ErrCode(err) == codes.NotFound:
 		case err != nil:
 			return err
 		default:
 			var current spanner.NullString
-			if err := row.Columns(&cycle, &current, &epoch, &expiry, &prevStart); err != nil {
+			if err := row.Columns(&cycle, &current, &epoch, &expiry, &prevStart, &condemnCycle, &maxGrace); err != nil {
 				return err
 			}
 			if current.Valid && current.StringVal != holder && expiry.Valid && expiry.Time.After(now) {
@@ -138,7 +148,9 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		if expiry.Valid {
 			l.PreviousExpiry = expiry.Time
 		}
-		return txn.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(stateTable, map[string]any{
+		l.PreviousCondemnCycle = condemnCycle.Int64
+		l.MaxGrace = time.Duration(maxGrace.Int64) * time.Second
+		cols := map[string]any{
 			"Name":                   name,
 			"Cycle":                  l.Cycle,
 			"Phase":                  phase,
@@ -150,7 +162,13 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 			"PreviousCycleStartTime": prevStart,
 			"GraceSeconds":           int64(grace / time.Second),
 			"UpdateTime":             spanner.CommitTimestamp,
-		})})
+		}
+		if phase == PhaseCondemn || phase == PhaseDelete {
+			l.MaxGrace = max(l.MaxGrace, grace.Truncate(time.Second))
+			cols["CondemnCycle"] = l.Cycle
+			cols["MaxGraceSeconds"] = int64(l.MaxGrace / time.Second)
+		}
+		return txn.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(stateTable, cols)})
 	})
 	if err != nil {
 		var held *ErrLeaseHeld
@@ -181,29 +199,32 @@ type ListState struct {
 	Location string
 	// SnapshotTime is the snapshot time of the cycle that wrote it.
 	SnapshotTime time.Time
-	// Complete tells that every marker of the list was written.
-	Complete bool
+	// Complete tells that every marker of the list was written, and
+	// CompleteTime is the commit time of the write that recorded it; a cycle
+	// that only recorded Complete leaves it zero.
+	Complete     bool
+	CompleteTime time.Time
 }
 
 // ReadList returns the condemned list recorded in the state of the lease.
 func (l *Lease) ReadList(ctx context.Context) (ListState, error) {
-	row, err := l.client.Single().ReadRow(ctx, stateTable, spanner.Key{l.name}, []string{"ListLocation", "ListSnapshotTime", "ListComplete"})
+	row, err := l.client.Single().ReadRow(ctx, stateTable, spanner.Key{l.name}, []string{"ListLocation", "ListSnapshotTime", "ListComplete", "ListCompleteTime"})
 	if err != nil {
 		return ListState{}, fmt.Errorf("failed to read the GC list state: %w", err)
 	}
 	var location spanner.NullString
-	var snapshot spanner.NullTime
+	var snapshot, completeTime spanner.NullTime
 	var complete spanner.NullBool
-	if err := row.Columns(&location, &snapshot, &complete); err != nil {
+	if err := row.Columns(&location, &snapshot, &complete, &completeTime); err != nil {
 		return ListState{}, fmt.Errorf("failed to read the GC list state: %w", err)
 	}
-	return ListState{Location: location.StringVal, SnapshotTime: snapshot.Time, Complete: complete.Valid && complete.Bool}, nil
+	return ListState{Location: location.StringVal, SnapshotTime: snapshot.Time, Complete: complete.Valid && complete.Bool, CompleteTime: completeTime.Time}, nil
 }
 
 // RecordList records the condemned list of this cycle, not complete yet.
 func (l *Lease) RecordList(ctx context.Context, location string, snapshot time.Time) error {
 	if err := l.update(ctx, func(time.Time) map[string]any {
-		return map[string]any{"ListLocation": location, "ListSnapshotTime": snapshot, "ListComplete": false}
+		return map[string]any{"ListLocation": location, "ListSnapshotTime": snapshot, "ListComplete": false, "ListCompleteTime": spanner.NullTime{}}
 	}); err != nil {
 		return fmt.Errorf("failed to record the GC condemned list: %w", err)
 	}
@@ -211,10 +232,10 @@ func (l *Lease) RecordList(ctx context.Context, location string, snapshot time.T
 }
 
 // CompleteList records that every marker of the list of this cycle was
-// written.
+// written, with the commit time of the write.
 func (l *Lease) CompleteList(ctx context.Context) error {
 	if err := l.update(ctx, func(time.Time) map[string]any {
-		return map[string]any{"ListComplete": true}
+		return map[string]any{"ListComplete": true, "ListCompleteTime": spanner.CommitTimestamp}
 	}); err != nil {
 		return fmt.Errorf("failed to record the GC condemned list as complete: %w", err)
 	}

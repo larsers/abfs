@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS GcState (
 ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListSnapshotTime TIMESTAMP;
 ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListComplete BOOL;
 
+-- What a delete cycle needs to trust the list: ListCompleteTime is the commit
+-- time of the write that completed the list, CondemnCycle the cycle of the
+-- last condemn or delete lease, MaxGraceSeconds the largest grace of such a
+-- lease, and LegacyServersGoneTime the time a cycle first found GcReplicas
+-- empty, NULL while it holds a row.
+ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListCompleteTime TIMESTAMP OPTIONS (allow_commit_timestamp=true);
+ALTER TABLE GcState ADD COLUMN IF NOT EXISTS CondemnCycle INT64;
+ALTER TABLE GcState ADD COLUMN IF NOT EXISTS LegacyServersGoneTime TIMESTAMP OPTIONS (allow_commit_timestamp=true);
+ALTER TABLE GcState ADD COLUMN IF NOT EXISTS MaxGraceSeconds INT64;
+
 -- One heartbeat row per server replica. Version is the GC edge extractor
 -- version the replica writes into the Bigtable table gc; GcEnabled, the touch
 -- period and the cache TTL are its settings, zero meaning off.
