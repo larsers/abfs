@@ -51,9 +51,10 @@ type ReplicaReport struct {
 	// ServersRemoved counts the rows of GcServers that the run deleted, those
 	// older than any grace a delete could still need them for.
 	ServersRemoved int64 `json:"servers_removed"`
-	// LegacyServersGoneTime is when a cycle first found GcReplicas empty, so
-	// that no server of an older version, which keeps no row after it stops,
-	// can have run since; nil while GcReplicas holds a row.
+	// LegacyServersGoneTime is when a cycle first found GcReplicas empty, and
+	// every read since found it empty too; nil while GcReplicas holds a row.
+	// A server of an older version keeps no row after it stops, so one that
+	// ran only between two reads is not seen.
 	LegacyServersGoneTime *time.Time `json:"legacy_servers_gone_time,omitempty"`
 }
 

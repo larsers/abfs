@@ -53,14 +53,16 @@ func readServerEvidence(ctx context.Context, client *spanner.Client, name string
 }
 
 // checkLegacyServers reads GcReplicas and records in the GcState row name
-// since when it has been empty. A server of an older version deletes its row when it stops
-// and leaves no other trace, so the only evidence that none ran in a window is
-// that GcReplicas was found empty before the window started and every cycle
-// since found it empty too. The transaction sets LegacyServersGoneTime to its
-// commit time when it finds no row and the time is not set, and clears it
-// when it finds a row. It returns the rows and the time, zero when not set.
-// Both writes state a fact of the read, so a collector that lost its lease
-// may make them too.
+// since when it has been empty. A server of an older version writes its row
+// when it starts, deletes it when it stops and leaves no other trace, so the
+// collector sees only the servers of an older version that run at one of its
+// reads. LegacyServersGoneTime before a window start means that every read
+// since then found GcReplicas empty; it does not show that no such server ran
+// in the window, since one that started and stopped between two reads left no
+// row to find. The transaction sets LegacyServersGoneTime to its commit time
+// when it finds no row and the time is not set, and clears it when it finds a
+// row. It returns the rows and the time, zero when not set. Both writes state
+// a fact of the read, so a collector that lost its lease may make them too.
 func checkLegacyServers(ctx context.Context, client *spanner.Client, name string) ([]Replica, time.Time, error) {
 	var replicas []Replica
 	var gone time.Time
@@ -151,8 +153,8 @@ func (e *serverEvidence) longestCacheTTL(start time.Time) time.Duration {
 // windowBlockers returns the reasons in e why a cycle whose snapshot is
 // snapshot must not delete: a process that may have run in the window and
 // crashed, lost touches, ran without link validation or with settings that
-// break the timing rules, or a server of an older version that may have run
-// in it.
+// break the timing rules, or GcReplicas not found empty at every read since
+// the window start.
 func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []string {
 	var reasons []string
 	add := func(format string, args ...any) {
