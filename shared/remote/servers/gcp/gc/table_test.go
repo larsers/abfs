@@ -178,3 +178,21 @@ func TestParseRow_RejectsBadRows(t *testing.T) {
 		})
 	}
 }
+
+// A backfill write that stalls ends after the write deadline and is retried,
+// so a stalled tablet does not hold the backfill.
+func TestEdgeWriter_AttemptDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	calls := 0
+	w := &EdgeWriter{budget: writeBudget{deadline: 50 * time.Millisecond}, apply: func(ctx context.Context, row string, m *bigtable.Mutation) error {
+		calls++
+		if calls == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}}
+	require.NoError(t, w.Write(ctx, testHash("a"), "tree", nil))
+	require.Equal(t, 2, calls)
+}

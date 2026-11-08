@@ -29,6 +29,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
@@ -38,14 +40,14 @@ import (
 
 // The server side of the garbage collector, on with NewServerOpts.GC: reads
 // rescue condemned objects, hits touch objects and map rows, cache entries
-// expire, and each replica writes a heartbeat.
+// expire, and each server writes a heartbeat, without which it does not serve.
 const (
 	DefaultCacheTTL            = gc.DefaultCacheTTL
 	DefaultGCTouchInterval     = 36 * time.Hour
 	DefaultGCHeartbeatInterval = 5 * time.Minute
-	touchBufferSize            = 100 * 1000
 	maxTouchedMapRows          = 256 * 1024
 	heartbeatTimeout           = 30 * time.Second
+	firstHeartbeatRetry        = 5 * time.Second
 	rescueWorkers              = 32
 	metricsScope               = "github.com/google/abfs/shared/remote/servers/gcp"
 )
@@ -64,11 +66,12 @@ const (
 
 var rescuePathNames = [numRescuePaths]string{"headers", "validation", "put_object", "get_object", "map_results"}
 
-// cacheEpoch and cacheNow give cache entries their load and touch times in
-// seconds since the process started, plus one so that zero means unset.
+// firstHeartbeatTimeout is how long a server tries to write its first
+// heartbeat before it fails to start, and writeServer writes a heartbeat;
+// tests change both.
 var (
-	cacheEpoch = time.Now()
-	cacheNow   = func() uint32 { return uint32(time.Since(cacheEpoch)/time.Second) + 1 }
+	firstHeartbeatTimeout = time.Minute
+	writeServer           = gc.WriteServer
 )
 
 // contentEntry is an entry of the s.content LRU cache.
@@ -87,6 +90,7 @@ type toucher interface {
 	TryTouchObject(key gc.Hash) bool
 	TouchMapRow(row string) bool
 	Stats() gc.TouchStats
+	Late() bool
 	Close()
 }
 
@@ -102,11 +106,27 @@ type gcHooks struct {
 	// byte of from.
 	touchedMapRows []*lru.Cache[mapRowKey, uint32]
 	stopHeartbeat  func()
-	// replicaID is the ID of this server's heartbeat row, empty without one.
-	replicaID string
-	metrics   metric.Registration
-	rescueLog *rescueLog
-	stopped   bool
+	// server is this process's heartbeat row in GcServers, which exists once
+	// hasRow is set. reportedLosses counts the touches lost when the last
+	// heartbeat was written.
+	server         gc.Server
+	hasRow         bool
+	reportedLosses int64
+	// heartbeatStale is the age in seconds of the last successful heartbeat,
+	// at lastHeartbeat on the cacheNow clock, beyond which the server stops
+	// serving; zero without a heartbeat.
+	heartbeatStale uint32
+	lastHeartbeat  atomic.Uint32
+	// pause and pausePending record a pause of the process that the next
+	// heartbeat records as a touch loss.
+	pause        pauseDetector
+	pausePending bool
+	// lastAttempt is the start of the last heartbeat attempt on the cacheNow
+	// clock.
+	lastAttempt uint32
+	metrics     metric.Registration
+	rescueLog   *rescueLog
+	stopped     bool
 
 	// rescues counts per path and index into rescueTypes.
 	rescues           [numRescuePaths][]atomic.Int64
@@ -134,6 +154,11 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 	if opts.CacheTTL < 0 || opts.GCTouchInterval < 0 || opts.GCHeartbeatInterval < 0 {
 		return fmt.Errorf("invalid negative cache TTL %s, touch interval %s or heartbeat interval %s", opts.CacheTTL, opts.GCTouchInterval, opts.GCHeartbeatInterval)
 	}
+	// The collector sees the touches a server lost only through its
+	// heartbeat, so a server that rescues and touches must write one.
+	if !opts.GCReadOnly && (opts.GCHeartbeatInterval == 0 || opts.GCHeartbeatInterval > gc.MaxHeartbeatInterval) {
+		return fmt.Errorf("invalid GC heartbeat interval %s: with GC it must be above 0 and at most %s", opts.GCHeartbeatInterval, gc.MaxHeartbeatInterval)
+	}
 	if err := s.checkGCResources(ctx); err != nil {
 		return fmt.Errorf("garbage collector resources missing, run 'abfs server gcp init --gc' to create them: %w", err)
 	}
@@ -147,6 +172,7 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 }
 
 // enableGCHooks turns the hooks on and starts the toucher and the heartbeat.
+// It fails when it cannot write the first heartbeat.
 func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	s.casdb.EnableGC()
 	s.gcEdges = gc.NewEdgeWriter(s.casdb.BTClient())
@@ -170,7 +196,7 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 				return err
 			}
 		}
-		g.toucher = gc.NewToucher(s.casdb.BTClient(), touchBufferSize)
+		g.toucher = gc.NewToucher(s.casdb.BTClient(), gc.TouchBufferSize)
 	}
 	reg, err := s.registerGCMetrics()
 	if err != nil {
@@ -179,19 +205,28 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	}
 	g.metrics = reg
 	if opts.GCHeartbeatInterval > 0 && !opts.GCReadOnly {
-		s.startHeartbeat(opts.GCHeartbeatInterval, gc.Replica{
-			Version:       gc.ExtractorVersion,
-			GC:            true,
-			TouchInterval: time.Duration(g.touchInterval) * time.Second,
-			CacheTTL:      time.Duration(g.cacheTTL) * time.Second,
-		})
+		g.server = gc.Server{
+			ID:                gc.NewReplicaID(),
+			Version:           gc.ExtractorVersion,
+			GC:                true,
+			TouchInterval:     time.Duration(g.touchInterval) * time.Second,
+			CacheTTL:          time.Duration(g.cacheTTL) * time.Second,
+			HeartbeatInterval: time.Duration(seconds(opts.GCHeartbeatInterval)) * time.Second,
+			LinkValidation:    s.validateLinks,
+		}
+		if err := s.startHeartbeat(opts.GCHeartbeatInterval); err != nil {
+			s.stopGCHooks()
+			return err
+		}
 	}
 	return nil
 }
 
-// stopGCHooks stops the heartbeat, writes the buffered touches and, when it
-// wrote all of them, deletes the heartbeat row of this server. A row left
-// behind tells the collector that touches of this process may be lost.
+// stopGCHooks stops the heartbeat, writes the buffered touches and records in
+// the heartbeat row of this server that it stopped, and whether it lost
+// touches or was paused since its last heartbeat. The row stays: a row
+// without the stop tells the collector that the process crashed and its
+// touches may be lost.
 func (s *GCPServer) stopGCHooks() {
 	g := &s.gcHooks
 	if g.stopped {
@@ -206,7 +241,6 @@ func (s *GCPServer) stopGCHooks() {
 		g.stopHeartbeat()
 		g.stopHeartbeat = nil
 	}
-	lost := false
 	if g.toucher != nil {
 		before := g.toucher.Stats()
 		g.toucher.Close()
@@ -215,24 +249,66 @@ func (s *GCPServer) stopGCHooks() {
 		dropped, failed := after.Dropped-before.Dropped, after.Failed-before.Failed
 		log.Printf("GC touches at stop: %d written, %d dropped and %d failed while stopping; %d written, %d dropped and %d failed since the start",
 			after.Written-before.Written, dropped, failed, after.Written, after.Dropped, after.Failed)
-		lost = dropped > 0 || failed > 0
 	}
 	if g.rescueLog != nil {
 		g.rescueLog.flush()
 	}
-	if g.replicaID == "" {
+	if !g.hasRow {
 		return
 	}
+	g.hasRow = false
+	// A pause after the last heartbeat, or one whose heartbeat failed, is
+	// recorded by the stop.
+	if g.pausedSince() {
+		g.pausePending = true
+	}
+	lost := g.pausePending || g.losses() > g.reportedLosses
 	if lost {
-		log.Printf("Warning: kept the GC heartbeat row %s, because touches were lost while stopping", g.replicaID)
-		return
+		log.Printf("Warning: recorded lost touches in the GC heartbeat row %s", g.server.ID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatTimeout)
 	defer cancel()
-	if err := gc.DeleteReplica(ctx, s.casdb.SpannerClient(), g.replicaID); err != nil {
+	if err := gc.StopServer(ctx, s.casdb.SpannerClient(), g.server.ID, lost); err != nil {
 		log.Printf("Warning: %v", err)
 	}
-	g.replicaID = ""
+}
+
+// losses counts the touches this process lost so far: every touch that was
+// dropped or failed.
+func (g *gcHooks) losses() int64 {
+	if g.toucher == nil {
+		return 0
+	}
+	st := g.toucher.Stats()
+	return st.Dropped + st.Failed
+}
+
+// touchesLate reports whether the toucher holds touches past the time at
+// which they count as lost, whose loss it has not counted yet.
+func (g *gcHooks) touchesLate() bool {
+	return g.toucher != nil && g.toucher.Late()
+}
+
+// checkHeartbeat fails with Unavailable once the last successful heartbeat
+// of this server is older than two heartbeat intervals plus the write
+// timeout, until the next one succeeds. While its heartbeats fail, the
+// collector cannot learn of touches the server loses, so it must not serve
+// the uses they record.
+func (g *gcHooks) checkHeartbeat() error {
+	if g.heartbeatStale == 0 {
+		return nil
+	}
+	now, last := cacheNow(), g.lastHeartbeat.Load()
+	if now > last && now-last > g.heartbeatStale {
+		return status.Errorf(codes.Unavailable, "GC heartbeat stale: none written for %d s", now-last)
+	}
+	return nil
+}
+
+// CheckGCHeartbeat fails while the server does not serve because its GC
+// heartbeat is stale, for a health probe. It does no I/O.
+func (s *GCPServer) CheckGCHeartbeat(context.Context) error {
+	return s.gcHooks.checkHeartbeat()
 }
 
 func (g *gcHooks) expired(loaded uint32) bool {
@@ -249,11 +325,14 @@ func (s *GCPServer) lookupHeader(key entities.Hash) (CachedHeader, bool) {
 	return h, ok
 }
 
-// storeHeader caches hdr, read from Bigtable. With GC it replaces an expired
-// entry and keeps the touch mark of the entry it replaces when that touch is
-// of the current period; without GC it keeps an existing entry.
-func (s *GCPServer) storeHeader(hdr *ObjectHeader) CachedHeader {
+// storeHeader caches hdr, read from Bigtable by a read that started at
+// loaded on the cacheNow clock, so that the entry ages from the start of the
+// read. With GC it replaces an expired entry and keeps the touch mark of the
+// entry it replaces when that touch is of the current period; without GC it
+// keeps an existing entry.
+func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32) CachedHeader {
 	h := newCachedHeader(hdr)
+	h.Loaded = loaded
 	shard := s.headers[hdr.Id[0]]
 	if !s.gcHooks.on {
 		shard.PeekOrAdd(hdr.Id, h)
@@ -277,8 +356,8 @@ func (s *GCPServer) lookupContent(key entities.Hash) (*ObjectContent, bool) {
 }
 
 // storeContent caches content; see storeHeader.
-func (s *GCPServer) storeContent(key entities.Hash, content *ObjectContent) {
-	entry := contentEntry{content: content, loaded: cacheNow()}
+func (s *GCPServer) storeContent(key entities.Hash, content *ObjectContent, loaded uint32) {
+	entry := contentEntry{content: content, loaded: loaded}
 	if !s.gcHooks.on {
 		s.content[key[0]].PeekOrAdd(key, entry)
 		return
@@ -310,9 +389,12 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 		return cachedHdr, content, nil
 	}
 	// A read of the whole row sees the condemn marker with the content.
+	start := cacheNow()
 	header, content, err := s.casdb.GetObjectData(ctx, key)
 	if err == nil && header != nil {
-		err = s.rescueCondemned(ctx, pathGetObject, header)
+		if err = s.gcHooks.checkReadAge(start); err == nil {
+			err = s.rescueCondemned(ctx, pathGetObject, header)
+		}
 	}
 	if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
 		s.forget(key)
@@ -321,8 +403,8 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	if err != nil {
 		return CachedHeader{}, nil, err
 	}
-	cachedHdr = s.storeHeader(header)
-	s.storeContent(key, content)
+	cachedHdr = s.storeHeader(header, start)
+	s.storeContent(key, content, start)
 	s.touchHit(pathGetObject, key, cachedHdr)
 	return cachedHdr, content, nil
 }
@@ -333,17 +415,19 @@ func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *O
 	if hdr.Condemned == nil || s.gcHooks.rescue == nil {
 		return nil
 	}
-	err := s.rescueOne(ctx, path, hdr)
+	req := newRequestID(ctx)
+	err := s.rescueOne(ctx, path, req, hdr)
 	if err == nil {
-		s.gcHooks.rescueLog.call(ctx, path, 1, 1, 0)
+		s.gcHooks.rescueLog.call(ctx, path, req, 1, 1, 0)
 	} else if !errors.Is(err, casdb.ErrNotFound) {
-		s.gcHooks.rescueLog.call(ctx, path, 1, 0, 1)
+		s.gcHooks.rescueLog.call(ctx, path, req, 1, 0, 1)
 	}
 	return err
 }
 
 // rescueOne rescues hdr, which the collector condemned, and counts the result.
-func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, hdr *ObjectHeader) error {
+// The log lines name the request req of the call.
+func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, req string, hdr *ObjectHeader) error {
 	g := &s.gcHooks
 	condemned := hdr.Condemned
 	live, err := g.rescue(ctx, hdr.Id, condemned)
@@ -353,11 +437,11 @@ func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, hdr *ObjectH
 	}
 	if !live {
 		g.rescuesLost[path].Add(1)
-		log.Printf("Condemned object %s was deleted before it could be rescued", hdr.Id)
+		g.rescueLog.lost(ctx, path, req, hdr)
 		return casdb.ErrNotFound
 	}
 	g.rescues[path][rescueType(hdr.Type)].Add(1)
-	g.rescueLog.object(path, hdr, condemned)
+	g.rescueLog.object(path, req, hdr, condemned)
 	hdr.Condemned = nil
 	return nil
 }
@@ -376,12 +460,16 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 	var rescued, failed atomic.Int64
 	var g errgroup.Group
 	g.SetLimit(rescueWorkers)
+	var req string
 	for i, h := range hdrs {
 		if h.Condemned == nil {
 			continue
 		}
+		if req == "" {
+			req = newRequestID(ctx)
+		}
 		g.Go(func() error {
-			err := s.rescueOne(ctx, path, h)
+			err := s.rescueOne(ctx, path, req, h)
 			switch {
 			case err == nil:
 				rescued.Add(1)
@@ -395,7 +483,7 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 		})
 	}
 	err := g.Wait()
-	s.gcHooks.rescueLog.call(ctx, path, len(hdrs), int(rescued.Load()), int(failed.Load()))
+	s.gcHooks.rescueLog.call(ctx, path, req, len(hdrs), int(rescued.Load()), int(failed.Load()))
 	if err != nil {
 		return nil, err
 	}
@@ -544,12 +632,27 @@ func (s *GCPServer) chunkMissing(ctx context.Context, key entities.Hash, content
 	}
 }
 
-// startHeartbeat writes the heartbeat r of this replica now and then every
-// interval until stopGCHooks.
-func (s *GCPServer) startHeartbeat(interval time.Duration, r gc.Replica) {
-	r.ID = gc.NewReplicaID()
-	s.gcHooks.replicaID = r.ID
-	log.Printf("GC replica ID %s, heartbeat every %s", r.ID, interval)
+// startHeartbeat writes the first heartbeat of this server, retrying for up
+// to firstHeartbeatTimeout, so that the server has a row before it serves,
+// and then one every interval until stopGCHooks.
+func (s *GCPServer) startHeartbeat(interval time.Duration) error {
+	g := &s.gcHooks
+	log.Printf("GC server ID %s, heartbeat every %s", g.server.ID, interval)
+	g.lastAttempt = 0
+	first, cancelFirst := context.WithTimeout(context.Background(), firstHeartbeatTimeout)
+	defer cancelFirst()
+	for {
+		err := s.heartbeat(first)
+		if err == nil {
+			break
+		}
+		select {
+		case <-first.Done():
+			return fmt.Errorf("failed to write the first GC heartbeat within %s: %w", firstHeartbeatTimeout, err)
+		case <-time.After(firstHeartbeatRetry):
+		}
+	}
+	g.heartbeatStale = seconds(2*interval + heartbeatTimeout)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -557,27 +660,57 @@ func (s *GCPServer) startHeartbeat(interval time.Duration, r gc.Replica) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			s.heartbeat(ctx, &r)
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 			}
+			_ = s.heartbeat(ctx)
 		}
 	}()
-	s.gcHooks.stopHeartbeat = func() {
+	g.stopHeartbeat = func() {
 		cancel()
 		<-done
 	}
+	return nil
 }
 
-func (s *GCPServer) heartbeat(ctx context.Context, r *gc.Replica) {
+// heartbeat writes one heartbeat of this server. The touch stats are read
+// after the Spanner read that gives StatsTime, so every loss counted before
+// that time is in the row.
+func (s *GCPServer) heartbeat(ctx context.Context) error {
+	g := &s.gcHooks
+	start := cacheNow()
+	if g.heartbeatLate(start) {
+		log.Printf("Warning: no GC heartbeat attempt for over the heartbeat interval plus %s; recording the gap as a touch loss", gc.TouchDrainBound)
+		g.pausePending = true
+	}
 	hctx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
 	defer cancel()
-	if err := gc.WriteHeartbeat(hctx, s.casdb.SpannerClient(), r); err != nil && ctx.Err() == nil {
-		s.gcHooks.heartbeatFailures.Add(1)
+	sp := s.casdb.SpannerClient()
+	statsTime, err := gc.ReadServerTime(hctx, sp, g.server.ID)
+	if err == nil {
+		if g.pausedSince() {
+			log.Printf("Warning: the wall clock advanced more than the monotonic clock by over %s since the last GC heartbeat; recording the pause as a touch loss", maxPause)
+			g.pausePending = true
+		}
+		// A late touch leaves the toucher's slots only after its loss is
+		// counted, so the slots are read first.
+		late := g.touchesLate()
+		losses := g.losses()
+		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || late || losses > g.reportedLosses); err == nil {
+			g.reportedLosses = losses
+			g.pausePending = false
+			g.hasRow = true
+			g.lastHeartbeat.Store(start)
+			return nil
+		}
+	}
+	if ctx.Err() == nil {
+		g.heartbeatFailures.Add(1)
 		log.Printf("Warning: %v", err)
 	}
+	return err
 }
 
 func (s *GCPServer) registerGCMetrics() (metric.Registration, error) {
@@ -613,7 +746,7 @@ func (s *GCPServer) registerGCMetrics() (metric.Registration, error) {
 		return nil, err
 	}
 	heartbeats, err := meter.Int64ObservableCounter("abfs.gcp.gc.heartbeat_failures",
-		metric.WithDescription("Failed writes of the replica heartbeat"))
+		metric.WithDescription("Failed writes of the server heartbeat"))
 	if err != nil {
 		return nil, err
 	}

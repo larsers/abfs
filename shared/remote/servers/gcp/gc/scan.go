@@ -489,15 +489,34 @@ type mapRow struct {
 	time     int64
 }
 
-// scanMaps reads the keys and cell times of the table maps. It returns the
-// rows of each scan shard, which are not copied into one array, so that they
-// do not take twice their memory while the edges are scanned.
-func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *graph) ([][]mapRow, int64, error) {
+// mapScan is the result of scanMaps: the rows of each scan shard, which are
+// not copied into one array, so that they do not take twice their memory
+// while the edges are scanned, and the keys of the rows with an end without a
+// node, by shard and index, which the node ids cannot give.
+type mapScan struct {
+	rows      [][]mapRow
+	rawKeys   []map[int]string
+	malformed int64
+}
+
+// rowKey returns the key of the row i of shard s.
+func (m *mapScan) rowKey(g *graph, s, i int) string {
+	r := &m.rows[s][i]
+	if r.from == noNode || r.to == noNode {
+		return m.rawKeys[s][i]
+	}
+	return g.key(r.from).String() + "#" + g.key(r.to).String()
+}
+
+// scanMaps reads the keys and cell times of the table maps.
+func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *graph) (*mapScan, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(mapsFamily), bigtable.LatestNFilter(1), bigtable.StripValueFilter())
 	rows := make([][]mapRow, len(bounds)-1)
+	rawKeys := make([]map[int]string, len(bounds)-1)
 	malformed := make([]int64, len(bounds)-1)
 	g, gctx := errgroup.WithContext(ctx)
 	for i := range rows {
+		rawKeys[i] = make(map[int]string)
 		g.Go(func() error {
 			err := table.ReadRows(gctx, bigtable.NewRange(bounds[i], bounds[i+1]), func(row bigtable.Row) bool {
 				from, to, ok := strings.Cut(row.Key(), "#")
@@ -506,11 +525,15 @@ func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *g
 					return true
 				}
 				t := latest(row[mapsFamily])
-				rows[i] = append(rows[i], mapRow{
+				r := mapRow{
 					from: gr.find(entities.NewHash(from)),
 					to:   gr.find(entities.NewHash(to)),
 					time: t.UnixMicro(),
-				})
+				}
+				if r.from == noNode || r.to == noNode {
+					rawKeys[i][len(rows[i])] = row.Key()
+				}
+				rows[i] = append(rows[i], r)
 				return true
 			}, bigtable.RowFilter(filter))
 			if err != nil {
@@ -520,13 +543,13 @@ func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *g
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	var bad int64
+	scan := &mapScan{rows: rows, rawKeys: rawKeys}
 	for _, m := range malformed {
-		bad += m
+		scan.malformed += m
 	}
-	return rows, bad, nil
+	return scan, nil
 }
 
 // key returns the key of node id.

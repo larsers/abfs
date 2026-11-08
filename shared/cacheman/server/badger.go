@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"runtime"
 	"sort"
 	"strconv"
@@ -121,6 +122,13 @@ type BadgerIndexStore struct {
 	cleanMu sync.Mutex
 	done    chan struct{}
 	closed  bool
+
+	// With localWriteCheck, eviction keeps local writes the server has not confirmed.
+	localWriteCheck         atomic.Bool
+	evictSkippedUnconfirmed atomic.Int64
+	// clearRemoteHook, if set, runs inside each ClearRemote transaction, which fails with its
+	// error.
+	clearRemoteHook func(hash entities.Hash) error
 }
 
 // NewBadgerIndexStore creates a BadgerIndexStore.
@@ -573,6 +581,12 @@ func (b *BadgerIndexStore) ForEach(fn func(key entities.Hash, entry *IndexEntry,
 
 // MarkObjectRemote implements IndexStore.
 func (b *BadgerIndexStore) MarkObjectRemote(key entities.Hash) error {
+	if b.localWriteCheck.Load() {
+		if _, err := b.ConfirmRemote(key); err != nil {
+			return err
+		}
+	}
+
 	var (
 		lruTime   int64
 		localSize uint64
@@ -754,6 +768,11 @@ func (b *BadgerIndexStore) UseMany(hashes []entities.Hash) error {
 
 // Evict implements IndexStore.
 func (b *BadgerIndexStore) Evict() ([]*IndexKeyEntry, int64, int64, error) {
+	return b.EvictUpTo(math.MaxInt64)
+}
+
+// EvictUpTo implements IndexStore.
+func (b *BadgerIndexStore) EvictUpTo(maxTimestamp int64) ([]*IndexKeyEntry, int64, int64, error) {
 	if !b.trackUse {
 		return nil, 0, 0, errors.New("store is not configured for eviction")
 	}
@@ -762,7 +781,7 @@ func (b *BadgerIndexStore) Evict() ([]*IndexKeyEntry, int64, int64, error) {
 	var lockedShards []int
 	var candidates []KeyTimestamp
 	var keyEntries []*IndexKeyEntry
-	var sizeDelta, lruSizeDelta, localCountDelta, indexCountDelta int64
+	var sizeDelta, lruSizeDelta, localCountDelta, indexCountDelta, skipped int64
 
 	// We conditionally grab the timestamp lock below.
 	defer func() {
@@ -775,12 +794,12 @@ func (b *BadgerIndexStore) Evict() ([]*IndexKeyEntry, int64, int64, error) {
 	// methods are backpressured.
 	err := b.db.Update(func(txn *badger.Txn) error {
 		var err error
-		candidates, err = b.oldestCandidates(txn)
+		candidates, err = b.oldestCandidates(txn, maxTimestamp)
 		if err != nil {
 			return fmt.Errorf("failed to find candidates to evict: %v", err)
 		}
 		if len(candidates) == 0 {
-			return errors.New("there is nothing to evict")
+			return errNothingToEvict
 		}
 
 		var hashes []entities.Hash
@@ -792,7 +811,17 @@ func (b *BadgerIndexStore) Evict() ([]*IndexKeyEntry, int64, int64, error) {
 		b.lockTimestampShards(lockedShards)
 		locked = true
 
+		skipped = 0
 		for _, c := range candidates {
+			keep, keptSize, err := b.keepUnconfirmedLocked(txn, c.Key, c.Timestamp)
+			if err != nil {
+				return err
+			}
+			if keep {
+				lruSizeDelta -= keptSize
+				skipped++
+				continue
+			}
 			ke, err := b.deleteWithTimestampLocked(txn, c.Key, c.Timestamp, holdFlag)
 			if err != nil {
 				return err
@@ -825,6 +854,7 @@ func (b *BadgerIndexStore) Evict() ([]*IndexKeyEntry, int64, int64, error) {
 	for _, c := range candidates {
 		b.deleteTimestampLocked(c.Key)
 	}
+	b.evictSkippedUnconfirmed.Add(skipped)
 
 	return keyEntries, newSz, newLRUSz, nil
 }
@@ -957,9 +987,9 @@ func (b *BadgerIndexStore) KeepAlive(key entities.Hash) error {
 	}, defaultNumTries)
 }
 
-// Returns up-to `batchSize` oldest candidates (hash and timestamp).
+// Returns up-to `batchSize` oldest candidates (hash and timestamp) used at or before maxTimestamp.
 // Should only be called from the context of an open transaction.
-func (b *BadgerIndexStore) oldestCandidates(txn *badger.Txn) ([]KeyTimestamp, error) {
+func (b *BadgerIndexStore) oldestCandidates(txn *badger.Txn, maxTimestamp int64) ([]KeyTimestamp, error) {
 	var candidates []KeyTimestamp
 
 	it := txn.NewIterator(keyOnlyIterationOpts())
@@ -970,6 +1000,9 @@ func (b *BadgerIndexStore) oldestCandidates(txn *badger.Txn) ([]KeyTimestamp, er
 		kt, err := keyTimestampFromKey(item.Key())
 		if err != nil {
 			return nil, err
+		}
+		if kt.Timestamp > maxTimestamp {
+			break
 		}
 		candidates = append(candidates, kt)
 
@@ -1034,6 +1067,9 @@ func (b *BadgerIndexStore) deleteWithTimestampLocked(txn *badger.Txn, hash entit
 		entryErr = txn.SetEntry(e)
 	} else {
 		entryErr = txn.Delete(entryKey(hash))
+		if b.localWriteCheck.Load() {
+			entryErr = errors.Join(entryErr, txn.Delete(checkKey(hash)))
+		}
 	}
 
 	lruErr := txn.Delete(lruKey(timestamp, hash))

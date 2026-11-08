@@ -164,7 +164,7 @@ func (m *mountTracker) mountedSince(t time.Time) bool {
 // queued and retry, so this also covers an unreachable server.
 func (c *CacheMan) uploadsIdle() bool {
 	sync := c.getSync()
-	if sync == nil {
+	if sync == nil || c.localWrites.queued() > 0 {
 		return false
 	}
 	for state, counts := range sync.Stats().States {

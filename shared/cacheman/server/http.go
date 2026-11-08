@@ -252,11 +252,13 @@ func (c *CacheMan) handleRemoteOk(w http.ResponseWriter, r *http.Request) {
 
 func (c *CacheMan) handleInterfaceVersion(w http.ResponseWriter, r *http.Request) {
 	c.WriteJSON(w, r, struct {
-		Implemented string `json:"implemented"`
-		Required    string `json:"required"`
+		Implemented string   `json:"implemented"`
+		Required    string   `json:"required"`
+		Features    []string `json:"features,omitempty"`
 	}{
 		Implemented: version.CachemanABFSImplementedVersion,
 		Required:    version.CachemanABFSRequiredVersion,
+		Features:    c.features(),
 	})
 }
 

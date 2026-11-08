@@ -98,7 +98,8 @@ type RefCounts struct {
 	Null int64 `json:"null"`
 	// Roots counts the refs whose targets are roots.
 	Roots int64 `json:"roots"`
-	// Expired counts the refs that retention would tombstone.
+	// Expired counts the refs past their retention, which a delete cycle
+	// removes.
 	Expired int64 `json:"expired"`
 	// Malformed counts targets that are not hashes.
 	Malformed int64 `json:"malformed,omitempty"`
@@ -112,6 +113,9 @@ type refSnapshot struct {
 	// the workspace refs.
 	mounts     []Hash
 	workspaces []Hash
+	// expired holds the refs past their retention, which a delete cycle
+	// removes.
+	expired []expiredRef
 }
 
 type refRoot struct {
@@ -125,13 +129,14 @@ type refRoot struct {
 func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapshot time.Time) (*refSnapshot, error) {
 	txn := client.ReadOnlyTransaction().WithTimestampBound(spanner.ReadTimestamp(snapshot))
 	defer txn.Close()
-	stmt := spanner.Statement{SQL: `SELECT p.Project, r.Ref, r.UpdateTime, r.Target FROM Refs AS r JOIN Projects AS p ON p.ProjectId = r.ProjectId`}
+	stmt := spanner.Statement{SQL: `SELECT r.ProjectId, p.Host, p.Project, r.Ref, r.UpdateTime, r.Target FROM Refs AS r JOIN Projects AS p ON p.ProjectId = r.ProjectId`}
 	snap := &refSnapshot{counts: make(map[RefClass]*RefCounts)}
 	err := txn.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: spannerpb.RequestOptions_PRIORITY_LOW}).Do(func(row *spanner.Row) error {
-		var project, ref string
+		var projectID int64
+		var host, project, ref string
 		var updated time.Time
 		var target spanner.NullString
-		if err := row.Columns(&project, &ref, &updated, &target); err != nil {
+		if err := row.Columns(&projectID, &host, &project, &ref, &updated, &target); err != nil {
 			return err
 		}
 		class := classifyRef(project, ref)
@@ -147,6 +152,7 @@ func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapsh
 		}
 		if o.refRetention(class, updated, snapshot) {
 			c.Expired++
+			snap.expired = append(snap.expired, expiredRef{class: class, projectID: projectID, host: host, project: project, ref: ref, updated: updated, target: target.StringVal})
 			return nil
 		}
 		if !entities.IsHash(target.StringVal) {
@@ -195,6 +201,16 @@ type MountCounts struct {
 	// WithoutKeepAlive counts mount details of clients that ran without the GC
 	// keep-alive or with one of its intervals zero.
 	WithoutKeepAlive int64 `json:"without_keepalive"`
+	// WithoutLocalWriteCheck counts mount details with the keep-alive whose
+	// cacheman does not keep locally written content until a server confirms
+	// it, so that it may evict the only copy of an object a delete removes.
+	WithoutLocalWriteCheck int64 `json:"without_local_write_check"`
+	// TouchIntervalTooLong counts mount details with the keep-alive whose
+	// touch interval, plus the tenth the keep-alive may be late, is not below
+	// the grace less the longest server touch interval and cache TTL and the
+	// clock skew margin: an object the mount touched may stop being recent
+	// before the next touch.
+	TouchIntervalTooLong int64 `json:"touch_interval_too_long"`
 	// PinnedManifests counts the distinct pinned manifests parsed.
 	PinnedManifests int64 `json:"pinned_manifests"`
 	// Revisions counts the distinct project revisions that are object keys,
@@ -214,6 +230,10 @@ type MountCounts struct {
 	// Samples lists up to maxSamples mount details for each count above, by
 	// the count's name.
 	Samples map[string][]MountSample `json:"samples,omitempty"`
+	// longestTouch is the longest touch interval of the mount details with
+	// the keep-alive, which a delete checks again against the servers that
+	// run just before it.
+	longestTouch time.Duration
 }
 
 // MountSample names the mount details, and the workspace snapshot, behind a
@@ -272,19 +292,26 @@ type pinReader struct {
 	ignored   map[Hash]int
 	seen      map[Hash]bool
 	revisions []pinnedRevision
+
+	// touchLimit is the bound of TouchIntervalTooLong.
+	touchLimit time.Duration
 }
 
 // pinnedRevisions reads the mount details of each live mount and of the mount
 // behind each workspace snapshot, and the pinned manifests they name. It
 // returns the project revisions that are object keys: the commits the mounts
-// and workspaces are based on, which neither links.
-func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, mounts, workspaces []Hash) ([]pinnedRevision, MountCounts, MountCounts, error) {
+// and workspaces are based on, which neither links. A mount with the
+// keep-alive whose touch interval is not safely below touchLimit is counted
+// in TouchIntervalTooLong.
+func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, mounts, workspaces []Hash, touchLimit time.Duration) ([]pinnedRevision, MountCounts, MountCounts, error) {
 	p := &pinReader{
 		objs:      objs,
 		details:   make(map[Hash]*binding.MountDetails),
 		manifests: make(map[Hash][]Hash),
 		ignored:   make(map[Hash]int),
 		seen:      make(map[Hash]bool),
+
+		touchLimit: touchLimit,
 	}
 	mountCounts := MountCounts{Live: int64(len(mounts))}
 	seenDetails := make(map[Hash]bool, len(mounts))
@@ -370,6 +397,16 @@ func (p *pinReader) mount(ctx context.Context, c *MountCounts, seenDetails, seen
 	if cfg := md.Config; cfg == nil || !cfg.GCKeepAlive || cfg.GCKeepAliveRefInterval <= 0 || cfg.GCKeepAliveTouchInterval <= 0 {
 		c.WithoutKeepAlive++
 		c.sample("without_keepalive", src)
+	} else {
+		if !md.GCLocalWriteCheck {
+			c.WithoutLocalWriteCheck++
+			c.sample("without_local_write_check", src)
+		}
+		c.longestTouch = max(c.longestTouch, cfg.GCKeepAliveTouchInterval)
+		if !keepAliveTouchFits(cfg.GCKeepAliveTouchInterval, p.touchLimit) {
+			c.TouchIntervalTooLong++
+			c.sample("touch_interval_too_long", src)
+		}
 	}
 	pinned := md.PinnedManifestHash
 	if pinned.IsZero() {
@@ -401,6 +438,13 @@ func (p *pinReader) mount(ctx context.Context, c *MountCounts, seenDetails, seen
 		}
 	}
 	return nil
+}
+
+// keepAliveTouchFits reports whether the keep-alive of a mount that touches
+// every interval, up to a tenth late, touches its objects again before the
+// last touch stops keeping them recent, which it does for limit.
+func keepAliveTouchFits(interval, limit time.Duration) bool {
+	return interval+interval/10 < limit
 }
 
 func (p *pinReader) mountDetails(ctx context.Context, h Hash) (*binding.MountDetails, error) {

@@ -31,8 +31,9 @@ var healthProbeTables = []string{"objects", "maps", "chunks"}
 // permission is not detected.
 func (s *GCPServer) HealthProbes() map[string]func(context.Context) error {
 	return map[string]func(context.Context) error{
-		"spanner":  s.casdb.CheckTables,
-		"bigtable": s.checkBigtable,
+		"spanner":      s.casdb.CheckTables,
+		"bigtable":     s.checkBigtable,
+		"gc-heartbeat": s.CheckGCHeartbeat,
 		"storage": func(ctx context.Context) error {
 			return checkBucketWith(ctx, s.storage, s.bucketName)
 		},

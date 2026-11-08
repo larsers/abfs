@@ -94,6 +94,8 @@ type GCKeepAlive struct {
 	touchWait time.Duration
 	// The touches that failed in a row.
 	touchFailures int
+
+	localWrites *localWriteWatch
 }
 
 // MountRef returns the ref in the ABFS meta project that points to a mount's details.
@@ -216,6 +218,7 @@ func (k *GCKeepAlive) untilNext(now time.Time) time.Duration {
 }
 
 func (k *GCKeepAlive) step(ctx context.Context, now time.Time) {
+	k.checkLocalWrites(ctx)
 	if d := k.refInterval(); d > 0 && now.Sub(k.lastRef) >= waitOr(k.refWait, d) {
 		k.lastRef = now
 		k.refWait = k.nextWait(d)
@@ -515,6 +518,7 @@ func scanMountHashes(ctx context.Context, roots []string, attrs mountAttrs) (Mou
 
 func (c *casfs) startGCKeepAlive(ctx context.Context) {
 	if k := NewGCKeepAlive(c.MountInfo, c.mountDetails, c.manifestServer, c.cacheman, c.mountPoint); k != nil {
+		k.WatchLocalWriteCheck(c.mountDetails, c.cacheman.Features, c.store)
 		go k.Run(ctx)
 	}
 }

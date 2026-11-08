@@ -35,7 +35,7 @@ func TestFilterServer_HealthProbes(t *testing.T) {
 	s := createTestServer(t, depot.NewMasterDepot([]depot.Depot{depot.NewMemoryDepot("mem", 1000)}))
 	var f any = NewFilterServer(s, nil)
 	probes := f.(healthProber).HealthProbes()
-	require.ElementsMatch(t, []string{"spanner", "bigtable", "storage"}, slices.Collect(maps.Keys(probes)))
+	require.ElementsMatch(t, []string{"spanner", "bigtable", "gc-heartbeat", "storage"}, slices.Collect(maps.Keys(probes)))
 
 	f = NewFilterServer(inmemory.New(), nil)
 	require.Nil(t, f.(healthProber).HealthProbes())

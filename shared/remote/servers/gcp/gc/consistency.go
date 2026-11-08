@@ -32,6 +32,9 @@ const (
 	objectsMetaFamily = "meta"
 	objectsSizeColumn = "meta:size"
 	maxMissingKept    = 10
+	// maxTooNew is the largest number of objects written during the scan that
+	// a delete checks again; with more it refuses, so the scan keeps one more.
+	maxTooNew = 10000
 	// clockSkewMargin covers the skew between the clocks of the servers, which
 	// stamp object rows, and of the collector.
 	clockSkewMargin = time.Minute
@@ -73,14 +76,17 @@ type consistencyScan struct {
 	// seen holds the nodes that have an objects row.
 	seen bitmap
 	// unreachable lists the unreachable nodes that have an objects row, in
-	// key order, when the scan was asked to keep them.
+	// key order, and tooNew up to maxTooNew+1 keys counted in TooNew, when the
+	// scan was asked to keep them.
 	unreachable []sizedNode
+	tooNew      []string
 }
 
 // checkConsistency scans the meta family of the table objects. It checks that
 // every object written before checkBefore has a node in g, and sums the sizes
 // of the reachable and unreachable objects. With keep it also lists the
-// unreachable nodes that have an objects row.
+// unreachable nodes that have an objects row, and the keys of the objects
+// written too close to the scan to tell.
 func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []string, g *graph, live bitmap, checkBefore time.Time, keep bool) (*consistencyScan, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.LatestNFilter(1))
 	seen := newBitmap(g.size())
@@ -88,6 +94,7 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 	report := &ConsistencyReport{Ran: true}
 	var sizes objectBytes
 	unreachable := make([][]sizedNode, len(bounds)-1)
+	tooNew := make([][]string, len(bounds)-1)
 	eg, gctx := errgroup.WithContext(ctx)
 	for i := range len(bounds) - 1 {
 		eg.Go(func() error {
@@ -111,6 +118,9 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 						}
 					} else {
 						r.TooNew++
+						if keep && len(tooNew[i]) <= maxTooNew {
+							tooNew[i] = append(tooNew[i], row.Key())
+						}
 					}
 					return true
 				}
@@ -154,6 +164,9 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 	scan := &consistencyScan{report: report, sizes: sizes, seen: seen}
 	for _, nodes := range unreachable {
 		scan.unreachable = append(scan.unreachable, nodes...)
+	}
+	for _, keys := range tooNew {
+		scan.tooNew = append(scan.tooNew, keys[:min(len(keys), maxTooNew+1-len(scan.tooNew))]...)
 	}
 	return scan, nil
 }

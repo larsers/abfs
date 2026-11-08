@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/spanner"
@@ -152,7 +153,7 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
 	require.NoError(err)
 	defer client.Close()
-	for _, table := range []string{"GcState", "GcReplicas"} {
+	for _, table := range []string{"GcState", "GcReplicas", "GcServers"} {
 		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
 		require.Error(err, table)
 	}
@@ -174,13 +175,13 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	row, err := btClient.Open("objects").ReadRow(ctx, "kept")
 	require.NoError(err)
 	require.NotEmpty(row)
-	for _, table := range []string{"GcState", "GcReplicas"} {
+	for _, table := range []string{"GcState", "GcReplicas", "GcServers"} {
 		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
 		require.NoError(err, table)
 	}
 	s, err := New(ctx, &NewServerOpts{
 		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
-		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCHeartbeatInterval: time.Minute,
 	})
 	require.NoError(err)
 	require.NoError(s.Close())
@@ -209,7 +210,7 @@ func TestSetup_AddsGCStateListColumns(t *testing.T) {
 	require.NoError(err)
 	serverOpts := &NewServerOpts{
 		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
-		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCHeartbeatInterval: time.Minute,
 	}
 	_, err = New(ctx, serverOpts)
 	require.ErrorContains(err, "init --gc")
@@ -241,7 +242,7 @@ func TestNew_ChecksResources(t *testing.T) {
 	newOpts := func(o *SetupOpts) *NewServerOpts {
 		return &NewServerOpts{
 			ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID,
-			BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: o.GC,
+			BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: o.GC, GCHeartbeatInterval: time.Minute,
 		}
 	}
 	tests := []struct {
@@ -374,7 +375,7 @@ func TestNew_ChecksSingleRowTransactions(t *testing.T) {
 			o := setupOpts(t, newEmulatorDatabase(t))
 			s, err := New(context.Background(), &NewServerOpts{
 				ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID, BtInstance: o.BtInstance, BucketName: o.BucketName,
-				MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCReadOnly: tt.readOnly,
+				MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCReadOnly: tt.readOnly, GCHeartbeatInterval: time.Minute,
 			})
 			if err == nil {
 				_ = s.Close()

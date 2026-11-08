@@ -187,3 +187,78 @@ func TestLease_KeepRenews(t *testing.T) {
 	require.ErrorIs(runCtx.Err(), context.Canceled)
 	require.ErrorIs(context.Cause(runCtx), context.Canceled)
 }
+
+// Only condemn and delete leases advance the last condemn cycle and the
+// largest grace, so that a delete can tell whether a condemn or delete cycle
+// ran after the one that wrote its list, while dry runs do not count.
+func TestAcquireLease_RecordsCondemnCycleAndLargestGrace(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	sp := newEmulatorCASDBServer(t).casdb.SpannerClient()
+	state := func() (cycle, grace spanner.NullInt64) {
+		row, err := sp.Single().ReadRow(ctx, "GcState", spanner.Key{gc.DefaultStateName}, []string{"CondemnCycle", "MaxGraceSeconds"})
+		require.NoError(err)
+		require.NoError(row.Columns(&cycle, &grace))
+		return cycle, grace
+	}
+	steps := []struct {
+		phase     string
+		grace     time.Duration
+		wantPrev  int64
+		wantMax   time.Duration
+		wantCycle int64
+	}{
+		{gc.PhaseDryRun, testGrace, 0, 0, 0},
+		{gc.PhaseCondemn, testGrace, 0, testGrace, 2},
+		// A dry run with a longer grace neither raises the largest grace nor
+		// counts as a condemn cycle.
+		{gc.PhaseDryRun, 2 * testGrace, 2, testGrace, 2},
+		{gc.PhaseDelete, testGrace / 2, 2, testGrace, 4},
+		{gc.PhaseCondemn, testGrace + 90*time.Minute + 500*time.Millisecond, 4, testGrace + 90*time.Minute, 5},
+	}
+	for i, s := range steps {
+		l, err := gc.AcquireLease(ctx, sp, gc.DefaultStateName, "holder", s.phase, time.Minute, s.grace)
+		require.NoError(err)
+		require.Equal(int64(i+1), l.Cycle)
+		require.Equal(s.wantPrev, l.PreviousCondemnCycle, "step %d", i)
+		require.Equal(s.wantMax, l.MaxGrace, "step %d", i)
+		cycle, grace := state()
+		require.Equal(s.wantCycle, cycle.Int64, "step %d", i)
+		require.Equal(int64(s.wantMax/time.Second), grace.Int64, "step %d", i)
+		l.Release()
+	}
+}
+
+// A list gets its completion time from the commit of CompleteList, and a new
+// list clears it, so that a stale time never vouches for a newer list.
+func TestLease_ListCompleteTime(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	sp := newEmulatorCASDBServer(t).casdb.SpannerClient()
+
+	l, err := gc.AcquireLease(ctx, sp, gc.DefaultStateName, "holder", gc.PhaseCondemn, time.Minute, testGrace)
+	require.NoError(err)
+	defer l.Release()
+	require.NoError(l.RecordList(ctx, "gc/default/list-1", l.Start))
+	st, err := l.ReadList(ctx)
+	require.NoError(err)
+	require.False(st.Complete)
+	require.True(st.CompleteTime.IsZero())
+
+	require.NoError(l.CompleteList(ctx))
+	st, err = l.ReadList(ctx)
+	require.NoError(err)
+	require.True(st.Complete)
+	require.True(st.CompleteTime.After(l.Start), "completion %s, lease %s", st.CompleteTime, l.Start)
+	row, err := sp.Single().ReadRow(ctx, "GcState", spanner.Key{gc.DefaultStateName}, []string{"UpdateTime"})
+	require.NoError(err)
+	var updated time.Time
+	require.NoError(row.Columns(&updated))
+	require.Equal(updated, st.CompleteTime, "the commit time of CompleteList")
+
+	require.NoError(l.RecordList(ctx, "gc/default/list-2", l.Start))
+	st, err = l.ReadList(ctx)
+	require.NoError(err)
+	require.False(st.Complete)
+	require.True(st.CompleteTime.IsZero())
+}

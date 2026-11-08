@@ -551,3 +551,34 @@ func TestMaintenanceKeepsLocalOnlyAliveTime(t *testing.T) {
 	require.NoError(t, it.c.maintenanceWork())
 	require.Equal(t, int64(1), it.c.pushBlobsStat.Request.Load())
 }
+
+// An entry waiting for the server to confirm a local write keeps its blob through the idle
+// sweep, and the sweep waits while checks are queued.
+func TestIdleLocalGC_KeepsUnconfirmedLocalWrite(t *testing.T) {
+	old := localWriteCheckPeriod
+	localWriteCheckPeriod = time.Hour
+	defer func() { localWriteCheckPeriod = old }()
+
+	r := newCheckRemote()
+	it := newIdleGCTest(t, r)
+	it.c.config.GCKeepAlive = true
+	it.c.applyLocalWriteCheck(it.c.config)
+	it.c.startLocalWriteCheck(context.Background())
+	now := time.Now()
+	h := it.putBlob(t, "fetched long ago, written again", true, now.Add(2*localGCThreshold))
+	it.c.NewObject(h, protocol.TypeBlob)
+	it.putBlob(t, "fetched long ago, written again", false, now.Add(2*localGCThreshold))
+	require.True(t, hasMarker(it.c, h))
+
+	it.clock.Advance(idleGCStartWindow)
+	ran, err := it.c.runIdleGC(context.Background())
+	require.NoError(t, err)
+	require.False(t, ran)
+
+	it.c.localWrites.take(localWriteCheckBatchSize)
+	ran, err = it.c.runIdleGC(context.Background())
+	require.NoError(t, err)
+	require.True(t, ran)
+	require.True(t, it.hasBlob(t, h))
+	require.NotNil(t, it.c.index.Get(h))
+}

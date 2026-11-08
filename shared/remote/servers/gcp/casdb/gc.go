@@ -70,8 +70,9 @@ func (c *CASDB) headerFamilies() string {
 // the columns added after they were first created.
 func (c *CASDB) CheckGCSchema(ctx context.Context) error {
 	for _, q := range []struct{ table, columns string }{
-		{"GcState", "ListLocation, ListSnapshotTime, ListComplete"},
+		{"GcState", "ListLocation, ListSnapshotTime, ListComplete, ListCompleteTime, CondemnCycle, LegacyServersGoneTime, MaxGraceSeconds"},
 		{"GcReplicas", "1"},
+		{"GcServers", "HeartbeatIntervalSeconds, LinkValidation, StatsTime, TouchLossTime, StoppedAt"},
 	} {
 		err := c.dbClient.Single().Query(ctx, spanner.Statement{SQL: "SELECT " + q.columns + " FROM " + q.table + " LIMIT 1"}).Do(func(*spanner.Row) error { return nil })
 		if err != nil {

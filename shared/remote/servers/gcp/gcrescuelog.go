@@ -19,10 +19,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 
@@ -76,9 +78,9 @@ func newRescueLog() *rescueLog {
 	return &rescueLog{now: time.Now}
 }
 
-// call logs a call that read the rows of read objects and rescued or failed
-// to rescue some of them.
-func (l *rescueLog) call(ctx context.Context, path rescuePath, read, rescued, failed int) {
+// call logs a call with the request id req that read the rows of read
+// objects and rescued or failed to rescue some of them.
+func (l *rescueLog) call(ctx context.Context, path rescuePath, req string, read, rescued, failed int) {
 	if rescued == 0 && failed == 0 {
 		return
 	}
@@ -91,12 +93,22 @@ func (l *rescueLog) call(ctx context.Context, path rescuePath, read, rescued, fa
 	}
 	l.calls++
 	addr, forwarded, version := rescueClient(ctx)
-	log.Printf("Rescued %d condemned objects of %d read in %s, %d failed: peer %s, x-forwarded-for %q, client-version %q",
-		rescued, read, rescuePathNames[path], failed, addr, forwarded, version)
+	log.Printf("Rescued %d condemned objects of %d read in %s, %d failed: request %s, peer %s, x-forwarded-for %q, client-version %q",
+		rescued, read, rescuePathNames[path], failed, req, addr, forwarded, version)
 }
 
-// object logs the rescue of hdr, whose marker was condemned.
-func (l *rescueLog) object(path rescuePath, hdr *ObjectHeader, condemned []byte) {
+// lost logs that the collector deleted the object of hdr before the call
+// with the request id req could rescue it. The lines are not limited: each is
+// an object a client may have needed.
+func (l *rescueLog) lost(ctx context.Context, path rescuePath, req string, hdr *ObjectHeader) {
+	addr, forwarded, version := rescueClient(ctx)
+	log.Printf("Condemned object %s was deleted before it could be rescued in %s: request %s, peer %s, x-forwarded-for %q, client-version %q",
+		hdr.Id, rescuePathNames[path], req, addr, forwarded, version)
+}
+
+// object logs the rescue of hdr, whose marker was condemned, by the call with
+// the request id req.
+func (l *rescueLog) object(path rescuePath, req string, hdr *ObjectHeader, condemned []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.windowLocked()
@@ -105,7 +117,7 @@ func (l *rescueLog) object(path rescuePath, hdr *ObjectHeader, condemned []byte)
 		return
 	}
 	l.lines++
-	log.Printf("Rescued %s %s in %s, condemned by GC cycle %s", hdr.Type, hdr.Id, rescuePathNames[path], markerCycle(condemned))
+	log.Printf("Rescued %s %s in %s, condemned by GC cycle %s: request %s", hdr.Type, hdr.Id, rescuePathNames[path], markerCycle(condemned), req)
 }
 
 // windowLocked starts a new window once rescueLogWindow has passed.
@@ -142,6 +154,18 @@ func markerCycle(condemned []byte) string {
 		return fmt.Sprint(binary.BigEndian.Uint64(condemned))
 	}
 	return fmt.Sprintf("%x", condemned)
+}
+
+// newRequestID returns the id that the rescue log lines of one call share, a
+// random one, followed by the trace ID of the call when it is traced. The
+// calls of one client operation can share a trace, so the trace ID alone does
+// not name the call.
+func newRequestID(ctx context.Context) string {
+	id := fmt.Sprintf("%016x", rand.Uint64())
+	if sc := trace.SpanContextFromContext(ctx); sc.HasTraceID() {
+		return id + ", trace " + sc.TraceID().String()
+	}
+	return id
 }
 
 // rescueClient returns what identifies the client of ctx: the peer address,

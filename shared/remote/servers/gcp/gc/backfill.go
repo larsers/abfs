@@ -52,6 +52,9 @@ type BackfillOpts struct {
 	Rate float64
 	// DryRun counts the gc rows to write and writes none.
 	DryRun bool
+	// WriteDeadline is the deadline of one attempt of a gc row write; zero
+	// uses DefaultWriteDeadline.
+	WriteDeadline time.Duration
 }
 
 // TypeCounts counts the objects of one type that a backfill handled.
@@ -103,15 +106,20 @@ func Backfill(ctx context.Context, client *bigtable.Client, objects remote.Remot
 	if o.BatchSize <= 0 {
 		o.BatchSize = DefaultBackfillBatchSize
 	}
+	if o.WriteDeadline <= 0 {
+		o.WriteDeadline = DefaultWriteDeadline
+	}
 	bounds, err := splitRange(o.Start, o.End, o.Shards)
 	if err != nil {
 		return nil, err
 	}
+	writer := NewEdgeWriter(client)
+	writer.budget = writeBudget{deadline: o.WriteDeadline}
 	b := &backfill{
 		objectsTable: client.Open(objectsTable),
 		gcTable:      client.Open(TableName),
 		objects:      objects,
-		writer:       NewEdgeWriter(client),
+		writer:       writer,
 		opts:         o,
 		limiter:      newLimiter(o.Rate),
 		stats:        BackfillStats{Types: make(map[string]*TypeCounts)},

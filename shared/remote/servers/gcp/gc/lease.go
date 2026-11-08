@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -32,8 +33,19 @@ const (
 	DefaultLeaseDuration = 5 * time.Minute
 	PhaseDryRun          = "dry-run"
 	PhaseCondemn         = "condemn"
+	PhaseDelete          = "delete"
+	PhaseUndo            = "undo"
 	minLeaseDuration     = 3 * time.Second
 	releaseTimeout       = 10 * time.Second
+)
+
+// renewRetry is the wait before a failed lease renewal is tried again,
+// renewLease renews a lease and wallNow reads the clock of the write checks;
+// tests change them.
+var (
+	renewRetry = 10 * time.Second
+	renewLease = (*Lease).renew
+	wallNow    = time.Now
 )
 
 // ErrLeaseLost reports that another process took the lease over.
@@ -73,9 +85,19 @@ type Lease struct {
 	// that lease had been released. A holder that stalled may still act until
 	// then.
 	PreviousExpiry time.Time
+	// PreviousCondemnCycle is the cycle of the last condemn or delete lease
+	// before this one, zero when there was none. Leases of the other phases
+	// do not change it.
+	PreviousCondemnCycle int64
+	// MaxGrace is the largest grace of any condemn or delete lease, this one
+	// included.
+	MaxGrace time.Duration
 	// taken is the local time just before the lease was taken, the base of the
 	// watchdog.
 	taken time.Time
+	// expiry is the expiry that Spanner recorded when the lease was taken or
+	// last renewed, in Unix nanoseconds.
+	expiry atomic.Int64
 }
 
 // DefaultHolder names this process as a lease holder.
@@ -90,28 +112,32 @@ func DefaultHolder() string {
 // AcquireLease takes the lease of the garbage collector name for duration and
 // starts a new cycle in the given phase: it increments the cycle number and
 // the lease epoch and records the start time, the grace and the expiry of the
-// lease it takes over. It fails with *ErrLeaseHeld while another holder's
-// lease is valid.
+// lease it takes over. A condemn or delete lease also records its cycle as
+// the last condemn cycle and raises the largest grace to its own. It fails
+// with *ErrLeaseHeld while another holder's lease is valid.
 func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, phase string, duration, grace time.Duration) (*Lease, error) {
 	if duration < minLeaseDuration {
 		return nil, fmt.Errorf("lease duration %s is shorter than %s", duration, minLeaseDuration)
 	}
 	l := &Lease{client: client, name: name, holder: holder, duration: duration, taken: time.Now()}
+	var leaseExpiry time.Time
 	commit, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		now, err := spannerNow(ctx, txn)
 		if err != nil {
 			return err
 		}
+		leaseExpiry = now.Add(duration)
 		var cycle, epoch int64
 		var prevStart, expiry spanner.NullTime
-		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime"})
+		var condemnCycle, maxGrace spanner.NullInt64
+		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime", "CondemnCycle", "MaxGraceSeconds"})
 		switch {
 		case spanner.ErrCode(err) == codes.NotFound:
 		case err != nil:
 			return err
 		default:
 			var current spanner.NullString
-			if err := row.Columns(&cycle, &current, &epoch, &expiry, &prevStart); err != nil {
+			if err := row.Columns(&cycle, &current, &epoch, &expiry, &prevStart, &condemnCycle, &maxGrace); err != nil {
 				return err
 			}
 			if current.Valid && current.StringVal != holder && expiry.Valid && expiry.Time.After(now) {
@@ -123,19 +149,27 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		if expiry.Valid {
 			l.PreviousExpiry = expiry.Time
 		}
-		return txn.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(stateTable, map[string]any{
+		l.PreviousCondemnCycle = condemnCycle.Int64
+		l.MaxGrace = time.Duration(maxGrace.Int64) * time.Second
+		cols := map[string]any{
 			"Name":                   name,
 			"Cycle":                  l.Cycle,
 			"Phase":                  phase,
 			"LeaseHolder":            holder,
 			"LeaseEpoch":             l.Epoch,
-			"LeaseExpiry":            now.Add(duration),
+			"LeaseExpiry":            leaseExpiry,
 			"PreviousLeaseExpiry":    expiry,
 			"CycleStartTime":         now,
 			"PreviousCycleStartTime": prevStart,
 			"GraceSeconds":           int64(grace / time.Second),
 			"UpdateTime":             spanner.CommitTimestamp,
-		})})
+		}
+		if phase == PhaseCondemn || phase == PhaseDelete {
+			l.MaxGrace = max(l.MaxGrace, grace.Truncate(time.Second))
+			cols["CondemnCycle"] = l.Cycle
+			cols["MaxGraceSeconds"] = int64(l.MaxGrace / time.Second)
+		}
+		return txn.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(stateTable, cols)})
 	})
 	if err != nil {
 		var held *ErrLeaseHeld
@@ -145,6 +179,7 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		return nil, fmt.Errorf("failed to take the GC lease: %w", err)
 	}
 	l.Start = commit
+	l.expiry.Store(leaseExpiry.UnixNano())
 	return l, nil
 }
 
@@ -165,29 +200,32 @@ type ListState struct {
 	Location string
 	// SnapshotTime is the snapshot time of the cycle that wrote it.
 	SnapshotTime time.Time
-	// Complete tells that every marker of the list was written.
-	Complete bool
+	// Complete tells that every marker of the list was written, and
+	// CompleteTime is the commit time of the write that recorded it; a cycle
+	// that only recorded Complete leaves it zero.
+	Complete     bool
+	CompleteTime time.Time
 }
 
 // ReadList returns the condemned list recorded in the state of the lease.
 func (l *Lease) ReadList(ctx context.Context) (ListState, error) {
-	row, err := l.client.Single().ReadRow(ctx, stateTable, spanner.Key{l.name}, []string{"ListLocation", "ListSnapshotTime", "ListComplete"})
+	row, err := l.client.Single().ReadRow(ctx, stateTable, spanner.Key{l.name}, []string{"ListLocation", "ListSnapshotTime", "ListComplete", "ListCompleteTime"})
 	if err != nil {
 		return ListState{}, fmt.Errorf("failed to read the GC list state: %w", err)
 	}
 	var location spanner.NullString
-	var snapshot spanner.NullTime
+	var snapshot, completeTime spanner.NullTime
 	var complete spanner.NullBool
-	if err := row.Columns(&location, &snapshot, &complete); err != nil {
+	if err := row.Columns(&location, &snapshot, &complete, &completeTime); err != nil {
 		return ListState{}, fmt.Errorf("failed to read the GC list state: %w", err)
 	}
-	return ListState{Location: location.StringVal, SnapshotTime: snapshot.Time, Complete: complete.Valid && complete.Bool}, nil
+	return ListState{Location: location.StringVal, SnapshotTime: snapshot.Time, Complete: complete.Valid && complete.Bool, CompleteTime: completeTime.Time}, nil
 }
 
 // RecordList records the condemned list of this cycle, not complete yet.
 func (l *Lease) RecordList(ctx context.Context, location string, snapshot time.Time) error {
 	if err := l.update(ctx, func(time.Time) map[string]any {
-		return map[string]any{"ListLocation": location, "ListSnapshotTime": snapshot, "ListComplete": false}
+		return map[string]any{"ListLocation": location, "ListSnapshotTime": snapshot, "ListComplete": false, "ListCompleteTime": spanner.NullTime{}}
 	}); err != nil {
 		return fmt.Errorf("failed to record the GC condemned list: %w", err)
 	}
@@ -195,10 +233,10 @@ func (l *Lease) RecordList(ctx context.Context, location string, snapshot time.T
 }
 
 // CompleteList records that every marker of the list of this cycle was
-// written.
+// written, with the commit time of the write.
 func (l *Lease) CompleteList(ctx context.Context) error {
 	if err := l.update(ctx, func(time.Time) map[string]any {
-		return map[string]any{"ListComplete": true}
+		return map[string]any{"ListComplete": true, "ListCompleteTime": spanner.CommitTimestamp}
 	}); err != nil {
 		return fmt.Errorf("failed to record the GC condemned list as complete: %w", err)
 	}
@@ -219,9 +257,28 @@ func (l *Lease) Release() {
 }
 
 func (l *Lease) renew(ctx context.Context) error {
-	return l.update(ctx, func(now time.Time) map[string]any {
-		return map[string]any{"LeaseExpiry": now.Add(l.duration)}
+	var expiry time.Time
+	err := l.update(ctx, func(now time.Time) map[string]any {
+		expiry = now.Add(l.duration)
+		return map[string]any{"LeaseExpiry": expiry}
 	})
+	if err == nil {
+		l.expiry.Store(expiry.UnixNano())
+	}
+	return err
+}
+
+// checkWrite fails when a write call of two attempts of d each, started now,
+// could end after the expiry of the lease less the clock skew margin. The
+// check runs on the wall clock against the expiry Spanner recorded, so a run
+// whose renewals failed, or whose process was paused while its monotonic
+// clock stood still, stops writing before another holder can take the lease
+// over.
+func (l *Lease) checkWrite(d time.Duration) error {
+	if wallNow().Add(2*d + clockSkewMargin).After(time.Unix(0, l.expiry.Load())) {
+		return errLeaseExpiring
+	}
+	return nil
 }
 
 // update writes the columns that set returns, given the Spanner time, if the
@@ -263,11 +320,12 @@ func (l *Lease) margin() time.Duration {
 	return l.duration / 4
 }
 
-// Keep renews the lease in the background until stop is called. The returned
-// context is canceled when the lease is lost, or when it is about to expire
-// because renewals failed; context.Cause tells which. The watchdog runs on the
-// local clock from the start of the last successful renewal, which is never
-// later than the expiry Spanner recorded.
+// Keep renews the lease in the background until stop is called, every third
+// of the lease duration and renewRetry after a renewal that failed. The
+// returned context is canceled when the lease is lost, or when it is about to
+// expire because renewals failed; context.Cause tells which. The watchdog runs
+// on the local clock from the start of the last successful renewal, which is
+// never later than the expiry Spanner recorded.
 func (l *Lease) Keep(ctx context.Context) (_ context.Context, stop func()) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
@@ -277,8 +335,8 @@ func (l *Lease) Keep(ctx context.Context) (_ context.Context, stop func()) {
 		deadline := l.taken.Add(l.duration - l.margin())
 		watchdog := time.NewTimer(time.Until(deadline))
 		defer watchdog.Stop()
-		ticker := time.NewTicker(l.duration / 3)
-		defer ticker.Stop()
+		next := time.NewTimer(l.duration / 3)
+		defer next.Stop()
 		for {
 			select {
 			case <-done:
@@ -288,20 +346,22 @@ func (l *Lease) Keep(ctx context.Context) (_ context.Context, stop func()) {
 			case <-watchdog.C:
 				cancel(errLeaseExpiring)
 				return
-			case <-ticker.C:
+			case <-next.C:
 				start := time.Now()
 				rctx, rcancel := context.WithDeadline(ctx, deadline)
-				err := l.renew(rctx)
+				err := renewLease(l, rctx)
 				rcancel()
 				switch {
 				case err == nil:
 					deadline = start.Add(l.duration - l.margin())
 					watchdog.Reset(time.Until(deadline))
+					next.Reset(l.duration / 3)
 				case errors.Is(err, ErrLeaseLost):
 					cancel(ErrLeaseLost)
 					return
 				default:
 					log.Printf("Warning: failed to renew the GC lease: %v", err)
+					next.Reset(min(renewRetry, l.duration/3))
 				}
 			}
 		}

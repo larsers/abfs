@@ -25,6 +25,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -37,6 +38,7 @@ import (
 	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 
@@ -255,9 +257,77 @@ func TestGCHooks_RescueLosesToDelete(t *testing.T) {
 	require.Equal(int64(1), s.gcHooks.mapResultsDropped.Load())
 }
 
+// lockedBuffer is a log output that goroutines a call leaves behind may still
+// write to while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// A rescue that loses to a delete in link validation or in MapResults
+// answers missing, and its log line names the call, the client and the
+// request: the trace ID of a traced call, else a random id.
+func TestGCHooks_LostRescueLogsTheCall(t *testing.T) {
+	require := require.New(t)
+	s := newGCHooksServer(t, &NewServerOpts{})
+	rescue := s.gcHooks.rescue
+	s.gcHooks.rescue = func(ctx context.Context, key entities.Hash, condemned []byte) (bool, error) {
+		deleteObjectRow(t, s, key)
+		return rescue(ctx, key, condemned)
+	}
+	logged := &lockedBuffer{}
+	log.SetOutput(logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	client := `, peer 10.0.0.9:4711, x-forwarded-for "10.1.2.3, 10.0.0.9", client-version "0.1.23"`
+
+	linked := putBlob(t, s, "linked")
+	condemnObject(t, s, linked, 3)
+	traceID := trace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	ctx := trace.ContextWithSpanContext(rescueClientContext(), trace.NewSpanContext(trace.SpanContextConfig{TraceID: traceID, SpanID: trace.SpanID{1}}))
+	tree, data := treeOf(linked)
+	var linkErr *remote.ErrObjectLinkValidation
+	require.ErrorAs(s.PutObject(ctx, tree, remote.NewContentReader(io.NopCloser(bytes.NewReader(data)), remote.EncodingRaw)), &linkErr)
+	require.Equal([]entities.Hash{linked}, linkErr.MissingLinks)
+	// Each call has its own request id, also when the calls share a trace.
+	linked2 := putBlob(t, s, "linked 2")
+	condemnObject(t, s, linked2, 3)
+	tree2, data2 := treeOf(linked2)
+	require.ErrorAs(s.PutObject(ctx, tree2, remote.NewContentReader(io.NopCloser(bytes.NewReader(data2)), remote.EncodingRaw)), &linkErr)
+	var reqs []string
+	for _, key := range []entities.Hash{linked, linked2} {
+		lostLine := regexp.MustCompile(fmt.Sprintf(`Condemned object %s was deleted before it could be rescued in validation: request ([0-9a-f]{16}), trace %s`, key, traceID) + regexp.QuoteMeta(client))
+		m := lostLine.FindStringSubmatch(logged.String())
+		require.NotNil(m, key)
+		reqs = append(reqs, m[1])
+	}
+	require.NotEqual(reqs[0], reqs[1])
+
+	from := putBlob(t, s, "request")
+	result := putBlob(t, s, "result")
+	require.NoError(s.AddMapResult(context.Background(), from, result))
+	condemnObject(t, s, result, 3)
+	results, err := s.MapResults(rescueClientContext(), from)
+	require.NoError(err)
+	require.Empty(results)
+	require.Regexp(fmt.Sprintf(`(?m)Condemned object %s was deleted before it could be rescued in map_results: request [0-9a-f]{16}`, result)+regexp.QuoteMeta(client)+`$`, logged.String())
+	require.Equal(int64(1), s.gcHooks.mapResultsDropped.Load())
+}
+
 // A keep-alive batch right after a condemn cycle can hold many condemned
-// objects; their rescues run in parallel, and one the collector deleted first
-// is reported missing.
+// objects; their rescues run in parallel, one the collector deleted first is
+// reported missing, and the log lines of the batch share one request id.
 func TestGCHooks_RescuesABatchInParallel(t *testing.T) {
 	require := require.New(t)
 	s := newGCHooksServer(t, &NewServerOpts{})
@@ -285,10 +355,17 @@ func TestGCHooks_RescuesABatchInParallel(t *testing.T) {
 		return rescue(ctx, key, condemned)
 	}
 
+	logged := captureLog(t)
 	hdrs, err := s.Headers(context.Background(), keys)
 	require.NoError(err)
 	for i, h := range hdrs {
 		require.Equal(keys[i] == gone, h.IsEmpty(), i)
+	}
+	// Every line of the call names the same request.
+	reqs := requestIDPattern.FindAllStringSubmatch(logged.String(), -1)
+	require.Len(reqs, 101)
+	for _, r := range reqs {
+		require.Equal(reqs[0][1], r[1])
 	}
 	for _, key := range keys {
 		if key != gone {
@@ -374,6 +451,8 @@ func (f *fakeToucher) TouchMapRow(row string) bool {
 
 func (f *fakeToucher) Stats() gc.TouchStats { return gc.TouchStats{} }
 
+func (f *fakeToucher) Late() bool { return false }
+
 func (f *fakeToucher) Close() {}
 
 // Headers and MapResults, the calls of the client keep-alive and of builds,
@@ -450,7 +529,7 @@ func TestGCHooks_TouchThrottle(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		s.gcHooks.toucher.Close()
 		st := s.gcHooks.toucher.Stats()
-		s.gcHooks.toucher = gc.NewToucher(s.casdb.BTClient(), touchBufferSize)
+		s.gcHooks.toucher = gc.NewToucher(s.casdb.BTClient(), gc.TouchBufferSize)
 		return st.Written
 	}
 
@@ -625,8 +704,8 @@ func TestGCHooks_ChunkMissingDuringRead(t *testing.T) {
 	// The collector deleted the row during the read.
 	require.NoError(readObject(s, putBlob(t, s, "other")))
 	deleteObjectRow(t, s, key)
-	s.storeHeader(&ObjectHeader{Id: key, Type: "blob", Size: 5})
-	s.storeContent(key, content)
+	s.storeHeader(&ObjectHeader{Id: key, Type: "blob", Size: 5}, cacheNow())
+	s.storeContent(key, content, cacheNow())
 	err = readObject(s, key)
 	require.ErrorIs(err, entities.ErrNotExist)
 	_, ok := s.headers[key[0]].Peek(key)
@@ -700,88 +779,21 @@ func TestGCHooks_ChunkMissingInBucket(t *testing.T) {
 	require.False(ok)
 }
 
-func TestGCHooks_Heartbeat(t *testing.T) {
-	require := require.New(t)
-	ctx := context.Background()
-	s := newEmulatorCASDBServer(t)
-	require.NoError(s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Hour, GCTouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}))
-	t.Cleanup(s.stopGCHooks)
-
-	var replicas []gc.Replica
-	require.Eventually(func() bool {
-		var err error
-		replicas, err = gc.ReadReplicas(ctx, s.casdb.SpannerClient())
-		require.NoError(err)
-		return len(replicas) == 1
-	}, 10*time.Second, 50*time.Millisecond)
-	r := replicas[0]
-	require.Equal(int64(gc.ExtractorVersion), r.Version)
-	require.True(r.GC)
-	require.Equal(36*time.Hour, r.TouchInterval)
-	require.Equal(6*time.Hour, r.CacheTTL)
-	require.WithinDuration(time.Now(), r.LastSeen, time.Minute)
-	require.Zero(s.gcHooks.heartbeatFailures.Load())
+// rescueClientContext returns the context of a call from a client behind a
+// load balancer.
+func rescueClientContext() context.Context {
+	ctx := peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 9), Port: 4711}})
+	return metadata.NewIncomingContext(ctx, metadata.Pairs("x-forwarded-for", "10.1.2.3, 10.0.0.9", "client-version", "0.1.23"))
 }
 
-// lossyToucher loses a touch while it closes.
-type lossyToucher struct {
-	fakeToucher
-	failed atomic.Int64
-}
-
-func (l *lossyToucher) Stats() gc.TouchStats { return gc.TouchStats{Failed: l.failed.Load()} }
-
-func (l *lossyToucher) Close() { l.failed.Store(1) }
-
-// A server that stops after writing its buffered touches deletes its
-// heartbeat row, so that a restart on the same host does not count as a
-// second live row. A stop that lost touches keeps the row, which marks the
-// stop as unclean for the collector.
-func TestGCHooks_StopDeletesHeartbeatRow(t *testing.T) {
-	for _, lose := range []bool{false, true} {
-		t.Run(fmt.Sprintf("touches lost %v", lose), func(t *testing.T) {
-			require := require.New(t)
-			ctx := context.Background()
-			s := newEmulatorCASDBServer(t)
-			require.NoError(s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Hour, GCTouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}))
-			t.Cleanup(s.stopGCHooks)
-			if lose {
-				s.gcHooks.toucher.Close()
-				s.gcHooks.toucher = &lossyToucher{}
-			}
-			require.Eventually(func() bool {
-				replicas, err := gc.ReadReplicas(ctx, s.casdb.SpannerClient())
-				require.NoError(err)
-				return len(replicas) == 1
-			}, 10*time.Second, 50*time.Millisecond)
-
-			logged := captureLog(t)
-			s.stopGCHooks()
-			replicas, err := gc.ReadReplicas(ctx, s.casdb.SpannerClient())
-			require.NoError(err)
-			if lose {
-				require.Len(replicas, 1)
-				require.Contains(logged.String(), "GC touches at stop: 0 written, 0 dropped and 1 failed while stopping")
-				require.Contains(logged.String(), "kept the GC heartbeat row "+replicas[0].ID)
-			} else {
-				require.Empty(replicas)
-				require.Contains(logged.String(), "GC touches at stop:")
-			}
-		})
-	}
-}
-
-func TestGCHooks_RejectsNegativeDurations(t *testing.T) {
-	s, _ := createTestServerWithCASDB(t)
-	require.Error(t, s.startGCHooks(context.Background(), &NewServerOpts{GC: true, CacheTTL: -time.Second}))
-}
+var requestIDPattern = regexp.MustCompile(`request ([0-9a-f]+)`)
 
 // A rescue is counted by call and type and logged with the client, as the
-// load balancer forwards it, and the cycle of the marker.
+// load balancer forwards it, the cycle of the marker and a request id that
+// the object line and the call line share and the next call does not.
 func TestGCHooks_Metrics(t *testing.T) {
 	require := require.New(t)
-	ctx := peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 9), Port: 4711}})
-	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("x-forwarded-for", "10.1.2.3, 10.0.0.9", "client-version", "0.1.23"))
+	ctx := rescueClientContext()
 	reader := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
@@ -792,8 +804,11 @@ func TestGCHooks_Metrics(t *testing.T) {
 	require.NoError(err)
 	lines := strings.Split(strings.TrimSpace(logged.String()), "\n")
 	require.Len(lines, 2, logged.String())
-	require.Contains(lines[0], fmt.Sprintf("Rescued blob %s in headers, condemned by GC cycle 3", key))
-	require.Contains(lines[1], `Rescued 1 condemned objects of 1 read in headers, 0 failed: peer 10.0.0.9:4711, x-forwarded-for "10.1.2.3, 10.0.0.9", client-version "0.1.23"`)
+	require.Contains(lines[0], fmt.Sprintf("Rescued blob %s in headers, condemned by GC cycle 3: request ", key))
+	req := requestIDPattern.FindStringSubmatch(lines[0])
+	require.NotNil(req, lines[0])
+	require.Len(req[1], 16)
+	require.Contains(lines[1], `Rescued 1 condemned objects of 1 read in headers, 0 failed: request `+req[1]+`, peer 10.0.0.9:4711, x-forwarded-for "10.1.2.3, 10.0.0.9", client-version "0.1.23"`)
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(reader.Collect(ctx, &rm))
@@ -830,6 +845,14 @@ func TestGCHooks_Metrics(t *testing.T) {
 	require.Contains(got, "abfs.gcp.cache.ttl_expiries/content")
 	require.Contains(got, "abfs.gcp.gc.map_results_dropped")
 	require.Contains(got, "abfs.gcp.gc.heartbeat_failures")
+
+	condemnObject(t, s, key, 4)
+	logged.Reset()
+	_, err = s.Headers(ctx, []entities.Hash{key})
+	require.NoError(err)
+	next := requestIDPattern.FindStringSubmatch(logged.String())
+	require.NotNil(next, logged.String())
+	require.NotEqual(req[1], next[1])
 }
 
 // The object lines and the call lines of the rescue log are limited per
@@ -842,19 +865,19 @@ func TestRescueLog_LimitsLines(t *testing.T) {
 	l.now = func() time.Time { return now }
 	hdr := &ObjectHeader{Id: entities.EmptyDirHash, Type: "tree"}
 	for range rescueKeyLines + 5 {
-		l.object(pathHeaders, hdr, []byte{0, 0, 0, 0, 0, 0, 0, 2})
+		l.object(pathHeaders, "r1", hdr, []byte{0, 0, 0, 0, 0, 0, 0, 2})
 	}
 	require.Equal(rescueKeyLines, strings.Count(logged.String(), "condemned by GC cycle 2"))
 	// GetObject logs one call per object.
 	for range rescueCallLines + 3 {
-		l.call(context.Background(), pathGetObject, 1, 1, 0)
+		l.call(context.Background(), pathGetObject, "r1", 1, 1, 0)
 	}
 	require.Equal(rescueCallLines, strings.Count(logged.String(), "Rescued 1 condemned objects of 1 read in get_object"))
 	now = now.Add(rescueLogWindow)
-	l.object(pathHeaders, hdr, []byte{0, 0, 0, 0, 0, 0, 0, 2})
+	l.object(pathHeaders, "r1", hdr, []byte{0, 0, 0, 0, 0, 0, 0, 2})
 	require.Contains(logged.String(), "Left out the lines of 5 rescued objects in the minute from 2026-11-07T12:00:00Z")
 	require.Contains(logged.String(), "Left out the lines of 3 calls with rescues in the minute from 2026-11-07T12:00:00Z")
 	require.Equal(rescueKeyLines+1, strings.Count(logged.String(), "condemned by GC cycle 2"))
-	l.call(context.Background(), pathGetObject, 1, 1, 0)
+	l.call(context.Background(), pathGetObject, "r1", 1, 1, 0)
 	require.Equal(rescueCallLines+1, strings.Count(logged.String(), "Rescued 1 condemned objects of 1 read in get_object"))
 }

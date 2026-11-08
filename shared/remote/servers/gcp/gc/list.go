@@ -163,8 +163,8 @@ type listRecord struct {
 // writeList writes the condemned list name with the header h and the
 // records that next returns, until it returns false. The object is created
 // only if it does not exist.
-func writeList(ctx context.Context, bucket *storage.BucketHandle, name string, h *listHeader, next func() (listRecord, bool)) error {
-	return createObject(ctx, bucket, name, h.runID(), "application/octet-stream", func(w io.Writer) error {
+func writeList(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *listHeader, next func() (listRecord, bool)) error {
+	return createObject(ctx, b, bucket, name, h.runID(), "application/octet-stream", func(w io.Writer) error {
 		if err := h.write(w); err != nil {
 			return err
 		}
@@ -187,17 +187,23 @@ func writeList(ctx context.Context, bucket *storage.BucketHandle, name string, h
 }
 
 // createObject writes the object name with write, only if no object of that
-// name exists. If one exists, written by the same run, an earlier attempt of
-// this call wrote it and the call succeeds.
-func createObject(ctx context.Context, bucket *storage.BucketHandle, name, runID, contentType string, write func(io.Writer) error) error {
+// name exists, within the streaming deadline of the budget b. If one exists,
+// written by the same run, an earlier attempt of this call wrote it and the
+// call succeeds.
+func createObject(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name, runID, contentType string, write func(io.Writer) error) error {
 	obj := bucket.Object(name)
-	wctx, cancel := context.WithCancel(ctx)
+	sctx, wrap, stop, err := b.stream(ctx)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	wctx, cancel := context.WithCancel(sctx)
 	defer cancel()
 	w := obj.If(storage.Conditions{DoesNotExist: true}).NewWriter(wctx)
 	w.ContentType = contentType
 	w.Metadata = map[string]string{runIDMetadata: runID}
-	bw := bufio.NewWriterSize(w, 1<<20)
-	err := write(bw)
+	bw := bufio.NewWriterSize(wrap(w), 1<<20)
+	err = write(bw)
 	if err == nil {
 		err = bw.Flush()
 	}
@@ -276,9 +282,9 @@ func readList(ctx context.Context, bucket *storage.BucketHandle, name string) (_
 }
 
 // pruneLists deletes the list objects of the state beyond the newest keep
-// cycles, with their companions, and returns how many it deleted. It leaves
-// other names under the prefix alone.
-func pruneLists(ctx context.Context, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
+// cycles, with their companions, and returns how many it deleted, each delete
+// within the budget b. It leaves other names under the prefix alone.
+func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
 	prefix := listPrefix + state + "/"
 	byCycle := make(map[int64][]string)
 	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
@@ -300,11 +306,98 @@ func pruneLists(ctx context.Context, bucket *storage.BucketHandle, state string,
 	var n int64
 	for _, c := range cycles[:max(0, len(cycles)-keep)] {
 		for _, name := range byCycle[c] {
-			if err := bucket.Object(name).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+			if err := deleteObject(ctx, b, bucket.Object(name)); err != nil {
 				return n, fmt.Errorf("failed to delete the old condemned list %s: %w", name, err)
 			}
 			n++
 		}
 	}
 	return n, nil
+}
+
+// pruneRecords deletes the delete records of the cycles of the state beyond
+// the newest keep cycles whose records were all flagged longer than the
+// record retention ago, and returns how many it deleted, each delete within
+// the budget b. Before it deletes the records of a cycle, it writes the pruned
+// marker of the cycle. A record without the flag stays whatever its age,
+// because the chunks it names may still be to delete, and so do the other
+// records of its cycle, so that an undo of the cycle finds all of them.
+func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
+	retention, err := recordRetention(ctx, b, bucket)
+	if err != nil {
+		return 0, err
+	}
+	prefix := recordPrefixOf(state)
+	records := make(map[int64][]string)
+	kept := make(map[int64]bool)
+	oldest := wallNow().Add(-retention)
+	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("failed to list the delete records under %s: %w", prefix, err)
+		}
+		c, rest, ok := strings.Cut(strings.TrimPrefix(attrs.Name, prefix), "/")
+		cycle, err := strconv.ParseInt(c, 10, 64)
+		if !ok || err != nil || rest == prunedMarker {
+			continue
+		}
+		records[cycle] = append(records[cycle], attrs.Name)
+		if !flaggedBefore(attrs, oldest) {
+			kept[cycle] = true
+		}
+	}
+	sorted := slices.Sorted(maps.Keys(records))
+	var n int64
+	for _, c := range sorted[:max(0, len(sorted)-keep)] {
+		if kept[c] {
+			continue
+		}
+		if err := writePrunedMarker(ctx, b, bucket, state, c); err != nil {
+			return n, err
+		}
+		for _, name := range records[c] {
+			if err := deleteObject(ctx, b, bucket.Object(name)); err != nil {
+				return n, fmt.Errorf("failed to delete the delete record %s: %w", name, err)
+			}
+			n++
+		}
+	}
+	return n, nil
+}
+
+// flaggedBefore reports whether the delete record with attrs was flagged
+// before oldest. The chunks it names enter soft delete when the step flags
+// it, which can be long after the record was written, and the flag write
+// updates the record.
+func flaggedBefore(attrs *storage.ObjectAttrs, oldest time.Time) bool {
+	return attrs.Metadata[chunksDoneMetadata] != "" && attrs.Updated.Before(oldest)
+}
+
+// writePrunedMarker writes the pruned marker of cycle, unless it exists.
+func writePrunedMarker(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, cycle int64) error {
+	name := prunedMarkerName(state, cycle)
+	err := retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
+		w := bucket.Object(name).If(storage.Conditions{DoesNotExist: true}).NewWriter(actx)
+		w.Metadata = map[string]string{chunksDoneMetadata: strconv.FormatInt(cycle, 10)}
+		return w.Close()
+	})
+	if err != nil && !preconditionFailed(err) {
+		return fmt.Errorf("failed to mark the delete records of cycle %d as pruned: %w", cycle, err)
+	}
+	return nil
+}
+
+// deleteObject deletes obj with the retries of the collector, each attempt
+// within the budget b, so that a listing that ran long cannot delete after
+// the lease is lost. An object already gone counts as deleted.
+func deleteObject(ctx context.Context, b writeBudget, obj *storage.ObjectHandle) error {
+	err := retryWith(ctx, firstRetryWait, b, obj.Delete)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil
+	}
+	return err
 }

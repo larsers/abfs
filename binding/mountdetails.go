@@ -42,6 +42,9 @@ type MountDetails struct {
 	Config             *instance.Config
 	MountDuration      float64
 	Error              string
+	// GCLocalWriteCheck is true when the mount's cacheman keeps locally written content
+	// until the server confirms it, which the server GC needs to delete what a mount may hold.
+	GCLocalWriteCheck bool `json:",omitempty"`
 }
 
 func init() {

@@ -52,6 +52,7 @@ func newHooksTestBigtable(t *testing.T, opts ...grpc.DialOption) *bigtable.Clien
 		objectsTableName: {"meta", "data", ObjectsFamily},
 		mapsTableName:    {mapsFamily},
 		TableName:        {EdgesFamily, TouchFamily},
+		chunksTableName:  {objectsDataFamily},
 	}
 	for table, families := range tables {
 		require.NoError(t, adm.CreateTable(ctx, table))
@@ -269,4 +270,111 @@ func TestToucher_CountsAnOmittedEntryAsFailed(t *testing.T) {
 	require.Positive(omitted)
 	require.Equal(TouchStats{Written: int64(len(keys)) - omitted, Failed: omitted}, toucher.Stats())
 	require.Equal(int32(len(keys)), sent.Load(), "an omitted entry was sent again")
+}
+
+// blockMutateRows holds every MutateRows call until release is closed, and
+// closes entered at the first one.
+func blockMutateRows(entered, release chan struct{}) grpc.DialOption {
+	var once atomic.Bool
+	return grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		if strings.HasSuffix(method, "/MutateRows") {
+			if once.CompareAndSwap(false, true) {
+				close(entered)
+			}
+			<-release
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	})
+}
+
+// A late touch is counted as failed before its write, so that a heartbeat
+// that reads the stats while the write still runs records the loss.
+func TestToucher_CountsALateTouchBeforeItsWrite(t *testing.T) {
+	require := require.New(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	tc := newToucher(newHooksTestBigtable(t, blockMutateRows(entered, release)), 10)
+	require.True(tc.TouchObject(testHashes(1)[0]))
+	tc.now = func() time.Time { return time.Now().Add(TouchDrainBound) }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tc.flush(context.Background(), []touch{<-tc.queue})
+	}()
+	<-entered
+	require.Equal(TouchStats{Failed: 1}, tc.Stats())
+	close(release)
+	<-done
+	require.Equal(TouchStats{Written: 1, Failed: 1}, tc.Stats())
+}
+
+// Late reports a touch that waited past the late bound while no worker took
+// it, as in a frozen process, until a flush counts it.
+func TestToucher_Late(t *testing.T) {
+	require := require.New(t)
+	tc := newToucher(newHooksTestBigtable(t), 10)
+	var offset atomic.Int64
+	tc.now = func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+	keys := testHashes(2)
+	require.True(tc.TouchObject(keys[0]))
+	require.False(tc.Late())
+	offset.Store(int64(tc.lateAfter - touchAgeSlot))
+	require.False(tc.Late(), "a touch within the late bound")
+	offset.Store(int64(tc.lateAfter + 2*touchAgeSlot))
+	require.True(tc.Late())
+	// A touch queued now is not late; the old one still is.
+	require.True(tc.TouchObject(keys[1]))
+	first := <-tc.queue
+	require.True(tc.Late())
+	tc.flush(context.Background(), []touch{first})
+	require.False(tc.Late())
+	require.Equal(TouchStats{Written: 1, Failed: 1}, tc.Stats())
+	// A dropped touch does not stay pending.
+	tc.flush(context.Background(), []touch{<-tc.queue})
+	close(tc.stop)
+	require.False(tc.TouchObject(keys[0]))
+	offset.Store(int64(10 * tc.lateAfter))
+	require.False(tc.Late())
+	require.Equal(TouchStats{Written: 2, Dropped: 1, Failed: 1}, tc.Stats())
+}
+
+// The late bound leaves a write its timeout before TouchDrainBound: a touch
+// queued for nearly the drain bound is late, as its write could end after it.
+func TestToucher_LateBoundLeavesTimeForTheWrite(t *testing.T) {
+	require := require.New(t)
+	tc := newToucher(newHooksTestBigtable(t), 10)
+	var offset atomic.Int64
+	tc.now = func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+	require.True(tc.TouchObject(testHashes(1)[0]))
+	offset.Store(int64(TouchDrainBound - touchWriteTimeout/2))
+	require.True(tc.Late())
+	tc.flush(context.Background(), []touch{<-tc.queue})
+	require.Equal(TouchStats{Written: 1, Failed: 1}, tc.Stats())
+}
+
+// A touch whose write runs while the process is frozen stays visible to Late
+// until the write's outcome is counted, so that a heartbeat right after the
+// freeze records the loss the write will count.
+func TestToucher_LateWhileTheWriteRuns(t *testing.T) {
+	require := require.New(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	tc := newToucher(newHooksTestBigtable(t, blockMutateRows(entered, release)), 10)
+	var offset atomic.Int64
+	tc.now = func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+	require.True(tc.TouchObject(testHashes(1)[0]))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tc.flush(context.Background(), []touch{<-tc.queue})
+	}()
+	<-entered
+	require.False(tc.Late())
+	offset.Store(int64(TouchDrainBound - touchAgeSlot))
+	require.False(tc.Late(), "a write within the drain bound")
+	offset.Store(int64(TouchDrainBound + time.Minute))
+	require.True(tc.Late())
+	require.Equal(TouchStats{}, tc.Stats())
+	close(release)
+	<-done
+	require.False(tc.Late())
+	require.Equal(TouchStats{Written: 1}, tc.Stats())
 }

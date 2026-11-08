@@ -78,25 +78,45 @@ type liveKey struct {
 	Rescued bool `json:"rescued"`
 }
 
+// previousList is the condemned list that GcState names at the start of a
+// cycle: its state, its keys, nil when it could not be read, and why.
+type previousList struct {
+	state ListState
+	list  *condemnedList
+	err   string
+}
+
+// readPreviousList reads the condemned list that the state of the lease
+// names from bucket. A list that is gone is reported, not an error.
+func readPreviousList(ctx context.Context, lease *Lease, bucket *storage.BucketHandle) (previousList, error) {
+	state, err := lease.ReadList(ctx)
+	if err != nil || state.Location == "" {
+		return previousList{}, err
+	}
+	prev := previousList{state: state}
+	l, err := readList(ctx, bucket, state.Location)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		log.Printf("Warning: the condemned list %s of the last condemn cycle is gone; the markers of its keys stay until a read or a cycle replaces them", state.Location)
+		prev.err = "not found"
+		return prev, nil
+	}
+	if err != nil {
+		return previousList{}, err
+	}
+	prev.list = l
+	return prev, nil
+}
+
 // readPrevious reads the condemned list that GcState names, so that the mark
 // tracks its keys.
 func (c *condemner) readPrevious(ctx context.Context, lease *Lease, d *dryRun) error {
-	state, err := lease.ReadList(ctx)
-	if err != nil || state.Location == "" {
+	var err error
+	if c.prev, err = readPreviousList(ctx, lease, c.bucket); err != nil {
 		return err
 	}
-	c.prevState = state
-	l, err := readList(ctx, c.bucket, state.Location)
-	if errors.Is(err, storage.ErrObjectNotExist) {
-		log.Printf("Warning: the condemned list %s of the last condemn cycle is gone; the markers of its keys stay until a read or a cycle replaces them", state.Location)
-		c.prevErr = "not found"
-		return nil
+	if c.prev.list != nil {
+		d.tracked = c.prev.list.keys
 	}
-	if err != nil {
-		return err
-	}
-	c.prev = l
-	d.tracked = l.keys
 	return nil
 }
 
@@ -104,12 +124,12 @@ func (c *condemner) readPrevious(ctx context.Context, lease *Lease, d *dryRun) e
 // mark found live and writes every such key, with the root that keeps it, to
 // the live list of this cycle. A delete never creates a row.
 func (c *condemner) clearLive(ctx context.Context, lease *Lease, res *Result) (*PreviousListReport, error) {
-	state := c.prevState
+	state := c.prev.state
 	if state.Location == "" {
 		return nil, nil
 	}
-	rep := &PreviousListReport{Location: state.Location, SnapshotTime: state.SnapshotTime, Complete: state.Complete, Error: c.prevErr}
-	l := c.prev
+	rep := &PreviousListReport{Location: state.Location, SnapshotTime: state.SnapshotTime, Complete: state.Complete, Error: c.prev.err}
+	l := c.prev.list
 	if l == nil {
 		return rep, nil
 	}
@@ -181,7 +201,7 @@ func (c *condemner) clearLive(ctx context.Context, lease *Lease, res *Result) (*
 		}
 	}
 	name := listObjectName(c.opts.StateName, res.Report.Cycle) + liveSuffix
-	err = createObject(ctx, c.bucket, name, runID(c.opts.Holder, lease.Epoch), "application/gzip", func(w io.Writer) error {
+	err = createObject(ctx, c.budget, c.bucket, name, runID(c.opts.Holder, lease.Epoch), "application/gzip", func(w io.Writer) error {
 		zw := gzip.NewWriter(w)
 		enc := json.NewEncoder(zw)
 		for i := range lines {
@@ -209,7 +229,7 @@ func (c *condemner) clearMarkers(ctx context.Context, rows []string) error {
 		if err := lim.wait(ctx, len(batch)); err != nil {
 			return err
 		}
-		if err := applyBulk(ctx, table, batch, mut); err != nil {
+		if err := applyBulk(ctx, c.budget, table, batch, mut); err != nil {
 			return fmt.Errorf("failed to clear the condemn markers of live objects: %w", err)
 		}
 	}

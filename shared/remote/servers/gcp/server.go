@@ -58,7 +58,8 @@ type (
 // the 20-byte hash. It reduces heap allocations and GC pointer scans.
 type CachedHeader struct {
 	Size int64
-	// Loaded is the cacheNow time the header was read from Bigtable.
+	// Loaded is the cacheNow time at which the Bigtable read of the header
+	// started; without GC, at which it was cached.
 	Loaded uint32
 	// Passing for up to 2^16 unique object types
 	Type  uint16
@@ -263,7 +264,9 @@ type NewServerOpts struct {
 	// each object and map row at most once; zero disables touches.
 	GCTouchInterval time.Duration
 	// GCHeartbeatInterval is the time between two heartbeats of this server in
-	// the table GcReplicas; zero disables the heartbeat.
+	// the table GcServers. With GC and not GCReadOnly it must be above zero
+	// and at most gc.MaxHeartbeatInterval, and the server stops serving while
+	// its last successful heartbeat is older than two intervals and 30 s.
 	GCHeartbeatInterval time.Duration
 	// GCReadOnly, with GC, leaves the state of the garbage collector as it is:
 	// reads answer for condemned objects without rescuing them, and the server
@@ -400,6 +403,9 @@ func (s *GCPServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 
 // Headers implements remote.RemoteProvider.
 func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities.ObjectHeader, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	headers, err := s.getHeaders(ctx, pathHeaders, keys)
 	if err != nil {
 		return nil, err
@@ -460,7 +466,7 @@ func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedH
 		if err != nil {
 			return CachedHeader{}, nil, err
 		}
-		s.storeContent(key, content)
+		s.storeContent(key, content, cacheNow())
 		return cachedHdr, content, nil
 	case !hdrOk && contentOk:
 		header, err := s.casdb.GetHeader(ctx, key)
@@ -485,13 +491,16 @@ func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedH
 		cachedHdr = newCachedHeader(header)
 		content = objContent
 		s.headers[shard].PeekOrAdd(key, cachedHdr)
-		s.storeContent(key, content)
+		s.storeContent(key, content, cacheNow())
 		return cachedHdr, content, nil
 	}
 }
 
 // GetObject implements remote.RemoteProvider.
 func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.ContentReadCloser, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	header, content, err := s.getObjectData(ctx, key)
 	if err != nil {
 		return nil, err
@@ -525,6 +534,9 @@ func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.Cont
 // PutObject implements remote.RemoteProvider.
 func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remote.ContentReadCloser) (retErr error) {
 	defer entities.CloseErrCheck(reader, &retErr)
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 
 	existingHdr, err := s.getHeader(ctx, key)
 	if err != nil || existingHdr.Valid {
@@ -565,12 +577,15 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	}
 
 	links := validator.Links()
+	guard := s.validationGuard()
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
 	}
 	// The edges go first, so that no object row exists without them.
 	if s.gcEdges != nil {
-		if err := s.gcEdges.Put(ctx, key, validator.Type(), validator.Object()); err != nil {
+		if err := guard.do(ctx, func(ctx context.Context) error {
+			return s.gcEdges.Put(ctx, key, validator.Type(), validator.Object())
+		}); err != nil {
 			return err
 		}
 	}
@@ -585,11 +600,14 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 		Content:  content,
 	}
 
-	addAttempted = true
-	err = s.addObject(ctx, header, objContent)
+	written := cacheNow()
+	err = guard.do(ctx, func(ctx context.Context) error {
+		addAttempted = true
+		return s.addObject(ctx, header, objContent)
+	})
 	if err == nil {
-		s.storeHeader(header)
-		s.storeContent(key, objContent)
+		s.storeHeader(header, written)
+		s.storeContent(key, objContent, written)
 	}
 
 	return err
@@ -610,6 +628,9 @@ func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
 
 // MapResults implements remote.RemoteProvider.
 func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.Hash, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	results, err := s.casdb.MapResults(ctx, from)
 	if err != nil || !s.gcHooks.on {
 		return results, err
@@ -619,10 +640,14 @@ func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.
 
 // AddMapResult implements remote.RemoteProvider.
 func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remote.Hash) error {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 	if !s.validateLinks {
 		return s.casdb.AddMapResult(ctx, from, to)
 	}
 	// Unlike object links, a zero hash is not allowed here, as in file-based.
+	guard := s.validationGuard()
 	hdrs, err := s.getHeaders(ctx, pathValidation, []entities.Hash{from, to})
 	if err != nil {
 		return err
@@ -640,7 +665,7 @@ func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remot
 
 		return &remote.ErrObjectLinkValidation{MissingLinks: missing}
 	}
-	return s.casdb.AddMapResult(ctx, from, to)
+	return guard.do(ctx, func(ctx context.Context) error { return s.casdb.AddMapResult(ctx, from, to) })
 }
 
 func (s *GCPServer) projectForRefs(ctx context.Context, server string, project string, createIfMissing bool) (int64, error) {
@@ -679,6 +704,9 @@ func (s *GCPServer) projectForRefs(ctx context.Context, server string, project s
 
 // GetRefs implements remote.RemoteProvider.
 func (s *GCPServer) GetRefs(ctx context.Context, server string, project string, refs []string) ([]remote.Hash, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	id, err := s.projectForRefs(ctx, server, project, false)
 	if errors.Is(err, casdb.ErrNotFound) {
 		if err := s.checkServerExists(ctx, server); err != nil {
@@ -707,6 +735,9 @@ func (s *GCPServer) checkServerExists(ctx context.Context, server string) error 
 
 // SearchRefs implements remote.RemoteProvider.
 func (s *GCPServer) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error) {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return nil, err
+	}
 	var projectID *int64
 	if project != "" {
 		id, err := s.projectForRefs(ctx, server, project, false)
@@ -774,6 +805,9 @@ func (s *GCPServer) SearchRefs(ctx context.Context, server string, project strin
 
 // PutRefs implements remote.RemoteProvider.
 func (s *GCPServer) PutRefs(ctx context.Context, server string, project string, refs []remote.RefHash) error {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 	id, err := s.projectForRefs(ctx, server, project, true)
 	if err != nil {
 		return err
@@ -782,10 +816,11 @@ func (s *GCPServer) PutRefs(ctx context.Context, server string, project string, 
 	for i, ref := range refs {
 		links[i] = ref.Hash
 	}
+	guard := s.validationGuard()
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
 	}
-	return s.casdb.AddRefs(ctx, id, refs)
+	return guard.do(ctx, func(ctx context.Context) error { return s.casdb.AddRefs(ctx, id, refs) })
 }
 
 // XchgRef implements remote.RemoteProvider.
@@ -801,6 +836,9 @@ func (s *GCPServer) XchgRef(ctx context.Context, server string, project string, 
 
 // XchgRefs implements remote.RemoteProvider.
 func (s *GCPServer) XchgRefs(ctx context.Context, server string, project string, refs []remote.RefXchg) error {
+	if err := s.gcHooks.checkHeartbeat(); err != nil {
+		return err
+	}
 	if len(refs) == 0 {
 		return nil
 	}
@@ -812,10 +850,11 @@ func (s *GCPServer) XchgRefs(ctx context.Context, server string, project string,
 	for i, ref := range refs {
 		links[i] = ref.Desired
 	}
+	guard := s.validationGuard()
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
 	}
-	return s.casdb.XchgRefs(ctx, id, refs)
+	return guard.do(ctx, func(ctx context.Context) error { return s.casdb.XchgRefs(ctx, id, refs) })
 }
 
 // Mark implements remote.RemoteProvider.
@@ -875,9 +914,12 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 		s.touchHit(pathPutObject, hash, cached)
 		return cached, nil
 	}
+	start := cacheNow()
 	obj, err := s.casdb.GetHeader(ctx, hash)
 	if err == nil && obj != nil {
-		err = s.rescueCondemned(ctx, pathPutObject, obj)
+		if err = s.gcHooks.checkReadAge(start); err == nil {
+			err = s.rescueCondemned(ctx, pathPutObject, obj)
+		}
 	}
 	if err == casdb.ErrNotFound {
 		s.forgetMissing(hash)
@@ -886,7 +928,7 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 	if err != nil || obj == nil {
 		return CachedHeader{}, err
 	}
-	cached := s.storeHeader(obj)
+	cached := s.storeHeader(obj, start)
 	s.touchHit(pathPutObject, hash, cached)
 	return cached, nil
 }
@@ -918,9 +960,12 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 
 	s.headersCacheMissCount.Add(int64(missCount))
 
+	start := cacheNow()
 	objs, err := s.casdb.GetHeaders(ctx, misses)
 	if err == nil && s.gcHooks.on {
-		objs, err = s.rescueHeaders(ctx, path, objs)
+		if err = s.gcHooks.checkReadAge(start); err == nil {
+			objs, err = s.rescueHeaders(ctx, path, objs)
+		}
 	}
 	if err != nil {
 		s.headersErrCount.Add(int64(missCount))
@@ -929,7 +974,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 
 	foundCount := 0
 	for _, o := range objs {
-		cached := s.storeHeader(o)
+		cached := s.storeHeader(o, start)
 		s.touchHit(path, o.Id, cached)
 		for _, i := range missesIdx[o.Id] {
 			foundCount++

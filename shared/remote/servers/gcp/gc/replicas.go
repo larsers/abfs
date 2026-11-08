@@ -27,14 +27,19 @@ const (
 	staleReplicaAge = 24 * time.Hour
 )
 
-// ReplicaReport reports the server replicas seen in GcReplicas.
+// ReplicaReport reports the server replicas seen in GcReplicas and
+// GcServers.
 type ReplicaReport struct {
 	// Live counts the replicas whose heartbeat is younger than liveReplicaAge.
 	Live int64 `json:"live"`
 	// Stale counts the other rows.
 	Stale int64 `json:"stale"`
-	// Removed counts the rows not seen for a day, which the run deleted.
+	// Removed counts the rows of GcReplicas not seen for a day, which the
+	// run deleted.
 	Removed int64 `json:"removed"`
+	// Stopped counts the rows of GcServers of processes that stopped without
+	// losing touches at the stop. They are not checked here and stay.
+	Stopped int64 `json:"stopped"`
 	// Hosts counts the distinct host names among the live replicas, and
 	// RowsPerHost the live rows of each host. A host has more than one live
 	// row after a server restarted without removing its row.
@@ -43,6 +48,14 @@ type ReplicaReport struct {
 	// Warnings lists the live replicas whose settings break the timing rules
 	// of the collector. A condemn mode would refuse to run with any of them.
 	Warnings []string `json:"warnings,omitempty"`
+	// ServersRemoved counts the rows of GcServers that the run deleted, those
+	// older than any grace a delete could still need them for.
+	ServersRemoved int64 `json:"servers_removed"`
+	// LegacyServersGoneTime is when a cycle first found GcReplicas empty, and
+	// every read since found it empty too; nil while GcReplicas holds a row.
+	// A server of an older version keeps no row after it stops, so one that
+	// ran only between two reads is not seen.
+	LegacyServersGoneTime *time.Time `json:"legacy_servers_gone_time,omitempty"`
 }
 
 // ReplicaHost returns the host name of a replica ID made by NewReplicaID.
@@ -53,15 +66,29 @@ func ReplicaHost(id string) string {
 	return id
 }
 
+// serverReplicas returns the rows of GcServers that checkReplicas checks,
+// all but those of processes that stopped without losing touches at the
+// stop, and how many it left out. A process whose stop recorded a loss counts
+// until its row is stale, as a row that a server keeps in GcReplicas then. A
+// loss recorded by an earlier heartbeat does not keep a stopped row live:
+// such a row of GcReplicas went away at the stop.
+func serverReplicas(servers []Server) ([]Replica, int64) {
+	var replicas []Replica
+	var stopped int64
+	for _, s := range servers {
+		if !s.StoppedAt.IsZero() && !s.TouchLossTime.Equal(s.StoppedAt) {
+			stopped++
+			continue
+		}
+		replicas = append(replicas, Replica{ID: s.ID, Version: s.Version, GC: s.GC, TouchInterval: s.TouchInterval, CacheTTL: s.CacheTTL, LastSeen: s.LastSeen})
+	}
+	return replicas, stopped
+}
+
 // checkReplicas checks the settings of the replicas seen within
-// liveReplicaAge before now against the timing rules: a used object must be
-// touched at least once per half grace, and a replica must read a cached
-// entry again within one cycle and within the TTL the grace allows for.
+// liveReplicaAge before now against the timing rules of replicaProblems.
 func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaReport {
 	var rep ReplicaReport
-	warn := func(r *Replica, format string, args ...any) {
-		rep.Warnings = append(rep.Warnings, fmt.Sprintf("replica %s: ", r.ID)+fmt.Sprintf(format, args...))
-	}
 	for i := range replicas {
 		r := &replicas[i]
 		if now.Sub(r.LastSeen) > liveReplicaAge {
@@ -77,27 +104,41 @@ func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaRepo
 			rep.Hosts++
 		}
 		rep.RowsPerHost[host]++
-		if !r.GC {
-			warn(r, "runs without the garbage collector hooks")
-			continue
-		}
-		if r.Version < ExtractorVersion {
-			warn(r, "writes gc rows of edge rules version %d, older than version %d of this collector", r.Version, ExtractorVersion)
-		}
-		switch {
-		case r.TouchInterval <= 0:
-			warn(r, "writes no touches, so objects that mounts and builds use are not recorded")
-		case r.TouchInterval > o.Grace/2:
-			warn(r, "touch interval %s is longer than half the grace (%s)", r.TouchInterval, o.Grace/2)
-		}
-		switch {
-		case r.CacheTTL <= 0:
-			warn(r, "keeps cache entries without a TTL, so it can answer for an object long after a condemn")
-		case r.CacheTTL >= o.Cycle:
-			warn(r, "cache TTL %s is not shorter than the cycle (%s)", r.CacheTTL, o.Cycle)
-		case r.CacheTTL > o.CacheTTL:
-			warn(r, "cache TTL %s is longer than the cache TTL of the grace check (%s)", r.CacheTTL, o.CacheTTL)
+		for _, p := range replicaProblems(r, o) {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("replica %s: %s", r.ID, p))
 		}
 	}
 	return rep
+}
+
+// replicaProblems returns how the settings of r break the timing rules: a
+// used object must be touched at least once per half grace, and a replica
+// must read a cached entry again within one cycle and within the TTL the
+// grace allows for.
+func replicaProblems(r *Replica, o *DryRunOpts) []string {
+	if !r.GC {
+		return []string{"runs without the garbage collector hooks"}
+	}
+	var problems []string
+	add := func(format string, args ...any) {
+		problems = append(problems, fmt.Sprintf(format, args...))
+	}
+	if r.Version < ExtractorVersion {
+		add("writes gc rows of edge rules version %d, older than version %d of this collector", r.Version, ExtractorVersion)
+	}
+	switch {
+	case r.TouchInterval <= 0:
+		add("writes no touches, so objects that mounts and builds use are not recorded")
+	case r.TouchInterval > o.Grace/2:
+		add("touch interval %s is longer than half the grace (%s)", r.TouchInterval, o.Grace/2)
+	}
+	switch {
+	case r.CacheTTL <= 0:
+		add("keeps cache entries without a TTL, so it can answer for an object long after a condemn")
+	case r.CacheTTL >= o.Cycle:
+		add("cache TTL %s is not shorter than the cycle (%s)", r.CacheTTL, o.Cycle)
+	case r.CacheTTL > o.CacheTTL:
+		add("cache TTL %s is longer than the cache TTL of the grace check (%s)", r.CacheTTL, o.CacheTTL)
+	}
+	return problems
 }
