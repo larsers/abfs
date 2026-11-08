@@ -124,9 +124,9 @@ type gcHooks struct {
 	// lastAttempt is the start of the last heartbeat attempt on the cacheNow
 	// clock.
 	lastAttempt uint32
-	metrics      metric.Registration
-	rescueLog    *rescueLog
-	stopped      bool
+	metrics     metric.Registration
+	rescueLog   *rescueLog
+	stopped     bool
 
 	// rescues counts per path and index into rescueTypes.
 	rescues           [numRescuePaths][]atomic.Int64
@@ -283,8 +283,8 @@ func (g *gcHooks) losses() int64 {
 	return st.Dropped + st.Failed
 }
 
-// touchesLate reports whether the toucher holds touches it will count as
-// failed once it writes them.
+// touchesLate reports whether the toucher holds touches past the time at
+// which they count as lost, whose loss it has not counted yet.
 func (g *gcHooks) touchesLate() bool {
 	return g.toucher != nil && g.toucher.Late()
 }
@@ -694,8 +694,11 @@ func (s *GCPServer) heartbeat(ctx context.Context) error {
 			log.Printf("Warning: the wall clock advanced more than the monotonic clock by over %s since the last GC heartbeat; recording the pause as a touch loss", maxPause)
 			g.pausePending = true
 		}
+		// A late touch leaves the toucher's slots only after its loss is
+		// counted, so the slots are read first.
+		late := g.touchesLate()
 		losses := g.losses()
-		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || losses > g.reportedLosses || g.touchesLate()); err == nil {
+		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || late || losses > g.reportedLosses); err == nil {
 			g.reportedLosses = losses
 			g.pausePending = false
 			g.hasRow = true

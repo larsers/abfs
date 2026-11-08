@@ -54,8 +54,8 @@ const (
 	// failed.
 	TouchDrainBound = TouchBufferSize/touchBatchSize/touchWorkers*touchWriteTimeout + touchFlushInterval
 	// touchAgeSlot and touchAgeSlots set the slots of queue time in which a
-	// Toucher counts the touches not yet written or counted as failed, so that
-	// Late can tell whether one of them is overdue.
+	// Toucher counts the touches whose write did not start, and those whose
+	// write runs, so that Late can tell whether one of them is overdue.
 	touchAgeSlot  = time.Second
 	touchAgeSlots = 4096
 )
@@ -96,6 +96,7 @@ type Toucher struct {
 	epoch       time.Time
 	now         func() time.Time
 	pending     [touchAgeSlots]atomic.Int64
+	writing     [touchAgeSlots]atomic.Int64
 	stalled     atomic.Bool
 	stop        chan struct{}
 	stopOnce    sync.Once
@@ -148,7 +149,7 @@ func (t *Toucher) TouchMapRow(row string) bool {
 
 func (t *Toucher) add(tc touch, wait bool) bool {
 	tc.queued = t.now()
-	pending := t.pendingSlot(tc)
+	pending := t.slot(&t.pending, tc)
 	pending.Add(1)
 	if !t.enqueue(tc, wait) {
 		pending.Add(-1)
@@ -195,26 +196,32 @@ func (t *Toucher) Stats() TouchStats {
 	}
 }
 
-// Late reports whether a touch is still queued, or waits for its write to
-// start, past the time at which it counts as failed. A frozen or starved
-// process holds such touches without counting them until its workers run
-// again, so a heartbeat reports them as lost before they are counted.
+// Late reports whether a touch waits for its write to start past the time at
+// which it counts as failed, or whether a write runs past TouchDrainBound
+// after its touch was queued. A frozen or starved process holds such touches
+// without counting them until its workers run again, so a heartbeat reports
+// them as lost before they are counted.
 func (t *Toucher) Late() bool {
+	return t.overdue(&t.pending, t.lateAfter) || t.overdue(&t.writing, TouchDrainBound)
+}
+
+// overdue reports whether slots counts a touch queued longer than bound ago.
+func (t *Toucher) overdue(slots *[touchAgeSlots]atomic.Int64, bound time.Duration) bool {
 	age := t.now().Sub(t.epoch)
 	now := int64(age / touchAgeSlot)
-	// Every touch of a slot up to newest waited longer than lateAfter. Slots
+	// Every touch of a slot up to newest waited longer than bound. Slots
 	// older than touchAgeSlots share the counts of newer ones.
-	newest := int64((age-t.lateAfter)/touchAgeSlot) - 1
+	newest := int64((age-bound)/touchAgeSlot) - 1
 	for slot := max(0, now-touchAgeSlots+1); slot <= newest; slot++ {
-		if t.pending[slot%touchAgeSlots].Load() > 0 {
+		if slots[slot%touchAgeSlots].Load() > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func (t *Toucher) pendingSlot(tc touch) *atomic.Int64 {
-	return &t.pending[int64(tc.queued.Sub(t.epoch)/touchAgeSlot)%touchAgeSlots]
+func (t *Toucher) slot(slots *[touchAgeSlots]atomic.Int64, tc touch) *atomic.Int64 {
+	return &slots[int64(tc.queued.Sub(t.epoch)/touchAgeSlot)%touchAgeSlots]
 }
 
 // Close writes the buffered touches and stops the Toucher. Touches queued
@@ -281,11 +288,14 @@ func (t *Toucher) drain(batch []touch) {
 func (t *Toucher) flush(ctx context.Context, batch []touch) {
 	var objectRows, mapRows []string
 	var late int64
+	writing := make([]touch, 0, len(batch))
 	for _, tc := range batch {
 		if t.now().Sub(tc.queued) > t.lateAfter {
 			late++
+		} else {
+			writing = append(writing, tc)
+			t.slot(&t.writing, tc).Add(1)
 		}
-		t.pendingSlot(tc).Add(-1)
 		if tc.mapRow {
 			mapRows = append(mapRows, tc.row)
 		} else {
@@ -293,14 +303,21 @@ func (t *Toucher) flush(ctx context.Context, batch []touch) {
 		}
 	}
 	// The collector counts on a touch landing within TouchDrainBound of its
-	// use; a heartbeat during the writes must see the late ones.
+	// use; a heartbeat during the writes must see the late ones. Each touch
+	// stays counted in a slot until its failure is counted.
 	t.failed.Add(late)
+	for _, tc := range batch {
+		t.slot(&t.pending, tc).Add(-1)
+	}
 	objectTouch := bigtable.NewMutation()
 	objectTouch.Set(TouchFamily, TouchColumn, bigtable.ServerTime, nil)
 	mapTouch := bigtable.NewMutation()
 	mapTouch.Set(mapsFamily, "", bigtable.ServerTime, []byte("1"))
 	t.write(ctx, t.gcTable, TableName, objectRows, objectTouch)
 	t.write(ctx, t.mapsTable, mapsTableName, mapRows, mapTouch)
+	for _, tc := range writing {
+		t.slot(&t.writing, tc).Add(-1)
+	}
 }
 
 // write applies mut to rows and retries the rows that fail with a transient
