@@ -16,10 +16,13 @@ package gcp
 
 import (
 	"context"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -133,6 +136,41 @@ func TestValidationDeadline_FailsLateWrite(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A gc row write that ends after the bound leaves no object row: the guard
+// checks the bound again before the object row is written, so that no new
+// parent of an object lands later than the collector allows for.
+func TestValidationDeadline_ObjectRowAfterSlowGCRow(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	var now atomic.Uint32
+	now.Store(100)
+	orig := cacheNow
+	cacheNow = now.Load
+	t.Cleanup(func() { cacheNow = orig })
+	bound := uint32(gc.ValidationWriteBound / time.Second)
+	var armed atomic.Bool
+	slowGCRow := grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		resp, err := handler(ctx, req)
+		if r, ok := req.(interface{ GetTableName() string }); ok && armed.Load() && strings.HasSuffix(r.GetTableName(), "/"+gc.TableName) {
+			now.Add(bound)
+		}
+		return resp, err
+	})
+	s := newEmulatorCASDBServerWith(t, slowGCRow)
+	require.NoError(s.enableGCHooks(&NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
+	t.Cleanup(s.stopGCHooks)
+	key, data := treeOf(putBlob(t, s, "linked"))
+
+	armed.Store(true)
+	err := putRaw(s, key, data)
+	armed.Store(false)
+	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.NotNil(readGCRow(t, s, key), "the gc row was written")
+	_, err = s.casdb.GetHeader(ctx, key)
+	require.ErrorIs(err, casdb.ErrNotFound)
+	require.NoError(putRaw(s, key, data))
 }
 
 func refName(i int) string {

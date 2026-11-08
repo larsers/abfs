@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
@@ -196,7 +197,7 @@ func TestGCHooks_FirstHeartbeatFailureStopsStart(t *testing.T) {
 }
 
 // Once the last successful heartbeat is older than two intervals plus the
-// write timeout, every call answers Unavailable and the health probe fails,
+// write timeout, every call that reads or writes the store answers Unavailable and the health probe fails,
 // until a heartbeat succeeds again. A server that lost its Spanner writes must
 // not serve uses whose lost touches no row would show.
 func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
@@ -215,12 +216,35 @@ func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
 		}
 		return orig(ctx, c, sv, statsTime, lost)
 	}
+	// Every call that reads or writes the store, each with the code it got.
+	var n atomic.Int32
+	calls := map[string]func() error{
+		"Headers":   func() error { _, err := s.Headers(ctx, []entities.Hash{key}); return err },
+		"GetObject": func() error { return readObject(s, key) },
+		"PutObject": func() error {
+			content := fmt.Sprintf("put %d", n.Add(1))
+			return putRaw(s, objects.HashBlobBytes([]byte(content)), fmt.Appendf(nil, "blob %d\x00%s", len(content), content))
+		},
+		"MapResults":   func() error { _, err := s.MapResults(ctx, key); return err },
+		"AddMapResult": func() error { return s.AddMapResult(ctx, key, key) },
+		"PutRefs": func() error {
+			return s.PutRefs(ctx, "example.com", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: key}})
+		},
+		"XchgRefs": func() error {
+			return s.XchgRefs(ctx, "example.com", "p", []remote.RefXchg{{Ref: fmt.Sprintf("refs/heads/x%d", n.Add(1)), Desired: key}})
+		},
+		"GetRefs": func() error { _, err := s.GetRefs(ctx, "example.com", "p", []string{"refs/heads/main"}); return err },
+		"SearchRefs": func() error {
+			_, err := s.SearchRefs(ctx, "example.com", "p", "refs/heads/", 10)
+			return err
+		},
+	}
 	serving := func() error {
-		_, herr := s.Headers(ctx, []entities.Hash{key})
-		gerr := readObject(s, key)
-		perr := s.PutRefs(ctx, "example.com", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: key}})
-		require.Equal(status.Code(herr), status.Code(gerr))
-		require.Equal(status.Code(herr), status.Code(perr))
+		herr := calls["Headers"]()
+		for name, call := range calls {
+			err := call()
+			require.Equal(status.Code(herr), status.Code(err), "%s: %v", name, err)
+		}
 		require.Equal(status.Code(herr), status.Code(s.CheckGCHeartbeat(ctx)))
 		return herr
 	}
