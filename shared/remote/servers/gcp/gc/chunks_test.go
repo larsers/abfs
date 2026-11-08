@@ -561,9 +561,27 @@ func TestDeleteStep_ChunksOfDeletedKeysOnly(t *testing.T) {
 	require.Zero(scan.report.MissingGCRows)
 }
 
-// Pruning deletes the flagged records of the cycles beyond the newest keep
-// ones and keeps every record without the flag, whose chunks may still be
-// to delete, each delete within the write budget.
+// laterBy moves the wall clock d ahead for the rest of the test.
+func laterBy(t *testing.T, d time.Duration) {
+	orig := wallNow
+	wallNow = func() time.Time { return orig().Add(d) }
+	t.Cleanup(func() { wallNow = orig })
+}
+
+// leaseAt is a lease that does not expire within an hour of the wall clock.
+func leaseAt() *Lease {
+	l := &Lease{Epoch: 3}
+	l.expiry.Store(wallNow().Add(time.Hour).UnixNano())
+	return l
+}
+
+// Pruning deletes the records of the cycles beyond the newest keep ones
+// whose records are all flagged and older than the soft delete retention of
+// the bucket, and at least seven days, so that an undo finds them while it
+// can restore what they name. A record without the flag, whose chunks may
+// still be to delete, keeps every record of its cycle. Before it deletes the
+// records of a cycle, it writes the pruned marker of the cycle, which it
+// keeps, and every write is within the write budget.
 func TestPruneRecords(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -580,9 +598,11 @@ func TestPruneRecords(t *testing.T) {
 		flagged, kept bool
 	}
 	records := []record{
-		{"gc/deleted/default/3/0-0-0", true, false},
+		{"gc/deleted/default/3/0-0-0", true, true},
 		{"gc/deleted/default/3/1-0-0", false, true},
 		{"gc/deleted/default/4/1-2-0", true, false},
+		{"gc/deleted/default/4/1-3-0", true, false},
+		{"gc/deleted/default/5/1-0-0", true, false},
 		{"gc/deleted/default/7/1-0-0", true, true},
 		{"gc/deleted/default/8/1-0-0", true, true},
 		{"gc/deleted/default/notes", true, true},
@@ -591,21 +611,59 @@ func TestPruneRecords(t *testing.T) {
 	for _, r := range records {
 		write(r.name, r.flagged)
 	}
-	expiring := &Lease{}
-	expiring.expiry.Store(time.Now().Add(2*DefaultWriteDeadline + clockSkewMargin - time.Second).UnixNano())
-	removed, err := pruneRecords(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: expiring}, bucket, "default", 2)
-	require.ErrorIs(err, errLeaseExpiring)
-	require.Zero(removed)
-
-	removed, err = pruneRecords(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: farLease()}, bucket, "default", 2)
-	require.NoError(err)
-	require.Equal(int64(2), removed)
-	for _, r := range records {
-		_, err := bucket.Object(r.name).Attrs(ctx)
-		if r.kept {
-			require.NoError(err, r.name)
-		} else {
-			require.ErrorIs(err, storage.ErrObjectNotExist, r.name)
+	markers := []string{prunedMarkerName(DefaultStateName, 4), prunedMarkerName(DefaultStateName, 5)}
+	prune := func(lease *Lease) (int64, error) {
+		return pruneRecords(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: lease}, bucket, DefaultStateName, 2)
+	}
+	requireRecords := func(pruned bool) {
+		for _, r := range records {
+			_, err := bucket.Object(r.name).Attrs(ctx)
+			if r.kept || !pruned {
+				require.NoError(err, r.name)
+			} else {
+				require.ErrorIs(err, storage.ErrObjectNotExist, r.name)
+			}
+		}
+		for _, m := range markers {
+			attrs, err := bucket.Object(m).Attrs(ctx)
+			if !pruned {
+				require.ErrorIs(err, storage.ErrObjectNotExist, m)
+				continue
+			}
+			require.NoError(err, m)
+			require.NotEmpty(attrs.Metadata[chunksDoneMetadata], m)
 		}
 	}
+
+	// Younger than seven days.
+	removed, err := prune(leaseAt())
+	require.NoError(err)
+	require.Zero(removed)
+	requireRecords(false)
+
+	laterBy(t, undoWindow+time.Hour)
+	expiring := &Lease{}
+	expiring.expiry.Store(wallNow().Add(2*DefaultWriteDeadline + clockSkewMargin - time.Second).UnixNano())
+	removed, err = prune(expiring)
+	require.ErrorIs(err, errLeaseExpiring)
+	require.Zero(removed)
+	requireRecords(false)
+
+	// Younger than the soft delete retention of the bucket.
+	_, err = bucket.Update(ctx, storage.BucketAttrsToUpdate{SoftDeletePolicy: &storage.SoftDeletePolicy{RetentionDuration: undoWindow + 2*time.Hour}})
+	require.NoError(err)
+	removed, err = prune(leaseAt())
+	require.NoError(err)
+	require.Zero(removed)
+	requireRecords(false)
+
+	laterBy(t, 2*time.Hour)
+	removed, err = prune(leaseAt())
+	require.NoError(err)
+	require.Equal(int64(3), removed)
+	requireRecords(true)
+	removed, err = prune(leaseAt())
+	require.NoError(err)
+	require.Zero(removed)
+	requireRecords(true)
 }

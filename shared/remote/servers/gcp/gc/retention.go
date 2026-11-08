@@ -244,10 +244,15 @@ func removeRefBatch(ctx context.Context, sp *spanner.Client, b writeBudget, batc
 }
 
 // pruneRefRecords deletes the ref records of the state beyond the newest keep
-// cycles and returns how many it deleted, each delete within the budget b.
+// cycles that are older than the record retention, and returns how many it
+// deleted, each delete within the budget b.
 func pruneRefRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
+	retention, err := recordRetention(ctx, b, bucket)
+	if err != nil {
+		return 0, err
+	}
 	prefix := refRecordPrefixOf(state)
-	byCycle := make(map[int64]string)
+	byCycle := make(map[int64]*storage.ObjectAttrs)
 	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
 	for {
 		attrs, err := it.Next()
@@ -261,13 +266,18 @@ func pruneRefRecords(ctx context.Context, b writeBudget, bucket *storage.BucketH
 		if err != nil {
 			continue
 		}
-		byCycle[cycle] = attrs.Name
+		byCycle[cycle] = attrs
 	}
 	cycles := slices.Sorted(maps.Keys(byCycle))
+	oldest := wallNow().Add(-retention)
 	var n int64
 	for _, c := range cycles[:max(0, len(cycles)-keep)] {
-		if err := deleteObject(ctx, b, bucket.Object(byCycle[c])); err != nil {
-			return n, fmt.Errorf("failed to delete the old ref record %s: %w", byCycle[c], err)
+		attrs := byCycle[c]
+		if !attrs.Created.Before(oldest) {
+			continue
+		}
+		if err := deleteObject(ctx, b, bucket.Object(attrs.Name)); err != nil {
+			return n, fmt.Errorf("failed to delete the old ref record %s: %w", attrs.Name, err)
 		}
 		n++
 	}

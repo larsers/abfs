@@ -290,8 +290,8 @@ func TestRemoveExpiredRefs_FailedTransaction(t *testing.T) {
 	require.Equal([]int{500, 500}, f.commits.deletes)
 }
 
-// The pruning keeps the ref records of the newest cycles and leaves other
-// names and other states alone.
+// The pruning keeps the ref records of the newest cycles and those younger
+// than seven days, and leaves other names and other states alone.
 func TestPruneRefRecords(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -303,7 +303,11 @@ func TestPruneRefRecords(t *testing.T) {
 		require.NoError(err)
 		require.NoError(w.Close())
 	}
-	n, err := pruneRefRecords(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: farLease()}, bucket, DefaultStateName, 2)
+	n, err := pruneRefRecords(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: leaseAt()}, bucket, DefaultStateName, 2)
+	require.NoError(err)
+	require.Zero(n)
+	laterBy(t, undoWindow+time.Minute)
+	n, err = pruneRefRecords(ctx, writeBudget{deadline: DefaultWriteDeadline, lease: leaseAt()}, bucket, DefaultStateName, 2)
 	require.NoError(err)
 	require.Equal(int64(2), n)
 	for i, name := range names {

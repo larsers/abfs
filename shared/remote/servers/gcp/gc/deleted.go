@@ -46,6 +46,16 @@ const (
 	// inlineDepot is the depot of the server that keeps content in the
 	// descriptor itself, which needs no delete.
 	inlineDepot = "inline"
+	// prunedMarker is the object <cycle>/pruned among the delete records,
+	// written before the records of the cycle are pruned, so that an undo of
+	// the cycle fails instead of finding nothing to restore. It carries the
+	// flag of a done record, so that the chunk step skips it.
+	prunedMarker = "pruned"
+	// undoWindow is the shortest time delete and ref records are kept. It is
+	// the shortest soft delete retention under which the chunk step deletes
+	// bucket chunks, the time a deleted chunk can come back, and longer than
+	// the retention of the backups an undo restores from.
+	undoWindow = 7 * 24 * time.Hour
 )
 
 // recordPrefixOf returns the prefix of the delete records of the garbage
@@ -58,6 +68,33 @@ func recordPrefixOf(state string) string {
 // range and level of the delete step of cycle.
 func recordObjectName(state string, cycle int64, level, rng, batch int) string {
 	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + strconv.Itoa(level) + "-" + strconv.Itoa(rng) + "-" + strconv.Itoa(batch)
+}
+
+// prunedMarkerName returns the name of the marker of the pruned records of
+// cycle.
+func prunedMarkerName(state string, cycle int64) string {
+	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + prunedMarker
+}
+
+// recordRetention returns how long delete and ref records are kept after they
+// were written: as long as the bucket keeps a deleted chunk in soft delete,
+// and at least undoWindow, so that an undo finds them while it can restore
+// what they name. The read runs within the deadline of b.
+func recordRetention(ctx context.Context, b writeBudget, bucket *storage.BucketHandle) (time.Duration, error) {
+	var attrs *storage.BucketAttrs
+	err := retryWith(ctx, firstRetryWait, writeBudget{deadline: b.deadline}, func(actx context.Context) error {
+		var err error
+		attrs, err = bucket.Attrs(actx)
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to read the soft delete retention of the bucket: %w", err)
+	}
+	keep := undoWindow
+	if p := attrs.SoftDeletePolicy; p != nil {
+		keep = max(keep, p.RetentionDuration)
+	}
+	return keep, nil
 }
 
 // recordHeader is the header of a delete record.

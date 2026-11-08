@@ -315,14 +315,22 @@ func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle
 	return n, nil
 }
 
-// pruneRecords deletes the flagged delete records of the state beyond the
-// newest keep cycles and returns how many it deleted, each delete within the
-// budget b. A record without the flag stays whatever its age, because the
-// chunks it names may still be to delete.
+// pruneRecords deletes the delete records of the cycles of the state beyond
+// the newest keep cycles whose records are all flagged and older than the
+// record retention, and returns how many it deleted, each delete within the
+// budget b. Before it deletes the records of a cycle, it writes the pruned
+// marker of the cycle. A record without the flag stays whatever its age,
+// because the chunks it names may still be to delete, and so do the other
+// records of its cycle, so that an undo of the cycle finds all of them.
 func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
+	retention, err := recordRetention(ctx, b, bucket)
+	if err != nil {
+		return 0, err
+	}
 	prefix := recordPrefixOf(state)
-	cycles := make(map[int64]bool)
-	flagged := make(map[int64][]string)
+	records := make(map[int64][]string)
+	kept := make(map[int64]bool)
+	oldest := wallNow().Add(-retention)
 	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
 	for {
 		attrs, err := it.Next()
@@ -332,20 +340,26 @@ func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHand
 		if err != nil {
 			return 0, fmt.Errorf("failed to list the delete records under %s: %w", prefix, err)
 		}
-		c, _, ok := strings.Cut(strings.TrimPrefix(attrs.Name, prefix), "/")
+		c, rest, ok := strings.Cut(strings.TrimPrefix(attrs.Name, prefix), "/")
 		cycle, err := strconv.ParseInt(c, 10, 64)
-		if !ok || err != nil {
+		if !ok || err != nil || rest == prunedMarker {
 			continue
 		}
-		cycles[cycle] = true
-		if attrs.Metadata[chunksDoneMetadata] != "" {
-			flagged[cycle] = append(flagged[cycle], attrs.Name)
+		records[cycle] = append(records[cycle], attrs.Name)
+		if attrs.Metadata[chunksDoneMetadata] == "" || !attrs.Created.Before(oldest) {
+			kept[cycle] = true
 		}
 	}
-	sorted := slices.Sorted(maps.Keys(cycles))
+	sorted := slices.Sorted(maps.Keys(records))
 	var n int64
 	for _, c := range sorted[:max(0, len(sorted)-keep)] {
-		for _, name := range flagged[c] {
+		if kept[c] {
+			continue
+		}
+		if err := writePrunedMarker(ctx, b, bucket, state, c); err != nil {
+			return n, err
+		}
+		for _, name := range records[c] {
 			if err := deleteObject(ctx, b, bucket.Object(name)); err != nil {
 				return n, fmt.Errorf("failed to delete the delete record %s: %w", name, err)
 			}
@@ -353,6 +367,20 @@ func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHand
 		}
 	}
 	return n, nil
+}
+
+// writePrunedMarker writes the pruned marker of cycle, unless it exists.
+func writePrunedMarker(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, cycle int64) error {
+	name := prunedMarkerName(state, cycle)
+	err := retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
+		w := bucket.Object(name).If(storage.Conditions{DoesNotExist: true}).NewWriter(actx)
+		w.Metadata = map[string]string{chunksDoneMetadata: strconv.FormatInt(cycle, 10)}
+		return w.Close()
+	})
+	if err != nil && !preconditionFailed(err) {
+		return fmt.Errorf("failed to mark the delete records of cycle %d as pruned: %w", cycle, err)
+	}
+	return nil
 }
 
 // deleteObject deletes obj with the retries of the collector, each attempt
