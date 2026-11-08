@@ -770,6 +770,38 @@ func TestPruneRecords(t *testing.T) {
 	requireRecords(true)
 }
 
+// The retention of a delete record counts from its flag, when its chunks
+// entered soft delete, not from its write: a record whose chunk step ran days
+// late stays while an undo can still restore its chunks.
+func TestPruneRecords_RetentionCountsFromTheFlag(t *testing.T) {
+	require := require.New(t)
+	now := time.Now()
+	oldest := now.Add(-undoWindow)
+	old := now.Add(-undoWindow - 24*time.Hour)
+	flagged := map[string]string{chunksDoneMetadata: "9"}
+	for _, tt := range []struct {
+		name  string
+		attrs storage.ObjectAttrs
+		want  bool
+	}{
+		{"flagged now", storage.ObjectAttrs{Created: old, Updated: now, Metadata: flagged}, false},
+		{"flagged long ago", storage.ObjectAttrs{Created: old, Updated: old, Metadata: flagged}, true},
+		{"unflagged", storage.ObjectAttrs{Created: old, Updated: old}, false},
+	} {
+		require.Equal(tt.want, flaggedBefore(&tt.attrs, oldest), tt.name)
+	}
+
+	// The flag write moves the update time of the record.
+	ctx := context.Background()
+	bucket := newTestBucket(t)
+	obj := bucket.Object("gc/deleted/default/3/0-0-0")
+	require.NoError(obj.NewWriter(ctx).Close())
+	time.Sleep(10 * time.Millisecond)
+	attrs, err := obj.Update(ctx, storage.ObjectAttrsToUpdate{Metadata: flagged})
+	require.NoError(err)
+	require.True(attrs.Updated.After(attrs.Created), "updated %s, created %s", attrs.Updated, attrs.Created)
+}
+
 // The chunk delay must exceed the lifetime of a signed URL of a chunk by
 // twice the clock skew margin: the servers date the URLs by their clocks and
 // the step judges the age of a record by its own.

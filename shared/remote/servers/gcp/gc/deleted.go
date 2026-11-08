@@ -76,8 +76,9 @@ func prunedMarkerName(state string, cycle int64) string {
 	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + prunedMarker
 }
 
-// recordRetention returns how long delete and ref records are kept after they
-// were written: as long as the bucket keeps a deleted chunk in soft delete,
+// recordRetention returns how long ref records are kept after they were
+// written, and delete records after they were flagged: as long as the bucket
+// keeps a deleted chunk in soft delete,
 // and at least undoWindow, so that an undo finds them while it can restore
 // what they name. The read runs within the deadline of b.
 func recordRetention(ctx context.Context, b writeBudget, bucket *storage.BucketHandle) (time.Duration, error) {

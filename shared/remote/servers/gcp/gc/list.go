@@ -316,9 +316,9 @@ func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle
 }
 
 // pruneRecords deletes the delete records of the cycles of the state beyond
-// the newest keep cycles whose records are all flagged and older than the
-// record retention, and returns how many it deleted, each delete within the
-// budget b. Before it deletes the records of a cycle, it writes the pruned
+// the newest keep cycles whose records were all flagged longer than the
+// record retention ago, and returns how many it deleted, each delete within
+// the budget b. Before it deletes the records of a cycle, it writes the pruned
 // marker of the cycle. A record without the flag stays whatever its age,
 // because the chunks it names may still be to delete, and so do the other
 // records of its cycle, so that an undo of the cycle finds all of them.
@@ -346,7 +346,7 @@ func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHand
 			continue
 		}
 		records[cycle] = append(records[cycle], attrs.Name)
-		if attrs.Metadata[chunksDoneMetadata] == "" || !attrs.Created.Before(oldest) {
+		if !flaggedBefore(attrs, oldest) {
 			kept[cycle] = true
 		}
 	}
@@ -367,6 +367,14 @@ func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHand
 		}
 	}
 	return n, nil
+}
+
+// flaggedBefore reports whether the delete record with attrs was flagged
+// before oldest. The chunks it names enter soft delete when the step flags
+// it, which can be long after the record was written, and the flag write
+// updates the record.
+func flaggedBefore(attrs *storage.ObjectAttrs, oldest time.Time) bool {
+	return attrs.Metadata[chunksDoneMetadata] != "" && attrs.Updated.Before(oldest)
 }
 
 // writePrunedMarker writes the pruned marker of cycle, unless it exists.
