@@ -55,6 +55,7 @@ func (c *gcpGCCmd) Spec() cmd.CmdSpec {
 		Subcommands: []cmd.ABFSCmd{
 			&gcpGCBackfillCmd{RootCmd: c.RootCmd},
 			&gcpGCRunCmd{RootCmd: c.RootCmd},
+			&gcpGCWalkCmd{RootCmd: c.RootCmd},
 		},
 	}
 }
@@ -320,6 +321,127 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		}
 	}
 	return err
+}
+
+type gcpGCWalkCmd struct {
+	*root.RootCmd
+	server  gcp.NewServerOpts
+	opts    gc.WalkOpts
+	details []string
+	keys    []string
+}
+
+func (c *gcpGCWalkCmd) Spec() cmd.CmdSpec {
+	return cmd.CmdSpec{
+		Name:  "walk",
+		Usage: "--mount-details <hash>[,<hash>] --key <hash>[,<hash>] --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--workers <n>]",
+		Desc: `Tell whether keys are in the content of the checkouts of mounts. Reads each mount
+details object and its pinned manifest, and walks the commit and the trees of every
+pinned revision from object content, without the gc table, so a gap in the GC edges
+does not hide a key. Prints, per key, whether the walk reached it and the first path
+that did. It reads trees only to list their entries, so a blob need not exist to be
+found. Its reads rescue and touch nothing; it takes no lease and writes nothing. Fails
+when the walk is incomplete: mount details without a pinned manifest, revisions that
+are not hashes, or objects it could not read; a key outside may then be inside.`,
+	}
+}
+
+func (c *gcpGCWalkCmd) RegisterFlags(fl *pflag.FlagSet) {
+	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
+	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
+	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
+	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
+	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", "The GCP Bigtable App Profile ID (empty uses the instance default app profile)")
+	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	fl.StringSliceVar(&c.details, "mount-details", nil, "The mount details, separated by commas, whose pinned revisions are walked: the targets of the mount refs of a client (required)")
+	fl.StringSliceVar(&c.keys, "key", nil, "The object keys, separated by commas, to look for (required)")
+	fl.IntVar(&c.opts.Workers, "workers", gc.DefaultWalkWorkers, "The number of pinned revisions walked in parallel")
+}
+
+func (c *gcpGCWalkCmd) checkOpts() error {
+	if len(c.details) == 0 || len(c.keys) == 0 {
+		return errors.New("pass --mount-details and --key")
+	}
+	if c.opts.Workers < 1 {
+		return fmt.Errorf("invalid --workers %d: it must be at least 1", c.opts.Workers)
+	}
+	var err error
+	if c.opts.MountDetails, err = parseKeys("--mount-details", c.details); err != nil {
+		return err
+	}
+	c.opts.Keys, err = parseKeys("--key", c.keys)
+	return err
+}
+
+func parseKeys(flag string, keys []string) ([]entities.Hash, error) {
+	hashes := make([]entities.Hash, 0, len(keys))
+	for _, k := range keys {
+		if !entities.IsHash(k) {
+			return nil, fmt.Errorf("invalid key %q for %s", k, flag)
+		}
+		hashes = append(hashes, entities.NewHash(k))
+	}
+	return hashes, nil
+}
+
+func (c *gcpGCWalkCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
+	args.EnsureNoArgs(fl)
+	if err := c.checkOpts(); err != nil {
+		return err
+	}
+	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+		return err
+	}
+	// Its reads must not rescue condemned objects or count as a use, or the
+	// walk would keep what it is asked about.
+	c.server.GC = true
+	c.server.GCReadOnly = true
+	server, err := gcp.New(ctx, &c.server)
+	if err != nil {
+		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Printf("Warning: error closing ABFS server: %v", err)
+		}
+	}()
+	res, err := server.WalkGC(ctx, &c.opts)
+	if err != nil {
+		return err
+	}
+	printWalk(res)
+	if res.Incomplete > 0 {
+		return fmt.Errorf("the walk is incomplete: %d mount details, revisions or objects could not be read or followed", res.Incomplete)
+	}
+	return nil
+}
+
+func printWalk(res *gc.WalkResult) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "KEY\tCLOSURE\tTYPE\tPATH\tCOMMIT\tMOUNT DETAILS")
+	for _, k := range res.Keys {
+		if !k.Reached {
+			fmt.Fprintf(w, "%s\toutside\t-\t-\t-\t-\n", k.Key)
+			continue
+		}
+		path, commit := "-", "-"
+		if k.Path != "" {
+			path = k.Path
+		}
+		if !k.Commit.IsZero() {
+			commit = k.Commit.String()
+		}
+		fmt.Fprintf(w, "%s\tinside\t%s\t%s\t%s\t%s\n", k.Key, k.Type, path, commit, k.MountDetails)
+	}
+	_ = w.Flush()
+	fmt.Printf("Walked %d mount details, %d pinned manifests, %d revisions, %d trees and %d entries of files and submodules.\n",
+		res.MountDetails, res.PinnedManifests, res.Revisions, res.Trees, res.Entries)
+	if res.Incomplete > 0 {
+		fmt.Printf("Incomplete, so a key outside may be inside: %d mount details, revisions or objects could not be read or followed, such as:\n", res.Incomplete)
+		for _, s := range res.IncompleteSamples {
+			fmt.Printf("  %s\n", s)
+		}
+	}
 }
 
 // checkAppProfile reads the Bigtable app profile of a GC command and warns
