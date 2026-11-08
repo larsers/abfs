@@ -185,7 +185,8 @@ func (d *deleter) logRefused(cycle int64) {
 // run runs the steps of a delete cycle after the markers of the live keys of
 // the previous list were cleared: the chunk step of the records of earlier
 // cycles, the second server read and, unless a check refused, the delete
-// step. It returns the nodes it deleted, which the cycle must not condemn.
+// step. It returns the nodes it deleted or found without a row, which the
+// cycle must not condemn.
 func (d *deleter) run(ctx context.Context, lease *Lease, res *Result) (bitmap, error) {
 	if err := d.deleteChunks(ctx); err != nil {
 		return nil, err
@@ -315,6 +316,8 @@ func (d *deleter) deleteStep(ctx context.Context, lease *Lease, res *Result) (bi
 				s.rep.NotMatchedSample = append(s.rep.NotMatchedSample, s.g.key(id).String())
 			}
 		case outcomeGone:
+			// A marker would give the gone row a row of its own.
+			deleted.set(id)
 			s.rep.Gone++
 		case outcomeBlocked:
 			s.rep.Blocked++

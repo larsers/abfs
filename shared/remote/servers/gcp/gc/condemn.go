@@ -251,7 +251,8 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		if err != nil {
 			return err
 		}
-		// A marker written to a deleted row would make a row of its own.
+		// A marker written to a deleted or gone row would make a row of its
+		// own.
 		if deleted != nil {
 			nodes = slices.DeleteFunc(slices.Clone(nodes), func(n sizedNode) bool { return deleted.has(n.id) })
 		}

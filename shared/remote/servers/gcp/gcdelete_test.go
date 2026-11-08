@@ -268,6 +268,33 @@ func TestDeleteGC_MatchesOnlyTheExactMarker(t *testing.T) {
 	require.Equal(int64(4), res.Report.Condemn.Condemned)
 }
 
+// A key whose row is gone between the consistency scan and the read of the
+// delete step is not condemned again, so that its marker does not write a
+// row that holds only the marker.
+func TestDeleteGC_GoneRowGetsNoMarker(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	gone := f.blob("row gone before the delete step", f.old)
+	kept := f.blob("rescued before the delete step", f.old)
+	f.delete(nil)
+	f.age()
+
+	f.checks.hook = func() {
+		del := bigtable.NewMutation()
+		del.DeleteRow()
+		require.NoError(f.s.casdb.BTClient().Open("objects").Apply(context.Background(), gone.String(), del))
+		f.setMarker(kept)
+	}
+	res := f.deletes(nil)
+	step := res.Report.Delete.Step
+	require.Equal(int64(1), step.Gone)
+	require.Equal(int64(1), step.NotMatched)
+	require.Zero(step.Deleted)
+	require.Empty(f.row("objects", gone))
+	require.Equal([][]byte{marker(2)}, f.markerCells(kept))
+	require.Equal(int64(1), res.Report.Condemn.Condemned)
+}
+
 // A server that reads a condemned commit between the mark and the delete
 // step rescues it, and the step then keeps the commit and everything below
 // it, which the next cycle finds live through the rescue's touch.
