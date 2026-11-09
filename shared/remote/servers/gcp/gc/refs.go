@@ -44,6 +44,7 @@ const (
 	RefConfig        RefClass = "config"
 	RefACL           RefClass = "acl"
 	RefWorkspace     RefClass = "workspace"
+	RefSnapshot      RefClass = "snapshot"
 	RefMount         RefClass = "mount"
 	RefUnmount       RefClass = "unmount"
 	RefBuild         RefClass = "build"
@@ -58,6 +59,7 @@ var metaRefClasses = []struct {
 	class  RefClass
 }{
 	{"refs/abfs/ws/", RefWorkspace},
+	{"refs/abfs/snapshot/", RefSnapshot},
 	{"refs/abfs/mount/", RefMount},
 	{"refs/abfs/unmount/", RefUnmount},
 	{"refs/abfs/build/", RefBuild},
@@ -109,10 +111,11 @@ type RefCounts struct {
 type refSnapshot struct {
 	counts map[RefClass]*RefCounts
 	roots  []refRoot
-	// mounts and workspaces hold the targets of the live mount refs and of
-	// the workspace refs.
+	// mounts, workspaces and snapshots hold the targets of the live mount
+	// refs, of the workspace refs and of the snapshot refs.
 	mounts     []Hash
 	workspaces []Hash
+	snapshots  []Hash
 	// expired holds the refs past their retention, which a delete cycle
 	// removes.
 	expired []expiredRef
@@ -167,6 +170,8 @@ func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapsh
 			snap.mounts = append(snap.mounts, h)
 		case RefWorkspace:
 			snap.workspaces = append(snap.workspaces, h)
+		case RefSnapshot:
+			snap.snapshots = append(snap.snapshots, h)
 		}
 		return nil
 	})
@@ -186,6 +191,8 @@ func (o *DryRunOpts) refRetention(c RefClass, updated, snapshot time.Time) bool 
 		// An unmount ref keeps its unmount details and the mount details
 		// they link, so that no ref names a missing object.
 		return !updated.After(snapshot.Add(-o.BuildRetention))
+	case RefSnapshot:
+		return !updated.After(snapshot.Add(-o.SnapshotRetention))
 	}
 	return false
 }
@@ -193,7 +200,7 @@ func (o *DryRunOpts) refRetention(c RefClass, updated, snapshot time.Time) bool 
 // MountCounts reports the pinned manifests of the live mounts, or of the
 // mounts that the workspace snapshots were taken from.
 type MountCounts struct {
-	// Live counts the live mount refs, or the workspace refs.
+	// Live counts the live mount refs, or the workspace or snapshot refs.
 	Live int64 `json:"live"`
 	// WithoutPinnedManifest counts mount details that name no pinned manifest,
 	// and workspace snapshots that name no mount details.
@@ -258,10 +265,12 @@ func (c *MountCounts) sample(count string, src *pinSource) {
 }
 
 // pinSource is the mount details that pinned a revision first, and the
-// workspace snapshot that named them.
+// workspace snapshot that named them, which a snapshot ref named when
+// snapshotRef is set.
 type pinSource struct {
 	details, workspace Hash
 	host, user         string
+	snapshotRef        bool
 }
 
 func (p *pinSource) sample() MountSample {
@@ -297,13 +306,30 @@ type pinReader struct {
 	touchLimit time.Duration
 }
 
+// pinCounts reports the pins of the live mounts, of the workspace refs and
+// of the snapshot refs.
+type pinCounts struct {
+	mounts, workspaces, snapshots MountCounts
+}
+
+// counts returns the counts that the revisions of src belong to.
+func (c *pinCounts) counts(src *pinSource) *MountCounts {
+	switch {
+	case src.workspace.IsZero():
+		return &c.mounts
+	case src.snapshotRef:
+		return &c.snapshots
+	}
+	return &c.workspaces
+}
+
 // pinnedRevisions reads the mount details of each live mount and of the mount
-// behind each workspace snapshot, and the pinned manifests they name. It
-// returns the project revisions that are object keys: the commits the mounts
-// and workspaces are based on, which neither links. A mount with the
-// keep-alive whose touch interval is not safely below touchLimit is counted
-// in TouchIntervalTooLong.
-func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, mounts, workspaces []Hash, touchLimit time.Duration) ([]pinnedRevision, MountCounts, MountCounts, error) {
+// behind each workspace snapshot that a workspace or snapshot ref names, and
+// the pinned manifests they name. It returns the project revisions that are
+// object keys: the commits the mounts and workspaces are based on, which
+// neither links. A mount with the keep-alive whose touch interval is not
+// safely below touchLimit is counted in TouchIntervalTooLong.
+func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, refs *refSnapshot, touchLimit time.Duration) ([]pinnedRevision, pinCounts, error) {
 	p := &pinReader{
 		objs:      objs,
 		details:   make(map[Hash]*binding.MountDetails),
@@ -313,50 +339,59 @@ func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, mounts, wo
 
 		touchLimit: touchLimit,
 	}
-	mountCounts := MountCounts{Live: int64(len(mounts))}
-	seenDetails := make(map[Hash]bool, len(mounts))
+	var counts pinCounts
+	counts.mounts.Live = int64(len(refs.mounts))
+	seenDetails := make(map[Hash]bool, len(refs.mounts))
 	seenManifests := make(map[Hash]bool)
-	for _, h := range mounts {
-		if err := p.mount(ctx, &mountCounts, seenDetails, seenManifests, &pinSource{details: h}); err != nil {
-			return nil, mountCounts, MountCounts{}, err
+	for _, h := range refs.mounts {
+		if err := p.mount(ctx, &counts.mounts, seenDetails, seenManifests, &pinSource{details: h}); err != nil {
+			return nil, counts, err
 		}
 	}
-	wsCounts := MountCounts{Live: int64(len(workspaces))}
-	seenDetails = make(map[Hash]bool, len(workspaces))
-	seenManifests = make(map[Hash]bool)
-	seenSnapshots := make(map[Hash]bool, len(workspaces))
-	for _, h := range workspaces {
+	if err := p.snapshots(ctx, &counts.workspaces, refs.workspaces, false); err != nil {
+		return nil, counts, err
+	}
+	if err := p.snapshots(ctx, &counts.snapshots, refs.snapshots, true); err != nil {
+		return nil, counts, err
+	}
+	for _, r := range p.revisions {
+		counts.counts(r.src).Revisions++
+	}
+	return p.revisions, counts, nil
+}
+
+// snapshots reads the mount details behind each of the workspace snapshots
+// and their pinned manifests into c.
+func (p *pinReader) snapshots(ctx context.Context, c *MountCounts, snapshots []Hash, snapshotRef bool) error {
+	c.Live = int64(len(snapshots))
+	seenDetails := make(map[Hash]bool, len(snapshots))
+	seenManifests := make(map[Hash]bool)
+	seenSnapshots := make(map[Hash]bool, len(snapshots))
+	for _, h := range snapshots {
 		if seenSnapshots[h] {
 			continue
 		}
 		seenSnapshots[h] = true
-		src := &pinSource{workspace: h}
-		details, err := wsMountDetails(ctx, objs, h)
+		src := &pinSource{workspace: h, snapshotRef: snapshotRef}
+		details, err := wsMountDetails(ctx, p.objs, h)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, mountCounts, wsCounts, ctx.Err()
+				return ctx.Err()
 			}
-			p.failed(&wsCounts, src, "workspace snapshot", err)
+			p.failed(c, src, "workspace snapshot", err)
 			continue
 		}
 		if details.IsZero() {
-			wsCounts.WithoutPinnedManifest++
-			wsCounts.sample("without_pinned_manifest", src)
+			c.WithoutPinnedManifest++
+			c.sample("without_pinned_manifest", src)
 			continue
 		}
 		src.details = details
-		if err := p.mount(ctx, &wsCounts, seenDetails, seenManifests, src); err != nil {
-			return nil, mountCounts, wsCounts, err
+		if err := p.mount(ctx, c, seenDetails, seenManifests, src); err != nil {
+			return err
 		}
 	}
-	for _, r := range p.revisions {
-		if r.src.workspace.IsZero() {
-			mountCounts.Revisions++
-		} else {
-			wsCounts.Revisions++
-		}
-	}
-	return p.revisions, mountCounts, wsCounts, nil
+	return nil
 }
 
 // failed counts an object of src that could not be read: a missing one in

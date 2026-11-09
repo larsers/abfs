@@ -204,6 +204,15 @@ func (f *gcFixture) workspace(ref string, details, root entities.Hash) entities.
 	return ws
 }
 
+// snapshot stores a workspace snapshot of root taken from the mount with the
+// given details, and writes a snapshot ref to it last written at updated.
+func (f *gcFixture) snapshot(details, root entities.Hash, updated time.Time) entities.Hash {
+	f.t.Helper()
+	ws := f.object(&binding.WSSnapshot{Version: binding.CurrentWSSnapshotVersion, MountDetails: details, Snapshot: binding.Snapshot{Root: root}}, f.old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/snapshot/user/u/"+ws.String(), ws, updated)
+	return ws
+}
+
 func TestDryRunGC_RetentionClasses(t *testing.T) {
 	require := require.New(t)
 	f := newGCFixture(t)
@@ -413,6 +422,55 @@ func TestDryRunGC_WorkspaceKeepsPinnedBase(t *testing.T) {
 	require.Equal([]gc.MountSample{{Workspace: bare.String()}}, w.Samples["without_pinned_manifest"])
 	require.Equal([]gc.MountSample{{Details: objects.HashBlobBytes([]byte("never stored")).String(), Workspace: lost.String()}}, w.Samples["not_found"])
 	require.Zero(r.LiveMounts.Live)
+}
+
+// A snapshot ref keeps its workspace snapshot, the mount details it was taken
+// from and the commits that mount was pinned to, for the snapshot retention
+// after the ref was last written and no longer.
+func TestDryRunGC_SnapshotRefKeepsPinnedBase(t *testing.T) {
+	require := require.New(t)
+	f := newGCFixture(t)
+	old := f.old
+	snapshotOf := func(name string, age time.Duration) (ws, wsTree, details, pinned, base, baseTree entities.Hash) {
+		baseTree = f.tree(old, f.blob(name+" base file", old))
+		base = f.commit(baseTree, name+" base", old)
+		details, pinned = f.mountDetails([]string{base.String()})
+		wsTree = f.tree(old, f.blob(name+" edited file", old))
+		ws = f.snapshot(details, wsTree, f.now.Add(-age))
+		return ws, wsTree, details, pinned, base, baseTree
+	}
+	// The branch moved to a commit that shares nothing with the bases.
+	f.ref("platform/a", "refs/heads/main", f.commit(f.tree(old, f.blob("orphan file", old)), "orphan", old), old)
+	ws, wsTree, details, pinned, base, baseTree := snapshotOf("kept", 700*time.Hour)
+	oldWS, oldWSTree, oldDetails, oldPinned, oldBase, oldBaseTree := snapshotOf("expired", 740*time.Hour)
+
+	o := gc.DefaultDryRunOpts()
+	o.Shards = 3
+	o.Explain = []entities.Hash{ws, base}
+	res := f.run(&o)
+	requireReachable(t, res, true, ws, wsTree, details, pinned, base, baseTree)
+	requireReachable(t, res, false, oldWS, oldWSTree, oldDetails, oldPinned, oldBase, oldBaseTree)
+	r := res.Report
+	require.Equal(&gc.RefCounts{Refs: 2, Roots: 1, Expired: 1}, r.Refs[gc.RefSnapshot])
+	require.Equal(int64(1), r.RefsToTombstone)
+	require.Equal(720.0, r.Settings.SnapshotRetentionHours)
+	s := r.Snapshots
+	require.Equal(int64(1), s.Live)
+	require.Equal(int64(1), s.PinnedManifests)
+	require.Equal(int64(1), s.Revisions)
+	require.Zero(s.Errors)
+	require.Zero(r.Workspaces.Live)
+	require.Zero(r.Workspaces.Revisions)
+	require.Equal("snapshot", r.Explain[0].FirstRoot.Class)
+	require.Equal(gc.RootPinnedRevisions, r.Explain[1].FirstRoot.Class)
+	require.Equal(&gc.MountSample{Details: details.String(), Workspace: ws.String(), Host: "host-a", User: "u"}, r.Explain[1].FirstRoot.Pin)
+
+	// A longer retention keeps both.
+	o.SnapshotRetention = 1000 * time.Hour
+	res = f.run(&o)
+	requireReachable(t, res, true, ws, oldWS, oldDetails, oldPinned, oldBase, oldBaseTree)
+	require.Equal(&gc.RefCounts{Refs: 2, Roots: 2}, res.Report.Refs[gc.RefSnapshot])
+	require.Equal(int64(2), res.Report.Snapshots.Revisions)
 }
 
 func TestDryRunGC_UnknownTypeFailsClosed(t *testing.T) {

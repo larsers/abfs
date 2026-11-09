@@ -157,6 +157,33 @@ func TestDeleteGC_RemovesExpiredRefs(t *testing.T) {
 	f.requirePresent(kept)
 }
 
+// A delete cycle removes a snapshot ref past the snapshot retention, and the
+// next cycle deletes the snapshot, its mount details and the commit that
+// mount was pinned to. A snapshot ref within the retention keeps all of them.
+func TestDeleteGC_RemovesExpiredSnapshotRefs(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	snapshotOf := func(name string, updated time.Time) []entities.Hash {
+		base := f.commit(f.tree(f.old, f.blob(name+" base file", f.old)), name+" base", f.old)
+		details, pinned := f.mountDetails([]string{base.String()})
+		ws := f.snapshot(details, f.tree(f.old, f.blob(name+" edited file", f.old)), updated)
+		return []entities.Hash{ws, details, pinned, base}
+	}
+	kept := snapshotOf("kept", time.Now())
+	expired := snapshotOf("expired", f.old)
+
+	res := f.delete(nil)
+	require.Equal(map[gc.RefClass]*gc.RefRemovalCounts{gc.RefSnapshot: {Recorded: 1, Removed: 1}}, res.Report.Delete.Refs.Classes)
+	require.Equal([]string{"refs/abfs/snapshot/user/u/" + kept[0].String()}, f.metaRefs("refs/abfs/snapshot/"))
+	requireReachable(t, res, true, kept...)
+	requireReachable(t, res, false, expired...)
+
+	f.age()
+	f.deletes(nil)
+	f.requireGone(expired...)
+	f.requirePresent(kept...)
+}
+
 // A failed removal of the refs past their retention refuses the deletes of
 // the cycle, which condemns and completes its list: what an expired ref
 // still names is not deleted while the ref exists. The next cycle removes

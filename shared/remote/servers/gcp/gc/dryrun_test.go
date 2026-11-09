@@ -50,6 +50,7 @@ func TestClassifyRef(t *testing.T) {
 		{entities.ABFSMetaProject, "config", RefConfig},
 		{entities.ABFSMetaProject, "acl", RefACL},
 		{entities.ABFSMetaProject, "refs/abfs/ws/user/u/ws", RefWorkspace},
+		{entities.ABFSMetaProject, "refs/abfs/snapshot/user/u/0123456789abcdef0123456789abcdef01234567", RefSnapshot},
 		{entities.ABFSMetaProject, "refs/abfs/mount/user/u/1", RefMount},
 		{entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", RefUnmount},
 		{entities.ABFSMetaProject, "refs/abfs/build/user/u/b", RefBuild},
@@ -80,6 +81,8 @@ func TestRefRetention(t *testing.T) {
 		{RefBuildStart, 721 * time.Hour, true},
 		{RefUnmount, time.Hour, false},
 		{RefUnmount, 721 * time.Hour, true},
+		{RefSnapshot, 719 * time.Hour, false},
+		{RefSnapshot, 721 * time.Hour, true},
 	}
 	for _, tt := range tests {
 		require.Equal(t, tt.expired, o.refRetention(tt.class, now.Add(-tt.age), now), "%s %s", tt.class, tt.age)

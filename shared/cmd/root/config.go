@@ -60,7 +60,7 @@ func registerConfigFlags(fl *pflag.FlagSet, c *instance.ConfigOptional) {
 	optflags.OptString(fl, &c.RBERemote, "rbe-remote", "", "RBE remote address (override config)")
 
 	// Server GC keep-alive flags
-	optflags.OptBool(fl, &c.GCKeepAlive, "gc-keepalive", "", "Keep live mounts visible to the server GC (override config)")
+	optflags.OptBool(fl, &c.GCKeepAlive, "gc-keepalive", "", "Keep live mounts and workspace snapshots visible to the server GC (override config)")
 	optflags.OptDuration(fl, &c.GCKeepAliveRefInterval, "gc-keepalive-ref-interval", "", "With gc-keepalive, interval between rewrites of a live mount's ref for the server GC, zero disables (override config)")
 	optflags.OptDuration(fl, &c.GCKeepAliveTouchInterval, "gc-keepalive-touch-interval", "", "With gc-keepalive, interval between Headers touches of a live mount's objects for the server GC, zero disables (override config)")
 }
