@@ -438,10 +438,10 @@ func TestEffective_Includes(t *testing.T) {
 	files := map[string]string{
 		"default.xml": testManifest(`
  <project name="platform/external/uuid" path="ws/a-uuid"></project>
- <include name="supplier.xml" groups="supplier"></include>`),
-		"supplier.xml": `<manifest>
- <include name="layer.xml" groups="layer" revision="supplier-rev"></include>
- <extend-project name="platform/external/cmp" revision="v0.6.0" base-rev="supplier-rev"></extend-project>
+ <include name="top.xml" groups="top"></include>`),
+		"top.xml": `<manifest>
+ <include name="layer.xml" groups="layer" revision="top-rev"></include>
+ <extend-project name="platform/external/cmp" revision="v0.6.0" base-rev="top-rev"></extend-project>
 </manifest>`,
 		"layer.xml": `<manifest>
  <include name="projects.xml" groups="extra"></include>
@@ -462,9 +462,9 @@ func TestEffective_Includes(t *testing.T) {
 	require.NoError(t, m.Effective())
 	requireProjected(t, m)
 	require.Equal(t, []string{
-		"ws/a-uuid platform/external/uuid main aosp [extra layer own supplier]",
-		"ws/cmp platform/external/cmp v0.6.0 partner [extra layer supplier]",
-		"ws/go platform/external/go supplier-rev aosp [extra layer supplier]",
+		"ws/a-uuid platform/external/uuid main aosp [extra layer own top]",
+		"ws/cmp platform/external/cmp v0.6.0 partner [extra layer top]",
+		"ws/go platform/external/go top-rev aosp [extra layer top]",
 	}, projectLines(m))
 }
 

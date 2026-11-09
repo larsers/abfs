@@ -472,7 +472,9 @@ func projectMappingsForFile(contentor contentor, manifestURL string, manifestFil
 		return projectMappings, err
 	}
 
-	// Grab all the remotes. A remote defined twice has the same attributes, or flattening failed.
+	// Grab all the remotes. A name defined twice maps to its last definition, as in
+	// RemoteFromName. When the file has includes, flattening has already failed on a
+	// second definition with other attributes.
 	for _, remote := range m.Remote {
 		fetchSchemeURL, err := url.Parse(remote.Fetch)
 		if err != nil {

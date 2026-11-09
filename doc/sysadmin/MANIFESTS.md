@@ -1,7 +1,7 @@
 # Manifests and tree layouts
 
 This page is for the people who set up ABFS for CI/CD and for developers whose source tree
-does not look like AOSP: a supplier delivery layered over AOSP and SoC vendor lists, with
+does not look like AOSP: a manifest that layers its own project lists over AOSP with
 `remove-project`, `extend-project` and include groups, an Android tree in a subdirectory next to
 other parts of the product, or both. It says how ABFS reads such a manifest, what it needs from
 such a layout, and how to check that a mount is ready to build.
@@ -86,7 +86,7 @@ repos:
         - branch: release-1
           file: default.xml
         - branch: release-1
-          file: supplier-only.xml
+          file: partial.xml
 ```
 
 The pusher applies `remove-project` and `extend-project` as the mount does. It mirrors the
@@ -104,7 +104,7 @@ are still read.
 Classic mount of a named entry file, with a group filter:
 
 ```sh
-abfs mount -b release-1 --branch-file supplier-only.xml -g shared $MOUNT
+abfs mount -b release-1 --branch-file partial.xml -g example $MOUNT
 ```
 
 `-g` selects projects whose groups come from the project, from an `<include groups=>` or
@@ -114,7 +114,7 @@ A workspace mount takes the same options; `abfs mount` passes `--branch-file` to
 as its `-m`:
 
 ```sh
-abfs mount --ws ci -b release-1 --branch-file supplier-only.xml -g shared $MOUNT
+abfs mount --ws ci -b release-1 --branch-file partial.xml -g example $MOUNT
 ```
 
 #### Local manifests
@@ -140,7 +140,7 @@ with the same entry file and groups:
 
 ```sh
 mkdir /tmp/repo-check && cd /tmp/repo-check
-repo init -u https://gerrit.example.com/platform/manifest -b release-1 -g shared
+repo init -u https://gerrit.example.com/platform/manifest -b release-1 -g example
 repo list -a -p | sort > /tmp/repo-paths.txt
 sort $MOUNT/.repo/projects.list | diff /tmp/repo-paths.txt -
 ```

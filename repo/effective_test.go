@@ -100,7 +100,7 @@ func TestSetManifest_WarningsNameTheFile(t *testing.T) {
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
-	file := filepath.Join(t.TempDir(), "supplier.xml")
+	file := filepath.Join(t.TempDir(), "layered.xml")
 	require.NoError(t, os.WriteFile(file, []byte(`<manifest>
   <remote name="aosp" fetch="https://android.googlesource.com/" />
   <default revision="main" remote="aosp" />

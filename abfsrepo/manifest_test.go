@@ -184,16 +184,16 @@ func TestLoadManifest_LocalManifests(t *testing.T) {
 		"b-add.xml": `<manifest>
   <default revision="main" remote="origin" />
   <project name="p/local" path="local" revision="dev" />
-  <include name="local_manifests/shared.inc" />
+  <include name="local_manifests/added.inc" />
 </manifest>
 `,
 		"c-extend.xml": `<manifest>
   <extend-project name="p/three" revision="v2" groups="mine" />
-  <extend-project name="p/shared" dest-path="shared-moved" />
+  <extend-project name="p/added" dest-path="added-moved" />
 </manifest>
 `,
-		"shared.inc": `<manifest>
-  <project name="p/shared" path="shared" />
+		"added.inc": `<manifest>
+  <project name="p/added" path="added" />
 </manifest>
 `,
 		"notes.txt": "not a manifest",
@@ -202,7 +202,7 @@ func TestLoadManifest_LocalManifests(t *testing.T) {
 	}
 
 	require.NoError(t, r.loadManifest(context.Background()))
-	require.Equal(t, []string{"local", "one", "shared-moved", "three"}, selectedPaths(r))
+	require.Equal(t, []string{"added-moved", "local", "one", "three"}, selectedPaths(r))
 	revision, err := r.projectRevision(r.projectsByPath["three"])
 	require.NoError(t, err)
 	require.Equal(t, "v2", revision)
