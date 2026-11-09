@@ -144,7 +144,15 @@ func processExited(process *os.Process) bool {
 	// The state follows the command name, which is in parentheses and may contain
 	// spaces or parentheses itself.
 	i := bytes.LastIndexByte(stat, ')')
-	return i >= 0 && i+2 < len(stat) && stat[i+2] == 'Z'
+	if i < 0 || i+2 >= len(stat) || stat[i+2] != 'Z' {
+		return false
+	}
+	// The main thread is a zombie as soon as it exits, while other threads may still
+	// be exiting and hold the open files, among them the socket and its lock. A thread
+	// leaves the task list only after it has closed them, so the process is gone once
+	// the main thread is the only one left.
+	tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", process.Pid))
+	return err == nil && len(tasks) == 1
 }
 
 func (c *stopCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {

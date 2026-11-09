@@ -46,7 +46,24 @@ const (
 	// A detached cacheman gets /dev/null as stdin, so it must not exit on its end.
 	fakeCachemanDetachedEnv = "ABFS_TEST_FAKE_CACHEMAN_DETACHED"
 	fakeCachemanNoSIGINTEnv = "ABFS_TEST_FAKE_CACHEMAN_NO_SIGINT"
+	mainThreadExitsDirEnv   = "ABFS_TEST_MAIN_THREAD_EXITS_DIR"
 )
+
+// init is a helper process when mainThreadExitsDirEnv is set: it listens on the
+// cacheman socket and ends only its main thread, so the process looks like a zombie
+// while its other threads still hold the socket. Init runs on the main thread.
+func init() {
+	cacheDir := os.Getenv(mainThreadExitsDirEnv)
+	if cacheDir == "" {
+		return
+	}
+	signal.Ignore(syscall.SIGINT)
+	if _, err := net.Listen("unix", client.HTTPSocketPath(cacheDir)); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	_, _, _ = syscall.RawSyscall(syscall.SYS_EXIT, 0, 0, 0)
+}
 
 func testInstance(cacheDir string) *instance.Instance {
 	return &instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir, LogDir: cacheDir}}
@@ -412,6 +429,42 @@ func TestStopCachemanInst_Kill(t *testing.T) {
 	inst := testInstance(cacheDir)
 	require.NoError(t, stopCachemanInst(context.Background(), inst))
 	_, found, err := findCacheman(inst)
+	require.NoError(t, err)
+	require.False(t, found, "stop returned before cacheman exited")
+}
+
+// A process whose main thread has exited is a zombie in /proc/<pid>/stat while its
+// other threads still exit and hold the socket, so stop must wait for them as well.
+func TestStopCachemanInst_MainThreadExited(t *testing.T) {
+	old := stopTimeout
+	stopTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { stopTimeout = old })
+	cacheDir := t.TempDir()
+	c := exec.Command(os.Args[0], "-test.run=^$")
+	c.Env = append(os.Environ(), mainThreadExitsDirEnv+"="+cacheDir)
+	require.NoError(t, c.Start())
+	exited := make(chan struct{})
+	go func() {
+		_ = c.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = c.Process.Kill()
+		<-exited
+	})
+
+	stat := fmt.Sprintf("/proc/%d/stat", c.Process.Pid)
+	require.Eventually(t, func() bool {
+		b, err := os.ReadFile(stat)
+		return err == nil && bytes.Contains(b, []byte(") Z "))
+	}, 10*time.Second, 10*time.Millisecond, "main thread did not exit")
+	_, found, err := findCacheman(testInstance(cacheDir))
+	require.NoError(t, err)
+	require.True(t, found, "the other threads do not hold the socket")
+
+	inst := testInstance(cacheDir)
+	require.NoError(t, stopCachemanInst(context.Background(), inst))
+	_, found, err = findCacheman(inst)
 	require.NoError(t, err)
 	require.False(t, found, "stop returned before cacheman exited")
 }
