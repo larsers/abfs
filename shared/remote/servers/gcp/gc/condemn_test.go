@@ -67,16 +67,18 @@ func TestCondemnBlockers(t *testing.T) {
 		{"newer rows", func(r *Report) { r.Objects.NewerRows = 1 }, []string{"1 gc rows have newer edge rules"}},
 		{"mount read error", func(r *Report) { r.LiveMounts.Errors = 1 }, []string{"the pins of 1 live mounts could not be read"}},
 		{"workspace read error", func(r *Report) { r.Workspaces.Errors = 1 }, []string{"the pins of 1 workspaces could not be read"}},
+		{"snapshot read error", func(r *Report) { r.Snapshots.Errors = 1 }, []string{"the pins of 1 snapshots could not be read"}},
 		{"dangling source root", dangling("source"), []string{"1 roots of class source have no gc row"}},
 		{"dangling project-status root", dangling("project-status"), []string{"class project-status"}},
 		{"dangling pushed-packs root", dangling("pushed-packs"), []string{"class pushed-packs"}},
 		{"dangling workspace root", dangling("workspace"), []string{"class workspace"}},
+		{"dangling snapshot root", dangling("snapshot"), []string{"class snapshot"}},
 		{"dangling mount root", dangling("mount"), []string{"class mount"}},
 		{"dangling permanent root", dangling("permanent"), []string{"class permanent"}},
 		// Projects skipped with --ignore-missing-projects pin commits that were
 		// never pushed; a missing object pins nothing.
 		{"dangling pinned revision", dangling(RootPinnedRevisions), nil},
-		{"missing mount details", func(r *Report) { r.LiveMounts.NotFound, r.Workspaces.NotFound = 1, 1 }, nil},
+		{"missing mount details", func(r *Report) { r.LiveMounts.NotFound, r.Workspaces.NotFound, r.Snapshots.NotFound = 1, 1, 1 }, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

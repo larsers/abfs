@@ -118,7 +118,7 @@ func TestGCWalk_CountsWhatItCannotFollow(t *testing.T) {
 	require.Len(got.IncompleteSamples, 3)
 	require.Contains(got.IncompleteSamples[0], `project p1 has revision "main"`)
 	require.Contains(got.IncompleteSamples[1], "name no pinned manifest")
-	require.Contains(got.IncompleteSamples[2], fmt.Sprintf("tree %s at p0/sub of commit %s", sub, commit))
+	require.Contains(got.IncompleteSamples[2], fmt.Sprintf("tree %s at p0/sub of revision %s", sub, commit))
 	require.EqualError(got.Err(), "the walk is incomplete: 3 mount details, revisions or objects could not be read or followed")
 }
 
@@ -149,6 +149,89 @@ func TestGCWalk_FollowsTheAnnotatedTree(t *testing.T) {
 	require.Equal(int64(2), got.Revisions)
 	require.Equal(int64(1), got.Incomplete, got.IncompleteSamples)
 	require.Contains(got.IncompleteSamples[0], `project p1 has abfs.dir.hash.tag "main", which is not a hash`)
+}
+
+// A manifest can pin a project at an annotated tag. The walk follows the tag,
+// and a tag of a tag, to the commit and walks the commit's tree.
+func TestGCWalk_FollowsAnnotatedTags(t *testing.T) {
+	require := require.New(t)
+	f := newGCFixture(t)
+	file := f.blob("tagged", f.old)
+	commit := f.commit(f.namedTree(treeEntry{"100644", "f", file}), "release", f.old)
+	tag := f.tag(commit, "commit", "v1")
+	outer := f.tag(tag, "tag", "v1-signed")
+	details, _ := f.mountDetails([]string{outer.String()})
+
+	got, err := f.s.WalkGC(context.Background(), &gc.WalkOpts{MountDetails: []entities.Hash{details}, Keys: []entities.Hash{file, commit, tag}, Workers: 1})
+	require.NoError(err)
+	require.Equal(int64(0), got.Incomplete, got.IncompleteSamples)
+	require.Equal([]gc.WalkKey{
+		{Key: file, Reached: true, Type: gc.WalkBlob, MountDetails: details, Commit: outer, Path: "p0/f"},
+		{Key: commit, Reached: true, Type: gc.WalkCommit, MountDetails: details, Commit: outer, Path: "p0"},
+		{Key: tag, Reached: true, Type: gc.WalkTag, MountDetails: details, Commit: outer, Path: "p0"},
+	}, got.Keys)
+}
+
+// The walk follows at most 10 nested tags, and only to a commit. A pinned
+// revision or a tag target that is neither a commit nor a tag, or that cannot
+// be read, leaves the walk incomplete and is reported by what pinned it, not
+// as a commit.
+func TestGCWalk_TagChainLimits(t *testing.T) {
+	f := newGCFixture(t)
+	file := f.blob("tagged", f.old)
+	tree := f.namedTree(treeEntry{"100644", "f", file})
+	commit := f.commit(tree, "release", f.old)
+	chain := func(n int) entities.Hash {
+		h, typ := commit, "commit"
+		for i := range n {
+			h, typ = f.tag(h, typ, fmt.Sprintf("v%d-%d", n, i)), "tag"
+		}
+		return h
+	}
+	missing := entities.NewHash("0123456789abcdef0123456789abcdef01234567")
+	treeTag := f.tag(tree, "tree", "tree-tag")
+	tests := []struct {
+		name     string
+		revision entities.Hash
+		key      entities.Hash
+		typ      string
+		sample   string
+	}{
+		{name: "10 nested tags", revision: chain(10), key: file, typ: gc.WalkBlob},
+		{name: "11 nested tags", revision: chain(11), key: commit, sample: "more than 10 nested tags"},
+		{name: "tag of a tree", revision: treeTag, key: tree, typ: gc.WalkTagTarget, sample: "tag-target " + tree.String() + " at p0 of revision " + treeTag.String() + ": unexpected object *gitobjects.Tree"},
+		{name: "tree pinned", revision: tree, key: tree, typ: gc.WalkRevision, sample: "revision " + tree.String() + " at p0 of revision " + tree.String() + ": unexpected object *gitobjects.Tree"},
+		{name: "missing revision", revision: missing, key: missing, typ: gc.WalkRevision, sample: "revision " + missing.String()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			details, _ := f.mountDetails([]string{tt.revision.String()})
+			got, err := f.s.WalkGC(context.Background(), &gc.WalkOpts{MountDetails: []entities.Hash{details}, Keys: []entities.Hash{tt.key}, Workers: 1})
+			require.NoError(err)
+			if tt.sample == "" {
+				require.Equal(int64(0), got.Incomplete, got.IncompleteSamples)
+			} else {
+				require.Equal(int64(1), got.Incomplete, got.IncompleteSamples)
+				require.Contains(got.IncompleteSamples[0], tt.sample)
+			}
+			want := gc.WalkKey{Key: tt.key}
+			if tt.typ != "" {
+				want = gc.WalkKey{Key: tt.key, Reached: true, Type: tt.typ, MountDetails: details, Commit: tt.revision, Path: "p0"}
+				if tt.typ == gc.WalkBlob {
+					want.Path = "p0/f"
+				}
+			}
+			require.Equal([]gc.WalkKey{want}, got.Keys)
+		})
+	}
+}
+
+// tag stores an annotated tag of target, an object of type typ.
+func (f *gcFixture) tag(target entities.Hash, typ, name string) entities.Hash {
+	body := fmt.Appendf(nil, "object %s\ntype %s\ntag %s\ntagger A <a@example.com> 0 +0000\n\n%s\n", target, typ, name, name)
+	data := append(fmt.Appendf(nil, "tag %d\x00", len(body)), body...)
+	return f.put(entities.Hash(sha1.Sum(data)), data, f.old)
 }
 
 // The walk refuses a server whose reads rescue or touch, which would keep

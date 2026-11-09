@@ -45,7 +45,7 @@ type rootRef struct {
 // refClassOrder is the order in which the mark walks the ref roots. Pinned
 // revisions come after the unmount refs, before the builds.
 var refClassOrder = []RefClass{
-	RefSource, RefProjectStatus, RefPushedPacks, RefConfig, RefACL, RefWorkspace, RefMount, RefUnmount,
+	RefSource, RefProjectStatus, RefPushedPacks, RefConfig, RefACL, RefWorkspace, RefSnapshot, RefMount, RefUnmount,
 	RefBuild, RefBuildStart, RefOtherMeta,
 }
 

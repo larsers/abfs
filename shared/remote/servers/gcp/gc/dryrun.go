@@ -40,6 +40,9 @@ const (
 	DefaultCacheTTL       = 6 * time.Hour
 	DefaultLongestPush    = 3 * time.Hour
 	DefaultScanShards     = 16
+
+	// DefaultSnapshotRetention keeps a workspace snapshot as long as a build.
+	DefaultSnapshotRetention = 720 * time.Hour
 )
 
 // DryRunOpts sets a dry run of the garbage collector.
@@ -52,6 +55,9 @@ type DryRunOpts struct {
 	// BuildRetention is how long build, build-start and unmount refs stay
 	// roots after their last write.
 	BuildRetention time.Duration
+	// SnapshotRetention is how long a snapshot ref stays a root after its
+	// last write.
+	SnapshotRetention time.Duration
 	// MapRetention is how long an eval map row stays a root after its last
 	// write or use.
 	MapRetention time.Duration
@@ -84,17 +90,18 @@ type DryRunOpts struct {
 // DefaultDryRunOpts returns the default options.
 func DefaultDryRunOpts() DryRunOpts {
 	return DryRunOpts{
-		Grace:          DefaultGrace,
-		MountIdle:      DefaultMountIdle,
-		BuildRetention: DefaultBuildRetention,
-		MapRetention:   DefaultMapRetention,
-		Cycle:          DefaultCycle,
-		CacheTTL:       DefaultCacheTTL,
-		LongestPush:    DefaultLongestPush,
-		Consistency:    true,
-		Shards:         DefaultScanShards,
-		LeaseDuration:  DefaultLeaseDuration,
-		WriteDeadline:  DefaultWriteDeadline,
+		Grace:             DefaultGrace,
+		MountIdle:         DefaultMountIdle,
+		BuildRetention:    DefaultBuildRetention,
+		SnapshotRetention: DefaultSnapshotRetention,
+		MapRetention:      DefaultMapRetention,
+		Cycle:             DefaultCycle,
+		CacheTTL:          DefaultCacheTTL,
+		LongestPush:       DefaultLongestPush,
+		Consistency:       true,
+		Shards:            DefaultScanShards,
+		LeaseDuration:     DefaultLeaseDuration,
+		WriteDeadline:     DefaultWriteDeadline,
 	}
 }
 
@@ -108,6 +115,7 @@ func (o *DryRunOpts) Validate() error {
 		value time.Duration
 	}{
 		{"grace", o.Grace}, {"mount idle time", o.MountIdle}, {"build retention", o.BuildRetention},
+		{"snapshot retention", o.SnapshotRetention},
 		{"map retention", o.MapRetention}, {"cycle", o.Cycle}, {"lease duration", o.LeaseDuration},
 		{"write deadline", o.WriteDeadline},
 	} {
@@ -144,8 +152,10 @@ type Report struct {
 	RefsToTombstone int64       `json:"refs_to_tombstone"`
 	LiveMounts      MountCounts `json:"live_mounts"`
 	// Workspaces reports the pinned manifests of the mounts that the
-	// workspace snapshots were taken from.
+	// workspace snapshots were taken from, and Snapshots those of the
+	// snapshots that snapshot refs name.
 	Workspaces MountCounts `json:"workspaces"`
+	Snapshots  MountCounts `json:"snapshots"`
 	// Replicas reports the server replicas and their settings.
 	Replicas ReplicaReport `json:"replicas"`
 	// AppProfile reports the Bigtable app profile of the command, which the
@@ -173,14 +183,15 @@ type Report struct {
 
 // Settings records the options of the run.
 type Settings struct {
-	GraceHours          float64 `json:"grace_hours"`
-	MountIdleHours      float64 `json:"mount_idle_hours"`
-	BuildRetentionHours float64 `json:"build_retention_hours"`
-	MapRetentionHours   float64 `json:"map_retention_hours"`
-	CycleHours          float64 `json:"cycle_hours"`
-	CacheTTLHours       float64 `json:"cache_ttl_hours"`
-	LongestPushHours    float64 `json:"longest_push_hours"`
-	Shards              int     `json:"shards"`
+	GraceHours             float64 `json:"grace_hours"`
+	MountIdleHours         float64 `json:"mount_idle_hours"`
+	BuildRetentionHours    float64 `json:"build_retention_hours"`
+	SnapshotRetentionHours float64 `json:"snapshot_retention_hours"`
+	MapRetentionHours      float64 `json:"map_retention_hours"`
+	CycleHours             float64 `json:"cycle_hours"`
+	CacheTTLHours          float64 `json:"cache_ttl_hours"`
+	LongestPushHours       float64 `json:"longest_push_hours"`
+	Shards                 int     `json:"shards"`
 }
 
 // RootCounts counts the roots of one class.
@@ -409,14 +420,15 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		StartTime:    d.start,
 		SnapshotTime: snapshot,
 		Settings: Settings{
-			GraceHours:          o.Grace.Hours(),
-			MountIdleHours:      o.MountIdle.Hours(),
-			BuildRetentionHours: o.BuildRetention.Hours(),
-			MapRetentionHours:   o.MapRetention.Hours(),
-			CycleHours:          o.Cycle.Hours(),
-			CacheTTLHours:       o.CacheTTL.Hours(),
-			LongestPushHours:    o.LongestPush.Hours(),
-			Shards:              o.Shards,
+			GraceHours:             o.Grace.Hours(),
+			MountIdleHours:         o.MountIdle.Hours(),
+			BuildRetentionHours:    o.BuildRetention.Hours(),
+			SnapshotRetentionHours: o.SnapshotRetention.Hours(),
+			MapRetentionHours:      o.MapRetention.Hours(),
+			CycleHours:             o.Cycle.Hours(),
+			CacheTTLHours:          o.CacheTTL.Hours(),
+			LongestPushHours:       o.LongestPush.Hours(),
+			Shards:                 o.Shards,
 		},
 		Roots: make(map[string]*RootCounts),
 		Types: make(map[string]*TypeReport),
@@ -461,11 +473,10 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
-	revisions, mounts, workspaces, err := pinnedRevisions(ctx, d.objs, refs.mounts, refs.workspaces, servers.keepAliveTouchLimit(snapshot, o.Grace))
+	revisions, pins, err := pinnedRevisions(ctx, d.objs, refs, servers.keepAliveTouchLimit(snapshot, o.Grace))
 	if err != nil {
 		return nil, err
 	}
-	r.LiveMounts, r.Workspaces = mounts, workspaces
 	r.Seconds.Mounts = time.Since(step).Seconds()
 
 	step = time.Now()
@@ -524,13 +535,11 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		if d.addRoot(m, g, RootPinnedRevisions, rev.hash, rootRef{kind: rootPinned, i: i}) {
 			continue
 		}
-		c := &r.LiveMounts
-		if !rev.src.workspace.IsZero() {
-			c = &r.Workspaces
-		}
+		c := pins.counts(rev.src)
 		c.DanglingRevisions++
 		c.sample("dangling_revisions", rev.src)
 	}
+	r.LiveMounts, r.Workspaces, r.Snapshots = pins.mounts, pins.workspaces, pins.snapshots
 	for i, root := range refs.roots[pinnedAt:] {
 		d.addRoot(m, g, string(root.class), root.target, rootRef{kind: rootOfRef, i: pinnedAt + i})
 	}

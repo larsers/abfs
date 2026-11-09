@@ -23,6 +23,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/google/abfs/binding"
+	cachemanclient "github.com/google/abfs/shared/cacheman/client"
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/args"
 	"github.com/google/abfs/shared/cmd/clierr"
@@ -32,7 +33,16 @@ import (
 type snapshotCmd struct {
 	*wsCmd
 	restoreHex string
-	abfs       *binding.Client
+	abfs       snapshotClient
+	refs       refPutter
+}
+
+// snapshotClient is the part of the ABFS client that ws snapshot uses.
+type snapshotClient interface {
+	Snapshot(ctx context.Context) (binding.Snapshot, error)
+	RestoreSnapshot(ctx context.Context, snap binding.Snapshot) error
+	MountDetails() (*binding.MountDetails, error)
+	Store() entities.CASStore
 }
 
 func newSnapshotCmd(c *wsCmd) *snapshotCmd {
@@ -67,7 +77,11 @@ func (c *snapshotCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		}
 	}()
 	c.abfs = abfs
+	c.refs = cachemanclient.NewHTTPClientWithTimeout(c.Config.CacheDir, snapshotRefTimeout)
+	return c.exec(ctx)
+}
 
+func (c *snapshotCmd) exec(ctx context.Context) error {
 	if c.restoreHex == "" {
 		snap, err := c.snapshot(ctx)
 		if err != nil {
@@ -84,10 +98,10 @@ func (c *snapshotCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	if err != nil {
 		return err
 	}
-
-	if err := abfs.RestoreSnapshot(ctx, snap.Snapshot); err != nil {
+	if err := c.abfs.RestoreSnapshot(ctx, snap.Snapshot); err != nil {
 		return err
 	}
+	c.putRef(snapHash)
 	fmt.Println("Done.")
 	return nil
 }
@@ -115,5 +129,6 @@ func (c *snapshotCmd) snapshot(ctx context.Context) (*binding.WSSnapshot, error)
 	if err := c.abfs.Store().PutObject(ctx, wsSnap.Hash, wsSnap.Encoded); err != nil {
 		return nil, err
 	}
+	c.putRef(wsSnap.Hash)
 	return wsSnap, nil
 }

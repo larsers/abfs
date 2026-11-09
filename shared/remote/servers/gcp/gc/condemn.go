@@ -140,7 +140,7 @@ func Condemn(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucke
 // blockingRootClasses are the root classes in which a root without a gc row
 // stops a condemn: what such a root keeps is not known.
 var blockingRootClasses = []string{
-	string(RefSource), string(RefProjectStatus), string(RefPushedPacks), string(RefWorkspace), string(RefMount), RootPermanent,
+	string(RefSource), string(RefProjectStatus), string(RefPushedPacks), string(RefWorkspace), string(RefSnapshot), string(RefMount), RootPermanent,
 }
 
 // condemnBlockers returns the reasons in the report r why the cycle must not
@@ -172,6 +172,9 @@ func condemnBlockers(r *Report, o *CondemnOpts) []string {
 	}
 	if r.Workspaces.Errors > 0 {
 		add("the pins of %d workspaces could not be read", r.Workspaces.Errors)
+	}
+	if r.Snapshots.Errors > 0 {
+		add("the pins of %d snapshots could not be read", r.Snapshots.Errors)
 	}
 	for _, class := range blockingRootClasses {
 		if c := r.Roots[class]; c != nil && c.Dangling > 0 {
