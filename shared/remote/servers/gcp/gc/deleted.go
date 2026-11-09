@@ -53,8 +53,8 @@ const (
 	prunedMarker = "pruned"
 	// undoWindow is the shortest time delete and ref records are kept. It is
 	// the shortest soft delete retention under which the chunk step deletes
-	// bucket chunks, the time a deleted chunk can come back, and longer than
-	// the retention of the backups an undo restores from.
+	// bucket chunks, the time a deleted chunk can come back, and no shorter
+	// than the retention of the backups an undo restores from.
 	undoWindow = 7 * 24 * time.Hour
 )
 
