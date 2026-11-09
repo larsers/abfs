@@ -31,15 +31,24 @@ import (
 // DefaultWalkWorkers is the number of pinned revisions Walk walks in parallel.
 const DefaultWalkWorkers = 16
 
+// maxTagChain is the most annotated tags the walk follows from a pinned
+// revision to its commit.
+const maxTagChain = 10
+
 // What a walk found a key as.
 const (
 	WalkMountDetails   = "mount-details"
 	WalkManifest       = "manifest"
 	WalkPinnedManifest = "pinned-manifest"
 	WalkCommit         = "commit"
+	WalkTag            = "tag"
 	WalkTree           = "tree"
 	WalkBlob           = "blob"
 	WalkSubmodule      = "submodule"
+	// WalkRevision is a pinned revision, and WalkTagTarget the object a tag
+	// names, that could not be read or is neither a commit nor a tag.
+	WalkRevision  = "revision"
+	WalkTagTarget = "tag-target"
 	// WalkDirHash prefixes the type of what the walk found below the tree a
 	// pinned manifest names for a project in place of its commit's tree.
 	WalkDirHash = "dir-hash-"
@@ -336,7 +345,7 @@ func (rw *revisionWalk) failed(ctx context.Context, what string, h Hash, path st
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	rw.incomplete = append(rw.incomplete, fmt.Sprintf("%s %s at %s of commit %s: %v", what, h, path, rw.rev.commit, err))
+	rw.incomplete = append(rw.incomplete, fmt.Sprintf("%s %s at %s of revision %s: %v", what, h, path, rw.rev.commit, err))
 	return nil
 }
 
@@ -345,18 +354,30 @@ func (w *walker) walkCommit(ctx context.Context, rw *revisionWalk) error {
 	if !rev.dirHash.IsZero() {
 		return w.walkTree(ctx, rw, rev.dirHash, rev.path, make(map[Hash]bool))
 	}
-	rw.hit(w, rev.commit, WalkCommit, rev.path)
-	_, obj, err := remote.DecodeObject(ctx, w.objs, rev.commit)
-	if err != nil {
-		return rw.failed(ctx, "commit", rev.commit, rev.path, err)
+	// A pinned revision can be an annotated tag; the checkout holds the
+	// commit the tag names.
+	h, what := rev.commit, WalkRevision
+	for range maxTagChain + 1 {
+		_, obj, err := remote.DecodeObject(ctx, w.objs, h)
+		if err != nil {
+			rw.hit(w, h, what, rev.path)
+			return rw.failed(ctx, what, h, rev.path, err)
+		}
+		switch o := obj.(type) {
+		case *gitobjects.Commit:
+			rw.hit(w, h, WalkCommit, rev.path)
+			// The first link of a commit is its tree; the parents are
+			// history, which a checkout does not hold.
+			return w.walkTree(ctx, rw, o.Links()[0], rev.path, make(map[Hash]bool))
+		case *gitobjects.Tag:
+			rw.hit(w, h, WalkTag, rev.path)
+			h, what = o.Links()[0], WalkTagTarget
+		default:
+			rw.hit(w, h, what, rev.path)
+			return rw.failed(ctx, what, h, rev.path, fmt.Errorf("unexpected object %T", obj))
+		}
 	}
-	c, ok := obj.(*gitobjects.Commit)
-	if !ok {
-		return rw.failed(ctx, "commit", rev.commit, rev.path, fmt.Errorf("unexpected object %T", obj))
-	}
-	// The first link of a commit is its tree; the parents are history, which
-	// a checkout does not hold.
-	return w.walkTree(ctx, rw, c.Links()[0], rev.path, make(map[Hash]bool))
+	return rw.failed(ctx, "tag", rev.commit, rev.path, fmt.Errorf("more than %d nested tags", maxTagChain))
 }
 
 func (w *walker) walkTree(ctx context.Context, rw *revisionWalk, h Hash, path string, seen map[Hash]bool) error {
