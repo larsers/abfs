@@ -63,7 +63,7 @@ SHA256SUMS           of every other file
 | What a chart value does, its default, which names must match the KCC tree | `docs/configuration.md` |
 | What a CI build pod needs, the example Job, Airflow | `docs/ci-job.md` |
 | A known error message | `docs/troubleshooting.md` |
-| The ABFS server, client and pusher themselves | `doc/sysadmin/` and `doc/android-dev/` in the ABFS source tree (`source/` in a bundle); the GCP server in `doc/sysadmin/GCP_SERVER.md` |
+| The ABFS server, client and pusher themselves | `doc/sysadmin/` and `doc/android-dev/` in the ABFS source tree (`source/` in a bundle); the GCP server in `doc/sysadmin/GCP_SERVER.md`, its garbage collector in `doc/sysadmin/GCP_GC.md` |
 
 ## Commands
 

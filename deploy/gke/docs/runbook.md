@@ -224,7 +224,7 @@ Garbage collection is off by default. Neither backend mode creates its resources
 
 The Spanner tables are never entries of the Config Connector `ddl` list. That list is ordered and append-only, so garbage collector entries in it would collide with the base schema entries of later releases. Config Connector does not read the schema back from Spanner, so tables that `init` adds do not change the `SpannerDatabase`.
 
-To turn it on, follow "Enable or disable garbage collection" in `doc/sysadmin/GCP_SERVER.md` of the deployed commit (in `source/` of the bundle). In this deployment, its steps 1 and 2 become these three:
+To turn it on, follow "Enable or disable garbage collection" in `doc/sysadmin/GCP_GC.md` of the deployed commit (in `source/` of the bundle). In this deployment, its steps 1 and 2 become these three:
 
 1. With `backend-new`, list `components/gc` after `backend-new` in the overlay, apply it, and wait until every object is Ready. Do this before `init --gc`: Config Connector deletes a column family of `objects` that the object does not list, so a family `g` that `init` created would be removed again.
 2. Run `init --gc` from the workstation as in [Conformance check](#conformance-check), with `GC=--gc`. It adds the Spanner tables, and with `backend-existing` also the Bigtable parts, so on this run the before and after files differ (with `backend-existing` the describe of the table `gc` before `init` also fails, because the table does not exist yet). Then run the check again with `GC=--gc`; that run must print `conformant`.
