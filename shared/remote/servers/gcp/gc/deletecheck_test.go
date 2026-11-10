@@ -189,11 +189,11 @@ func TestDeleteBlockers(t *testing.T) {
 			s.CacheTTL = 0
 			c.addServer(s)
 		}, []string{"server srv-0-old: keeps cache entries without a TTL"}, nil},
-		{"stopped server of the window with a TTL above the cycle", func(c *deleteCase) {
+		{"stopped server of the window with a TTL the grace does not cover", func(c *deleteCase) {
 			s := stoppedServer("srv-0-old", c.ev.snapshot.Add(-2*time.Hour))
-			s.CacheTTL = 30 * time.Hour
+			s.CacheTTL = 70 * time.Hour
 			c.addServer(s)
-		}, []string{"plus the largest server cache TTL 30h0m0s", "server srv-0-old: cache TTL 30h0m0s is not shorter than the cycle"}, nil},
+		}, []string{"plus the largest server cache TTL 70h0m0s", "grace 72h0m0s is shorter than the cache TTL 70h0m0s of server srv-0-old plus the longest push 3h0m0s"}, nil},
 		{"stopped server before the window with bad settings", func(c *deleteCase) {
 			s := stoppedServer("srv-0-old", c.ev.snapshot.Add(-73*time.Hour))
 			s.TouchInterval, s.CacheTTL, s.LinkValidation = 0, 0, false
@@ -401,10 +401,10 @@ func TestLiveBlockers_MixedFleet(t *testing.T) {
 	require.Equal([]string{"5 server hosts write a GC heartbeat, but at least 6 are expected"}, liveBlockers(e, &o))
 
 	o.MinReplicas = 5
-	e.replicas[1].CacheTTL = 30 * time.Hour
+	e.replicas[1].CacheTTL = 0
 	got := liveBlockers(e, &o)
 	require.Len(got, 1)
-	require.Contains(got[0], "replica old-1-bb: cache TTL 30h0m0s is not shorter than the cycle")
+	require.Contains(got[0], "replica old-1-bb: keeps cache entries without a TTL")
 }
 
 // The types to delete must be known, there is at least one delete in

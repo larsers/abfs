@@ -157,7 +157,7 @@ func TestPutObject_GCOffWritesNoGCRow(t *testing.T) {
 
 func TestNew_GCOption(t *testing.T) {
 	require := require.New(t)
-	s := newEmulatorServer(t, &NewServerOpts{GC: true})
+	s := newEmulatorServer(t, &NewServerOpts{GC: true, CacheTTL: time.Hour, GCTouchInterval: time.Hour})
 	require.NotNil(s.gcEdges)
 	// New adds the empty file and directory through PutObject.
 	for _, key := range []entities.Hash{entities.EmptyFileHash, entities.EmptyDirHash} {

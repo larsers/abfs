@@ -6,7 +6,7 @@ Garbage collection removes objects that nothing needs any more from the tables a
 
 Garbage collection is off by default. Three parts take part when it is on:
 
-* the collector, `abfs server gcp gc run`, a job that runs one cycle at a time, once per `--cycle` (default `24h`);
+* the collector, `abfs server gcp gc run`, a job that runs one cycle at a time on a schedule, such as once a day (see [Timing bounds](#timing-bounds));
 * the servers, started with `--gc`, which record for the collector which objects are used;
 * the clients, with the client option `gc-keepalive`, which keep their mounts and the content they wrote visible to the collector.
 
@@ -48,8 +48,8 @@ A rescue shows that an object was still in use, so the delete of cycle N+1, a co
 | `abfs server gcp --gc` (server flag) | The server side: `gc` rows, touches, rescues, heartbeats | `gc` rows, touches, heartbeat rows; deletes nothing | On every server while garbage collection is on |
 | `gc backfill` | Writes the `gc` rows that objects lack or that have outdated edge rules | `gc` rows | After every server runs with `--gc`, and after an upgrade of the edge rules |
 | `gc run --dry-run` | Runs one cycle that only reports | `GcState`, removal of old heartbeat rows | Before condemn mode, and any time to look |
-| `gc run --condemn` | A dry run that also lists and marks the unreachable objects | Lists in the bucket, markers | Once per `--cycle`, after clean dry runs |
-| `gc run --delete` | A condemn cycle that first deletes from the previous list, deletes chunks and removes expired refs | Deletes rows, chunks and refs; writes records | Once per `--cycle`, after clean condemn cycles, with backups between cycles |
+| `gc run --condemn` | A dry run that also lists and marks the unreachable objects | Lists in the bucket, markers | On the job's schedule, after clean dry runs |
+| `gc run --delete` | A condemn cycle that first deletes from the previous list, deletes chunks and removes expired refs | Deletes rows, chunks and refs; writes records | On the job's schedule, after clean condemn cycles, with backups between cycles |
 | `gc undo` | Writes back what delete cycles deleted, from tables restored from backups | `objects`, `gc`, `maps` and `chunks` rows, bucket metadata | After a wrong delete, with the delete job stopped |
 | `gc walk` | Tells whether keys are in the checkouts of mounts, from object content | Nothing | To explain a key that a client used after it was condemned |
 
@@ -62,11 +62,11 @@ Garbage collection is off unless it is turned on, on the servers and on the clie
 1. Run `abfs server gcp init --gc` to add the garbage collector resources. A server with `--gc` refuses to start without them.
 2. Restart every server with `--gc`. From then on each new object gets its `gc` row.
 3. Run `abfs server gcp gc backfill` for the objects added before. Start it after the last server was restarted with `--gc`, so that no object is added without a row after the scan passed its key.
-4. Turn on the client option `gc-keepalive`, for all clients at once in the central client configuration (`abfs edit config:clients/configs`, see the [System Admin doc](README.md)) with `gc-keepalive: true` under `config:`, or per client with `abfs config`. Set it in the configuration cacheman starts from as well as in the one the mounts start from. Mounts started after the change rewrite their mount ref every `gc-keepalive-ref-interval` (default `15m`) and send the hashes of what they hold to the server every `gc-keepalive-touch-interval` (default `18h`), at most 10,000 hashes per second. A send that fails is tried again after 5 minutes, then after twice the previous wait, up to half the touch interval, until one works. Both intervals apply only with `gc-keepalive`; `0` turns either off.
-5. Run `abfs server gcp gc run --dry-run` once per `--cycle` while seeding and builds run, and check each report: no `replicas.warnings`, no `consistency.missing_gc_rows`, no `objects.outdated_rows`, and the dangling edges and roots.
-6. When the dry runs are clean, run `abfs server gcp gc run --condemn` once per `--cycle` instead (see [Condemn mode](#condemn-mode)).
+4. Turn on the client option `gc-keepalive`, for all clients at once in the central client configuration (`abfs edit config:clients/configs`, see the [System Admin doc](README.md)) with `gc-keepalive: true` under `config:`, or per client with `abfs config`. Set it in the configuration cacheman starts from as well as in the one the mounts start from. Mounts started after the change rewrite their mount ref every 15 minutes, a fixed interval that their mount details record (a configuration that still sets `gc-keepalive-ref-interval` loads, and the key is ignored), and send the hashes of what they hold to the server every `gc-keepalive-touch-interval` (default `18h`), at most 10,000 hashes per second. A send that fails is tried again after 5 minutes, then after twice the previous wait, up to half the touch interval, until one works. The touch interval applies only with `gc-keepalive`; `0` turns the sends off.
+5. Run `abfs server gcp gc run --dry-run` on the job's schedule while seeding and builds run, and check each report: no `replicas.warnings`, no `consistency.missing_gc_rows`, no `objects.outdated_rows`, and the dangling edges and roots.
+6. When the dry runs are clean, run `abfs server gcp gc run --condemn` on the same schedule instead (see [Condemn mode](#condemn-mode)).
 7. Prepare delete mode: a Bigtable instance with one cluster (see [Delete checks](#delete-checks)), an [app profile](#app-profile-of-the-collector) and the [permissions](#permissions-of-the-collector) of the collector, the bucket's [soft delete](#soft-delete-of-the-bucket), versioning off and no retention policy, and a job that takes [backups](#backups) between cycles.
-8. When the condemn cycles have run clean for a week or more under real use, run `abfs server gcp gc run --delete` once per `--cycle` instead (see [Delete mode](#delete-mode)). Before the first one, check the last condemn reports:
+8. When the condemn cycles have run clean for a week or more under real use, run `abfs server gcp gc run --delete` on the same schedule instead (see [Delete mode](#delete-mode)). Before the first one, check the last condemn reports:
    * `delete.refused` names no reason you cannot explain;
    * the `delete.plan` counts per type and their samples are explained;
    * `live_mounts.without_keepalive` and `live_mounts.without_local_write_check` are 0;
@@ -90,7 +90,7 @@ To turn garbage collection off, stop the collector job, restart the servers with
 ### Upgrades
 
 * Run `init --gc` with the new version first, then upgrade the servers and the collector together. A collector of an older version sees no heartbeat of servers that write `GcServers`, so its condemn cycles refuse on the host count.
-* After the upgrade, no server of an older version may run against the store, not even briefly. The collector sees such a server only while it runs at one of its reads of `GcReplicas`; one that starts and stops between two reads leaves no trace, and it ran without the timing bounds and loss records the delete checks rely on. One started with `--gc-heartbeat-interval 0` writes no row at all.
+* After the upgrade, no server of an older version may run against the store, not even briefly. The collector sees such a server only while it runs at one of its reads of `GcReplicas`; one that starts and stops between two reads leaves no trace, and it ran without the timing bounds and loss records the delete checks rely on. A server of an older version started with `--gc-heartbeat-interval 0` writes no row at all.
 * Use the same or a newer version for the collector than for the servers: a `gc` row with an object type the collector does not know stops the run, and a collector of an older version does not read `MapRowLossTime`, so it misses the map row touches that servers of this version lost, which older servers recorded in `TouchLossTime`.
 
 ## Where the data goes
@@ -129,7 +129,7 @@ The scans and writes of the collector are batch work. Give the `gc` commands the
 gcloud bigtable app-profiles create abfs-gc --instance=<bt-instance> --route-to=<cluster> --transactional-writes --priority=PRIORITY_LOW --description="ABFS GC collector"
 ```
 
-`gc backfill`, `gc run` and `gc undo` read the profile at start; `gc run --delete` fails before it scans when the profile cannot be read or lacks one of these settings, and the other modes and commands only warn. Every report records the profile in `app_profile`. `gc backfill`, `gc run` and `gc undo` also export the metrics of the client libraries by default (`--gcp-client-metrics`), so the attempt latencies and retries of the collector show per app profile in Cloud Monitoring.
+`gc backfill`, `gc run` and `gc undo` read the profile at start; `gc run --delete` fails before it scans when the profile cannot be read or lacks one of these settings, and the other modes and commands only warn. Every report records the profile in `app_profile`. With `--gcp-client-metrics`, off by default as on the server, the `gc` commands export the metrics of the client libraries, so the attempt latencies and retries of the collector show per app profile in Cloud Monitoring.
 
 ### Permissions of the collector
 
@@ -179,20 +179,20 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 
 ### A cycle
 
-1. Takes the lease in `GcState`, increments the cycle number and records the start and snapshot times. While another process holds a valid lease the command fails. The lease (`--lease`, default 5 minutes) is renewed while the cycle runs, and the cycle stops itself if the lease is lost or cannot be renewed in time.
+1. Takes the lease in `GcState`, increments the cycle number and records the start and snapshot times. While another process holds a valid lease the command fails. The lease (5 minutes) is renewed while the cycle runs, and the cycle stops itself if the lease is lost or cannot be renewed in time.
 2. Reads the server heartbeats (see [Heartbeat](#heartbeat)) in `GcServers`, and in `GcReplicas` those of servers of older versions. It warns about each live server, one seen within the last 30 minutes, whose settings break the timing rules:
    * a `--gc-touch-interval` of 0 or longer than half of `--grace`;
-   * a `--cache-ttl` of 0, not shorter than `--cycle`, or longer than the command's `--cache-ttl`;
+   * a `--cache-ttl` of 0;
    * GC edge rules older than the command's.
 
-   The warnings are in the report and the log; the condemn and delete modes refuse to run with any of them. The report counts the distinct host names among the live servers (`replicas.hosts`, the part of each ID before its last `-`) and their live rows per host (`replicas.rows_per_host`). A server that stops cleanly records the stop in its row, which then no longer counts as live unless the stop recorded lost object touches (`replicas.stopped` counts the others).
+   It also warns when `--grace` is shorter than the largest `--cache-ttl` of the servers that may have run within the grace plus `--longest-push`, and when no such server wrote a heartbeat; `settings.cache_ttl_hours` reports that largest TTL. The warnings are in the report and the log; the condemn and delete modes refuse to run with any of them. The report counts the distinct host names among the live servers (`replicas.hosts`, the part of each ID before its last `-`) and their live rows per host (`replicas.rows_per_host`). A server that stops cleanly records the stop in its row, which then no longer counts as live unless the stop recorded lost object touches (`replicas.stopped` counts the others).
 
    The command deletes the `GcServers` rows whose last heartbeat and stop are older than the longest of a day, the largest `--grace` of any condemn or delete cycle plus 10 hours, and its own `--grace` plus 10 hours (`replicas.servers_removed`), and the `GcReplicas` rows not written for a day (`replicas.removed`); the 10 hours are an hour and the 9 hours before the window in which a lost map row touch still counts. It records in `GcState` since when every read found `GcReplicas` empty (`replicas.legacy_servers_gone_time`), and the latest lost map row touch that shortens the keep-alive limit (`replicas.map_row_loss_time`, see [Client caches](#client-caches)). For a server that crashed, that time is 30 minutes after its last heartbeat.
 3. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
 4. For each live mount (see [Mounts and unmounts](#mounts-and-unmounts)), reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
-5. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
+5. Scans the `gc` table twice in 16 key ranges: first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
 6. Marks in memory everything the roots reach. It walks the roots one at a time in a fixed order: the refs of the classes source, workspaces, snapshots, mounts and unmount records, then the pinned revisions, builds, other `abfs-meta` refs, empty objects, recent objects and map rows, so that the report can name the root that reached an object first. Edges to objects without a `gc` row are skipped and counted. A `gc` row with an object type the binary does not know stops the run.
-7. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
+7. Scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
 8. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
 
 ### Root classes
@@ -211,7 +211,7 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 | Recent objects | objects whose `gc` row was written or touched within `--grace` (default `72h`) before the snapshot | `--grace` |
 | Empty objects | the empty file and the empty directory, which every server writes at start | always |
 
-Map rows with request types not listed are kept. A ref past its retention is no root; delete mode removes it (see [Ref removal](#ref-removal)). `--grace` must be at least `2 x --cycle + --cache-ttl + --longest-push` (defaults `24h`, `6h` and `3h`); the command refuses to run otherwise.
+Map rows with request types not listed are kept. A ref past its retention is no root; delete mode removes it (see [Ref removal](#ref-removal)). `--grace` must be longer than `--longest-push` (default `3h`, the longest git-pusher push or build upload), or the command refuses to run. It must also cover the largest `--cache-ttl` of the servers that may have run within it plus `--longest-push`, or condemn and delete cycles refuse (step 2 of [A cycle](#a-cycle)). Each server records its cache TTL in its heartbeat row, and the collector reads it there, as the [timing bounds](#timing-bounds) of delete mode do. `--mount-idle` must be at least 1 hour, four times the interval at which clients rewrite their mount ref.
 
 #### Mounts and unmounts
 
@@ -259,7 +259,7 @@ Memory grows with the `gc` table. The data of the mark takes about 35 bytes per 
 
 The scans read rows faster than Go's garbage collector frees them, so with the default settings the heap grows to about twice the data: 1.5 million objects and 30 million edges take about 170 MB of data and 360 MB of heap. Set `GOMEMLIMIT` for the command to about 1.2 times the data and the heap stays near it (about 190 MB for the same table). A table of 10^8 objects, 2x10^9 edges and 10^7 map rows needs about 12 GB of data: give the job 16 GB with `GOMEMLIMIT=14GiB`, or about 24 GB without it.
 
-The scans read the whole `gc` table, the `maps` keys and, with `--consistency`, the `meta` family of `objects`. Run the command with the [app profile of the collector](#app-profile-of-the-collector).
+The scans read the whole `gc` table, the `maps` keys and the `meta` family of `objects`. Run the command with the [app profile of the collector](#app-profile-of-the-collector).
 
 ## Walk the checkouts of mounts
 
@@ -277,14 +277,14 @@ abfs server gcp gc walk --mount-details <hash>[,<hash>] --key <key>[,<key>] --pr
 * It prints, per key, `inside` with its type, the first path that reached it (project path, then the path in the project, in manifest order), the pinned revision in the column `COMMIT` (a tag when the manifest pins one) and the mount details, or `outside`.
 * Its reads rescue and touch nothing; it takes no lease and writes nothing.
 * It fails when the walk is incomplete: mount details without a pinned manifest, revisions or annotated trees that are not hashes, objects it could not read, objects of an unexpected type, such as a tag of a tree, or more than 10 nested tags. A key outside may then be inside.
-* It reads every tree of the pinned revisions once per revision, `--workers` revisions at a time (default 16).
+* It reads every tree of the pinned revisions once per revision, 16 revisions at a time.
 
 ## Condemn mode
 
 `abfs server gcp gc run --condemn` runs the cycle of a dry run and then marks every object the mark found unreachable: it sets the cell `g:condemned` of its `objects` row to the cycle number, 8 bytes big-endian. It deletes nothing. A server with `--gc` that reads a marked object clears the marker and answers as for any other object (see [Rescue](#rescue)), so a marked object that a client reads again shows that the mark called something garbage that was still in use.
 
 ```sh
-abfs server gcp gc run --condemn --expected-replicas <hosts> --project <project> --instance <spanner-instance> --bucket <bucket> [--report gc-report.json] [--condemn-rate 5000] [--keep-lists 7] [--explain <key>[,<key>]]
+abfs server gcp gc run --condemn --expected-replicas <hosts> --project <project> --instance <spanner-instance> --bucket <bucket> [--report gc-report.json] [--explain <key>[,<key>]]
 ```
 
 ### Condemn refusals
@@ -294,7 +294,7 @@ The cycle condemns only when its own report is clean. It refuses, writes no mark
 * a warning in `replicas.warnings`;
 * the number of distinct host names among the servers seen within the last 30 minutes (`replicas.hosts`) differs from `--expected-replicas`, or is outside `--min-replicas` and `--max-replicas`;
 * a host has more than one live row: a server there crashed, or stopped with lost object touches, within the last 30 minutes and was started again, or two servers share the host name. A server that stops cleanly records its stop in its row (see [Heartbeat](#heartbeat)), so a restart alone does not refuse. A row without a stop means a crash, a kill or a preemption, and a stop that lost touches records the loss. The touches that the earlier process held in its buffer may be lost, so check its log for the stop line and wait until its row is older than 30 minutes;
-* the consistency check did not run (`--consistency=false` is refused for `--condemn`), or found objects without a `gc` row;
+* the consistency check did not run, or found objects without a `gc` row;
 * `gc` rows with outdated or newer edge rules (`objects.outdated_rows`, `objects.newer_rows`);
 * `live_mounts.errors`, `workspaces.errors` or `snapshots.errors`: a pin that could not be read may hide commits a mount, workspace or snapshot needs;
 * a dangling root in the classes `source`, `project-status`, `pushed-packs`, `workspace`, `snapshot`, `mount` or `permanent`. Dangling `pinned-revisions` roots, for example of projects a mount skipped with `--ignore-missing-projects`, do not refuse; check them in `dangling_revisions` and its samples.
@@ -312,8 +312,8 @@ Give each server enough time to stop: the time the platform allows before it kil
 1. Reads the list that `GcState.ListLocation` names, the list of the last condemn cycle, and has the mark record the root that first reaches each of its keys.
 2. Deletes the markers of the keys of that list that the mark found live and writes every such key to `gc/condemned/<state>/<cycle>.live` in the server bucket (see [The .live object](#the-live-object)).
 3. Writes the list of the objects it condemns to `gc/condemned/<state>/<cycle>` (the state is `default`), and records it in `GcState` (`ListLocation`, `ListSnapshotTime`, `ListComplete` false). The list is a binary object: a header with the cycle, the snapshot time, the run and the type names, then per object its 20-byte key, its type and its size, in key order, 29 bytes per object.
-4. Writes the markers of the objects of the list, in key order, in batches of 2,000, at most `--condemn-rate` (default `5000`) per second (`0` means no limit). It marks only objects whose `objects` row the consistency scan read, so it never creates a row. Each write replaces any older marker, so an object that stays unreachable carries the newest cycle number. Then it sets `ListComplete` and the completion time.
-5. Removes the list and `.live` objects of all but the newest `--keep-lists` (default `7`) cycles.
+4. Writes the markers of the objects of the list, in key order, in batches of 2,000, at most 5,000 per second. It marks only objects whose `objects` row the consistency scan read, so it never creates a row. Each write replaces any older marker, so an object that stays unreachable carries the newest cycle number. Then it sets `ListComplete` and the completion time.
+5. Removes the list and `.live` objects of all but the newest 7 cycles.
 
 The list is written before any marker, and the markers of the previous list are cleared before the new list replaces it. So a cycle that stops midway leaves every marker in a list that the next cycle reads: that cycle clears the markers of keys now live and rewrites the others to its own number. The report section `condemn` counts the objects marked, per type, and their bytes.
 
@@ -372,15 +372,12 @@ Only `--delete` takes the flags from `--delete-types` to `--allow-no-soft-delete
 | `--delete-types` | every type | Object types, separated by commas, that the cycle may delete. Others are kept, with every object they link |
 | `--accept-mounts-without-keepalive` | off | Delete blobs, trees and eval objects while live mounts run without `gc-keepalive`; the check then only warns, except after a lost map row touch (see [Client caches](#client-caches)) |
 | `--no-backup-check` | off | Delete without the [backups](#backups) of the four tables |
-| `--delete-rate` | `2000` | Objects deleted per second (`0` means no limit) |
-| `--delete-workers` | `32` | Conditional deletes in flight, split evenly over the `--shards` key ranges; at least `--shards` |
-| `--chunk-delay` | `1h` | How long after its record the chunks of a deleted object are deleted, at the earliest in the next cycle; at least 12 minutes: the 10 minute lifetime of signed chunk URLs plus a minute of clock skew on each side |
-| `--chunk-rate` | `500` | Chunks deleted per second (`0` means no limit) |
 | `--allow-no-soft-delete` | off | Delete bucket chunks although the bucket keeps deleted objects for less than 7 days (see [Soft delete](#soft-delete-of-the-bucket)) |
 | `--mount-idle`, `--build-retention` | `336h`, `720h` | As in the dry run; delete mode removes the refs past them |
 | `--snapshot-retention` | `720h` | Keep what a snapshot ref reaches, with the commits its mount was pinned to, for this time after the ref was written; delete mode removes older snapshot refs. All modes read it |
-| `--write-deadline` | `30s` | Deadline of one attempt of a Bigtable write, the client library's retries included; at most an eighth of `--lease` |
-| `--gcp-client-metrics` | on | Export the client library metrics to Cloud Monitoring |
+| `--gcp-client-metrics` | off | Export the client library metrics to Cloud Monitoring |
+
+These are fixed: the delete step deletes at most 2,000 objects per second, with 32 conditional deletes in flight over the 16 key ranges; the chunk step deletes at most 500 chunks per second, and only those of records at least 15 minutes old, at the earliest in the next cycle, which is longer than the 10 minute lifetime of signed chunk URLs plus a minute of clock skew on each side; one attempt of a Bigtable write has a deadline of 30 seconds, a list object that plus its size at 8 MiB/s.
 
 ### Timing bounds
 
@@ -391,9 +388,11 @@ Each delete cycle checks its snapshot time against the list it deletes from:
 
 The window of a cycle starts `--grace` plus a minute before its snapshot; the checks of the servers cover every server process that may have run in it.
 
-At the defaults (`--cycle 24h`, `--cache-ttl 6h`, `--grace 72h`) a delete cycle must start at least about 6.1 hours after the previous cycle completed its list and less than 71 hours 57 minutes after that cycle's snapshot: one missed daily cycle still deletes, two do not. A cycle outside the bounds only condemns, and the cycle after it can delete again.
+At the defaults (`--cache-ttl 6h`, `--grace 72h`) and one cycle a day, a delete cycle must start at least about 6.1 hours after the previous cycle completed its list and less than 71 hours 57 minutes after that cycle's snapshot: one missed daily cycle still deletes, two do not. A cycle outside the bounds only condemns, and the cycle after it can delete again.
 
-For a trial on a small store, servers at `--cache-ttl 5m --gc-touch-interval 30m` and the collector at `--grace 90m --cycle 30m --cache-ttl 5m --longest-push 20m` make cycles 30 minutes apart. The lower bound is then the list completion plus about 10.2 minutes and the upper bound the list snapshot plus 87 minutes.
+The collector does not take the schedule as a setting: both bounds use the recorded times of the list. Choose the time between two cycles longer than the largest `--cache-ttl` of the servers plus the time a cycle takes to complete its list plus about 5 minutes, and shorter than half of `--grace` so that one missed cycle still deletes.
+
+For a trial on a small store, servers at `--cache-ttl 5m --gc-touch-interval 30m` and the collector at `--grace 90m --longest-push 20m`, run every 30 minutes, fit these rules. The lower bound is then the list completion plus about 10.2 minutes and the upper bound the list snapshot plus 87 minutes.
 
 ### Delete checks
 
@@ -410,6 +409,7 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 | Live mounts run without the GC keep-alive, and a server lost map row touches or crashed, which `--accept-mounts-without-keepalive` does not accept | Deletes wait until the loss is `--grace` plus about 9 hours old, or until those mounts end or run with `gc-keepalive` |
 | A server runs without link validation | Restart it without `--no-link-validation` |
 | A server's settings break the timing rules | Fix the setting; deletes wait until the server with the old setting stopped `--grace` plus a minute ago |
+| `--grace` is shorter than the largest cache TTL of the servers in the window plus `--longest-push` | Lower the servers' `--cache-ttl` or raise `--grace`; deletes wait until the server with the longer TTL stopped `--grace` plus a minute ago |
 | `GcReplicas` holds rows, no cycle recorded that it is empty, or it was first found empty after the window start | Servers of an older version ran. Stop them; deletes wait until `--grace` plus a minute after a cycle first found `GcReplicas` empty |
 | The Bigtable instance has more than one cluster, or its clusters cannot be listed | Delete mode needs an instance with one cluster: conditional writes sent to different clusters can both succeed |
 | The app profile refused a conditional write, or the probe failed | Use a profile with single-cluster routing and single-row transactions; check the [permissions](#permissions-of-the-collector) |
@@ -448,11 +448,11 @@ Before the objects, the step deletes the map rows that name a candidate, and the
 
 Each batch of the delete step writes the object `gc/deleted/<state>/<cycle>/<level>-<range>-<batch>` before any of its deletes. It holds a header with the cycle, the run, the start of the grace and the completion time of the list the cycle deleted from, then per object its 20-byte key and its `data:content` descriptor when a chunk is outside the row, and per map row the keys of its two ends. The chunk step and `gc undo` read these records.
 
-When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest `--keep-lists` cycles that have records, and every record flagged within the longer of 7 days and the bucket's soft delete retention. Before it removes the records of a cycle it writes `gc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts them and gives the age of the oldest.
+When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest 7 cycles that have records, and every record flagged within the longer of 7 days and the bucket's soft delete retention. Before it removes the records of a cycle it writes `gc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts them and gives the age of the oldest.
 
 ### Chunk step
 
-In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag that were created at least `--chunk-delay` ago. For each object of a record:
+In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag that were created at least 15 minutes ago. For each object of a record:
 
 | Object row | Outcome | Count |
 | --- | --- | --- |
@@ -530,9 +530,9 @@ The section `delete` holds:
 
 ### Planning figures
 
-* A delete step removes about 24,000 objects in about 19 seconds on one Bigtable node, about 0.8 ms per object. The default `--delete-rate` of 2,000 per second also bounds it: 10^6 candidates take at least about 8 minutes.
+* A delete step removes about 24,000 objects in about 19 seconds on one Bigtable node, about 0.8 ms per object. Its rate of at most 2,000 objects per second also bounds it: 10^6 candidates take at least about 8 minutes.
 * A condemn or delete cycle over about 71 million objects takes about 7 to 14 minutes on one node with autoscaling to 3.
-* Writing the markers of about 27,000 objects takes about 6 seconds at the default `--condemn-rate`.
+* Writing the markers of about 27,000 objects takes about 6 seconds at the rate of at most 5,000 per second.
 * A delete cycle checks each object written during its consistency scan while the scan runs: it reads the object's `gc` row, and its `objects` row only when the `gc` row is missing, in batches of 100 keys with 8 batches in flight, and keeps only counts and the batches in flight in memory. That is one row read per object. Bigtable rates one SSD node at up to 17,000 row reads per second ([performance](https://docs.cloud.google.com/bigtable/docs/performance)), so on a node with no other load than the collector 1 million objects written during a scan take about 1 minute of reads and 10 million about 10 minutes, less with more nodes. The collector reads at low priority, so a node busy with a seed checks slower.
 * When the checks fall behind, the scan waits for them, at most 15 minutes summed over its key ranges. The wait makes a delete cycle up to about 15 minutes longer than a condemn cycle, about the length of one more cycle at 71 million objects, and about 1 minute longer when all 16 key ranges wait at once. The checks share the node with the scan, so they also slow it. Past that wait the scan stops checking and cancels the reads in flight, finishes at full speed, and the cycle refuses its deletes. A cycle during a seed or a large catch-up of a git-pusher can refuse this way; deletes resume in a later cycle with fewer writes during its scan.
 * The step runs one level per link in a chain of unreachable objects: for a dropped branch of 10,000 commits, expect about 10,000 levels and an estimated 13 to 20 minutes of delete step and tens of thousands of delete records, which the next chunk step reads.
@@ -585,7 +585,7 @@ The set taken before cycle N is also the source of an undo of cycle N and later 
 What the undo does:
 
 * It checks that each restored table was restored from a backup of its live table that ended before the first delete record of cycle n was written; `--no-source-check` skips this. It fails when a cycle in the range has pruned records.
-* It takes the lease in the phase `undo`, which does not count as a condemn cycle. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two `--write-deadline` attempts and a minute.
+* It takes the lease in the phase `undo`, which does not count as a condemn cycle. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two write attempts of 30 seconds each and a minute.
 * It restores the newest cycle first and in each cycle the deepest level first, so children come back before their parents.
 * For each object whose row is absent: its bucket chunks must exist and get the custom metadata `abfs-undo=<cycle>`, so that a chunk step that read them earlier cannot delete them; its chunk rows and its `gc` row are written with a new time and a touch, so it is recent for `--grace`; its `objects` row comes last, without the marker.
 * An object is not restored, nor anything that links it, when a bucket chunk is missing, its restored row holds another descriptor than its record, or it links an object deleted since the backup that this run did not restore.
@@ -597,7 +597,8 @@ What the undo does:
 * No server of an older version may run against the store after an upgrade, not even briefly (see [Upgrades](#upgrades)).
 * A map row is deleted only when every end that has a `gc` row is of a type `--delete-types` allows.
 * Widen `--delete-types` from the top of the graph down: commits, `project-status` and build objects first, then trees and deep trees, then blobs. Blobs, trees and eval objects need every live mount on `gc-keepalive` with a cacheman that checks local writes.
-* The servers' `--gc-touch-interval` must be at most half of the collector's `--grace`, and their `--cache-ttl` shorter than `--cycle` and at most the collector's `--cache-ttl`. The flags are set apart; the dry run warns about each server that breaks the rule.
+* The servers' `--gc-touch-interval` must be at most half of the collector's `--grace`, and their largest `--cache-ttl` plus the collector's `--longest-push` at most `--grace`. A server with `--gc` refuses to start with either at `0`. The collector reads both from the heartbeat rows; the dry run warns when they break the rule.
+* Schedule the cycles as [Timing bounds](#timing-bounds) says: further apart than the largest `--cache-ttl` of the servers plus the time a cycle takes, and less than half of `--grace` apart.
 
 ## What the server does for the garbage collector
 
@@ -608,9 +609,10 @@ The collector runs as a separate job. With `--gc`, the server records for it whi
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--gc` | off | Run the server side of the garbage collector. It needs the resources of `abfs server gcp init --gc`. Off, the server reads and writes only what a server without garbage collection does, and the flags below have no effect |
-| `--cache-ttl` | `6h` | With `--gc`, how long cached object headers and content are used before the server reads them again from Bigtable; `0` keeps them until they are evicted, which refuses condemn and delete cycles |
-| `--gc-touch-interval` | `36h` | With `--gc`, length of the period in which the server writes at most one touch per object and map row; `0` writes none, which refuses condemn and delete cycles |
-| `--gc-heartbeat-interval` | `5m` | With `--gc`, time between two heartbeats of the server in the Spanner table `GcServers`; above 0 and at most `10m` |
+| `--cache-ttl` | `6h` | With `--gc`, how long cached object headers and content are used before the server reads them again from Bigtable; above 0 |
+| `--gc-touch-interval` | `36h` | With `--gc`, length of the period in which the server writes at most one touch per object and map row; above 0 |
+
+A server with `--gc` refuses to start with `--cache-ttl 0` or `--gc-touch-interval 0`. It writes its [heartbeat](#heartbeat) every 5 minutes, a fixed interval.
 
 ### GC edges
 
@@ -668,7 +670,7 @@ Every dropped or failed touch of an object is recorded in the server's heartbeat
 
 ### Cache TTL and write bound
 
-The header and content caches keep an entry for `--cache-ttl` and then read it again from Bigtable, so that every server sees a marker long before the collector deletes the object. The TTL counts from the start of the Bigtable read that loaded the entry, on a clock that keeps running while the VM is suspended. A read that itself took `--cache-ttl` or longer is not used: the call fails with `Unavailable` and the client retries. The collector needs its cycle to be longer than the TTL. A shorter TTL costs more Bigtable reads on directory listings.
+The header and content caches keep an entry for `--cache-ttl` and then read it again from Bigtable, so that every server sees a marker long before the collector deletes the object. The TTL counts from the start of the Bigtable read that loaded the entry, on a clock that keeps running while the VM is suspended. A read that itself took `--cache-ttl` or longer is not used: the call fails with `Unavailable` and the client retries. A delete cycle waits the largest TTL of the servers after the previous list was complete (see [Timing bounds](#timing-bounds)), and the collector's `--grace` must cover the TTL plus its `--longest-push`. A shorter TTL costs more Bigtable reads on directory listings.
 
 After a call validated the links of a new object, ref or map result, the writes that record it must end within 2 minutes of the start of the validation. A write later than that fails the call with `Unavailable`, and the client sends it again, which validates again. The timing bounds of delete mode count on this.
 
@@ -679,18 +681,18 @@ After a call validated the links of a new object, ref or map result, the writes 
 
 ### Heartbeat
 
-Each server writes its row in the Spanner table `GcServers` before it serves and then every `--gc-heartbeat-interval`. The row holds:
+Each server writes its row in the Spanner table `GcServers` before it serves and then every 5 minutes. The row holds:
 
 * an ID made of the host name and a random suffix, logged at start;
 * the version of the GC edge rules the server writes into the table `gc`, and `GcEnabled`, always true;
-* its `--gc-touch-interval`, `--cache-ttl` and `--gc-heartbeat-interval`;
+* its `--gc-touch-interval`, `--cache-ttl` and heartbeat interval;
 * `LinkValidation`, false with `--no-link-validation`;
 * `LastSeen`, the commit time, and `StatsTime`, a Spanner read time taken just before the server read its touch counts;
 * `TouchLossTime`, set by a heartbeat or the stop that records a loss: object touches dropped or failed since the last heartbeat, a pause of the process (the wall clock ran more than 10 seconds ahead of the monotonic clock, as in a VM suspend), or a gap between heartbeat attempts longer than the interval plus 251 seconds;
 * `MapRowLossTime`, set the same way when map row touches were dropped or failed since the last heartbeat. Servers of older versions leave it empty and record those losses in `TouchLossTime`;
 * `StoppedAt`, set by a clean stop.
 
-The collector uses the rows to see which server versions and settings run and which servers crashed or lost touches. A server that cannot write its first heartbeat within a minute fails to start. A later failed write is logged and counted; once the last successful one is older than two intervals plus 30 seconds, every call answers `Unavailable` until the next one succeeds.
+The collector uses the rows to see which server versions and settings run and which servers crashed or lost touches. A server that cannot write its first heartbeat within a minute fails to start. A later failed write is logged and counted; once the last successful one is older than two intervals plus 30 seconds (10 minutes 30 seconds), every call answers `Unavailable` until the next one succeeds.
 
 When the server stops, it writes the touches left in its buffer, for up to 10 seconds, and logs one line `GC touches at stop: ...` with the object touches written, dropped and failed during the stop and since the start, and the map row touches written, dropped and failed since the start, because its metrics are no longer exported by then. Then it records the stop in its row, with `TouchLossTime` when it lost object touches and `MapRowLossTime` when it lost map row touches since its last heartbeat. The row stays. A row whose last heartbeat is older than 30 minutes and that has no `StoppedAt` marks a crash, a kill or a preemption, whose buffered touches may be lost; the collector counts it as a loss of object and map row touches. So does a stop whose record failed.
 

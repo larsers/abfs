@@ -162,6 +162,42 @@ func (e *serverEvidence) longestCacheTTL(start time.Time) time.Duration {
 	return d
 }
 
+// graceTTL returns the server with the largest cache TTL among those that
+// may have run since start, from their rows in GcServers and GcReplicas, and
+// false when no such row exists.
+func (e *serverEvidence) graceTTL(start time.Time) (Replica, bool) {
+	var longest Replica
+	found := false
+	consider := func(r Replica) {
+		if !found || r.CacheTTL > longest.CacheTTL {
+			longest, found = r, true
+		}
+	}
+	for _, s := range e.inWindow(start) {
+		consider(Replica{ID: s.ID, CacheTTL: s.CacheTTL})
+	}
+	for _, r := range e.replicas {
+		if !r.LastSeen.Add(liveReplicaAge).Before(start) {
+			consider(r)
+		}
+	}
+	return longest, found
+}
+
+// graceProblem returns why the grace of o does not cover the largest cache
+// TTL of the servers that may have run since start and the longest push, or
+// "" when it does. Without such a server the grace cannot be checked.
+func (e *serverEvidence) graceProblem(start time.Time, o *DryRunOpts) string {
+	r, found := e.graceTTL(start)
+	switch {
+	case !found:
+		return "no server that may have run within the grace wrote a GC heartbeat, so the grace cannot be checked against the cache TTL of the servers"
+	case o.Grace < r.CacheTTL+o.LongestPush:
+		return fmt.Sprintf("grace %s is shorter than the cache TTL %s of server %s plus the longest push %s", o.Grace, r.CacheTTL, r.ID, o.LongestPush)
+	}
+	return ""
+}
+
 // keepAliveTouchLimit returns how soon after a server answered that a mount's
 // object is present the keep-alive must touch it again, so that the object is
 // recent at the mark of every cycle until then, for a cycle whose snapshot is
@@ -282,6 +318,9 @@ func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []stri
 	}
 	start := windowStart(snapshot, o.Grace)
 	in := e.inWindow(start)
+	if p := e.graceProblem(start, o); p != "" {
+		add("%s", p)
+	}
 	slices.SortFunc(in, func(a, b Server) int { return cmp.Compare(a.ID, b.ID) })
 	for i := range in {
 		s := &in[i]

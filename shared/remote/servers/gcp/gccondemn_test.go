@@ -194,7 +194,8 @@ func TestCondemnGC_RefusedRunWritesNothing(t *testing.T) {
 	require.ErrorAs(err, &refused)
 	require.NotNil(res)
 	require.Equal(refused.Reasons, res.Report.Condemn.Refused)
-	require.Contains(refused.Reasons[0], "0 server hosts write a GC heartbeat, but 1 are expected")
+	require.Contains(refused.Reasons[0], "no server that may have run within the grace wrote a GC heartbeat")
+	require.Contains(refused.Reasons[1], "0 server hosts write a GC heartbeat, but 1 are expected")
 	require.Equal(int64(1), res.Report.Objects.Unreachable)
 
 	var cells int

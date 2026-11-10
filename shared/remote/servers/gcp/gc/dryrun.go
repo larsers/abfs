@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/remote"
 )
 
@@ -36,13 +37,16 @@ const (
 	DefaultMountIdle      = 336 * time.Hour
 	DefaultBuildRetention = 720 * time.Hour
 	DefaultMapRetention   = 720 * time.Hour
-	DefaultCycle          = 24 * time.Hour
-	DefaultCacheTTL       = 6 * time.Hour
 	DefaultLongestPush    = 3 * time.Hour
 	DefaultScanShards     = 16
 
 	// DefaultSnapshotRetention keeps a workspace snapshot as long as a build.
 	DefaultSnapshotRetention = 720 * time.Hour
+
+	// minMountIdle is the shortest mount idle time: four times the interval
+	// at which clients with the GC keep-alive rewrite their mount ref, so
+	// that a live mount does not lose its ref between two rewrites.
+	minMountIdle = 4 * instance.GCKeepAliveRefInterval
 )
 
 // DryRunOpts sets a dry run of the garbage collector.
@@ -64,14 +68,12 @@ type DryRunOpts struct {
 	// MapRetention is how long an eval map row stays a root after its last
 	// write or use.
 	MapRetention time.Duration
-	// Cycle, CacheTTL and LongestPush are the cycle period, the TTL of the
-	// servers' header and content caches, and the longest push; Grace must
-	// cover two cycles, one TTL and one push.
-	Cycle       time.Duration
-	CacheTTL    time.Duration
+	// LongestPush is the longest push or build upload. Grace must cover it
+	// and the largest cache TTL of the servers (see graceProblem).
 	LongestPush time.Duration
 	// Consistency checks that every object has a gc row, which reads the
-	// meta family of every object row.
+	// meta family of every object row. The command always sets it; tests
+	// turn it off.
 	Consistency bool
 	// Shards is the number of key ranges scanned in parallel.
 	Shards int
@@ -98,8 +100,6 @@ func DefaultDryRunOpts() DryRunOpts {
 		BuildRetention:    DefaultBuildRetention,
 		SnapshotRetention: DefaultSnapshotRetention,
 		MapRetention:      DefaultMapRetention,
-		Cycle:             DefaultCycle,
-		CacheTTL:          DefaultCacheTTL,
 		LongestPush:       DefaultLongestPush,
 		Consistency:       true,
 		Shards:            DefaultScanShards,
@@ -108,10 +108,9 @@ func DefaultDryRunOpts() DryRunOpts {
 	}
 }
 
-// Validate checks the timing rule: a touch is written at most once per half
-// grace, so the grace must exceed two cycles, plus one cache TTL for the
-// servers to see a condemn marker and one push for uploads whose root comes
-// last.
+// Validate checks the options. The grace must be longer than the longest
+// push; the cycle checks it against the cache TTL of the servers too (see
+// graceProblem).
 func (o *DryRunOpts) Validate() error {
 	for _, d := range []struct {
 		name  string
@@ -119,18 +118,21 @@ func (o *DryRunOpts) Validate() error {
 	}{
 		{"grace", o.Grace}, {"mount idle time", o.MountIdle}, {"build retention", o.BuildRetention},
 		{"snapshot retention", o.SnapshotRetention},
-		{"map retention", o.MapRetention}, {"cycle", o.Cycle}, {"lease duration", o.LeaseDuration},
+		{"map retention", o.MapRetention}, {"lease duration", o.LeaseDuration},
 		{"write deadline", o.WriteDeadline},
 	} {
 		if d.value <= 0 {
 			return fmt.Errorf("invalid %s %s: it must be positive", d.name, d.value)
 		}
 	}
-	if o.CacheTTL < 0 || o.LongestPush < 0 {
-		return fmt.Errorf("invalid cache TTL %s or longest push %s: they cannot be negative", o.CacheTTL, o.LongestPush)
+	if o.LongestPush < 0 {
+		return fmt.Errorf("invalid longest push %s: it cannot be negative", o.LongestPush)
 	}
-	if need := 2*o.Cycle + o.CacheTTL + o.LongestPush; o.Grace < need {
-		return fmt.Errorf("grace %s is shorter than 2 x cycle (%s) + cache TTL (%s) + longest push (%s) = %s", o.Grace, o.Cycle, o.CacheTTL, o.LongestPush, need)
+	if o.Grace <= o.LongestPush {
+		return fmt.Errorf("grace %s is not longer than the longest push %s", o.Grace, o.LongestPush)
+	}
+	if o.MountIdle < minMountIdle {
+		return fmt.Errorf("mount idle time %s is shorter than %s, four times the interval at which clients rewrite their mount ref", o.MountIdle, minMountIdle)
 	}
 	if o.Shards <= 0 {
 		return fmt.Errorf("invalid number of shards %d", o.Shards)
@@ -191,10 +193,12 @@ type Settings struct {
 	BuildRetentionHours    float64 `json:"build_retention_hours"`
 	SnapshotRetentionHours float64 `json:"snapshot_retention_hours"`
 	MapRetentionHours      float64 `json:"map_retention_hours"`
-	CycleHours             float64 `json:"cycle_hours"`
-	CacheTTLHours          float64 `json:"cache_ttl_hours"`
-	LongestPushHours       float64 `json:"longest_push_hours"`
-	Shards                 int     `json:"shards"`
+	// CacheTTLHours is the largest cache TTL of the servers that may have
+	// run within the grace, which the grace check used; zero when no server
+	// recorded one.
+	CacheTTLHours    float64 `json:"cache_ttl_hours"`
+	LongestPushHours float64 `json:"longest_push_hours"`
+	Shards           int     `json:"shards"`
 }
 
 // RootCounts counts the roots of one class.
@@ -430,8 +434,6 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 			BuildRetentionHours:    o.BuildRetention.Hours(),
 			SnapshotRetentionHours: o.SnapshotRetention.Hours(),
 			MapRetentionHours:      o.MapRetention.Hours(),
-			CycleHours:             o.Cycle.Hours(),
-			CacheTTLHours:          o.CacheTTL.Hours(),
 			LongestPushHours:       o.LongestPush.Hours(),
 			Shards:                 o.Shards,
 		},
@@ -449,6 +451,12 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	fromServers, stopped := serverReplicas(servers.servers)
 	r.Replicas = checkReplicas(slices.Concat(servers.replicas, fromServers), snapshot, o)
 	r.Replicas.Stopped = stopped
+	start := windowStart(snapshot, o.Grace)
+	longest, _ := servers.graceTTL(start)
+	r.Settings.CacheTTLHours = longest.CacheTTL.Hours()
+	if p := servers.graceProblem(start, o); p != "" {
+		r.Replicas.Warnings = append(r.Replicas.Warnings, p)
+	}
 	if !servers.legacyGone.IsZero() {
 		r.Replicas.LegacyServersGoneTime = &servers.legacyGone
 	}

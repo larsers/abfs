@@ -43,7 +43,7 @@ import (
 // rescue condemned objects, hits touch objects and map rows, cache entries
 // expire, and each server writes a heartbeat, without which it does not serve.
 const (
-	DefaultCacheTTL            = gc.DefaultCacheTTL
+	DefaultCacheTTL            = 6 * time.Hour
 	DefaultGCTouchInterval     = 36 * time.Hour
 	DefaultGCHeartbeatInterval = 5 * time.Minute
 	heartbeatTimeout           = 30 * time.Second
@@ -155,24 +155,47 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 	if !opts.GC {
 		return nil
 	}
-	if opts.CacheTTL < 0 || opts.GCTouchInterval < 0 || opts.GCHeartbeatInterval < 0 {
-		return fmt.Errorf("invalid negative cache TTL %s, touch interval %s or heartbeat interval %s", opts.CacheTTL, opts.GCTouchInterval, opts.GCHeartbeatInterval)
-	}
-	// The collector sees the touches a server lost only through its
-	// heartbeat, so a server that rescues and touches must write one.
-	if !opts.GCReadOnly && (opts.GCHeartbeatInterval == 0 || opts.GCHeartbeatInterval > gc.MaxHeartbeatInterval) {
-		return fmt.Errorf("invalid GC heartbeat interval %s: with GC it must be above 0 and at most %s", opts.GCHeartbeatInterval, gc.MaxHeartbeatInterval)
+	o, err := gcHookOpts(opts)
+	if err != nil {
+		return err
 	}
 	if err := s.checkGCResources(ctx); err != nil {
 		return fmt.Errorf("garbage collector resources missing, run 'abfs server gcp init --gc' to create them: %w", err)
 	}
 	// Read-only, the server rescues nothing and needs no conditional writes.
-	if !opts.GCReadOnly {
-		if err := s.checkSingleRowTransactions(ctx, opts); err != nil {
+	if !o.GCReadOnly {
+		if err := s.checkSingleRowTransactions(ctx, &o); err != nil {
 			return err
 		}
 	}
-	return s.enableGCHooks(opts)
+	return s.enableGCHooks(&o)
+}
+
+// gcHookOpts checks the GC options of opts and returns them with the default
+// heartbeat interval when it is zero. A server that rescues and touches needs
+// a cache TTL, a touch interval and a heartbeat: without them the collector
+// refuses every condemn and delete, and it sees the touches a server lost
+// only through its heartbeat.
+func gcHookOpts(opts *NewServerOpts) (NewServerOpts, error) {
+	o := *opts
+	if o.CacheTTL < 0 || o.GCTouchInterval < 0 || o.GCHeartbeatInterval < 0 {
+		return o, fmt.Errorf("invalid negative cache TTL %s, touch interval %s or heartbeat interval %s", o.CacheTTL, o.GCTouchInterval, o.GCHeartbeatInterval)
+	}
+	if o.GCReadOnly {
+		return o, nil
+	}
+	if o.GCHeartbeatInterval == 0 {
+		o.GCHeartbeatInterval = DefaultGCHeartbeatInterval
+	}
+	switch {
+	case o.CacheTTL == 0:
+		return o, errors.New("invalid cache TTL 0: with GC it must be above 0")
+	case o.GCTouchInterval == 0:
+		return o, errors.New("invalid GC touch interval 0: with GC it must be above 0")
+	case o.GCHeartbeatInterval > gc.MaxHeartbeatInterval:
+		return o, fmt.Errorf("invalid GC heartbeat interval %s: with GC it must be at most %s", o.GCHeartbeatInterval, gc.MaxHeartbeatInterval)
+	}
+	return o, nil
 }
 
 // enableGCHooks turns the hooks on and starts the toucher and the heartbeat.

@@ -182,7 +182,7 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	}
 	s, err := New(ctx, &NewServerOpts{
 		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
-		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCHeartbeatInterval: time.Minute,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
 	})
 	require.NoError(err)
 	require.NoError(s.Close())
@@ -211,7 +211,7 @@ func TestSetup_AddsGCStateListColumns(t *testing.T) {
 	require.NoError(err)
 	serverOpts := &NewServerOpts{
 		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
-		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCHeartbeatInterval: time.Minute,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
 	}
 	_, err = New(ctx, serverOpts)
 	require.ErrorContains(err, "init --gc")
@@ -255,7 +255,7 @@ func TestSetup_AddsGCServersMapRowLossColumn(t *testing.T) {
 	require.NoError(err)
 	serverOpts := &NewServerOpts{
 		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
-		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCHeartbeatInterval: time.Minute,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
 	}
 	_, err = New(ctx, serverOpts)
 	require.ErrorContains(err, "init --gc")
@@ -285,7 +285,7 @@ func TestNew_ChecksResources(t *testing.T) {
 	newOpts := func(o *SetupOpts) *NewServerOpts {
 		return &NewServerOpts{
 			ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID,
-			BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: o.GC, GCHeartbeatInterval: time.Minute,
+			BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: o.GC, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
 		}
 	}
 	tests := []struct {
@@ -418,7 +418,7 @@ func TestNew_ChecksSingleRowTransactions(t *testing.T) {
 			o := setupOpts(t, newEmulatorDatabase(t))
 			s, err := New(context.Background(), &NewServerOpts{
 				ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID, BtInstance: o.BtInstance, BucketName: o.BucketName,
-				MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCReadOnly: tt.readOnly, GCHeartbeatInterval: time.Minute,
+				MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCReadOnly: tt.readOnly, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
 			})
 			if err == nil {
 				_ = s.Close()

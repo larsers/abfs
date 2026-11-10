@@ -33,7 +33,6 @@ func TestGCPGCWalkFlags(t *testing.T) {
 		{nil, "pass --mount-details and --key"},
 		{[]string{"--mount-details=" + h1}, "pass --mount-details and --key"},
 		{[]string{"--key=" + h1}, "pass --mount-details and --key"},
-		{[]string{"--mount-details=" + h1, "--key=" + h2, "--workers=0"}, "invalid --workers 0"},
 		{[]string{"--mount-details=main", "--key=" + h2}, `invalid key "main" for --mount-details`},
 		{[]string{"--mount-details=" + h1, "--key=" + h2 + ",abc"}, `invalid key "abc" for --key`},
 		{[]string{"--mount-details=" + h1 + "," + h2, "--key=" + h2}, ""},

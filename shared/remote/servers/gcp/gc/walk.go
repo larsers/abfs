@@ -64,7 +64,8 @@ type WalkOpts struct {
 	MountDetails []Hash
 	// Keys are the object keys to look for.
 	Keys []Hash
-	// Workers is the number of pinned revisions walked in parallel.
+	// Workers is the number of pinned revisions walked in parallel; zero
+	// uses DefaultWalkWorkers.
 	Workers int
 }
 
@@ -154,7 +155,11 @@ func Walk(ctx context.Context, objs remote.RemoteProvider, o *WalkOpts) (*WalkRe
 	}
 	walks := make([]revisionWalk, len(revs))
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(max(1, o.Workers))
+	workers := o.Workers
+	if workers <= 0 {
+		workers = DefaultWalkWorkers
+	}
+	g.SetLimit(workers)
 	for i := range revs {
 		walks[i] = revisionWalk{rev: &revs[i], hits: make(map[int]walkHit)}
 		g.Go(func() error {

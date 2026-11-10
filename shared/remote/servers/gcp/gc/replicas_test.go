@@ -37,8 +37,9 @@ func TestCheckReplicas(t *testing.T) {
 		{"no touches", func(r *Replica) { r.TouchInterval = 0 }, "writes no touches"},
 		{"long touch interval", func(r *Replica) { r.TouchInterval = 37 * time.Hour }, "touch interval 37h0m0s is longer than half the grace (36h0m0s)"},
 		{"no TTL", func(r *Replica) { r.CacheTTL = 0 }, "without a TTL"},
-		{"TTL of a cycle", func(r *Replica) { r.CacheTTL = 24 * time.Hour }, "cache TTL 24h0m0s is not shorter than the cycle (24h0m0s)"},
-		{"TTL above the grace check", func(r *Replica) { r.CacheTTL = 7 * time.Hour }, "longer than the cache TTL of the grace check (6h0m0s)"},
+		// The grace check of the TTL counts every server of the window
+		// (TestGraceProblem), so a long TTL is no problem of a replica.
+		{"long TTL", func(r *Replica) { r.CacheTTL = 70 * time.Hour }, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
