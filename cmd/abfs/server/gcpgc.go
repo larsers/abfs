@@ -76,7 +76,7 @@ type gcpGCBackfillCmd struct {
 func (c *gcpGCBackfillCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "backfill",
-		Usage: "--project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--start <key>] [--end <key>] [--shards <n>] [--rate <n>] [--dry-run]",
+		Usage: "--project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--start <key>] [--shards <n>] [--rate <n>] [--dry-run]",
 		Desc: `Write the GC edges of existing objects to the Bigtable table gc.
 Scans the objects table and writes the gc row of every object whose row is missing or
 was written by an older edge extractor, reading and decoding every such object that is
@@ -94,13 +94,10 @@ func (c *gcpGCBackfillCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.StringVar(&c.opts.Start, "start", "", "The first object key to scan, a lowercase hexadecimal hash or prefix (default: the start of the table)")
-	fl.StringVar(&c.opts.End, "end", "", "The object key to stop before (default: the end of the table)")
 	fl.IntVar(&c.opts.Shards, "shards", gc.DefaultBackfillShards, "The number of key ranges scanned in parallel")
-	fl.IntVar(&c.opts.BatchSize, "batch-size", gc.DefaultBackfillBatchSize, "The number of object rows read per request")
 	fl.Float64Var(&c.opts.Rate, "rate", defaultBackfillRate, "The maximum number of object rows scanned per second (0 means no limit)")
 	fl.BoolVar(&c.opts.DryRun, "dry-run", false, "Count the gc rows to write and write none")
-	fl.DurationVar(&c.opts.WriteDeadline, "write-deadline", gc.DefaultWriteDeadline, "The deadline of one attempt of a gc row write, the client library's retries included")
-	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", true, clientMetricsUsage)
+	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
 }
 
 func (c *gcpGCBackfillCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -170,8 +167,8 @@ func (c *gcpGCRunCmd) Spec() cmd.CmdSpec {
 		Usage: "(--dry-run | (--condemn | --delete) (--expected-replicas <n> | --min-replicas <n> [--max-replicas <n>])) --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
 		Desc: `Run one garbage collection cycle and report it as JSON. Both modes take the GC lease,
 read the refs at one snapshot, scan the gc and maps tables and mark what the roots, the
-retention rules and the grace keep. With --consistency (required for --condemn) the cycle
-also scans the meta family of the objects table to check that every object has a gc row.
+retention rules and the grace keep. The cycle also scans the meta family of the objects
+table to check that every object has a gc row.
 
 --dry-run reports what a collection would remove and writes nothing but the garbage
 collector state in Spanner. --condemn also marks the unreachable objects with the cycle
@@ -179,8 +176,9 @@ number, after it wrote their list to the bucket; it deletes nothing, and servers
 clear the marker of any marked object they read. It refuses, and writes nothing, unless
 every check of the cycle passed: --expected-replicas distinct server hosts, or at least
 --min-replicas and at most --max-replicas, write a GC heartbeat, one live row each, with
-settings that fit the timing rules; no object lacks a gc row; and no pin or root could not
-be read. --explain adds, per key, the root that keeps it.
+settings that fit the timing rules; --grace covers the largest cache TTL of the servers
+plus --longest-push; no object lacks a gc row; and no pin or root could not be read.
+--explain adds, per key, the root that keeps it.
 
 --delete runs a condemn cycle that first deletes the objects of the list of the condemn or
 delete cycle before that are still unreachable and still hold its marker: the map rows that
@@ -192,8 +190,8 @@ server that may have run within the grace crashed, lost touches or ran without l
 validation; the Bigtable instance has one cluster and the app profile accepts conditional
 writes; ready backups of the tables exist (unless --no-backup-check); and no live mount can
 hold the only copy of content it wrote. A dry run and a condemn cycle report what a delete
-would remove. The chunks of deleted objects are removed one cycle later, at least
---chunk-delay after the record of their batch, unless the row of the object is back; that
+would remove. The chunks of deleted objects are removed one cycle later, at least 15
+minutes after the record of their batch, unless the row of the object is back; that
 step deletes nothing while the bucket keeps deleted objects for less than 7 days (unless
 --allow-no-soft-delete), has Object Versioning on or a retention policy, and it keeps a
 record until a ready backup of the chunks table started after its list (unless
@@ -209,7 +207,7 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
-	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", true, clientMetricsUsage)
+	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing")
 	fl.BoolVar(&c.condemn, "condemn", false, "Mark the unreachable objects as condemned and delete nothing")
@@ -220,37 +218,24 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringSliceVar(&c.opts.Types, "delete-types", nil, "In delete mode, the object types, separated by commas, that the cycle may delete (default: every type)")
 	fl.BoolVar(&c.opts.AcceptMountsWithoutKeepAlive, "accept-mounts-without-keepalive", false, "In delete mode, delete blobs, trees and eval objects while live mounts run without gc-keepalive, whose caches may hold the only copy of content they wrote; the check then only warns, except after a server lost map row touches: then such mounts still refuse the deletes")
 	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the list was complete")
-	fl.Float64Var(&c.opts.DeleteRate, "delete-rate", gc.DefaultDeleteRate, "In delete mode, the maximum number of objects deleted per second (0 means no limit)")
-	fl.IntVar(&c.opts.DeleteWorkers, "delete-workers", gc.DefaultDeleteWorkers, "In delete mode, the number of conditional deletes in flight, split evenly over the --shards key ranges; at least --shards")
-	fl.DurationVar(&c.opts.ChunkDelay, "chunk-delay", gc.DefaultChunkDelay, "In delete mode, how long after the record of a deleted object its chunks are deleted, at the earliest in the next cycle; at least 12 min, the 10 min lifetime of signed chunk URLs plus 1 min of clock skew on each side")
-	fl.Float64Var(&c.opts.ChunkRate, "chunk-rate", gc.DefaultChunkRate, "In delete mode, the maximum number of chunks of deleted objects deleted per second (0 means no limit)")
 	fl.BoolVar(&c.opts.AllowNoSoftDelete, "allow-no-soft-delete", false, "In delete mode, delete the bucket chunks of deleted objects although the bucket keeps deleted objects for less than 7 days, so that they cannot be restored")
 	fl.DurationVar(&c.opts.StartDelay, "delete-start-delay", 0, "In delete mode, a pause before the delete step, for tests")
 	if err := fl.MarkHidden("delete-start-delay"); err != nil {
 		panic(err)
 	}
-	fl.Float64Var(&c.opts.Rate, "condemn-rate", gc.DefaultCondemnRate, "With --condemn or --delete, the maximum number of objects marked per second (0 means no limit)")
-	fl.IntVar(&c.opts.KeepLists, "keep-lists", gc.DefaultKeepLists, "With --condemn or --delete, the number of condemned lists of the newest cycles kept in the bucket")
 	fl.StringVar(&c.report, "report", "", "Write the JSON report to this file instead of stdout")
 	fl.DurationVar(&c.opts.Grace, "grace", gc.DefaultGrace, "Keep objects written or touched within this time before the snapshot, and what they reach")
-	fl.DurationVar(&c.opts.MountIdle, "mount-idle", gc.DefaultMountIdle, "Count a mount as live, keeping its ref and the commits it was pinned to, while it wrote its mount ref within this time and has no unmount ref; delete mode removes older mount refs")
+	fl.DurationVar(&c.opts.MountIdle, "mount-idle", gc.DefaultMountIdle, "Count a mount as live, keeping its ref and the commits it was pinned to, while it wrote its mount ref within this time and has no unmount ref; delete mode removes older mount refs. At least 1h, four times the interval at which clients rewrite their mount ref")
 	fl.DurationVar(&c.opts.BuildRetention, "build-retention", gc.DefaultBuildRetention, "Keep what build and unmount refs reach for this time after they were written; delete mode removes older ones. A mount ref with an unmount ref keeps only its mount details, until it goes with that unmount ref or at --mount-idle, whichever comes first")
 	fl.DurationVar(&c.opts.SnapshotRetention, "snapshot-retention", gc.DefaultSnapshotRetention, "Keep what the ref of a workspace snapshot reaches, with the commits its mount was pinned to, for this time after the ref was written; delete mode removes older ones")
 	fl.DurationVar(&c.opts.MapRetention, "map-retention", gc.DefaultMapRetention, "Keep eval map results written or used within this time")
-	fl.DurationVar(&c.opts.Cycle, "cycle", gc.DefaultCycle, "The period between garbage collection cycles, for the check of --grace")
-	fl.DurationVar(&c.opts.CacheTTL, "cache-ttl", gc.DefaultCacheTTL, "The TTL of the servers' header and content caches, for the check of --grace")
 	fl.DurationVar(&c.opts.LongestPush, "longest-push", gc.DefaultLongestPush, "The longest push or build upload, for the check of --grace")
-	fl.BoolVar(&c.opts.Consistency, "consistency", true, "Check that every object has a gc row, and sum object sizes, with a scan of the meta family of the objects table")
-	fl.IntVar(&c.opts.Shards, "shards", gc.DefaultScanShards, "The number of key ranges scanned in parallel")
-	fl.DurationVar(&c.opts.LeaseDuration, "lease", gc.DefaultLeaseDuration, "The duration of the GC lease, renewed while the cycle runs")
-	fl.DurationVar(&c.opts.WriteDeadline, "write-deadline", gc.DefaultWriteDeadline, "The deadline of one attempt of a Bigtable write, the client library's retries included; a list object gets it plus its size at 8 MiB/s. At most an eighth of --lease")
 	fl.StringSliceVar(&c.explain, "explain", nil, "Object keys, separated by commas, whose gc row, reachability, first root, times and condemn marker the report explains")
 }
 
 // deleteOnlyFlags are the flags that only delete mode reads.
 var deleteOnlyFlags = []string{
-	"delete-types", "accept-mounts-without-keepalive", "no-backup-check", "delete-rate", "delete-workers",
-	"chunk-delay", "chunk-rate", "allow-no-soft-delete", "delete-start-delay",
+	"delete-types", "accept-mounts-without-keepalive", "no-backup-check", "allow-no-soft-delete", "delete-start-delay",
 }
 
 // checkOpts checks the mode flags set in fl and fills the keys to explain.
@@ -374,15 +359,12 @@ func (c *gcpGCUndoCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
-	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", true, clientMetricsUsage)
+	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.Int64Var(&c.opts.Cycle, "cycle", 0, "The first delete cycle whose deletes are undone (required)")
 	fl.Int64Var(&c.opts.Through, "through", 0, "The last delete cycle whose deletes are undone (default: --cycle)")
 	fl.StringVar(&c.opts.FromSuffix, "from-suffix", "", "The suffix of the names of the restored tables, as -r for objects-r, gc-r, maps-r and chunks-r (required)")
-	fl.IntVar(&c.opts.Workers, "workers", gc.DefaultUndoWorkers, "The number of objects of one delete record restored in parallel")
 	fl.BoolVar(&c.opts.NoSourceCheck, "no-source-check", false, "Restore from tables that are not restored from backups of the live tables taken before --cycle")
-	fl.DurationVar(&c.opts.LeaseDuration, "lease", gc.DefaultLeaseDuration, "The duration of the GC lease, renewed while the undo runs")
-	fl.DurationVar(&c.opts.WriteDeadline, "write-deadline", gc.DefaultWriteDeadline, "The deadline of one attempt of a write, the client library's retries included. At most an eighth of --lease")
 }
 
 func (c *gcpGCUndoCmd) checkOpts() error {
@@ -454,7 +436,7 @@ type gcpGCWalkCmd struct {
 func (c *gcpGCWalkCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "walk",
-		Usage: "--mount-details <hash>[,<hash>] --key <hash>[,<hash>] --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--workers <n>]",
+		Usage: "--mount-details <hash>[,<hash>] --key <hash>[,<hash>] --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
 		Desc: `Tell whether keys are in the content of the checkouts of mounts. Reads each mount
 details object and its pinned manifest, and walks the commit and the trees of every
 pinned revision from object content, without the gc table, so a gap in the GC edges
@@ -472,18 +454,15 @@ func (c *gcpGCWalkCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", "The GCP Bigtable App Profile ID (empty uses the instance default app profile)")
+	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.StringSliceVar(&c.details, "mount-details", nil, "The mount details, separated by commas, whose pinned revisions are walked: the targets of the mount refs of a client (required)")
 	fl.StringSliceVar(&c.keys, "key", nil, "The object keys, separated by commas, to look for (required)")
-	fl.IntVar(&c.opts.Workers, "workers", gc.DefaultWalkWorkers, "The number of pinned revisions walked in parallel")
 }
 
 func (c *gcpGCWalkCmd) checkOpts() error {
 	if len(c.details) == 0 || len(c.keys) == 0 {
 		return errors.New("pass --mount-details and --key")
-	}
-	if c.opts.Workers < 1 {
-		return fmt.Errorf("invalid --workers %d: it must be at least 1", c.opts.Workers)
 	}
 	var err error
 	if c.opts.MountDetails, err = parseKeys("--mount-details", c.details); err != nil {

@@ -85,7 +85,7 @@ abfs-server --port 50051 --project <project> --instance <spanner-instance> --buc
 | `--links-content` | off | Return signed Cloud Storage URLs, valid for 10 minutes, for objects larger than `--links-content-threshold`, so that clients download them from Cloud Storage directly. Clients then need access to `storage.googleapis.com`, and the server signs one URL per Cloud Storage object on every read. Without it, the server streams every object. |
 | `--links-content-threshold` | `1048576` | Size in bytes above which `--links-content` returns URLs |
 | `--gcp-client-metrics` | off | Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring |
-| `--gc` | off | Run the server side of the garbage collector. It needs the resources of `abfs server gcp init --gc`. With it, `--cache-ttl`, `--gc-touch-interval`, `--gc-touched-map-rows` and `--gc-heartbeat-interval` apply; see [Server flags](GCP_GC.md#server-flags) |
+| `--gc` | off | Run the server side of the garbage collector. It needs the resources of `abfs server gcp init --gc`. With it, `--cache-ttl` and `--gc-touch-interval` apply, both above 0, and the server writes a heartbeat every 5 minutes; see [Server flags](GCP_GC.md#server-flags) |
 | `--no-link-validation`, `--no-hash-validation` | off | As for the file-based server |
 | `--http-host` | `localhost` | Address of the HTTP server (`--http-port`). Its endpoints, such as `/debug` and `/server/status`, have no authentication. |
 

@@ -258,19 +258,18 @@ type NewServerOpts struct {
 	// without garbage collection does.
 	GC bool
 	// CacheTTL is how long cached headers and content are used before they are
-	// read again; zero keeps them until they are evicted.
+	// read again; zero keeps them until they are evicted. With GC and not
+	// GCReadOnly it must be above zero.
 	CacheTTL time.Duration
 	// GCTouchInterval is the length of the period in which this server touches
-	// each object and map row at most once; zero disables touches.
+	// each object and map row at most once; zero disables touches. With GC
+	// and not GCReadOnly it must be above zero.
 	GCTouchInterval time.Duration
-	// GCTouchedMapRows is the number of map rows whose last touch the server
-	// remembers, so that it touches each at most once per GCTouchInterval,
-	// at about 225 bytes per row; zero uses DefaultGCTouchedMapRows.
-	GCTouchedMapRows int
 	// GCHeartbeatInterval is the time between two heartbeats of this server in
-	// the table GcServers. With GC and not GCReadOnly it must be above zero
-	// and at most gc.MaxHeartbeatInterval, and the server stops serving while
-	// its last successful heartbeat is older than two intervals and 30 s.
+	// the table GcServers; zero uses DefaultGCHeartbeatInterval, and tests set
+	// shorter ones. It is at most gc.MaxHeartbeatInterval, and the server
+	// stops serving while its last successful heartbeat is older than two
+	// intervals and 30 s.
 	GCHeartbeatInterval time.Duration
 	// GCReadOnly, with GC, leaves the state of the garbage collector as it is:
 	// reads answer for condemned objects without rescuing them, and the server

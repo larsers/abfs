@@ -119,8 +119,8 @@ func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaRepo
 
 // replicaProblems returns how the settings of r break the timing rules: a
 // used object must be touched at least once per half grace, and a replica
-// must read a cached entry again within one cycle and within the TTL the
-// grace allows for.
+// must read a cached entry again after a TTL. graceProblem checks the TTL
+// against the grace.
 func replicaProblems(r *Replica, o *DryRunOpts) []string {
 	if !r.GC {
 		return []string{"runs without the garbage collector hooks"}
@@ -138,13 +138,8 @@ func replicaProblems(r *Replica, o *DryRunOpts) []string {
 	case r.TouchInterval > o.Grace/2:
 		add("touch interval %s is longer than half the grace (%s)", r.TouchInterval, o.Grace/2)
 	}
-	switch {
-	case r.CacheTTL <= 0:
+	if r.CacheTTL <= 0 {
 		add("keeps cache entries without a TTL, so it can answer for an object long after a condemn")
-	case r.CacheTTL >= o.Cycle:
-		add("cache TTL %s is not shorter than the cycle (%s)", r.CacheTTL, o.Cycle)
-	case r.CacheTTL > o.CacheTTL:
-		add("cache TTL %s is longer than the cache TTL of the grace check (%s)", r.CacheTTL, o.CacheTTL)
 	}
 	return problems
 }

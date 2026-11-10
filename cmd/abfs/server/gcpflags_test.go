@@ -29,14 +29,12 @@ import (
 
 func TestGCPFlags_GCHooks(t *testing.T) {
 	tests := []struct {
-		args           []string
-		gc             bool
-		ttl, touch, hb time.Duration
-		mapRows        int
+		args       []string
+		gc         bool
+		ttl, touch time.Duration
 	}{
-		{nil, false, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval, gcp.DefaultGCHeartbeatInterval, gcp.DefaultGCTouchedMapRows},
-		{[]string{"--gc", "--cache-ttl=0", "--gc-touch-interval=0", "--gc-heartbeat-interval=1m", "--gc-touched-map-rows=1000"}, true, 0, 0, time.Minute, 1000},
-		{[]string{"--gc", "--gc-touched-map-rows=0"}, true, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval, gcp.DefaultGCHeartbeatInterval, 0},
+		{nil, false, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval},
+		{[]string{"--gc", "--cache-ttl=5m", "--gc-touch-interval=30m"}, true, 5 * time.Minute, 30 * time.Minute},
 	}
 	for _, tt := range tests {
 		cmd := NewStandaloneGCPServerCmd(root.NewRootCommand())
@@ -46,9 +44,12 @@ func TestGCPFlags_GCHooks(t *testing.T) {
 		require.Equal(t, tt.gc, cmd.gcpCmd.gc)
 		require.Equal(t, tt.ttl, cmd.gcpCmd.cacheTTL)
 		require.Equal(t, tt.touch, cmd.gcpCmd.gcTouchInterval)
-		require.Equal(t, tt.hb, cmd.gcpCmd.gcHeartbeatInterval)
-		require.Equal(t, tt.mapRows, cmd.gcpCmd.gcTouchedMapRows)
 	}
+	// The heartbeat interval is fixed.
+	cmd := NewStandaloneGCPServerCmd(root.NewRootCommand())
+	fl := pflag.NewFlagSet("abfs-server", pflag.ContinueOnError)
+	cmd.RegisterFlags(fl)
+	require.ErrorContains(t, fl.Parse([]string{"--gc-heartbeat-interval=1m"}), "unknown flag: --gc-heartbeat-interval")
 }
 
 func TestGCPInitFlags_GC(t *testing.T) {
@@ -65,8 +66,8 @@ func TestGCPInitFlags_GC(t *testing.T) {
 }
 
 // gc run takes exactly one mode, and --condemn and --delete need the expected
-// number or range of server hosts and the consistency check. The other modes
-// reject the flags only delete mode reads.
+// number or range of server hosts. The other modes reject the flags only
+// delete mode reads.
 func TestGCPGCRunFlags_Modes(t *testing.T) {
 	tests := []struct {
 		args    []string
@@ -76,12 +77,14 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--dry-run", "--condemn", "--expected-replicas=3"}, "pass one of --dry-run, --condemn and --delete"},
 		{[]string{"--dry-run"}, ""},
 		{[]string{"--condemn"}, "invalid expected replicas 0"},
-		{[]string{"--condemn", "--expected-replicas=3", "--consistency=false"}, "needs the consistency check"},
-		{[]string{"--condemn", "--expected-replicas=3", "--keep-lists=0"}, "invalid number of kept lists"},
 		{[]string{"--dry-run", "--explain=nothex"}, `invalid key "nothex"`},
-		{[]string{"--dry-run", "--write-deadline=38s"}, "two attempts must fit into a quarter of it"},
-		{[]string{"--dry-run", "--write-deadline=37s"}, ""},
-		{[]string{"--condemn", "--expected-replicas=3", "--condemn-rate=100", "--explain=" + strings.Repeat("ab", 20)}, ""},
+		{[]string{"--condemn", "--expected-replicas=3", "--explain=" + strings.Repeat("ab", 20)}, ""},
+		// The grace must exceed the longest push, and the mount idle time
+		// four rewrites of a mount ref.
+		{[]string{"--dry-run", "--grace=20m", "--longest-push=20m"}, "grace 20m0s is not longer than the longest push 20m0s"},
+		{[]string{"--dry-run", "--grace=90m", "--longest-push=20m"}, ""},
+		{[]string{"--dry-run", "--mount-idle=30m"}, "mount idle time 30m0s is shorter than 1h0m0s"},
+		{[]string{"--dry-run", "--mount-idle=1h"}, ""},
 		// An autoscaled fleet gives a range instead of the exact count.
 		{[]string{"--condemn", "--min-replicas=2"}, ""},
 		{[]string{"--condemn", "--min-replicas=2", "--max-replicas=11"}, ""},
@@ -96,10 +99,6 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--dry-run", "--delete-types=commit"}, "only delete mode takes --delete-types"},
 		{[]string{"--condemn", "--min-replicas=2", "--delete-start-delay=5m"}, "only delete mode takes --delete-start-delay"},
 		{[]string{"--condemn", "--min-replicas=2", "--allow-no-soft-delete"}, "only delete mode takes --allow-no-soft-delete"},
-		{[]string{"--condemn", "--min-replicas=2", "--delete-rate=100", "--delete-workers=16"}, "only delete mode takes --delete-rate, --delete-workers"},
-		{[]string{"--dry-run", "--chunk-delay=2h"}, "only delete mode takes --chunk-delay"},
-		{[]string{"--condemn", "--min-replicas=2", "--chunk-rate=0"}, "only delete mode takes --chunk-rate"},
-		{[]string{"--condemn", "--min-replicas=2", "--delete-rate=2000"}, "only delete mode takes --delete-rate"},
 		// Delete mode implies the condemn and takes its checks.
 		{[]string{"--delete"}, "invalid expected replicas 0"},
 		{[]string{"--delete", "--condemn", "--min-replicas=2"}, "pass one of --dry-run, --condemn and --delete"},
@@ -107,21 +106,16 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--delete", "--min-replicas=2"}, ""},
 		{[]string{"--delete", "--min-replicas=2", "--delete-types=commit,blob", "--no-backup-check", "--accept-mounts-without-keepalive", "--delete-start-delay=5m"}, ""},
 		{[]string{"--delete", "--min-replicas=2", "--delete-types=commits"}, `invalid object type "commits"`},
-		{[]string{"--delete", "--min-replicas=2", "--chunk-delay=10m"}, "not longer than the 10m0s lifetime of the signed URLs"},
-		{[]string{"--delete", "--min-replicas=2", "--delete-workers=0"}, "invalid number of delete workers 0"},
-		{[]string{"--delete", "--min-replicas=2", "--delete-workers=8"}, "8 delete workers are fewer than the 16 key ranges"},
-		{[]string{"--delete", "--min-replicas=2", "--delete-workers=8", "--shards=8"}, ""},
-		{[]string{"--delete", "--min-replicas=2", "--delete-rate=-1"}, "invalid delete rate"},
-		{[]string{"--delete", "--min-replicas=2", "--chunk-rate=-1"}, "invalid chunk delete rate"},
-		{[]string{"--delete", "--min-replicas=2", "--chunk-rate=0", "--allow-no-soft-delete"}, ""},
-		{[]string{"--delete", "--expected-replicas=3", "--consistency=false"}, "needs the consistency check"},
+		{[]string{"--delete", "--min-replicas=2", "--chunk-delay=1h"}, "unknown flag: --chunk-delay"},
 	}
 	for _, tt := range tests {
 		c := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
 		fl := pflag.NewFlagSet("run", pflag.ContinueOnError)
 		c.RegisterFlags(fl)
-		require.NoError(t, fl.Parse(tt.args))
-		err := c.checkOpts(fl)
+		err := fl.Parse(tt.args)
+		if err == nil {
+			err = c.checkOpts(fl)
+		}
 		if tt.wantErr != "" {
 			require.ErrorContains(t, err, tt.wantErr, tt.args)
 			continue
@@ -137,8 +131,12 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 	require.Equal(t, gc.DefaultKeepLists, c.opts.KeepLists)
 	require.Equal(t, float64(2000), c.opts.DeleteRate)
 	require.Equal(t, 32, c.opts.DeleteWorkers)
-	require.Equal(t, time.Hour, c.opts.ChunkDelay)
+	require.Equal(t, 15*time.Minute, c.opts.ChunkDelay)
 	require.Equal(t, float64(500), c.opts.ChunkRate)
+	require.Equal(t, 16, c.opts.Shards)
+	require.Equal(t, 5*time.Minute, c.opts.LeaseDuration)
+	require.Equal(t, 30*time.Second, c.opts.WriteDeadline)
+	require.True(t, c.opts.Consistency)
 	require.False(t, c.opts.AllowNoSoftDelete)
 	require.Zero(t, c.opts.StartDelay)
 	// The pause before the delete step is for tests and not in the help.
@@ -146,34 +144,35 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 	require.NotContains(t, fl.FlagUsages(), "delete-start-delay")
 }
 
-// The GC commands export the client library metrics by default, which show
-// the per-attempt latencies and retries of their app profile; the server
-// does not.
+// The server and every GC command take --gcp-client-metrics, off by default.
 func TestGCPGCFlags_ClientMetrics(t *testing.T) {
 	run := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
 	backfill := &gcpGCBackfillCmd{RootCmd: root.NewRootCommand()}
 	undo := &gcpGCUndoCmd{RootCmd: root.NewRootCommand()}
+	walk := &gcpGCWalkCmd{RootCmd: root.NewRootCommand()}
 	server := NewStandaloneGCPServerCmd(root.NewRootCommand())
 	for _, tt := range []struct {
 		register func(*pflag.FlagSet)
 		got      *bool
-		want     bool
 	}{
-		{run.RegisterFlags, &run.server.ClientMetrics, true},
-		{backfill.RegisterFlags, &backfill.server.ClientMetrics, true},
-		{undo.RegisterFlags, &undo.server.ClientMetrics, true},
-		{server.RegisterFlags, &server.gcpCmd.clientMetrics, false},
+		{run.RegisterFlags, &run.server.ClientMetrics},
+		{backfill.RegisterFlags, &backfill.server.ClientMetrics},
+		{undo.RegisterFlags, &undo.server.ClientMetrics},
+		{walk.RegisterFlags, &walk.server.ClientMetrics},
+		{server.RegisterFlags, &server.gcpCmd.clientMetrics},
 	} {
 		fl := pflag.NewFlagSet("gc", pflag.ContinueOnError)
 		tt.register(fl)
 		require.NoError(t, fl.Parse(nil))
-		require.Equal(t, tt.want, *tt.got)
+		require.False(t, *tt.got)
+		require.NoError(t, fl.Parse([]string{"--gcp-client-metrics"}))
+		require.True(t, *tt.got)
 	}
 }
 
-// gc undo needs the first cycle and the suffix of the restored tables, takes
-// a range of cycles in order, and bounds its write attempts by the lease as
-// gc run does.
+// gc undo needs the first cycle and the suffix of the restored tables, and
+// takes a range of cycles in order. Its workers, lease and write deadline are
+// fixed.
 func TestGCPGCUndoFlags(t *testing.T) {
 	tests := []struct {
 		args    []string
@@ -187,8 +186,6 @@ func TestGCPGCUndoFlags(t *testing.T) {
 		{[]string{"--cycle=3", "--through=2", "--from-suffix=-r"}, "the last cycle to undo, 2, is before the first, 3"},
 		{[]string{"--cycle=-1", "--from-suffix=-r"}, "invalid cycle -1"},
 		{[]string{"--cycle=2", "--from-suffix=a/b"}, `invalid suffix "a/b"`},
-		{[]string{"--cycle=2", "--from-suffix=-r", "--workers=0"}, "invalid number of workers 0"},
-		{[]string{"--cycle=2", "--from-suffix=-r", "--write-deadline=40s"}, "write deadline 40s is too long for the lease 5m0s"},
 	}
 	for _, tt := range tests {
 		c := &gcpGCUndoCmd{RootCmd: root.NewRootCommand()}
@@ -201,5 +198,8 @@ func TestGCPGCUndoFlags(t *testing.T) {
 			continue
 		}
 		require.NoError(t, err, tt.args)
+		require.Equal(t, gc.DefaultUndoWorkers, c.opts.Workers)
+		require.Equal(t, gc.DefaultLeaseDuration, c.opts.LeaseDuration)
+		require.Equal(t, gc.DefaultWriteDeadline, c.opts.WriteDeadline)
 	}
 }

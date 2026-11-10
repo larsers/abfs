@@ -26,16 +26,73 @@ import (
 
 func TestDryRunOpts_TimingCheck(t *testing.T) {
 	o := DefaultDryRunOpts()
-	o.Grace = 56 * time.Hour
-	require.ErrorContains(t, o.Validate(), "grace 56h0m0s is shorter than 2 x cycle (24h0m0s) + cache TTL (6h0m0s) + longest push (3h0m0s) = 57h0m0s")
+	o.Grace = 3 * time.Hour
+	require.ErrorContains(t, o.Validate(), "grace 3h0m0s is not longer than the longest push 3h0m0s")
 	// The check runs before anything is read or written.
 	_, err := DryRun(context.Background(), nil, nil, nil, nil, &o)
-	require.ErrorContains(t, err, "is shorter than")
+	require.ErrorContains(t, err, "is not longer than")
 
-	o.Grace = 57 * time.Hour
+	o.Grace = 3*time.Hour + time.Minute
 	require.NoError(t, o.Validate())
-	o.Cycle = 0
-	require.ErrorContains(t, o.Validate(), "invalid cycle")
+	o.LongestPush = -time.Minute
+	require.ErrorContains(t, o.Validate(), "invalid longest push")
+}
+
+// A mount ref is rewritten every 15 minutes, so a shorter idle time would
+// remove the refs of live mounts.
+func TestDryRunOpts_MountIdleFloor(t *testing.T) {
+	o := DefaultDryRunOpts()
+	o.MountIdle = time.Hour - time.Second
+	require.ErrorContains(t, o.Validate(), "mount idle time 59m59s is shorter than 1h0m0s")
+	o.MountIdle = time.Hour
+	require.NoError(t, o.Validate())
+}
+
+// The grace must cover the largest cache TTL of the servers that may have run
+// within it, stopped ones and those of an older version too, plus the longest
+// push. Without any such server it cannot be checked.
+func TestGraceProblem(t *testing.T) {
+	snapshot := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	o := DefaultDryRunOpts()
+	start := windowStart(snapshot, o.Grace)
+	server := func(id string, ttl time.Duration, lastSeen time.Time) Server {
+		return Server{ID: id, GC: true, CacheTTL: ttl, LastSeen: lastSeen}
+	}
+	tests := []struct {
+		name     string
+		servers  []Server
+		replicas []Replica
+		want     string
+		ttl      time.Duration
+	}{
+		{"no rows", nil, nil, "no server that may have run within the grace wrote a GC heartbeat", 0},
+		{"only rows before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot.Add(-80*time.Hour))}, nil, "no server that may have run", 6 * time.Hour},
+		{"default TTL", []Server{server("srv-0-aa", 6*time.Hour, snapshot)}, nil, "", 6 * time.Hour},
+		{"TTL that fits exactly", []Server{server("srv-0-aa", 69*time.Hour, snapshot)}, nil, "", 69 * time.Hour},
+		{"stopped server with a long TTL", []Server{
+			server("srv-0-aa", 6*time.Hour, snapshot),
+			{ID: "srv-1-bb", CacheTTL: 70 * time.Hour, LastSeen: snapshot.Add(-time.Hour), StoppedAt: snapshot.Add(-time.Hour)},
+		}, nil, "grace 72h0m0s is shorter than the cache TTL 70h0m0s of server srv-1-bb plus the longest push 3h0m0s", 70 * time.Hour},
+		{"server of an older version", []Server{server("srv-0-aa", 6*time.Hour, snapshot)},
+			[]Replica{{ID: "old-0-aa", CacheTTL: 70 * time.Hour, LastSeen: snapshot}}, "cache TTL 70h0m0s of server old-0-aa", 70 * time.Hour},
+		{"server of an older version only", nil, []Replica{{ID: "old-0-aa", CacheTTL: 6 * time.Hour, LastSeen: snapshot}}, "", 6 * time.Hour},
+		{"server of an older version before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot)},
+			[]Replica{{ID: "old-0-aa", CacheTTL: 70 * time.Hour, LastSeen: start.Add(-31 * time.Minute)}}, "", 6 * time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &serverEvidence{servers: tt.servers, replicas: tt.replicas, readTime: snapshot}
+			got := e.graceProblem(start, &o)
+			if tt.want == "" {
+				require.Empty(t, got)
+			} else {
+				require.Contains(t, got, tt.want)
+			}
+			if r, found := e.graceTTL(start); found {
+				require.Equal(t, tt.ttl, r.CacheTTL)
+			}
+		})
+	}
 }
 
 func TestClassifyRef(t *testing.T) {

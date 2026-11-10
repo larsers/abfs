@@ -255,9 +255,9 @@ func TestCondemnGC_MixedFleetHosts(t *testing.T) {
 	require.NoError(err)
 	require.Equal(int64(1), res.Report.Condemn.Condemned)
 
-	require.NoError(gc.WriteHeartbeat(ctx, sp, &gc.Replica{ID: "old-1-bb", Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 30 * time.Hour}))
+	require.NoError(gc.WriteHeartbeat(ctx, sp, &gc.Replica{ID: "old-1-bb", Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour}))
 	_, err = f.condemn(o)
 	require.ErrorAs(err, &refused)
 	require.Len(refused.Reasons, 1)
-	require.Contains(refused.Reasons[0], "replica old-1-bb: cache TTL 30h0m0s is not shorter than the cycle")
+	require.Contains(refused.Reasons[0], "replica old-1-bb: keeps cache entries without a TTL")
 }

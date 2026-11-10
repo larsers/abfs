@@ -38,7 +38,7 @@ import (
 const (
 	DefaultDeleteRate    = 2000
 	DefaultDeleteWorkers = 32
-	DefaultChunkDelay    = time.Hour
+	DefaultChunkDelay    = 15 * time.Minute
 	// signedURLLifetime is the lifetime of the signed URLs of bucket chunks
 	// that the server hands out.
 	signedURLLifetime = 10 * time.Minute

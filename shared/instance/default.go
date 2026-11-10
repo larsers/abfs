@@ -26,6 +26,10 @@ const DefaultFetchTimeout = 2 * time.Minute
 // read waiting for the server ends with the server's error, not a fetch timeout.
 const DefaultServerWaitTimeout = time.Minute
 
+// GCKeepAliveRefInterval is the interval at which a mount with gc-keepalive
+// rewrites its mount ref.
+const GCKeepAliveRefInterval = 15 * time.Minute
+
 var defaultConfig = &Config{
 	Class:               "default",
 	ManifestScheme:      "https",
@@ -59,7 +63,7 @@ var defaultConfig = &Config{
 	GitPrefetchIndices:  true,
 	GitPrefetchSymlinks: true,
 
-	GCKeepAliveRefInterval:   15 * time.Minute,
+	GCKeepAliveRefInterval:   GCKeepAliveRefInterval,
 	GCKeepAliveTouchInterval: 18 * time.Hour,
 
 	SetupOrderOnlyAsRegular: true,

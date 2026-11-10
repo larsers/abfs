@@ -271,6 +271,21 @@ func cellTimes(row bigtable.Row) map[string]bigtable.Timestamp {
 // the objects row last, with the times of the backup and without the condemn
 // marker. A map row comes back with a new time. A cycle after the range is
 // not undone.
+// Two attempts of the write deadline must fit into a quarter of the lease,
+// and a run needs a worker.
+func TestUndoOpts_Validate(t *testing.T) {
+	o := DefaultUndoOpts()
+	o.Cycle, o.FromSuffix = 5, undoSuffix
+	o.LeaseDuration = 4 * time.Minute
+	o.WriteDeadline = 30 * time.Second
+	require.NoError(t, o.Validate())
+	o.WriteDeadline = 31 * time.Second
+	require.ErrorContains(t, o.Validate(), "write deadline 31s is too long for the lease 4m0s")
+	o.WriteDeadline = 30 * time.Second
+	o.Workers = 0
+	require.ErrorContains(t, o.Validate(), "invalid number of workers 0")
+}
+
 func TestUndo_RestoresInOrder(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()

@@ -360,8 +360,10 @@ func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
 	require.Equal(int64(1), s.gcHooks.heartbeatFailures.Load())
 }
 
-// A server with GC needs a heartbeat interval of at most
-// gc.MaxHeartbeatInterval, because the collector waits that long for one.
+// A server with GC needs a cache TTL and a touch interval, without which the
+// collector refuses every condemn and delete, and a heartbeat interval of at
+// most gc.MaxHeartbeatInterval, because the collector waits that long for
+// one.
 func TestGCHooks_RejectsBadDurations(t *testing.T) {
 	tests := []struct {
 		name string
@@ -369,8 +371,9 @@ func TestGCHooks_RejectsBadDurations(t *testing.T) {
 		want string
 	}{
 		{"negative TTL", NewServerOpts{CacheTTL: -time.Second, GCHeartbeatInterval: time.Minute}, "invalid negative cache TTL"},
-		{"no heartbeat", NewServerOpts{}, "invalid GC heartbeat interval 0s"},
-		{"long heartbeat", NewServerOpts{GCHeartbeatInterval: 11 * time.Minute}, "invalid GC heartbeat interval 11m0s"},
+		{"no TTL", NewServerOpts{GCTouchInterval: time.Hour}, "invalid cache TTL 0: with GC it must be above 0"},
+		{"no touch interval", NewServerOpts{CacheTTL: time.Hour}, "invalid GC touch interval 0: with GC it must be above 0"},
+		{"long heartbeat", NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: 11 * time.Minute}, "invalid GC heartbeat interval 11m0s"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -379,4 +382,22 @@ func TestGCHooks_RejectsBadDurations(t *testing.T) {
 			require.ErrorContains(t, s.startGCHooks(context.Background(), &tt.opts), tt.want)
 		})
 	}
+}
+
+// The heartbeat interval is fixed; zero uses the default. A server that only
+// reads, as the collector's commands run it, needs no TTL, touches or
+// heartbeat.
+func TestGCHookOpts(t *testing.T) {
+	require := require.New(t)
+	o, err := gcHookOpts(&NewServerOpts{GC: true, CacheTTL: DefaultCacheTTL, GCTouchInterval: DefaultGCTouchInterval})
+	require.NoError(err)
+	require.Equal(DefaultGCHeartbeatInterval, o.GCHeartbeatInterval)
+
+	o, err = gcHookOpts(&NewServerOpts{GC: true, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute})
+	require.NoError(err)
+	require.Equal(time.Minute, o.GCHeartbeatInterval)
+
+	o, err = gcHookOpts(&NewServerOpts{GC: true, GCReadOnly: true})
+	require.NoError(err)
+	require.Zero(o.GCHeartbeatInterval)
 }
