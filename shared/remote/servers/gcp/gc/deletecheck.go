@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigtable"
@@ -38,8 +40,18 @@ var (
 )
 
 // tooNewBatch is the number of keys of one point read of the objects written
-// during the consistency scan.
-const tooNewBatch = 100
+// during the consistency scan, and tooNewReadsInFlight the number of batches
+// checked at once. tooNewMaxWait bounds how long the scan waits for the
+// checks, summed over its key ranges, which bounds how much longer a delete
+// cycle runs than a condemn cycle; past it the scan stops checking, the reads
+// in flight are cancelled and the cycle refuses its deletes. tooNewWaitSlice
+// is the longest single wait.
+const (
+	tooNewBatch         = 100
+	tooNewReadsInFlight = 8
+	tooNewMaxWait       = 15 * time.Minute
+	tooNewWaitSlice     = time.Second
+)
 
 // clientWrittenTypes are the object types that clients write into their
 // local caches, which may hold the only copy of such an object.
@@ -169,7 +181,8 @@ type deleteEvidence struct {
 	instance   instanceEvidence
 	// refRemovalErr is the error of the removal of expired refs.
 	refRemovalErr error
-	// tooNew is the result of checkTooNew, tooNewErr why it failed.
+	// tooNew is the check of the objects written during the consistency
+	// scan, tooNewErr why it failed.
 	tooNew    *TooNewReport
 	tooNewErr error
 }
@@ -273,14 +286,14 @@ func deleteBlockers(r *Report, ev *deleteEvidence, o *DeleteOpts) (reasons, warn
 	// A server without --gc writes no gc row, so a new object of one has none
 	// even after the scan.
 	switch {
-	case r.Consistency.TooNew > maxTooNew:
-		add("%d objects written during the consistency scan had no gc row, more than %d to check again", r.Consistency.TooNew, maxTooNew)
+	case ev.tooNew != nil && ev.tooNew.WithoutGCRow > 0:
+		add("%d objects without a gc row were written during the consistency scan, for example %s: a server without --gc is running", ev.tooNew.WithoutGCRow, strings.Join(ev.tooNew.Samples, ", "))
 	case ev.tooNewErr != nil:
 		add("cannot read the gc rows of the objects written during the consistency scan: %v", ev.tooNewErr)
 	case r.Consistency.TooNew > 0 && ev.tooNew == nil:
 		add("the gc rows of the %d objects written during the consistency scan were not checked", r.Consistency.TooNew)
-	case ev.tooNew != nil && ev.tooNew.WithoutGCRow > 0:
-		add("%d objects without a gc row were written during the consistency scan, for example %s: a server without --gc is running", ev.tooNew.WithoutGCRow, strings.Join(ev.tooNew.Samples, ", "))
+	case ev.tooNew != nil && ev.tooNew.Keys != r.Consistency.TooNew:
+		add("only %d of the %d objects written during the consistency scan were checked for a gc row: the checks fell behind the writes", ev.tooNew.Keys, r.Consistency.TooNew)
 	}
 	return reasons, warnings
 }
@@ -368,8 +381,9 @@ func statsWait(s *Server) time.Duration {
 }
 
 // TooNewReport reports the objects that the consistency scan found without a
-// gc row because they were written during it, read again after the scan.
+// gc row because they were written during it, read again while it ran.
 type TooNewReport struct {
+	// Keys counts the keys checked.
 	Keys int64 `json:"keys"`
 	// NotHashes counts keys that are not object hashes, which have no gc row.
 	NotHashes int64 `json:"not_hashes"`
@@ -381,66 +395,193 @@ type TooNewReport struct {
 	Samples      []string `json:"samples,omitempty"`
 }
 
-// checkTooNew reads the objects row and then the gc row of each key, so that
-// an object written in between, gc row first, is never found without one.
-// Each read is retried, each attempt within the budget b.
-func checkTooNew(ctx context.Context, bt *bigtable.Client, b writeBudget, keys []string) (*TooNewReport, error) {
-	rep := &TooNewReport{Keys: int64(len(keys))}
-	objects, gcTable := bt.Open(objectsTable), bt.Open(TableName)
+// tooNewCheck checks the objects that the consistency scan finds without a gc
+// row because they were written during it, in batches while the scan runs, so
+// that it holds counts and the batches in flight, not every key.
+//
+// It reads the gc row of a key first. A server with --gc writes the gc row of
+// an object before its objects row, and the scan has read that objects row,
+// so the gc row of such an object was written before the check reads it.
+// Only the collector that holds the lease removes objects rows and gc rows,
+// in its delete step and its chunk step, which both run after the scan and
+// the check (a backfill replaces the edges of a row in one mutation). So a
+// gc row that is missing was never written: a writer without --gc put the
+// object. The objects row is read only for those keys, so that an object
+// removed since the scan counts as gone, not as one without a gc row.
+//
+// A gc row can also be present for an object that a writer without --gc put:
+// a backfill takes no lease and writes the rows of such objects, so one that
+// reaches a key between the scan and the check hides that writer for that
+// key. A server with --gc does not write the gc row of an object that exists,
+// and an undo takes the lease.
+type tooNewCheck struct {
+	objects, gcTable *bigtable.Table
+	budget           writeBudget
+	// maxWait bounds the time that the scan waits for room in batches,
+	// summed over its key ranges.
+	maxWait time.Duration
+	batches chan []string
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	// stopped is set when a read failed or the wait is used up; the check
+	// then takes and reads no more batches. cut is set when the wait is used
+	// up: the reads in flight are cancelled, and their errors ignored, since
+	// the check is incomplete and refuses the deletes anyway.
+	stopped atomic.Bool
+	cut     atomic.Bool
+	// mu guards waited, rep and err.
+	mu     sync.Mutex
+	waited time.Duration
+	rep    TooNewReport
+	err    error
+}
+
+// newTooNewCheck returns a check that reads with bt, each attempt within the
+// budget b.
+func newTooNewCheck(bt *bigtable.Client, b writeBudget) *tooNewCheck {
+	return &tooNewCheck{objects: bt.Open(objectsTable), gcTable: bt.Open(TableName), budget: b, maxWait: tooNewMaxWait}
+}
+
+// start starts the workers, which check tooNewReadsInFlight batches at once.
+func (c *tooNewCheck) start(ctx context.Context) {
+	ctx, c.cancel = context.WithCancel(ctx)
+	c.batches = make(chan []string, tooNewReadsInFlight)
+	for range tooNewReadsInFlight {
+		c.wg.Go(func() {
+			for batch := range c.batches {
+				if c.stopped.Load() {
+					continue
+				}
+				if err := c.check(ctx, batch); err != nil {
+					c.mu.Lock()
+					if c.err == nil && !c.cut.Load() {
+						c.err = err
+					}
+					c.mu.Unlock()
+					c.stopped.Store(true)
+				}
+			}
+		})
+	}
+}
+
+// send queues a batch of keys and reports whether it did. It waits for room
+// until ctx ends or the scan has waited maxWait in all, which stops the check
+// and cancels its reads; it does not queue once the check stopped. The check
+// owns a queued batch.
+func (c *tooNewCheck) send(ctx context.Context, batch []string) bool {
+	if c.stopped.Load() {
+		return false
+	}
+	select {
+	case c.batches <- batch:
+		return true
+	default:
+	}
+	// Each wait is at most one slice long and counted when it ends, so that
+	// the ranges that wait at once share the budget.
+	for {
+		c.mu.Lock()
+		left := c.maxWait - c.waited
+		c.mu.Unlock()
+		if left <= 0 {
+			c.cut.Store(true)
+			c.stopped.Store(true)
+			c.cancel()
+			return false
+		}
+		start := time.Now()
+		t := time.NewTimer(min(left, tooNewWaitSlice))
+		var queued, done bool
+		select {
+		case c.batches <- batch:
+			queued = true
+		case <-ctx.Done():
+			done = true
+		case <-t.C:
+		}
+		t.Stop()
+		c.mu.Lock()
+		c.waited += time.Since(start)
+		c.mu.Unlock()
+		if queued || done || c.stopped.Load() {
+			return queued
+		}
+	}
+}
+
+// wait waits for the checks of the batches sent and returns the report of
+// the batches checked, and the first error of a read before the wait was used
+// up; after an error the batches still queued are dropped.
+func (c *tooNewCheck) wait() (*TooNewReport, error) {
+	close(c.batches)
+	c.wg.Wait()
+	c.cancel()
+	rep := c.rep
+	slices.Sort(rep.Samples)
+	return &rep, c.err
+}
+
+// check reads the gc row of each key of batch, and the objects row of the
+// keys without one. Each read is retried, each attempt within the budget.
+func (c *tooNewCheck) check(ctx context.Context, batch []string) error {
 	objectsFilter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.LatestNFilter(1), bigtable.StripValueFilter()))
 	gcFilter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter(EdgesFamily), bigtable.ColumnFilter(LinksColumn), bigtable.LatestNFilter(1), bigtable.StripValueFilter()))
+	var rep TooNewReport
 	var hashes []string
-	for _, k := range keys {
+	for _, k := range batch {
 		if entities.IsHash(k) {
 			hashes = append(hashes, k)
 		} else {
 			rep.NotHashes++
 		}
 	}
-	for lo := 0; lo < len(hashes); lo += tooNewBatch {
-		batch := hashes[lo:min(lo+tooNewBatch, len(hashes))]
-		var present map[string]bool
-		err := retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
-			present = make(map[string]bool, len(batch))
-			return objects.ReadRows(actx, bigtable.RowList(batch), func(row bigtable.Row) bool {
-				present[row.Key()] = len(row[objectsMetaFamily]) > 0
-				return true
-			}, objectsFilter)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to read the objects written during the scan: %w", err)
-		}
-		var still []string
-		for _, k := range batch {
-			if present[k] {
-				still = append(still, k)
-			} else {
-				rep.Gone++
-			}
-		}
-		if len(still) == 0 {
-			continue
-		}
+	var unlinked []string
+	if len(hashes) > 0 {
 		var linked map[string]bool
-		err = retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
-			linked = make(map[string]bool, len(still))
-			return gcTable.ReadRows(actx, bigtable.RowList(still), func(row bigtable.Row) bool {
+		err := retryWith(ctx, firstRetryWait, c.budget, func(actx context.Context) error {
+			linked = make(map[string]bool, len(hashes))
+			return c.gcTable.ReadRows(actx, bigtable.RowList(hashes), func(row bigtable.Row) bool {
 				linked[row.Key()] = true
 				return true
 			}, gcFilter)
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to read the gc rows of the objects written during the scan: %w", err)
+			return fmt.Errorf("failed to read the gc rows of the objects written during the scan: %w", err)
 		}
-		for _, k := range still {
-			if linked[k] {
-				continue
-			}
-			rep.WithoutGCRow++
-			if len(rep.Samples) < maxMissingKept {
-				rep.Samples = append(rep.Samples, k)
+		for _, k := range hashes {
+			if !linked[k] {
+				unlinked = append(unlinked, k)
 			}
 		}
 	}
-	return rep, nil
+	var missing []string
+	if len(unlinked) > 0 {
+		var present map[string]bool
+		err := retryWith(ctx, firstRetryWait, c.budget, func(actx context.Context) error {
+			present = make(map[string]bool, len(unlinked))
+			return c.objects.ReadRows(actx, bigtable.RowList(unlinked), func(row bigtable.Row) bool {
+				present[row.Key()] = len(row[objectsMetaFamily]) > 0
+				return true
+			}, objectsFilter)
+		})
+		if err != nil {
+			return fmt.Errorf("failed to read the objects written during the scan: %w", err)
+		}
+		for _, k := range unlinked {
+			if present[k] {
+				missing = append(missing, k)
+			} else {
+				rep.Gone++
+			}
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rep.Keys += int64(len(batch))
+	c.rep.NotHashes += rep.NotHashes
+	c.rep.Gone += rep.Gone
+	c.rep.WithoutGCRow += int64(len(missing))
+	c.rep.Samples = append(c.rep.Samples, missing[:min(len(missing), maxMissingKept-len(c.rep.Samples))]...)
+	return nil
 }

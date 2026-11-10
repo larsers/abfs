@@ -163,6 +163,7 @@ abfs server gcp gc backfill --project <project> --instance <spanner-instance> --
 * `--dry-run` only counts the rows to write.
 * `--rate` limits the object rows scanned per second (0 means no limit).
 * The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
+* Do not run it while delete cycles run: stop the collector job, or run it without `--delete`, until the backfill has finished. A delete cycle checks that each object written during its consistency scan has a `gc` row, which only a server with `--gc` writes; a backfill that writes the row of such an object in between hides the server without `--gc` that wrote it.
 
 A row is current when its version of the edge rules is at least the one its object type requires; only the rows of types whose rules changed are rewritten. Version 2 gives each deep tree an edge to every deep tree nested in it: a directory with 1,000 or more entries below it is stored as a deep tree of its own, which only deep trees link. Version 1 gave deep trees no edges, so the dry run counted those nested deep trees as unreachable although mounts read them.
 
@@ -191,7 +192,7 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 4. For each live mount, reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
 5. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
 6. Marks in memory everything the roots reach. It walks the roots one at a time in a fixed order: the refs of the classes source, workspaces, snapshots, mounts and unmount records, then the pinned revisions, builds, other `abfs-meta` refs, empty objects, recent objects and map rows, so that the report can name the root that reached an object first. Edges to objects without a `gc` row are skipped and counted. A `gc` row with an object type the binary does not know stops the run.
-7. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once.
+7. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
 8. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
 
 ### Root classes
@@ -220,7 +221,7 @@ The report counts:
 * roots whose object has no `gc` row (dangling roots);
 * objects and edges per type, reachable and unreachable, with up to 20 unreachable keys per type (`unreachable_sample`), and dangling edges with a few examples;
 * map rows live and expired per class;
-* the consistency result with the first objects missing a `gc` row. Objects written within a minute of the scan are not checked for a `gc` row (`too_new`), and `gc` rows without an object row (uploads in flight) are counted;
+* the consistency result with the first objects missing a `gc` row. Objects without a `gc` row that were written after the scan of the `gc` table started, less a minute, are counted apart (`too_new`): an upload during the scans lands there when its `gc` row was written after the scan of the `gc` table passed its key, so the count grows with the upload rate and is not an error. `gc` rows without an object row (uploads in flight) are counted too;
 * the time of each step and the peak heap;
 * while `GcState` names the list of a condemn or delete cycle, `delete.plan`: what a delete cycle would remove from it now, the candidates and `would_delete` per type with their bytes, the levels and the map rows (see [Delete mode](#delete-mode)). `delete.plan_error` says why the list could not be read.
 
@@ -406,7 +407,9 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 | No ready backup of a table started after the list was completed | Take the [backups](#backups) between cycles, or pass `--no-backup-check` |
 | The removal of expired refs failed | The next cycle tries again |
 | Live mounts run without `gc-keepalive`; mounts with it run with a cacheman that does not check local writes; mounts touch their objects less often than the grace allows | See [Client caches](#client-caches) |
-| Objects written during the consistency scan have no `gc` row, more than 10,000 such objects to check, or their rows cannot be read | A server without `--gc` writes to the store; find and stop it |
+| Objects written during the consistency scan have no `gc` row; the reason names up to 10 of them | A server without `--gc` writes to the store; find and stop it |
+| The `gc` rows of the objects written during the consistency scan cannot be read | Check the collector's access to Bigtable and the load of its app profile; the next cycle checks again |
+| Only some of the objects written during the consistency scan were checked: the checks fell behind the writes, and the scan stopped waiting for them | Nothing; deletes resume in a later cycle with fewer writes during its scan (see [Planning figures](#planning-figures)) |
 | A server wrote no heartbeat with touch counts read after the snapshot in time | Check that server's heartbeat writes (`abfs.gcp.gc.heartbeat_failures`) |
 
 A crash, an out-of-memory kill, a preemption, a pause of a VM, a stop killed before it recorded itself, or one dropped or failed touch on any server stops deletes for about `--grace` plus 31 minutes, which is three daily cycles at the defaults.
@@ -506,7 +509,7 @@ The section `delete` holds:
 | Field | Content |
 | --- | --- |
 | `refused`, `warnings` | why the cycle did not delete, and the checks that options turned into warnings |
-| `too_new` | the objects the consistency scan found without a `gc` row because they were written during it, read again |
+| `too_new` | the check of the objects the consistency scan found without a `gc` row because they were written during it: `keys` checked, which equals `consistency.too_new` unless the scan stopped waiting for the checks; `not_hashes`; `gone`, deleted again before the check; `without_gc_row`, with up to 10 `samples`, which are a sample and not the lowest keys. When the check failed, it counts the objects checked before, and the reason is in `refused` |
 | `plan` | what the cycle planned to delete |
 | `step` | the record prefix; the objects deleted per type and their bytes; `not_matched` with samples, each of which should have a rescue log line of a server; `gone`; `blocked` (below a key that was not deleted); `type_not_allowed`; keys of unknown outcome; `gc` rows and map rows deleted and kept; the time of the first 100 levels per key range |
 | `chunks` | the chunk step |
@@ -518,6 +521,8 @@ The section `delete` holds:
 * A delete step removes about 24,000 objects in about 19 seconds on one Bigtable node, about 0.8 ms per object. The default `--delete-rate` of 2,000 per second also bounds it: 10^6 candidates take at least about 8 minutes.
 * A condemn or delete cycle over about 71 million objects takes about 7 to 14 minutes on one node with autoscaling to 3.
 * Writing the markers of about 27,000 objects takes about 6 seconds at the default `--condemn-rate`.
+* A delete cycle checks each object written during its consistency scan while the scan runs: it reads the object's `gc` row, and its `objects` row only when the `gc` row is missing, in batches of 100 keys with 8 batches in flight, and keeps only counts and the batches in flight in memory. That is one row read per object. Bigtable rates one SSD node at up to 17,000 row reads per second ([performance](https://docs.cloud.google.com/bigtable/docs/performance)), so on a node with no other load than the collector 1 million objects written during a scan take about 1 minute of reads and 10 million about 10 minutes, less with more nodes. The collector reads at low priority, so a node busy with a seed checks slower.
+* When the checks fall behind, the scan waits for them, at most 15 minutes summed over its key ranges. The wait makes a delete cycle up to about 15 minutes longer than a condemn cycle, about the length of one more cycle at 71 million objects, and about 1 minute longer when all 16 key ranges wait at once. The checks share the node with the scan, so they also slow it. Past that wait the scan stops checking and cancels the reads in flight, finishes at full speed, and the cycle refuses its deletes. A cycle during a seed or a large catch-up of a git-pusher can refuse this way; deletes resume in a later cycle with fewer writes during its scan.
 * The step runs one level per link in a chain of unreachable objects: for a dropped branch of 10,000 commits, expect about 10,000 levels and an estimated 13 to 20 minutes of delete step and tens of thousands of delete records, which the next chunk step reads.
 * Deleted data is billed until it is gone: in backups for their retention, and soft-deleted chunks for the soft delete retention.
 

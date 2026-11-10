@@ -17,12 +17,15 @@ package gc
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/bigtable"
+	"cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -284,10 +287,23 @@ func TestDeleteBlockers(t *testing.T) {
 			c.r.Consistency.TooNew = 2
 			c.ev.tooNewErr = errors.New("unavailable")
 		}, []string{"cannot read the gc rows of the objects written during the consistency scan: unavailable"}, nil},
-		{"too many too_new keys", func(c *deleteCase) {
-			c.r.Consistency.TooNew = maxTooNew + 1
-			c.ev.tooNew = &TooNewReport{Keys: maxTooNew + 1}
-		}, []string{"more than 10000 to check again"}, nil},
+		{"many too_new keys with gc rows", func(c *deleteCase) {
+			c.r.Consistency.TooNew = 2_000_000
+			c.ev.tooNew = &TooNewReport{Keys: 2_000_000, NotHashes: 1, Gone: 300}
+		}, nil, nil},
+		{"too_new keys not all checked", func(c *deleteCase) {
+			c.r.Consistency.TooNew = 2
+			c.ev.tooNew = &TooNewReport{Keys: 1}
+		}, []string{"only 1 of the 2 objects written during the consistency scan were checked for a gc row"}, nil},
+		{"too_new key without a gc row before the check stopped", func(c *deleteCase) {
+			c.r.Consistency.TooNew = 3
+			c.ev.tooNew = &TooNewReport{Keys: 2, WithoutGCRow: 1, Samples: []string{"ab12"}}
+		}, []string{"1 objects without a gc row were written during the consistency scan, for example ab12"}, nil},
+		{"too_new key without a gc row before a read failed", func(c *deleteCase) {
+			c.r.Consistency.TooNew = 3
+			c.ev.tooNew = &TooNewReport{Keys: 2, WithoutGCRow: 1, Samples: []string{"ab12"}}
+			c.ev.tooNewErr = errors.New("unavailable")
+		}, []string{"1 objects without a gc row were written during the consistency scan, for example ab12"}, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -528,17 +544,17 @@ func TestStatsWait(t *testing.T) {
 }
 
 // The objects written during the consistency scan are read again: one that
-// still has no gc row was written by a server without --gc. A read that
-// stalls ends at the deadline of its attempt and is tried again.
-func TestCheckTooNew(t *testing.T) {
+// still has no gc row was written by a server without --gc, and one without
+// a gc row or an objects row is gone. A read that stalls ends at the
+// deadline of its attempt and is tried again.
+func TestTooNewCheck(t *testing.T) {
 	require := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var reads atomic.Int32
 	stall := grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 		if strings.HasSuffix(method, "/ReadRows") {
-			// The first read of the objects rows and the first of the gc
-			// rows, after the retry of the first.
+			// Two of the reads, which the batches in flight share.
 			if n := reads.Add(1); n == 1 || n == 3 {
 				<-ctx.Done()
 				return nil, ctx.Err()
@@ -569,9 +585,65 @@ func TestCheckTooNew(t *testing.T) {
 	all = append(all, "abfs-setup-check")
 
 	reads.Store(0)
-	rep, err := checkTooNew(ctx, client, writeBudget{deadline: 200 * time.Millisecond}, all)
+	check := newTooNewCheck(client, writeBudget{deadline: 200 * time.Millisecond})
+	check.start(ctx)
+	for lo := 0; lo < len(all); lo += tooNewBatch {
+		require.True(check.send(ctx, all[lo:min(lo+tooNewBatch, len(all))]))
+	}
+	rep, err := check.wait()
 	require.NoError(err)
-	require.Equal(&TooNewReport{Keys: 251, NotHashes: 1, Gone: 50, WithoutGCRow: 2, Samples: []string{keys[7].String(), keys[201].String()}}, rep)
+	require.Equal(&TooNewReport{Keys: 251, NotHashes: 1, Gone: 50, WithoutGCRow: 2, Samples: slices.Sorted(slices.Values([]string{keys[7].String(), keys[201].String()}))}, rep)
+}
+
+// A read that fails after the check found an object without a gc row does
+// not hide that object: the report keeps it with the error, and the delete
+// is refused naming it.
+func TestTooNewCheck_ReadFailsAfterWriterFound(t *testing.T) {
+	require := require.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	keys := testHashes(2 * tooNewBatch)
+	without := keys[0].String()
+	// Every read of gc rows fails, except the one of the batch with the
+	// object without a gc row.
+	client := newHooksTestBigtable(t, readHook(func(ctx context.Context, req *bigtablepb.ReadRowsRequest) error {
+		if strings.HasSuffix(req.GetTableName(), "/"+TableName) && !slices.ContainsFunc(req.GetRows().GetRowKeys(), func(k []byte) bool { return string(k) == without }) {
+			return status.Error(codes.PermissionDenied, "read refused by the test")
+		}
+		return nil
+	}))
+	put := func(table, key, family, column string) {
+		mut := bigtable.NewMutation()
+		mut.Set(family, column, bigtable.Now(), []byte("x"))
+		require.NoError(client.Open(table).Apply(ctx, key, mut))
+	}
+	var all []string
+	for _, k := range keys {
+		all = append(all, k.String())
+		put(objectsTable, k.String(), objectsMetaFamily, "type")
+		if k.String() != without {
+			put(TableName, k.String(), EdgesFamily, LinksColumn)
+		}
+	}
+
+	check := newTooNewCheck(client, writeBudget{deadline: time.Second})
+	check.start(ctx)
+	require.True(check.send(ctx, all[:tooNewBatch]))
+	require.Eventually(func() bool {
+		check.mu.Lock()
+		defer check.mu.Unlock()
+		return check.rep.Keys == tooNewBatch
+	}, 5*time.Second, 5*time.Millisecond)
+	require.True(check.send(ctx, all[tooNewBatch:]))
+	rep, err := check.wait()
+	require.ErrorContains(err, "failed to read the gc rows of the objects written during the scan")
+	require.Equal(&TooNewReport{Keys: tooNewBatch, WithoutGCRow: 1, Samples: []string{without}}, rep)
+
+	c := newDeleteCase()
+	c.r.Consistency.TooNew = int64(len(all))
+	c.ev.tooNew, c.ev.tooNewErr = rep, err
+	reasons, _ := deleteBlockers(c.r, c.ev, c.o)
+	require.Equal([]string{"1 objects without a gc row were written during the consistency scan, for example " + without + ": a server without --gc is running"}, reasons)
 }
 
 type fakeInstance struct {
@@ -640,52 +712,97 @@ func TestInstanceChecks_ProbeConditionalWrite(t *testing.T) {
 	require.Empty(row)
 }
 
-// The consistency scan of a condemn keeps the keys of the objects written
-// during it, one more than a delete checks again, and only those.
-func TestCheckConsistency_KeepsTooNewKeys(t *testing.T) {
+// The consistency scan of a delete cycle checks every object written during
+// it, however many, and only those: with a gc row written after the scan of
+// the table gc, the delete goes ahead; one object without a gc row refuses
+// it. A check that fails does not fail the scan, and refuses the delete.
+func TestCheckConsistency_ChecksTooNewKeys(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	client := newHooksTestBigtable(t)
 	old := bigtable.Time(time.Now().Add(-time.Hour))
-	keys := testHashes(maxTooNew + 5)
-	var rows []string
-	var muts []*bigtable.Mutation
+	const n = 12_000
+	keys := testHashes(n + 2)
 	meta := func(ts bigtable.Timestamp) *bigtable.Mutation {
 		mut := bigtable.NewMutation()
 		mut.Set(objectsMetaFamily, "type", ts, []byte("blob"))
 		return mut
 	}
-	for _, k := range keys[2:] {
-		rows, muts = append(rows, k.String()), append(muts, meta(bigtable.Now()))
+	edges := func(ts bigtable.Timestamp) *bigtable.Mutation {
+		mut := bigtable.NewMutation()
+		mut.Set(EdgesFamily, LinksColumn, ts, PackEdges(nil))
+		mut.Set(EdgesFamily, TypeColumn, ts, []byte("blob"))
+		mut.Set(EdgesFamily, VersionColumn, ts, versionBytes(ExtractorVersion))
+		return mut
 	}
-	errs, err := client.Open(objectsTable).ApplyBulk(ctx, rows, muts)
-	require.NoError(err)
-	require.Nil(errs)
+	bulk := func(table string, keys []Hash, mut func(bigtable.Timestamp) *bigtable.Mutation) {
+		var rows []string
+		var muts []*bigtable.Mutation
+		for _, k := range keys {
+			rows, muts = append(rows, k.String()), append(muts, mut(bigtable.Now()))
+		}
+		errs, err := client.Open(table).ApplyBulk(ctx, rows, muts)
+		require.NoError(err)
+		require.Nil(errs)
+	}
 	// One object with a gc row, and one without written before the scan.
-	edges := bigtable.NewMutation()
-	edges.Set(EdgesFamily, LinksColumn, old, PackEdges(nil))
-	edges.Set(EdgesFamily, TypeColumn, old, []byte("blob"))
-	edges.Set(EdgesFamily, VersionColumn, old, versionBytes(ExtractorVersion))
-	require.NoError(client.Open(TableName).Apply(ctx, keys[0].String(), edges))
+	require.NoError(client.Open(TableName).Apply(ctx, keys[0].String(), edges(old)))
 	require.NoError(client.Open(objectsTable).Apply(ctx, keys[0].String(), meta(old)))
 	require.NoError(client.Open(objectsTable).Apply(ctx, keys[1].String(), meta(old)))
+	bulk(objectsTable, keys[2:], meta)
 
 	bounds, err := splitRange("", "", 4)
 	require.NoError(err)
 	bounds = prefixBounds(bounds)
 	g, _, err := scanNodes(ctx, client.Open(TableName), bounds, time.Now().Add(-72*time.Hour))
 	require.NoError(err)
-	scan, err := checkConsistency(ctx, client.Open(objectsTable), bounds, g, newBitmap(g.size()), time.Now().Add(-time.Minute), true)
-	require.NoError(err)
-	require.Equal(int64(1), scan.report.MissingGCRows)
-	require.Equal(int64(maxTooNew+3), scan.report.TooNew)
-	require.Len(scan.tooNew, maxTooNew+1)
-	require.NotContains(scan.tooNew, keys[0].String())
-	require.NotContains(scan.tooNew, keys[1].String())
+	// The gc rows of the new objects land after the scan of the table gc, as
+	// those of uploads during a cycle do; one object has none.
+	without := keys[n/2].String()
+	bulk(TableName, slices.DeleteFunc(slices.Clone(keys[2:]), func(k Hash) bool { return k.String() == without }), edges)
 
-	scan, err = checkConsistency(ctx, client.Open(objectsTable), bounds, g, newBitmap(g.size()), time.Now().Add(-time.Minute), false)
+	scanWith := func(b writeBudget) *consistencyScan {
+		scan, err := checkConsistency(ctx, client.Open(objectsTable), bounds, g, newBitmap(g.size()), time.Now().Add(-time.Minute), true, newTooNewCheck(client, b))
+		require.NoError(err)
+		require.Equal(int64(1), scan.report.MissingGCRows)
+		require.Equal(int64(n), scan.report.TooNew)
+		return scan
+	}
+	blockers := func(scan *consistencyScan) []string {
+		c := newDeleteCase()
+		c.r.Consistency = *scan.report
+		c.ev.tooNew, c.ev.tooNewErr = scan.tooNew, scan.tooNewErr
+		reasons, _ := deleteBlockers(c.r, c.ev, c.o)
+		return reasons
+	}
+
+	scan := scanWith(writeBudget{deadline: time.Second})
+	require.NoError(scan.tooNewErr)
+	require.Equal(&TooNewReport{Keys: n, WithoutGCRow: 1, Samples: []string{without}}, scan.tooNew)
+	reasons := blockers(scan)
+	require.Len(reasons, 1)
+	require.Contains(reasons[0], "1 objects without a gc row were written during the consistency scan, for example "+without)
+
+	require.NoError(client.Open(TableName).Apply(ctx, without, edges(bigtable.Now())))
+	scan = scanWith(writeBudget{deadline: time.Second})
+	require.Equal(&TooNewReport{Keys: n}, scan.tooNew)
+	require.Empty(blockers(scan))
+
+	expiring := &Lease{}
+	expiring.expiry.Store(time.Now().Add(time.Minute).UnixNano())
+	scan = scanWith(writeBudget{deadline: DefaultWriteDeadline, lease: expiring})
+	require.Equal(&TooNewReport{}, scan.tooNew)
+	require.ErrorIs(scan.tooNewErr, errLeaseExpiring)
+	reasons = blockers(scan)
+	require.Len(reasons, 1)
+	require.Contains(reasons[0], "cannot read the gc rows of the objects written during the consistency scan")
+
+	// A scan without a check, as in a dry run or a condemn cycle, reads
+	// nothing more.
+	scan, err = checkConsistency(ctx, client.Open(objectsTable), bounds, g, newBitmap(g.size()), time.Now().Add(-time.Minute), false, nil)
 	require.NoError(err)
-	require.Empty(scan.tooNew)
+	require.Nil(scan.tooNew)
+	require.NoError(scan.tooNewErr)
 }
 
 // The evidence of a delete names the list the cycle read and the condemn
@@ -703,4 +820,328 @@ func TestNewDeleteEvidence(t *testing.T) {
 	ev = newDeleteEvidence(lease, &condemner{prev: previousList{state: state, err: "not found"}}, &Result{servers: servers})
 	require.Nil(ev.listHeader)
 	require.Equal("not found", ev.listErr)
+}
+
+// readHook returns a dial option that runs hook before each ReadRows request
+// of the client; an error it returns fails the read.
+func readHook(hook func(ctx context.Context, req *bigtablepb.ReadRowsRequest) error) grpc.DialOption {
+	return grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		s, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil || !strings.HasSuffix(method, "/ReadRows") {
+			return s, err
+		}
+		return &hookedRead{ClientStream: s, hook: hook}, nil
+	})
+}
+
+type hookedRead struct {
+	grpc.ClientStream
+	hook func(ctx context.Context, req *bigtablepb.ReadRowsRequest) error
+	err  error
+}
+
+func (r *hookedRead) SendMsg(m any) error {
+	if req, ok := m.(*bigtablepb.ReadRowsRequest); ok {
+		r.err = r.hook(r.Context(), req)
+	}
+	return r.ClientStream.SendMsg(m)
+}
+
+func (r *hookedRead) RecvMsg(m any) error {
+	if r.err != nil {
+		return r.err
+	}
+	return r.ClientStream.RecvMsg(m)
+}
+
+// tooNewScan is a store of objects written just now without a gc row in the
+// mark, split into four key ranges. Their gc rows are written after the mark,
+// as those of uploads during a cycle are. Once on is set, gcRead runs before
+// each read of the table gc and objectsRange before each scan of a range of
+// the table objects.
+type tooNewScan struct {
+	t            *testing.T
+	client       *bigtable.Client
+	bounds       []string
+	g            *graph
+	on           atomic.Bool
+	gcRead       func(ctx context.Context) error
+	objectsRange func(ctx context.Context, start string) error
+}
+
+func newTooNewScan(t *testing.T, n int) *tooNewScan {
+	t.Helper()
+	ctx := context.Background()
+	s := &tooNewScan{t: t}
+	s.client = newHooksTestBigtable(t, readHook(func(ctx context.Context, req *bigtablepb.ReadRowsRequest) error {
+		if !s.on.Load() {
+			return nil
+		}
+		switch {
+		case strings.HasSuffix(req.GetTableName(), "/"+TableName) && s.gcRead != nil:
+			return s.gcRead(ctx)
+		case strings.HasSuffix(req.GetTableName(), "/"+objectsTable) && len(req.GetRows().GetRowRanges()) > 0 && s.objectsRange != nil:
+			return s.objectsRange(ctx, string(req.GetRows().GetRowRanges()[0].GetStartKeyClosed()))
+		}
+		return nil
+	}))
+	bulk := func(table string, set func(mut *bigtable.Mutation)) {
+		var rows []string
+		var muts []*bigtable.Mutation
+		for _, k := range testHashes(n) {
+			mut := bigtable.NewMutation()
+			set(mut)
+			rows, muts = append(rows, k.String()), append(muts, mut)
+		}
+		errs, err := s.client.Open(table).ApplyBulk(ctx, rows, muts)
+		require.NoError(t, err)
+		require.Nil(t, errs)
+	}
+	bulk(objectsTable, func(mut *bigtable.Mutation) { mut.Set(objectsMetaFamily, "type", bigtable.Now(), []byte("blob")) })
+	bounds, err := splitRange("", "", 4)
+	require.NoError(t, err)
+	s.bounds = prefixBounds(bounds)
+	s.g, _, err = scanNodes(ctx, s.client.Open(TableName), s.bounds, time.Now().Add(-72*time.Hour))
+	require.NoError(t, err)
+	bulk(TableName, func(mut *bigtable.Mutation) {
+		mut.Set(EdgesFamily, LinksColumn, bigtable.Now(), PackEdges(nil))
+		mut.Set(EdgesFamily, TypeColumn, bigtable.Now(), []byte("blob"))
+		mut.Set(EdgesFamily, VersionColumn, bigtable.Now(), versionBytes(ExtractorVersion))
+	})
+	return s
+}
+
+// check returns a check whose reads attempt for at most deadline.
+func (s *tooNewScan) check(deadline time.Duration) *tooNewCheck {
+	return newTooNewCheck(s.client, writeBudget{deadline: deadline})
+}
+
+func (s *tooNewScan) run(ctx context.Context, check *tooNewCheck) (*consistencyScan, error) {
+	s.on.Store(true)
+	defer s.on.Store(false)
+	return checkConsistency(ctx, s.client.Open(objectsTable), s.bounds, s.g, newBitmap(s.g.size()), time.Now().Add(-time.Minute), false, check)
+}
+
+// blockers returns the reasons why a delete cycle with scan refuses.
+func (s *tooNewScan) blockers(scan *consistencyScan) []string {
+	c := newDeleteCase()
+	c.r.Consistency = *scan.report
+	c.ev.tooNew, c.ev.tooNewErr = scan.tooNew, scan.tooNewErr
+	reasons, _ := deleteBlockers(c.r, c.ev, c.o)
+	return reasons
+}
+
+// stall makes reads wait until their context ends and counts the reads that
+// wait and those that ended.
+type stall struct {
+	waiting, ended atomic.Int32
+}
+
+func (s *stall) read(ctx context.Context) error {
+	s.waiting.Add(1)
+	defer s.ended.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// When the checks fall behind the scan, the scan waits for them, and every
+// object is still checked.
+func TestCheckConsistency_TooNewBackpressure(t *testing.T) {
+	require := require.New(t)
+	const n = 4000
+	s := newTooNewScan(t, n)
+	s.gcRead = func(ctx context.Context) error {
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+	check := s.check(time.Second)
+	scan, err := s.run(context.Background(), check)
+	require.NoError(err)
+	require.Equal(int64(n), scan.report.TooNew)
+	require.NoError(scan.tooNewErr)
+	require.Equal(&TooNewReport{Keys: n}, scan.tooNew)
+	require.Positive(check.waited)
+	require.Empty(s.blockers(scan))
+}
+
+// When the scan has waited for the checks as long as the check allows, it
+// stops checking and finishes, and the delete is refused because not every
+// object was checked.
+func TestCheckConsistency_TooNewWaitUsedUp(t *testing.T) {
+	require := require.New(t)
+	const n = 4000
+	s := newTooNewScan(t, n)
+	s.gcRead = func(ctx context.Context) error {
+		time.Sleep(300 * time.Millisecond)
+		return nil
+	}
+	check := s.check(time.Second)
+	check.maxWait = 50 * time.Millisecond
+	start := time.Now()
+	scan, err := s.run(context.Background(), check)
+	require.NoError(err)
+	require.Less(time.Since(start), 3*time.Second)
+	require.Equal(int64(n), scan.report.TooNew)
+	require.NoError(scan.tooNewErr)
+	require.Less(scan.tooNew.Keys, int64(n))
+	require.GreaterOrEqual(check.waited, check.maxWait)
+	reasons := s.blockers(scan)
+	require.Len(reasons, 1)
+	require.Contains(reasons[0], fmt.Sprintf("only %d of the %d objects written during the consistency scan were checked for a gc row", scan.tooNew.Keys, n))
+}
+
+// When the scan uses up its wait while the reads of the check hang, the check
+// stops at once: the reads in flight are cancelled and their errors ignored,
+// and the batches still queued are not read. The delete is refused because
+// not every object was checked.
+func TestCheckConsistency_TooNewWaitUsedUpStopsReads(t *testing.T) {
+	require := require.New(t)
+	const n = 4000
+	s := newTooNewScan(t, n)
+	var reads stall
+	s.gcRead = reads.read
+	check := s.check(time.Minute)
+	type result struct {
+		scan *consistencyScan
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		scan, err := s.run(context.Background(), check)
+		done <- result{scan, err}
+	}()
+	require.Eventually(func() bool {
+		return reads.waiting.Load() == tooNewReadsInFlight && len(check.batches) == cap(check.batches)
+	}, 5*time.Second, 5*time.Millisecond)
+	check.mu.Lock()
+	check.maxWait = 0
+	check.mu.Unlock()
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		require.FailNow("the scan did not return after its wait was used up")
+	}
+	require.NoError(res.err)
+	scan := res.scan
+	require.Equal(int64(n), scan.report.TooNew)
+	require.NoError(scan.tooNewErr)
+	require.Equal(&TooNewReport{}, scan.tooNew)
+	require.Equal(int32(tooNewReadsInFlight), reads.waiting.Load())
+	require.Equal(reads.waiting.Load(), reads.ended.Load())
+	reasons := s.blockers(scan)
+	require.Len(reasons, 1)
+	require.Contains(reasons[0], fmt.Sprintf("only 0 of the %d objects written during the consistency scan were checked for a gc row", n))
+}
+
+// A check whose every read fails does not stop the scan, reads none of the
+// batches still queued, and refuses the delete.
+func TestCheckConsistency_TooNewReadsFail(t *testing.T) {
+	require := require.New(t)
+	const n = 4000
+	s := newTooNewScan(t, n)
+	var reads atomic.Int32
+	release := make(chan struct{})
+	s.gcRead = func(ctx context.Context) error {
+		reads.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return status.Error(codes.PermissionDenied, "read refused by the test")
+	}
+	check := s.check(time.Minute)
+	type result struct {
+		scan *consistencyScan
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		scan, err := s.run(context.Background(), check)
+		done <- result{scan, err}
+	}()
+	require.Eventually(func() bool {
+		return reads.Load() == tooNewReadsInFlight && len(check.batches) == cap(check.batches)
+	}, 5*time.Second, 5*time.Millisecond)
+	close(release)
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		require.FailNow("the scan did not return after the reads failed")
+	}
+	require.NoError(res.err)
+	scan := res.scan
+	require.Equal(int64(n), scan.report.TooNew)
+	require.Equal(int32(tooNewReadsInFlight), reads.Load())
+	require.Equal(&TooNewReport{}, scan.tooNew)
+	require.ErrorContains(scan.tooNewErr, "failed to read the gc rows of the objects written during the scan")
+	reasons := s.blockers(scan)
+	require.Len(reasons, 1)
+	require.Contains(reasons[0], "cannot read the gc rows of the objects written during the consistency scan")
+}
+
+// A scan that is cancelled while the check's reads hang and the scan waits
+// for room returns at once, and every read of the check has ended.
+func TestCheckConsistency_TooNewCancelled(t *testing.T) {
+	require := require.New(t)
+	s := newTooNewScan(t, 4000)
+	var reads stall
+	s.gcRead = reads.read
+	check := s.check(time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.run(ctx, check)
+		done <- err
+	}()
+	require.Eventually(func() bool {
+		return reads.waiting.Load() == tooNewReadsInFlight && len(check.batches) == cap(check.batches)
+	}, 5*time.Second, 5*time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.True(errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled, "%v", err)
+	case <-time.After(2 * time.Second):
+		require.Fail("the scan did not return after it was cancelled")
+	}
+	require.Equal(reads.waiting.Load(), reads.ended.Load())
+}
+
+// A key range whose scan fails while the other ranges wait for room ends the
+// scan with its error, and every read of the check has ended.
+func TestCheckConsistency_TooNewRangeFails(t *testing.T) {
+	require := require.New(t)
+	s := newTooNewScan(t, 4000)
+	var reads stall
+	s.gcRead = reads.read
+	release := make(chan struct{})
+	failing := s.bounds[1]
+	s.objectsRange = func(ctx context.Context, start string) error {
+		if start != failing {
+			return nil
+		}
+		<-release
+		return status.Error(codes.PermissionDenied, "scan refused by the test")
+	}
+	check := s.check(time.Minute)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.run(context.Background(), check)
+		done <- err
+	}()
+	require.Eventually(func() bool {
+		return reads.waiting.Load() == tooNewReadsInFlight && len(check.batches) == cap(check.batches)
+	}, 5*time.Second, 5*time.Millisecond)
+	close(release)
+	select {
+	case err := <-done:
+		require.ErrorContains(err, fmt.Sprintf("failed to scan the table objects from %q", failing))
+		require.Equal(codes.PermissionDenied, status.Code(err))
+	case <-time.After(2 * time.Second):
+		require.Fail("the scan did not return after a range failed")
+	}
+	require.Equal(reads.waiting.Load(), reads.ended.Load())
 }
