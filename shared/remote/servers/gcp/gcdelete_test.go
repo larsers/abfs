@@ -533,6 +533,36 @@ func TestDeleteGC_RefusedCycleCondemns(t *testing.T) {
 	f.requireGone(key)
 }
 
+// A mount without the keep-alive that abfs unmount ended refuses no deletes
+// of blobs; a live one does.
+func TestDeleteGC_EndedMountWithoutKeepAlive(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	recent := time.Now().Add(-time.Hour)
+	f.mount("refs/abfs/mount/user/u/1", nil, recent)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", f.blob("unmount details", f.old), recent)
+	key := f.blob("unreachable file", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	f.age()
+
+	res := f.deletes(nil)
+	require.Equal(int64(1), res.Report.Refs[gc.RefMount].Ended)
+	require.Zero(res.Report.LiveMounts.WithoutKeepAlive)
+	require.Empty(res.Report.Delete.Warnings)
+	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
+	f.requireGone(key)
+
+	f.mount("refs/abfs/mount/user/u/2", nil, recent)
+	f.age()
+	res = f.delete(nil)
+	require.Equal(int64(1), res.Report.LiveMounts.WithoutKeepAlive)
+	require.True(slices.ContainsFunc(res.Report.Delete.Refused, func(s string) bool {
+		return strings.Contains(s, "1 live mounts run without the GC keep-alive")
+	}), "%q", res.Report.Delete.Refused)
+	require.Nil(res.Report.Delete.Step)
+}
+
 // The cycle runs its steps in order: a refusal of the condemn checks stops
 // the cycle before any delete check; the checks of the instance run before
 // the markers of live keys are cleared, the delete step after that and
@@ -761,10 +791,10 @@ func TestDeleteGC_EndToEnd(t *testing.T) {
 	f.ref(entities.ABFSMetaProject, "refs/abfs/build/user/u/b2", newBuild, recentRef)
 	keep(newLog, newBuild)
 	oldUnmount := f.blob("old unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", oldUnmount, old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/3", oldUnmount, old)
 	drop(oldUnmount)
 	newUnmount := f.blob("new unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/2", newUnmount, recentRef)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/4", newUnmount, recentRef)
 	keep(newUnmount)
 
 	// Eval maps unused past the map retention and used recently.

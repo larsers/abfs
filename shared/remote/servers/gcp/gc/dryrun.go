@@ -51,9 +51,12 @@ type DryRunOpts struct {
 	// snapshot, and everything such an object reaches.
 	Grace time.Duration
 	// MountIdle is how long a mount ref stays a root after its last write.
+	// An ended mount ref, one with an unmount ref, keeps only its mount
+	// details and goes earlier when its unmount ref passes BuildRetention.
 	MountIdle time.Duration
 	// BuildRetention is how long build, build-start and unmount refs stay
-	// roots after their last write.
+	// roots after their last write. An ended mount ref goes with its unmount
+	// ref.
 	BuildRetention time.Duration
 	// SnapshotRetention is how long a snapshot ref stays a root after its
 	// last write.
