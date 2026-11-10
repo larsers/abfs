@@ -216,7 +216,7 @@ func TestGCHooks_HeartbeatRecordsPause(t *testing.T) {
 			if failed {
 				orig := writeServer
 				t.Cleanup(func() { writeServer = orig })
-				writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool) error {
+				writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool, bool) error {
 					return status.Error(codes.Unavailable, "injected")
 				}
 				require.Error(s.heartbeat(ctx))

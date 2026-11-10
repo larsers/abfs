@@ -62,14 +62,26 @@ const (
 
 // TouchStats counts the touches of a Toucher.
 type TouchStats struct {
-	// Written counts the touches written.
+	// Written counts the object touches written.
 	Written int64
-	// Dropped counts the touches dropped because the buffer stayed full.
+	// Dropped counts the object touches dropped because the buffer stayed
+	// full.
 	Dropped int64
-	// Failed counts the touches that could not be written, and those whose
-	// write could end later than TouchDrainBound after they were queued. A
-	// late touch is counted before its write.
+	// Failed counts the object touches that could not be written, and those
+	// whose write could end later than TouchDrainBound after they were
+	// queued. A late touch is counted before its write.
 	Failed int64
+	// MapRowsWritten, MapRowsDropped and MapRowsFailed count the map row
+	// touches the same way, except that a map row touch is dropped when the
+	// buffer is about half full.
+	MapRowsWritten int64
+	MapRowsDropped int64
+	MapRowsFailed  int64
+}
+
+// touchCounts counts the touches of one kind.
+type touchCounts struct {
+	written, dropped, failed atomic.Int64
 }
 
 type touch struct {
@@ -81,11 +93,16 @@ type touch struct {
 // Toucher writes touches in the background: the touch cell of an object's gc
 // row, and the cell of a map row, whose timestamp then records the last use.
 // Touches wait in a bounded buffer and are written in batches by several
-// workers. When the buffer is full, TouchObject and TouchMapRow wait up to
-// touchEnqueueWait for room and then drop the touch; after such a timeout,
-// touches are dropped without waiting until the buffer has room again, so that
-// writes that stall delay the calls only once. TryTouchObject never waits. The
-// cells get server timestamps, so all replicas write on one clock.
+// workers. When the buffer is full, TouchObject waits up to touchEnqueueWait
+// for room and then drops the touch; after such a timeout, object touches are
+// dropped without waiting until the buffer has room again, so that writes that
+// stall delay the calls only once. TryTouchObject never waits. TouchMapRow
+// never waits either, and queues a touch only while the buffer is less than
+// half full when it looks, so that map row touches take at most about half of
+// the buffer: concurrent calls may each find room and overshoot by a few.
+// The cells get server timestamps, so all replicas write on one clock. Map row
+// touches are counted apart from object touches, and Late watches only object
+// touches.
 type Toucher struct {
 	gcTable     *bigtable.Table
 	mapsTable   *bigtable.Table
@@ -101,9 +118,8 @@ type Toucher struct {
 	stop        chan struct{}
 	stopOnce    sync.Once
 	done        chan struct{}
-	written     atomic.Int64
-	dropped     atomic.Int64
-	failed      atomic.Int64
+	objects     touchCounts
+	mapRows     touchCounts
 }
 
 // NewToucher returns a running Toucher for the tables of client's instance that
@@ -141,22 +157,33 @@ func (t *Toucher) TryTouchObject(key Hash) bool {
 	return t.add(touch{row: key.String()}, false)
 }
 
-// TouchMapRow queues a rewrite of the cell of the map row with the given key. It
-// returns false when the buffer stayed full and the touch was dropped.
+// TouchMapRow queues a rewrite of the cell of the map row with the given key
+// without waiting. It returns false when the buffer was about half full or
+// more and the touch was dropped.
 func (t *Toucher) TouchMapRow(row string) bool {
-	return t.add(touch{mapRow: true, row: row}, true)
+	return t.add(touch{mapRow: true, row: row}, false)
 }
 
 func (t *Toucher) add(tc touch, wait bool) bool {
 	tc.queued = t.now()
-	pending := t.slot(&t.pending, tc)
-	pending.Add(1)
+	if !tc.mapRow {
+		t.slot(&t.pending, tc).Add(1)
+	}
 	if !t.enqueue(tc, wait) {
-		pending.Add(-1)
-		t.dropped.Add(1)
+		if !tc.mapRow {
+			t.slot(&t.pending, tc).Add(-1)
+		}
+		t.counts(tc).dropped.Add(1)
 		return false
 	}
 	return true
+}
+
+func (t *Toucher) counts(tc touch) *touchCounts {
+	if tc.mapRow {
+		return &t.mapRows
+	}
+	return &t.objects
 }
 
 func (t *Toucher) enqueue(tc touch, wait bool) bool {
@@ -164,6 +191,20 @@ func (t *Toucher) enqueue(tc touch, wait bool) bool {
 	case <-t.stop:
 		return false
 	default:
+	}
+	if tc.mapRow {
+		// A map row touch leaves stalled alone: only object touches tell
+		// whether the writes keep up with them. Calls that check at once may
+		// all queue, so map rows can take a little more than half.
+		if len(t.queue) >= cap(t.queue)/2 {
+			return false
+		}
+		select {
+		case t.queue <- tc:
+			return true
+		default:
+			return false
+		}
 	}
 	select {
 	case t.queue <- tc:
@@ -190,17 +231,20 @@ func (t *Toucher) enqueue(tc touch, wait bool) bool {
 // Stats returns the counts of the touches so far.
 func (t *Toucher) Stats() TouchStats {
 	return TouchStats{
-		Written: t.written.Load(),
-		Dropped: t.dropped.Load(),
-		Failed:  t.failed.Load(),
+		Written:        t.objects.written.Load(),
+		Dropped:        t.objects.dropped.Load(),
+		Failed:         t.objects.failed.Load(),
+		MapRowsWritten: t.mapRows.written.Load(),
+		MapRowsDropped: t.mapRows.dropped.Load(),
+		MapRowsFailed:  t.mapRows.failed.Load(),
 	}
 }
 
-// Late reports whether a touch waits for its write to start past the time at
-// which it counts as failed, or whether a write runs past TouchDrainBound
-// after its touch was queued. A frozen or starved process holds such touches
-// without counting them until its workers run again, so a heartbeat reports
-// them as lost before they are counted.
+// Late reports whether an object touch waits for its write to start past the
+// time at which it counts as failed, or whether a write runs past
+// TouchDrainBound after its touch was queued. A frozen or starved process
+// holds such touches without counting them until its workers run again, so a
+// heartbeat reports them as lost before they are counted.
 func (t *Toucher) Late() bool {
 	return t.overdue(&t.pending, t.lateAfter) || t.overdue(&t.writing, TouchDrainBound)
 }
@@ -287,34 +331,34 @@ func (t *Toucher) drain(batch []touch) {
 
 func (t *Toucher) flush(ctx context.Context, batch []touch) {
 	var objectRows, mapRows []string
-	var late int64
 	writing := make([]touch, 0, len(batch))
 	for _, tc := range batch {
+		if tc.mapRow {
+			mapRows = append(mapRows, tc.row)
+			if t.now().Sub(tc.queued) > t.lateAfter {
+				t.mapRows.failed.Add(1)
+			}
+			continue
+		}
+		objectRows = append(objectRows, tc.row)
+		// The collector counts on an object touch landing within
+		// TouchDrainBound of its use; a heartbeat during the writes must see
+		// the late ones. Each touch stays counted in a slot until its failure
+		// is counted.
 		if t.now().Sub(tc.queued) > t.lateAfter {
-			late++
+			t.objects.failed.Add(1)
 		} else {
 			writing = append(writing, tc)
 			t.slot(&t.writing, tc).Add(1)
 		}
-		if tc.mapRow {
-			mapRows = append(mapRows, tc.row)
-		} else {
-			objectRows = append(objectRows, tc.row)
-		}
-	}
-	// The collector counts on a touch landing within TouchDrainBound of its
-	// use; a heartbeat during the writes must see the late ones. Each touch
-	// stays counted in a slot until its failure is counted.
-	t.failed.Add(late)
-	for _, tc := range batch {
 		t.slot(&t.pending, tc).Add(-1)
 	}
 	objectTouch := bigtable.NewMutation()
 	objectTouch.Set(TouchFamily, TouchColumn, bigtable.ServerTime, nil)
 	mapTouch := bigtable.NewMutation()
 	mapTouch.Set(mapsFamily, "", bigtable.ServerTime, []byte("1"))
-	t.write(ctx, t.gcTable, TableName, objectRows, objectTouch)
-	t.write(ctx, t.mapsTable, mapsTableName, mapRows, mapTouch)
+	t.write(ctx, t.gcTable, TableName, objectRows, objectTouch, &t.objects)
+	t.write(ctx, t.mapsTable, mapsTableName, mapRows, mapTouch, &t.mapRows)
 	for _, tc := range writing {
 		t.slot(&t.writing, tc).Add(-1)
 	}
@@ -323,10 +367,10 @@ func (t *Toucher) flush(ctx context.Context, batch []touch) {
 // write applies mut to rows and retries the rows that fail with a transient
 // error, which the client library does not do for server timestamps. A retry
 // after a lost response writes a later timestamp, which only moves the touch
-// later.
-func (t *Toucher) write(ctx context.Context, table *bigtable.Table, name string, rows []string, mut *bigtable.Mutation) {
+// later. It counts the outcomes in c.
+func (t *Toucher) write(ctx context.Context, table *bigtable.Table, name string, rows []string, mut *bigtable.Mutation, c *touchCounts) {
 	wait := t.retryWait
-	failedBefore := t.failed.Load()
+	failedBefore := c.failed.Load()
 	var lastErr error
 	for attempt := 1; len(rows) > 0; attempt++ {
 		muts := make([]*bigtable.Mutation, len(rows))
@@ -341,40 +385,40 @@ func (t *Toucher) write(ctx context.Context, table *bigtable.Table, name string,
 			if retryable(ctx, err) {
 				retry = rows
 			} else {
-				t.failed.Add(int64(len(rows)))
+				c.failed.Add(int64(len(rows)))
 			}
 		case errs == nil:
-			t.written.Add(int64(len(rows)))
+			c.written.Add(int64(len(rows)))
 		default:
 			for i, e := range errs {
 				switch {
 				case e == nil:
-					t.written.Add(1)
+					c.written.Add(1)
 				case retryable(ctx, e):
 					retry = append(retry, rows[i])
 					lastErr = e
 				default:
-					t.failed.Add(1)
+					c.failed.Add(1)
 					lastErr = e
 				}
 			}
 		}
 		if len(retry) > 0 && attempt == writeAttempts {
-			t.failed.Add(int64(len(retry)))
+			c.failed.Add(int64(len(retry)))
 			retry = nil
 		}
 		if len(retry) > 0 {
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
-				t.failed.Add(int64(len(retry)))
+				c.failed.Add(int64(len(retry)))
 				retry = nil
 			}
 			wait = min(2*wait, maxRetryWait)
 		}
 		rows = retry
 	}
-	if failed := t.failed.Load() - failedBefore; failed > 0 {
+	if failed := c.failed.Load() - failedBefore; failed > 0 {
 		log.Printf("Warning: failed to write %d touches to Bigtable table %s: %v", failed, name, lastErr)
 	}
 }

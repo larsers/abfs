@@ -93,7 +93,8 @@ func TestDryRunGC_LegacyServersGoneTime(t *testing.T) {
 
 // A row of GcServers is the only trace of a crash or a lost touch, so every
 // mode keeps it for the largest grace of any condemn or delete cycle and its
-// own grace, plus an hour; crash rows, which have no stop time, are pruned
+// own grace, plus an hour and the 9 h before the window in which a lost map
+// row touch still counts; crash rows, which have no stop time, are pruned
 // too.
 func TestDryRunGC_PrunesServerRows(t *testing.T) {
 	require := require.New(t)
@@ -104,10 +105,11 @@ func TestDryRunGC_PrunesServerRows(t *testing.T) {
 	f.serverRow("crash-in", time.Hour, f.now.Add(-72*time.Hour-30*time.Minute), none, none)
 	f.serverRow("stopped-old", time.Hour, f.now.Add(-100*time.Hour), f.now.Add(-100*time.Hour), f.now.Add(-100*time.Hour))
 	f.serverRow("stopped-in", time.Hour, f.now.Add(-100*time.Hour), f.now.Add(-50*time.Hour), none)
+	f.serverRow("stopped-maps", time.Hour, f.now.Add(-100*time.Hour), f.now.Add(-81*time.Hour), none)
 
 	r := f.run(nil).Report
 	require.Equal(int64(2), r.Replicas.ServersRemoved)
-	require.Equal([]string{"crash-in", "stopped-in"}, f.serverIDs())
+	require.Equal([]string{"crash-in", "stopped-in", "stopped-maps"}, f.serverIDs())
 
 	// A condemn or delete lease with a longer grace keeps rows for it, even
 	// in a dry run with the default grace.
@@ -118,7 +120,7 @@ func TestDryRunGC_PrunesServerRows(t *testing.T) {
 	f.serverRow("crash-older", time.Hour, f.now.Add(-150*time.Hour), none, none)
 	r = f.run(nil).Report
 	require.Equal(int64(1), r.Replicas.ServersRemoved)
-	require.Equal([]string{"crash-in", "crash-old", "stopped-in"}, f.serverIDs())
+	require.Equal([]string{"crash-in", "crash-old", "stopped-in", "stopped-maps"}, f.serverIDs())
 
 	// So does the run's own grace.
 	f.serverRow("crash-older", time.Hour, f.now.Add(-150*time.Hour), none, none)
@@ -185,6 +187,45 @@ func TestDryRunGC_CountsKeepAliveMounts(t *testing.T) {
 	require.ElementsMatch([]gc.MountSample{{Details: slow.String(), Host: "host-c", User: "u"}, {Details: ttl.String(), Host: "host-e", User: "u"}}, m.Samples["touch_interval_too_long"])
 }
 
+// A server that lost map row touches makes the pin reader count a mount
+// whose touch interval no longer fits the grace less also the time clients
+// reuse map results and the time a keep-alive pass may take, and the report
+// gives the loss time. A row written by a server of an older version has no
+// map row loss time.
+func TestDryRunGC_MapRowLossShortensKeepAliveLimit(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newGCFixture(t)
+	f.serverRow("srv-0-aa", time.Hour, f.now, time.Time{}, time.Time{})
+	slow := f.keepAliveMount("refs/abfs/mount/user/u/a", 51*time.Hour, true)
+
+	// 1.1 x 51 h fits 72 h less 1 h, the 6 h cache TTL and the margin, and
+	// that less 8 h, but not that less 9 h.
+	r := f.run(nil).Report
+	require.Zero(r.LiveMounts.TouchIntervalTooLong)
+	require.Nil(r.Replicas.MapRowLossTime)
+
+	s := &gc.Server{ID: "srv-1-bb", Version: gc.ExtractorVersion, GC: true, TouchInterval: time.Hour, CacheTTL: 6 * time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
+	require.NoError(gc.WriteServer(ctx, f.s.casdb.SpannerClient(), s, time.Now(), false, true))
+	servers, err := gc.ReadServers(ctx, f.s.casdb.SpannerClient())
+	require.NoError(err)
+	var lossTime time.Time
+	for _, s := range servers {
+		if s.ID == "srv-1-bb" {
+			lossTime = s.MapRowLossTime
+			require.Zero(s.TouchLossTime)
+		} else {
+			require.Zero(s.MapRowLossTime, "a row without the column")
+		}
+	}
+	require.NotZero(lossTime)
+	r = f.run(nil).Report
+	require.Equal(int64(1), r.LiveMounts.TouchIntervalTooLong)
+	require.Equal([]gc.MountSample{{Details: slow.String(), Host: "host-a", User: "u"}}, r.LiveMounts.Samples["touch_interval_too_long"])
+	require.NotNil(r.Replicas.MapRowLossTime)
+	require.True(lossTime.Equal(*r.Replicas.MapRowLossTime))
+}
+
 // In a rolling upgrade the live hosts of both heartbeat tables count toward
 // the replica range, and the settings of the older servers' rows are checked
 // before a condemn.
@@ -196,7 +237,7 @@ func TestCondemnGC_MixedFleetHosts(t *testing.T) {
 	sp := f.s.casdb.SpannerClient()
 	for _, id := range []string{"new-0-aa", "new-1-bb", "new-2-cc"} {
 		s := &gc.Server{ID: id, Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
-		require.NoError(gc.WriteServer(ctx, sp, s, time.Now(), false))
+		require.NoError(gc.WriteServer(ctx, sp, s, time.Now(), false, false))
 	}
 	f.heartbeat("old-0-aa")
 	f.heartbeat("old-1-bb")

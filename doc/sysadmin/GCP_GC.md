@@ -36,7 +36,7 @@ A rescue shows that an object was still in use, so the delete of cycle N+1, a co
 
 **Client content.** A mount of a client with `gc-keepalive` rewrites its mount ref every 15 minutes and sends the hashes of what it holds to the server every 18 hours, which keeps them used. Cacheman with `gc-keepalive` keeps content a client wrote out of eviction until a server confirmed it holds the object. `abfs ws snapshot` writes a ref for the snapshot, which keeps it for `--snapshot-retention` after its last `ws snapshot` or `--restore`.
 
-**Servers.** Each server with `--gc` writes a heartbeat row to the Spanner table `GcServers` with its settings, whether it lost a record of a use (a touch), and its stop. A use the collector cannot see may be the last use of an object it deletes, so the collector refuses to condemn when the number of server hosts does not match, and refuses to delete when any server that ran within the grace crashed, lost a touch, paused or ran with settings that break the timing rules.
+**Servers.** Each server with `--gc` writes a heartbeat row to the Spanner table `GcServers` with its settings, whether it lost a record of a use (a touch) of an object or of a map row, and its stop. A use the collector cannot see may be the last use of an object it deletes, so the collector refuses to condemn when the number of server hosts does not match, and refuses to delete when any server that ran within the grace crashed, lost an object touch, paused or ran with settings that break the timing rules. A lost map row touch makes the keep-alive limit of the live mounts shorter (see [Client caches](#client-caches)).
 
 **Staged path.** Turn it on in three modes, each after the one before ran clean: `--dry-run` only reports, `--condemn` also marks, and `--delete` also deletes. Delete mode needs backups of the tables between cycles, which `gc undo` restores from.
 
@@ -91,7 +91,7 @@ To turn garbage collection off, stop the collector job, restart the servers with
 
 * Run `init --gc` with the new version first, then upgrade the servers and the collector together. A collector of an older version sees no heartbeat of servers that write `GcServers`, so its condemn cycles refuse on the host count.
 * After the upgrade, no server of an older version may run against the store, not even briefly. The collector sees such a server only while it runs at one of its reads of `GcReplicas`; one that starts and stops between two reads leaves no trace, and it ran without the timing bounds and loss records the delete checks rely on. One started with `--gc-heartbeat-interval 0` writes no row at all.
-* Use the same or a newer version for the collector than for the servers: a `gc` row with an object type the collector does not know stops the run.
+* Use the same or a newer version for the collector than for the servers: a `gc` row with an object type the collector does not know stops the run, and a collector of an older version does not read `MapRowLossTime`, so it misses the map row touches that servers of this version lost, which older servers recorded in `TouchLossTime`.
 
 ## Where the data goes
 
@@ -111,9 +111,9 @@ The state is `default`.
 
 ### Create the resources
 
-With `--gc`, `abfs server gcp init` also creates the garbage collector resources: the Bigtable table `gc`, the column family `g` of `objects` and the Spanner tables `GcState`, `GcServers` and `GcReplicas`. Without it, init creates only the server's own resources. Running it again with `--gc` adds the garbage collector resources to an existing deployment, and the columns that newer versions added to `GcState`.
+With `--gc`, `abfs server gcp init` also creates the garbage collector resources: the Bigtable table `gc`, the column family `g` of `objects` and the Spanner tables `GcState`, `GcServers` and `GcReplicas`. Without it, init creates only the server's own resources. Running it again with `--gc` adds the garbage collector resources to an existing deployment, and the columns that newer versions added to `GcState` and `GcServers`.
 
-Run it with the new version before you start servers of that version: a server with `--gc` checks these tables and columns at start and refuses to start without them. The statements are in `shared/remote/servers/gcp/casdb/gcschema.sql`, and each can be applied again without effect. A deployment that applies the schema with its own tooling as an append-only list of statements appends the new ones (`CREATE TABLE IF NOT EXISTS GcServers` and the four `ALTER TABLE GcState ADD COLUMN IF NOT EXISTS` statements of `ListCompleteTime`, `CondemnCycle`, `LegacyServersGoneTime` and `MaxGraceSeconds`) before it upgrades the servers.
+Run it with the new version before you start servers of that version: a server with `--gc` checks these tables and columns at start and refuses to start without them. The statements are in `shared/remote/servers/gcp/casdb/gcschema.sql`, and each can be applied again without effect. A deployment that applies the schema with its own tooling as an append-only list of statements appends the new ones (`CREATE TABLE IF NOT EXISTS GcServers`, the four `ALTER TABLE GcState ADD COLUMN IF NOT EXISTS` statements of `ListCompleteTime`, `CondemnCycle`, `LegacyServersGoneTime` and `MaxGraceSeconds`, and `ALTER TABLE GcServers ADD COLUMN IF NOT EXISTS MapRowLossTime`) before it upgrades the servers.
 
 `init` creates missing tables and does not change existing ones.
 
@@ -185,9 +185,9 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
    * a `--cache-ttl` of 0, not shorter than `--cycle`, or longer than the command's `--cache-ttl`;
    * GC edge rules older than the command's.
 
-   The warnings are in the report and the log; the condemn and delete modes refuse to run with any of them. The report counts the distinct host names among the live servers (`replicas.hosts`, the part of each ID before its last `-`) and their live rows per host (`replicas.rows_per_host`). A server that stops cleanly records the stop in its row, which then no longer counts as live unless the stop recorded lost touches (`replicas.stopped` counts the others).
+   The warnings are in the report and the log; the condemn and delete modes refuse to run with any of them. The report counts the distinct host names among the live servers (`replicas.hosts`, the part of each ID before its last `-`) and their live rows per host (`replicas.rows_per_host`). A server that stops cleanly records the stop in its row, which then no longer counts as live unless the stop recorded lost object touches (`replicas.stopped` counts the others).
 
-   The command deletes the `GcServers` rows whose last heartbeat and stop are older than the longest of a day, the largest `--grace` of any condemn or delete cycle plus an hour, and its own `--grace` plus an hour (`replicas.servers_removed`), and the `GcReplicas` rows not written for a day (`replicas.removed`). It records in `GcState` since when every read found `GcReplicas` empty (`replicas.legacy_servers_gone_time`).
+   The command deletes the `GcServers` rows whose last heartbeat and stop are older than the longest of a day, the largest `--grace` of any condemn or delete cycle plus 10 hours, and its own `--grace` plus 10 hours (`replicas.servers_removed`), and the `GcReplicas` rows not written for a day (`replicas.removed`); the 10 hours are an hour and the 9 hours before the window in which a lost map row touch still counts. It records in `GcState` since when every read found `GcReplicas` empty (`replicas.legacy_servers_gone_time`), and the latest lost map row touch that shortens the keep-alive limit (`replicas.map_row_loss_time`, see [Client caches](#client-caches)). For a server that crashed, that time is 30 minutes after its last heartbeat.
 3. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
 4. For each live mount (see [Mounts and unmounts](#mounts-and-unmounts)), reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
 5. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
@@ -241,7 +241,7 @@ The sections `live_mounts`, `workspaces` and `snapshots` report the pins:
 | `without_pinned_manifest` | mount details without a pinned manifest, and workspace snapshots without mount details |
 | `without_keepalive` | mount details of clients without `gc-keepalive` or with one of its intervals `0` |
 | `without_local_write_check` | mount details with `gc-keepalive` whose cacheman does not keep locally written content until a server confirms it |
-| `touch_interval_too_long` | mount details whose keep-alive touch interval plus a tenth is not shorter than `--grace` less the longest touch interval and cache TTL of the servers and a minute |
+| `touch_interval_too_long` | mount details whose keep-alive touch interval plus a tenth is not shorter than `--grace` less the longest touch interval and cache TTL of the servers and a minute, and also less 9 hours when `replicas.map_row_loss_time` is set |
 | `pinned_manifests`, `revisions`, `ignored_revisions` | the pinned manifests parsed, the revisions kept, and the revisions that are not hashes |
 | `dangling_revisions` | kept revisions without a `gc` row |
 | `not_found` | snapshots, mount details or manifests that do not exist; they pin nothing |
@@ -293,7 +293,7 @@ The cycle condemns only when its own report is clean. It refuses, writes no mark
 
 * a warning in `replicas.warnings`;
 * the number of distinct host names among the servers seen within the last 30 minutes (`replicas.hosts`) differs from `--expected-replicas`, or is outside `--min-replicas` and `--max-replicas`;
-* a host has more than one live row: a server there crashed, or stopped with lost touches, within the last 30 minutes and was started again, or two servers share the host name. A server that stops cleanly records its stop in its row (see [Heartbeat](#heartbeat)), so a restart alone does not refuse. A row without a stop means a crash, a kill or a preemption, and a stop that lost touches records the loss. The touches that the earlier process held in its buffer may be lost, so check its log for the stop line and wait until its row is older than 30 minutes;
+* a host has more than one live row: a server there crashed, or stopped with lost object touches, within the last 30 minutes and was started again, or two servers share the host name. A server that stops cleanly records its stop in its row (see [Heartbeat](#heartbeat)), so a restart alone does not refuse. A row without a stop means a crash, a kill or a preemption, and a stop that lost touches records the loss. The touches that the earlier process held in its buffer may be lost, so check its log for the stop line and wait until its row is older than 30 minutes;
 * the consistency check did not run (`--consistency=false` is refused for `--condemn`), or found objects without a `gc` row;
 * `gc` rows with outdated or newer edge rules (`objects.outdated_rows`, `objects.newer_rows`);
 * `live_mounts.errors`, `workspaces.errors` or `snapshots.errors`: a pin that could not be read may hide commits a mount, workspace or snapshot needs;
@@ -370,7 +370,7 @@ Only `--delete` takes the flags from `--delete-types` to `--allow-no-soft-delete
 | --- | --- | --- |
 | `--expected-replicas`, `--min-replicas`, `--max-replicas` | | As in condemn mode; one of the first two is required |
 | `--delete-types` | every type | Object types, separated by commas, that the cycle may delete. Others are kept, with every object they link |
-| `--accept-mounts-without-keepalive` | off | Delete blobs, trees and eval objects while live mounts run without `gc-keepalive`; the check then only warns (see [Client caches](#client-caches)) |
+| `--accept-mounts-without-keepalive` | off | Delete blobs, trees and eval objects while live mounts run without `gc-keepalive`; the check then only warns, except after a lost map row touch (see [Client caches](#client-caches)) |
 | `--no-backup-check` | off | Delete without the [backups](#backups) of the four tables |
 | `--delete-rate` | `2000` | Objects deleted per second (`0` means no limit) |
 | `--delete-workers` | `32` | Conditional deletes in flight, split evenly over the `--shards` key ranges; at least `--shards` |
@@ -405,7 +405,9 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 | The snapshot is before the lower bound | Run the cycle later; the reason names the earliest time |
 | The snapshot is not before the upper bound | Nothing; this cycle condemns again, and the next one on time deletes |
 | A server last wrote its heartbeat at a time and did not record a stop | It crashed, was killed or preempted. Deletes wait until its last heartbeat is about `--grace` plus 31 minutes old |
-| A server lost touches | Deletes wait until the loss is `--grace` plus a minute old. Find the cause in the server's log and `abfs.gcp.gc.touches` |
+| A server lost touches | Deletes wait until the loss is `--grace` plus a minute old. Find the cause in the server's log and `abfs.gcp.gc.touches` with `kind` `object` |
+| Live mounts touch their objects less often than the grace allows, less the 8 hours for which clients reuse map results and the hour a keep-alive pass may take, since a server lost map row touches, or crashed and may have lost them | Deletes wait until the loss is `--grace` plus about 9 hours old, or until those mounts end or touch more often. Find the cause in `abfs.gcp.gc.touches` with `kind` `map_row`, or in the log of the server that crashed |
+| Live mounts run without the GC keep-alive, and a server lost map row touches or crashed, which `--accept-mounts-without-keepalive` does not accept | Deletes wait until the loss is `--grace` plus about 9 hours old, or until those mounts end or run with `gc-keepalive` |
 | A server runs without link validation | Restart it without `--no-link-validation` |
 | A server's settings break the timing rules | Fix the setting; deletes wait until the server with the old setting stopped `--grace` plus a minute ago |
 | `GcReplicas` holds rows, no cycle recorded that it is empty, or it was first found empty after the window start | Servers of an older version ran. Stop them; deletes wait until `--grace` plus a minute after a cycle first found `GcReplicas` empty |
@@ -420,15 +422,15 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 | Only some of the objects written during the consistency scan were checked: the checks fell behind the writes, and the scan stopped waiting for them | Nothing; deletes resume in a later cycle with fewer writes during its scan (see [Planning figures](#planning-figures)) |
 | A server wrote no heartbeat with touch counts read after the snapshot in time | Check that server's heartbeat writes (`abfs.gcp.gc.heartbeat_failures`) |
 
-A crash, an out-of-memory kill, a preemption, a pause of a VM, a stop killed before it recorded itself, or one dropped or failed touch on any server stops deletes for about `--grace` plus 31 minutes, which is three daily cycles at the defaults.
+A crash, an out-of-memory kill, a preemption, a pause of a VM, a stop killed before it recorded itself, or one dropped or failed object touch on any server stops deletes for about `--grace` plus 31 minutes, which is three daily cycles at the defaults. A dropped or failed map row touch stops them for about `--grace` plus 9 hours only while a live mount touches its objects too seldom for the shorter limit, or a live mount without `gc-keepalive` runs under `--accept-mounts-without-keepalive`; with the trial settings above that is any live mount with `gc-keepalive`. A crash counts as such a loss too, for about `--grace` plus 9.5 hours after the server's last heartbeat.
 
 ### Client caches
 
 A client cache can hold the only copy of content a client wrote, such as build outputs equal to an old, unreachable blob. A cacheman with `gc-keepalive` on in its own configuration keeps such content out of eviction until a server confirmed the object after the write, and pushes it when the server lacks it; the mount records this in its mount details. When `--delete-types` allows blobs, trees, eval requests or eval responses, the cycle refuses its deletes while:
 
-* a live mount runs without `gc-keepalive` or with one of its intervals `0` (`live_mounts.without_keepalive`). Turn `gc-keepalive` on as step 4 of [Enable or disable garbage collection](#enable-or-disable-garbage-collection) says. `--accept-mounts-without-keepalive` turns this check into a warning: content such mounts wrote and their cache evicted is then lost once deleted. A mount without keep-alive writes its mount ref only when it starts, so it counts until `abfs unmount` ends it or for `--mount-idle` after it started, whichever comes first. After such a mount ended without `abfs unmount`, these deletes wait up to 14 days;
+* a live mount runs without `gc-keepalive` or with one of its intervals `0` (`live_mounts.without_keepalive`). Turn `gc-keepalive` on as step 4 of [Enable or disable garbage collection](#enable-or-disable-garbage-collection) says. `--accept-mounts-without-keepalive` turns this check into a warning: content such mounts wrote and their cache evicted is then lost once deleted. It does not do so after a lost map row touch (`replicas.map_row_loss_time`, see the next items): a mount without keep-alive never touches the outputs of a map result it applies, so without the map row only the touch of the server's answer keeps them, and these deletes wait until the loss is `--grace` plus about 9 hours old. A mount without keep-alive writes its mount ref only when it starts, so it counts until `abfs unmount` ends it or for `--mount-idle` after it started, whichever comes first. After such a mount ended without `abfs unmount`, these deletes wait up to 14 days;
 * a live mount with `gc-keepalive` runs with a cacheman that does not check local writes (`live_mounts.without_local_write_check`): an older cacheman, or one started with `gc-keepalive` off. A cacheman restarted with `gc-keepalive` off under a live mount turns that mount's field false for good; restart the mount;
-* a live mount touches its objects less often than the grace allows (`live_mounts.touch_interval_too_long`): its `gc-keepalive-touch-interval` plus a tenth must be shorter than `--grace` less the longest touch interval and cache TTL of the servers and a minute.
+* a live mount touches its objects less often than the grace allows (`live_mounts.touch_interval_too_long`): its `gc-keepalive-touch-interval` plus a tenth must be shorter than `--grace` less the longest touch interval and cache TTL of the servers and a minute. When a server recorded a lost map row touch since the window start less 9 hours, or a server crashed whose last heartbeat plus 30 minutes is in that time (`replicas.map_row_loss_time`), the limit is 9 hours shorter. A server that crashed may have lost map row touches it did not record. Cacheman answers map lookups from its own copy of the results a server returned for up to 8 hours, so a build can put the outputs of a result in the mount that long after a server returned it. The eval map row keeps those outputs, but a lost map row touch can let it expire, and then only the touch of the server's answer keeps them until the next keep-alive pass names them. The other hour allows for that pass: it sends at most 10,000 hashes a second, about 17 minutes for a mount of 10 million, and a failed pass is retried after 5 minutes. At the defaults the limit is about 30 hours, or about 21 hours after a map row loss, and the default `gc-keepalive-touch-interval` of `18h` fits both.
 
 At each start, cacheman runs a start pass: it goes through every entry it may evict, oldest first and at most 10,000 entries per second, and asks the server about the blobs, trees and objects among them. A cache of 10 million entries takes about 17 minutes. Until the pass ends, eviction takes only the entries the pass has checked; a cache at its eviction threshold with none of those left evicts unchecked entries. ARI entries, RBE CAS blobs and entries whose file is gone are not checked; eviction takes them as it does without `gc-keepalive`.
 
@@ -605,9 +607,10 @@ The collector runs as a separate job. With `--gc`, the server records for it whi
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--gc` | off | Run the server side of the garbage collector. It needs the resources of `abfs server gcp init --gc`. Off, the server reads and writes only what a server without garbage collection does, and the three flags below have no effect |
+| `--gc` | off | Run the server side of the garbage collector. It needs the resources of `abfs server gcp init --gc`. Off, the server reads and writes only what a server without garbage collection does, and the flags below have no effect |
 | `--cache-ttl` | `6h` | With `--gc`, how long cached object headers and content are used before the server reads them again from Bigtable; `0` keeps them until they are evicted, which refuses condemn and delete cycles |
 | `--gc-touch-interval` | `36h` | With `--gc`, length of the period in which the server writes at most one touch per object and map row; `0` writes none, which refuses condemn and delete cycles |
+| `--gc-touched-map-rows` | `4000000` | With `--gc`, the number of map rows whose last touch the server remembers; about 225 bytes each, so about 225 MB per million and 900 MB at the default when full. `0` uses the default |
 | `--gc-heartbeat-interval` | `5m` | With `--gc`, time between two heartbeats of the server in the Spanner table `GcServers`; above 0 and at most `10m` |
 
 ### GC edges
@@ -650,18 +653,19 @@ Each call that rescued an object, or failed to, logs lines that name the call an
 
 When a call finds an object (`Headers`, `GetObject`, the existence check of `PutObject`, the link checks, the results of `MapResults`), the server writes the cell `t:touch` of the object's row in the table `gc`, with a Bigtable server timestamp.
 
-* Each server writes at most one touch per object in each period of `--gc-touch-interval`, counted from the server start, so an object in use has a touch younger than the interval.
+* Each server writes at most one touch per object in each period of `--gc-touch-interval`, so an object in use has a touch younger than the interval. The periods count from the server start, shifted for each object by an offset taken from its key, so the periods of different objects end at different times and their next touches spread over the interval.
 * `MapResults` also writes the cell of each map row it returns again, with the same limit, so the timestamp of a map row is the time it was last used. Map results therefore come back in the order of their last use, oldest first, instead of the order they were added. ninjago tries the newest result first, so builds are not affected.
-* Each server remembers the last touch of 262,144 map rows. A server that returns more distinct rows per touch period touches a row again once it was forgotten, so its map row touches follow the rate of `MapResults` calls rather than the period.
+* Each server remembers the last touch of up to `--gc-touched-map-rows` map rows (default 4,000,000). A server that returns more distinct rows per touch period touches a row again once it was forgotten, so its map row touches follow the rate of `MapResults` calls rather than the period. The memory grows with the rows returned, about 225 bytes per row.
 
 Touches wait in a buffer of 100,000, and four workers write them in batches of up to 1,000, at least once a second:
 
-* When the buffer is full, `Headers` and `MapResults`, the calls of the client keep-alive and of builds, wait up to half a second per touch for room. A burst, such as the keep-alive of a large mount, is slowed to the rate the workers write instead of losing touches.
+* When the buffer is full, `Headers` and `MapResults`, the calls of the client keep-alive and of builds, wait up to half a second per object touch for room. A burst, such as the keep-alive of a large mount, is slowed to the rate the workers write instead of losing touches.
 * When a wait times out, touches are dropped and counted, without waiting, until the buffer has room again. So with `--gc` the latency of `Headers` and `MapResults` depends on the table `gc`: while the buffer is full they run at the rate the workers write, and when the writes stall, the first of them waits half a second.
 * `GetObject`, the existence check of `PutObject` and the link checks never wait for room; they drop the touch and count it. The next use of a dropped object writes its touch.
+* Map row touches never wait either, and are queued only while the buffer is less than half full, so they take at most about half of it and leave the rest to object touches. The next use of a row whose touch was dropped writes its touch.
 * A touch is written or counted as lost within 251 seconds of the use. A touch whose write starts later, because the process was frozen or starved, is written and also counted as failed.
 
-Every dropped or failed touch is recorded in the server's heartbeat row and refuses deletes for about `--grace`.
+Every dropped or failed touch of an object is recorded in the server's heartbeat row and refuses deletes for about `--grace`. Map row touches are counted and recorded apart: a map row touch keeps an eval map row, and through it the outputs of its result, within `--map-retention`. A lost one refuses deletes only while a live mount touches its objects too seldom to keep such outputs without the map row (see [Client caches](#client-caches)).
 
 ### Cache TTL and write bound
 
@@ -683,12 +687,13 @@ Each server writes its row in the Spanner table `GcServers` before it serves and
 * its `--gc-touch-interval`, `--cache-ttl` and `--gc-heartbeat-interval`;
 * `LinkValidation`, false with `--no-link-validation`;
 * `LastSeen`, the commit time, and `StatsTime`, a Spanner read time taken just before the server read its touch counts;
-* `TouchLossTime`, set by a heartbeat or the stop that records a loss: touches dropped or failed since the last heartbeat, a pause of the process (the wall clock ran more than 10 seconds ahead of the monotonic clock, as in a VM suspend), or a gap between heartbeat attempts longer than the interval plus 251 seconds;
+* `TouchLossTime`, set by a heartbeat or the stop that records a loss: object touches dropped or failed since the last heartbeat, a pause of the process (the wall clock ran more than 10 seconds ahead of the monotonic clock, as in a VM suspend), or a gap between heartbeat attempts longer than the interval plus 251 seconds;
+* `MapRowLossTime`, set the same way when map row touches were dropped or failed since the last heartbeat. Servers of older versions leave it empty and record those losses in `TouchLossTime`;
 * `StoppedAt`, set by a clean stop.
 
 The collector uses the rows to see which server versions and settings run and which servers crashed or lost touches. A server that cannot write its first heartbeat within a minute fails to start. A later failed write is logged and counted; once the last successful one is older than two intervals plus 30 seconds, every call answers `Unavailable` until the next one succeeds.
 
-When the server stops, it writes the touches left in its buffer, for up to 10 seconds, and logs one line `GC touches at stop: ...` with the touches written, dropped and failed during the stop and since the start, because its metrics are no longer exported by then. Then it records the stop in its row, with `TouchLossTime` when it lost touches since its last heartbeat. The row stays. A row whose last heartbeat is older than 30 minutes and that has no `StoppedAt` marks a crash, a kill or a preemption, whose buffered touches may be lost.
+When the server stops, it writes the touches left in its buffer, for up to 10 seconds, and logs one line `GC touches at stop: ...` with the object touches written, dropped and failed during the stop and since the start, and the map row touches written, dropped and failed since the start, because its metrics are no longer exported by then. Then it records the stop in its row, with `TouchLossTime` when it lost object touches and `MapRowLossTime` when it lost map row touches since its last heartbeat. The row stays. A row whose last heartbeat is older than 30 minutes and that has no `StoppedAt` marks a crash, a kill or a preemption, whose buffered touches may be lost; the collector counts it as a loss of object and map row touches. So does a stop whose record failed.
 
 `GcReplicas` stays empty for servers of this version. Servers of older versions write their heartbeat there and delete it at a clean stop; the collector reads it only to see them.
 
@@ -705,7 +710,7 @@ Metrics, as OpenTelemetry counters. Their names keep the dots when they are expo
 | `abfs.gcp.gc.rescues` | `call`, `type` | Marked objects rescued, by call: `headers`, `validation`, `put_object`, `get_object`, `map_results`, and by object type, `other` for a type the server does not know |
 | `abfs.gcp.gc.rescues_lost` | `call` | Marked objects that the collector deleted before the call could rescue them |
 | `abfs.gcp.gc.rescue_failures` | `call` | Rescues that failed, including those whose touch failed; each failed its call |
-| `abfs.gcp.gc.touches` | `result` | Touches `written`, `dropped` because the buffer was full, or `failed` |
+| `abfs.gcp.gc.touches` | `kind`, `result` | Touches of an `object` or a `map_row`, `written`, `dropped` because the buffer was full (about half full for map rows), or `failed` |
 | `abfs.gcp.cache.ttl_expiries` | `cache` | Cache lookups of `headers` or `content` that found an entry older than `--cache-ttl` |
 | `abfs.gcp.gc.map_results_dropped` | | Map results left out because their object is missing |
 | `abfs.gcp.gc.heartbeat_failures` | | Failed heartbeat writes |
@@ -728,7 +733,7 @@ Mounts and pins:
 Servers:
 
 * Only servers with `--gc` write a heartbeat. A server started without `--gc` writes no row, so the collector cannot see it: it does not touch or rescue what its clients use, and the dry run gives no warning about it. The condemn and delete modes check the number of server hosts, which is how they see such a server. Delete mode also refuses when an object written during its consistency scan has no `gc` row; objects written before show as missing `gc` rows. A server without `--gc` that only reads, or writes objects that exist, leaves no trace.
-* A condemned object read from a server's cache is not rescued, and neither are reads that never reach a server: cacheman's local content, signed URL reads within their 10 minutes, and ninjago's input checks from local attributes. Touches that a server dropped or failed to write, and touches in its buffer when it crashed or was killed, are lost the same way. A lost touch refuses deletes for about `--grace`; condemn mode does not refuse on it, and the next condemn cycle finds such objects live only if a root reaches them or a touch was written.
+* A condemned object read from a server's cache is not rescued, and neither are reads that never reach a server: cacheman's local content, signed URL reads within their 10 minutes, and ninjago's input checks from local attributes. Object touches that a server dropped or failed to write, and touches in its buffer when it crashed or was killed, are lost the same way. A lost object touch refuses deletes for about `--grace`; condemn mode does not refuse on it, and the next condemn cycle finds such objects live only if a root reaches them or a touch was written.
 * A pause of a server process under 10 seconds is not recorded.
 
 Clients:
@@ -741,10 +746,12 @@ Clients:
 * The keep-alive does not touch files under `.git` and `.ctrl` directories.
 * A cacheman restarted with `gc-keepalive` off under a live mount checks no local writes until the mount's next keep-alive tick, up to 15 minutes later, turns the mount's field false.
 * A cache that reaches its eviction threshold during the start pass evicts entries the pass has not checked when it fills faster than the pass goes through its entries, or when the server cannot be reached; cacheman counts them in `remote_checks.evicted_unchecked`.
+* After a server lost a map row touch, the outputs of a map result that a build applied up to 8 hours after a server returned it are kept only by the touch of that answer until the next keep-alive pass names them. They survive a keep-alive pass that reaches them up to an hour after it was due, plus what the shorter limit leaves over the touch interval and its tenth. A longer keep-alive outage, such as a stopped cacheman or a server that cannot be reached, can lose them. Without a lost map row touch, the eval map row keeps them for `--map-retention`.
 
 Builds and records:
 
 * `abfs rerun`, `abfs file-access` and `abfs export` on a build whose eval map rows are older than `--map-retention` fail on the missing eval responses, even while the build itself is kept by `--build-retention`.
+* A map row touch that a server dropped or failed to write leaves the row's last use earlier, so an eval map row in use can expire earlier than `--map-retention` after its last use. A build then runs the step again.
 
 Leaks, left for a later orphan sweep:
 

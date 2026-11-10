@@ -56,6 +56,7 @@ type gcpCmd struct {
 	gc                    bool
 	cacheTTL              time.Duration
 	gcTouchInterval       time.Duration
+	gcTouchedMapRows      int
 	gcHeartbeatInterval   time.Duration
 }
 
@@ -85,9 +86,10 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.clientMetrics, "gcp-client-metrics", false, "Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring")
 	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
 	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
-	fl.BoolVar(&c.gc, "gc", false, "Run the server side of the garbage collector: write the GC edges of new objects to the Bigtable table gc, rescue condemned objects that are used, and apply --cache-ttl, --gc-touch-interval and --gc-heartbeat-interval. Needs the resources of 'abfs server gcp init --gc'")
+	fl.BoolVar(&c.gc, "gc", false, "Run the server side of the garbage collector: write the GC edges of new objects to the Bigtable table gc, rescue condemned objects that are used, and apply --cache-ttl, --gc-touch-interval, --gc-touched-map-rows and --gc-heartbeat-interval. Needs the resources of 'abfs server gcp init --gc'")
 	fl.DurationVar(&c.cacheTTL, "cache-ttl", gcp.DefaultCacheTTL, "With --gc, how long cached object headers and content are used before they are read again from Bigtable (0 keeps them until they are evicted). The garbage collector needs it shorter than its cycle")
 	fl.DurationVar(&c.gcTouchInterval, "gc-touch-interval", gcp.DefaultGCTouchInterval, "With --gc, length of the period in which the server records at most one use of each object and map row for the garbage collector (0 disables these writes)")
+	fl.IntVar(&c.gcTouchedMapRows, "gc-touched-map-rows", gcp.DefaultGCTouchedMapRows, "With --gc, the number of map rows whose last touch the server remembers, so that it rewrites each at most once per --gc-touch-interval; each takes about 225 bytes, about 225 MB per million. 0 uses the default")
 	fl.DurationVar(&c.gcHeartbeatInterval, "gc-heartbeat-interval", gcp.DefaultGCHeartbeatInterval, "With --gc, time between two heartbeats of this server in the Spanner table GcServers, which the garbage collector reads: above 0 and at most 10m. The server does not start without its first heartbeat and answers Unavailable while its last successful one is older than two intervals plus 30s")
 }
 
@@ -122,6 +124,7 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		GC:                    c.gc,
 		CacheTTL:              c.cacheTTL,
 		GCTouchInterval:       c.gcTouchInterval,
+		GCTouchedMapRows:      c.gcTouchedMapRows,
 		GCHeartbeatInterval:   c.gcHeartbeatInterval,
 	})
 	if err != nil {

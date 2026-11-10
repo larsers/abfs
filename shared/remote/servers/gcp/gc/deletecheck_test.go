@@ -258,6 +258,22 @@ func TestDeleteBlockers(t *testing.T) {
 			liveMounts("without_keepalive", 1)(c)
 			c.o.AcceptMountsWithoutKeepAlive = true
 		}, nil, []string{"1 live mounts run without the GC keep-alive, so their caches may hold the only copy of a blob, tree or eval object they wrote, for example details d1 of u@host-a"}},
+		{"live mount without keep-alive, accepted, after a map row loss", func(c *deleteCase) {
+			liveMounts("without_keepalive", 1)(c)
+			c.o.AcceptMountsWithoutKeepAlive = true
+			c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour)
+		}, []string{"1 live mounts run without the GC keep-alive, for example details d1 of u@host-a, and server srv-2-cc lost map row touches at 2026-11-08T11:00:00Z: such a mount may apply a map result whose outputs no map row keeps any more, which --accept-mounts-without-keepalive does not accept; set gc-keepalive in their config"}, nil},
+		{"live mount without keep-alive, accepted, after a crash before the window", func(c *deleteCase) {
+			liveMounts("without_keepalive", 1)(c)
+			c.o.AcceptMountsWithoutKeepAlive = true
+			c.ev.servers.servers[2].LastSeen = windowStart(c.ev.snapshot, c.o.Grace).Add(-time.Hour)
+		}, []string{"1 live mounts run without the GC keep-alive, for example details d1 of u@host-a, and server srv-2-cc last wrote its heartbeat at 2026-11-05T10:59:00Z and did not record a stop: it crashed and may have lost map row touches"}, nil},
+		{"live mount without keep-alive, accepted, commits only after a map row loss", func(c *deleteCase) {
+			liveMounts("without_keepalive", 1)(c)
+			c.o.AcceptMountsWithoutKeepAlive = true
+			c.o.Types = []string{"commit"}
+			c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour)
+		}, nil, nil},
 		{"live mount without keep-alive, commits only", func(c *deleteCase) {
 			liveMounts("without_keepalive", 1)(c)
 			c.o.Types = []string{"commit"}
@@ -271,7 +287,12 @@ func TestDeleteBlockers(t *testing.T) {
 			liveMounts("without_local_write_check", 1)(c)
 			c.o.Types = []string{"commit"}
 		}, nil, nil},
-		{"keep-alive mount with a 40 h touch interval", liveMounts("touch_interval_too_long", 1), []string{"1 live mounts touch their objects less often than the grace allows"}, nil},
+		{"keep-alive mount with a 40 h touch interval", liveMounts("touch_interval_too_long", 1), []string{"1 live mounts touch their objects less often than the grace allows, for example details d1 of u@host-a"}, nil},
+		{"server lost map row touches", func(c *deleteCase) { c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour) }, nil, nil},
+		{"keep-alive mount too slow after a map row loss", func(c *deleteCase) {
+			liveMounts("touch_interval_too_long", 1)(c)
+			c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour)
+		}, []string{"1 live mounts touch their objects less often than the grace allows, and less the 8h0m0s for which clients reuse map results and the 1h0m0s a keep-alive pass may take, since server srv-2-cc lost map row touches at 2026-11-08T11:00:00Z, for example details d1 of u@host-a"}, nil},
 
 		// Writers without --gc.
 		{"too_new key without a gc row", func(c *deleteCase) {
@@ -526,6 +547,124 @@ func TestPollServerStats(t *testing.T) {
 	c.o.Types = []string{"commit"}
 	reasons, _ = poll(evidence(settings(36*time.Hour, time.Hour)))
 	require.Empty(t, reasons)
+	c.o.Types = nil
+
+	// A map row touch lost since the window start, less the 8 h clients
+	// reuse map results and the hour a keep-alive pass may take, leaves out
+	// those 9 h too: 1.1 x 29.5 h fits 72 h less 30 h, 1 h, a minute and
+	// 8 h, but not less the hour as well.
+	c.r.LiveMounts.longestTouch = 29*time.Hour + 30*time.Minute
+	mapRowLoss := func(at time.Time) func(e *serverEvidence) {
+		return func(e *serverEvidence) {
+			settings(30*time.Hour, time.Hour)(e)
+			e.servers[2].MapRowLossTime = at
+		}
+	}
+	windowStart := snapshot.Add(-c.o.Grace - clockSkewMargin)
+	reasons, _ = poll(evidence(mapRowLoss(snapshot.Add(-time.Hour))))
+	require.Equal(t, []string{"live mounts touch their objects every 29h30m0s, too seldom for the grace 72h0m0s less the longest touch interval and cache TTL of the servers that run now, and less the 8h0m0s for which clients reuse map results and the 1h0m0s a keep-alive pass may take, since server srv-2-cc lost map row touches at 2026-11-08T11:00:00Z"}, reasons)
+	reasons, _ = poll(evidence(mapRowLoss(windowStart.Add(-9 * time.Hour))))
+	require.Len(t, reasons, 1)
+	reasons, _ = poll(evidence(mapRowLoss(windowStart.Add(-9*time.Hour - time.Second))))
+	require.Empty(t, reasons)
+	reasons, _ = poll(evidence(settings(30*time.Hour, time.Hour)))
+	require.Empty(t, reasons)
+
+	// Accepted mounts without the keep-alive refuse after a map row loss
+	// that only the second read sees.
+	c.r.LiveMounts = MountCounts{WithoutKeepAlive: 2}
+	c.o.AcceptMountsWithoutKeepAlive = true
+	reasons, _ = poll(evidence(nil))
+	require.Empty(t, reasons)
+	reasons, _ = poll(evidence(mapRowLoss(snapshot.Add(5 * time.Minute))))
+	require.Equal(t, []string{"2 live mounts run without the GC keep-alive, and server srv-2-cc lost map row touches at 2026-11-08T12:05:00Z: such a mount may apply a map result whose outputs no map row keeps any more, which --accept-mounts-without-keepalive does not accept; set gc-keepalive in their config"}, reasons)
+	c.o.Types = []string{"commit"}
+	reasons, _ = poll(evidence(mapRowLoss(snapshot.Add(5 * time.Minute))))
+	require.Empty(t, reasons)
+}
+
+// A map row loss since the window start, less the time clients reuse map
+// results and the time a keep-alive pass may take, shortens the keep-alive
+// limit by both and refuses nothing else. A row of a server of an older
+// version has no map row loss time and records lost map row touches in its
+// touch loss time, which keeps the limit and refuses as any lost touch.
+func TestServerEvidence_MapRowLoss(t *testing.T) {
+	require := require.New(t)
+	c := newDeleteCase()
+	e, snapshot, grace := c.ev.servers, c.ev.snapshot, c.o.Grace
+	limit := grace - 36*time.Hour - 6*time.Hour - clockSkewMargin
+	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+
+	e.servers[1].MapRowLossTime = snapshot.Add(-time.Hour)
+	e.servers[2].MapRowLossTime = snapshot.Add(-2 * time.Hour)
+	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
+	s, lost := e.mapRowLoss(snapshot, grace)
+	require.True(lost)
+	require.False(s.crashed)
+	require.Equal("srv-1-bb", s.server)
+	require.Empty(windowBlockers(e, snapshot, &c.o.DryRunOpts))
+
+	// A loss of a process that stopped before map row losses count is not
+	// counted.
+	before := mapRowLossStart(snapshot, grace).Add(-time.Minute)
+	e.servers[1] = stoppedServer("srv-1-bb", before)
+	e.servers[1].MapRowLossTime = before
+	e.servers[2].MapRowLossTime = time.Time{}
+	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+
+	e.servers[1] = liveServer("srv-1-bb", snapshot)
+	e.servers[1].TouchLossTime = snapshot.Add(-time.Hour)
+	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+	require.Equal([]string{"server srv-1-bb lost touches at 2026-11-08T11:00:00Z, after the window start 2026-11-05T11:59:00Z"}, windowBlockers(e, snapshot, &c.o.DryRunOpts))
+}
+
+// A server that did not record a stop may have lost map row touches after its
+// last heartbeat that it never recorded, so its row counts as a map row loss
+// at the last time it may have run, its last heartbeat plus the age of a live
+// row, also when the crash is before the window start. A clean stop without a
+// map row loss and a live row do not count.
+func TestServerEvidence_CrashCountsAsMapRowLoss(t *testing.T) {
+	require := require.New(t)
+	c := newDeleteCase()
+	e, snapshot, grace := c.ev.servers, c.ev.snapshot, c.o.Grace
+	limit := grace - 36*time.Hour - 6*time.Hour - clockSkewMargin
+	start, lossStart := windowStart(snapshot, grace), mapRowLossStart(snapshot, grace)
+
+	crash := func(lastSeen time.Time) {
+		e.servers[1] = liveServer("srv-1-bb", lastSeen)
+		e.servers[1].LastSeen = lastSeen
+	}
+	crash(start.Add(-liveReplicaAge - time.Hour))
+	require.Empty(windowBlockers(e, snapshot, &c.o.DryRunOpts), "the crash is before the window")
+	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
+	loss, lost := e.mapRowLoss(snapshot, grace)
+	require.True(lost)
+	require.Equal(mapRowLossEvent{server: "srv-1-bb", at: start.Add(-time.Hour), crashed: true}, loss)
+	require.Equal(", and less the 8h0m0s for which clients reuse map results and the 1h0m0s a keep-alive pass may take, since server srv-1-bb last wrote its heartbeat at 2026-11-05T10:29:00Z and did not record a stop: it crashed and may have lost map row touches", e.mapRowLossNote(snapshot, grace))
+
+	crash(lossStart.Add(-liveReplicaAge))
+	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
+	crash(lossStart.Add(-liveReplicaAge - time.Second))
+	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+
+	// A failed record of the stop leaves a crashed row; a map row loss the
+	// last heartbeat recorded is earlier than the crash.
+	crash(start.Add(-liveReplicaAge - time.Hour))
+	e.servers[1].MapRowLossTime = e.servers[1].LastSeen
+	loss, _ = e.mapRowLoss(snapshot, grace)
+	require.Equal(start.Add(-time.Hour), loss.at)
+
+	e.servers[1] = stoppedServer("srv-1-bb", start.Add(-time.Hour))
+	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace), "a clean stop")
+	require.Empty(e.mapRowLossNote(snapshot, grace))
+
+	// A live row is not a crash, even when its last heartbeat is long before
+	// the snapshot of the cycle.
+	e.servers[1] = liveServer("srv-1-bb", snapshot)
+	e.readTime = e.servers[1].LastSeen.Add(liveReplicaAge)
+	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+	e.readTime = e.servers[1].LastSeen.Add(liveReplicaAge + time.Second)
+	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
 }
 
 // The collector waits for a server's heartbeat at most the largest heartbeat

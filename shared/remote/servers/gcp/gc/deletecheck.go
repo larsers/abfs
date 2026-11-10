@@ -65,7 +65,8 @@ type DeleteOpts struct {
 	Types []string
 	// AcceptMountsWithoutKeepAlive deletes objects of the types clients write
 	// while live mounts run without the GC keep-alive, whose caches may hold
-	// the only copy of such an object. The check then only warns.
+	// the only copy of such an object. The check then only warns, unless a
+	// map row loss counts for the cycle (see serverEvidence.mapRowLoss).
 	AcceptMountsWithoutKeepAlive bool
 	// NoBackupCheck deletes without a backup of the tables taken after the
 	// list was complete.
@@ -268,18 +269,32 @@ func deleteBlockers(r *Report, ev *deleteEvidence, o *DeleteOpts) (reasons, warn
 	if o.allowsClientWrittenTypes() {
 		m := &r.LiveMounts
 		if m.WithoutKeepAlive > 0 {
-			msg := fmt.Sprintf("%d live mounts run without the GC keep-alive, so their caches may hold the only copy of a blob, tree or eval object they wrote%s", m.WithoutKeepAlive, mountSamples(m, "without_keepalive"))
-			if o.AcceptMountsWithoutKeepAlive {
-				warnings = append(warnings, msg)
-			} else {
+			samples := mountSamples(m, "without_keepalive")
+			msg := fmt.Sprintf("%d live mounts run without the GC keep-alive, so their caches may hold the only copy of a blob, tree or eval object they wrote%s", m.WithoutKeepAlive, samples)
+			// The flag accepts the content such a mount wrote, not the
+			// outputs of a map result whose map row touch a server lost.
+			var mapRowLoss string
+			if ev.servers != nil {
+				mapRowLoss = ev.servers.withoutKeepAliveMapRowLoss(ev.snapshot, o.Grace, m.WithoutKeepAlive, samples)
+			}
+			switch {
+			case !o.AcceptMountsWithoutKeepAlive:
 				add("%s; set gc-keepalive in their config, or pass --accept-mounts-without-keepalive", msg)
+			case mapRowLoss != "":
+				reasons = append(reasons, mapRowLoss)
+			default:
+				warnings = append(warnings, msg)
 			}
 		}
 		if m.WithoutLocalWriteCheck > 0 {
 			add("%d live mounts with the GC keep-alive run with a cacheman that does not keep locally written content until a server confirms it%s", m.WithoutLocalWriteCheck, mountSamples(m, "without_local_write_check"))
 		}
 		if m.TouchIntervalTooLong > 0 {
-			add("%d live mounts touch their objects less often than the grace allows%s", m.TouchIntervalTooLong, mountSamples(m, "touch_interval_too_long"))
+			var note string
+			if ev.servers != nil {
+				note = ev.servers.mapRowLossNote(ev.snapshot, o.Grace)
+			}
+			add("%d live mounts touch their objects less often than the grace allows%s%s", m.TouchIntervalTooLong, note, mountSamples(m, "touch_interval_too_long"))
 		}
 	}
 
@@ -339,7 +354,12 @@ func pollServerStats(ctx context.Context, read func(ctx context.Context) (*serve
 		reasons := slices.Concat(windowBlockers(e, r.SnapshotTime, &o.DryRunOpts), liveBlockers(e, &o.CondemnOpts))
 		if o.allowsClientWrittenTypes() && r.LiveMounts.longestTouch > 0 {
 			if !keepAliveTouchFits(r.LiveMounts.longestTouch, e.keepAliveTouchLimit(r.SnapshotTime, o.Grace)) {
-				reasons = append(reasons, fmt.Sprintf("live mounts touch their objects every %s, too seldom for the grace %s less the longest touch interval and cache TTL of the servers that run now", r.LiveMounts.longestTouch, o.Grace))
+				reasons = append(reasons, fmt.Sprintf("live mounts touch their objects every %s, too seldom for the grace %s less the longest touch interval and cache TTL of the servers that run now%s", r.LiveMounts.longestTouch, o.Grace, e.mapRowLossNote(r.SnapshotTime, o.Grace)))
+			}
+		}
+		if o.allowsClientWrittenTypes() && o.AcceptMountsWithoutKeepAlive && r.LiveMounts.WithoutKeepAlive > 0 {
+			if reason := e.withoutKeepAliveMapRowLoss(r.SnapshotTime, o.Grace, r.LiveMounts.WithoutKeepAlive, ""); reason != "" {
+				reasons = append(reasons, reason)
 			}
 		}
 		if len(reasons) > 0 {
