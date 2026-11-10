@@ -430,7 +430,9 @@ A client cache can hold the only copy of content a client wrote, such as build o
 * a live mount with `gc-keepalive` runs with a cacheman that does not check local writes (`live_mounts.without_local_write_check`): an older cacheman, or one started with `gc-keepalive` off. A cacheman restarted with `gc-keepalive` off under a live mount turns that mount's field false for good; restart the mount;
 * a live mount touches its objects less often than the grace allows (`live_mounts.touch_interval_too_long`): its `gc-keepalive-touch-interval` plus a tenth must be shorter than `--grace` less the longest touch interval and cache TTL of the servers and a minute.
 
-Cacheman reports its checks in `remote_checks` of its stats.
+At each start, cacheman runs a start pass: it goes through every entry it may evict, oldest first and at most 10,000 entries per second, and asks the server about the blobs, trees and objects among them. A cache of 10 million entries takes about 17 minutes. Until the pass ends, eviction takes only the entries the pass has checked; a cache at its eviction threshold with none of those left evicts unchecked entries. ARI entries, RBE CAS blobs and entries whose file is gone are not checked; eviction takes them as it does without `gc-keepalive`.
+
+Cacheman reports its checks in `remote_checks` of its stats. `skipped` counts the entries the checks left out, and `restored` counts such entries that an older cacheman kept out of eviction and that a start returned to it; the start logs up to 10 of their hashes. Both include blobs, trees and objects whose file is gone, which cacheman cannot tell from RBE CAS blobs.
 
 ### Map rows
 
@@ -738,7 +740,7 @@ Clients:
 * Cacheman cannot push back a cached tree or eval response the server lacks when one of its children, at any depth, is in no local store, such as a child a lazy mount never read. It drops such a push at the first retry of that child once the child has been missing for 30 minutes, up to about two minutes after that, and counts this once per entry in `remote_checks.dropped`; the entry stays in the cache, and the next keep-alive touch or cacheman start pushes it again. It does not drop the push while an upload, a map result, a wait or a ref update needs the same child. While a mount is connected and the child stays missing, each keep-alive cycle can queue the push again, which then waits and is dropped again.
 * The keep-alive does not touch files under `.git` and `.ctrl` directories.
 * A cacheman restarted with `gc-keepalive` off under a live mount checks no local writes until the mount's next keep-alive tick, up to 15 minutes later, turns the mount's field false.
-* A cacheman that starts while the server cannot be reached and its cache is at its eviction threshold evicts before it checked its entries; it counts this in `remote_checks.evicted_unchecked`.
+* A cache that reaches its eviction threshold during the start pass evicts entries the pass has not checked when it fills faster than the pass goes through its entries, or when the server cannot be reached; cacheman counts them in `remote_checks.evicted_unchecked`.
 
 Builds and records:
 

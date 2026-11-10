@@ -18,8 +18,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +59,8 @@ type checkRemote struct {
 	putHold  chan struct{}
 	// answerHold holds the answers of Headers calls after the server read them.
 	answerHold chan struct{}
+	// asked counts the Headers calls that asked for each key.
+	asked map[entities.Hash]int
 
 	calls atomic.Int64
 	keys  atomic.Int64
@@ -66,6 +71,7 @@ func newCheckRemote() *checkRemote {
 		ABFSClient: inmemory.New(),
 		holdKeys:   make(map[entities.Hash]chan struct{}),
 		hidden:     make(map[entities.Hash]bool),
+		asked:      make(map[entities.Hash]int),
 	}
 }
 
@@ -141,6 +147,7 @@ func (r *checkRemote) Headers(ctx context.Context, keys []remote.Hash) ([]entiti
 	waits := []chan struct{}{r.hold}
 	for _, k := range keys {
 		waits = append(waits, r.holdKeys[k])
+		r.asked[k]++
 	}
 	fail := r.fail
 	answerHold := r.answerHold
@@ -194,6 +201,12 @@ func (r *checkRemote) PutObject(ctx context.Context, key remote.Hash, reader rem
 	defer r.mu.Unlock()
 	delete(r.hidden, key)
 	return nil
+}
+
+func (r *checkRemote) askedFor(h entities.Hash) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.asked[h]
 }
 
 func (r *checkRemote) has(t *testing.T, h entities.Hash) bool {
@@ -959,4 +972,392 @@ func TestCacheman_DropsStuckPush(t *testing.T) {
 	require.Eventually(t, func() bool { return r.has(t, tree) && confirmed(c, tree) }, 5*time.Second, 10*time.Millisecond)
 	require.Equal(t, int64(2), c.Stats().RemoteChecks.Pushed)
 	require.Equal(t, int64(1), c.Stats().RemoteChecks.Dropped)
+}
+
+// fetchARIAndCASBlob fetches an ARI and an RBE CAS blob as a build does and returns their index
+// keys once both are indexed.
+func fetchARIAndCASBlob(t *testing.T, c *CacheMan) (ariKey, casKey entities.Hash) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	casPayload := []byte("output of a remote action")
+	digest := sha256.Sum256(casPayload)
+	sha256Hex := hex.EncodeToString(digest[:])
+	ari := "rbe:" + sha256Hex + ":0"
+	c.ariClient = &mockARIBlobClient{blobs: map[string][]byte{
+		ari: []byte("an ARI"),
+		fmt.Sprintf("rbe:%s:%d", sha256Hex, len(casPayload)): casPayload,
+	}}
+	go c.fetchObjectsWorker(ctx)
+	go c.indexObjectsWorker(ctx)
+
+	done := make(chan error, 2)
+	c.FetchARI(ari, defaultFetchPriority, func(err error) { done <- err })
+	c.FetchCASBlob(sha256Hex, int64(len(casPayload)), defaultFetchPriority, func(err error) { done <- err })
+	require.NoError(t, <-done)
+	require.NoError(t, <-done)
+
+	ariKey = entities.Hash(sha1.Sum([]byte(ari)))
+	casKey = entities.Hash(sha1.Sum([]byte(fmt.Sprintf("cas:%s:%d", sha256Hex, len(casPayload)))))
+	require.Eventually(t, func() bool {
+		a, b := c.index.Get(ariKey), c.index.Get(casKey)
+		return a != nil && a.Local && b != nil && b.Local
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, EntryTypeARI, c.index.Get(ariKey).EntryType)
+	require.Equal(t, EntryTypeBlob, c.index.Get(casKey).EntryType)
+	return ariKey, casKey
+}
+
+// requireEvictable checks that h is a Remote entry in the LRU without a marker.
+func requireEvictable(t *testing.T, c *CacheMan, h entities.Hash) {
+	t.Helper()
+	entry := c.index.Get(h)
+	require.NotNil(t, entry)
+	require.True(t, entry.Local)
+	require.True(t, entry.Remote)
+	require.False(t, hasMarker(c, h))
+	require.True(t, inLRU(t, c, h))
+}
+
+func waitForStartPass(t *testing.T, c *CacheMan) {
+	t.Helper()
+	require.Eventually(t, func() bool { return !c.index.(*badgerIndex).gate.held.Load() }, 5*time.Second, 10*time.Millisecond)
+}
+
+// fakeClock is a clock for a keyPacer whose sleeps return at once, after onSleep if set.
+type fakeClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	sleeps  []time.Duration
+	onSleep func()
+}
+
+func (f *fakeClock) Now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.now
+}
+
+func (f *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
+	if f.onSleep != nil {
+		f.onSleep()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.now = f.now.Add(d)
+	f.sleeps = append(f.sleeps, d)
+	return ctx.Err()
+}
+
+func (f *fakeClock) advance(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.now = f.now.Add(d)
+}
+
+func (f *fakeClock) slept() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.sleeps)
+}
+
+func (f *fakeClock) pacer(rate int) *keyPacer {
+	return &keyPacer{rate: rate, now: f.Now, sleep: f.Sleep}
+}
+
+func TestKeyPacer(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	p := clock.pacer(10000)
+
+	require.NoError(t, p.wait(ctx, 10000))
+	require.NoError(t, p.wait(ctx, 5000))
+	require.NoError(t, p.wait(ctx, 5000))
+	require.Equal(t, []time.Duration{time.Second, 500 * time.Millisecond}, clock.slept())
+
+	// Time spent elsewhere counts toward the next wait, but only up to the time of one call:
+	// after a pause the first call goes at once and the next waits its full time.
+	clock.advance(200 * time.Millisecond)
+	require.NoError(t, p.wait(ctx, 10000))
+	clock.advance(10 * time.Second)
+	require.NoError(t, p.wait(ctx, 10000))
+	// A call with no keys neither waits nor counts.
+	require.NoError(t, p.wait(ctx, 0))
+	require.NoError(t, p.wait(ctx, 1))
+	require.Equal(t, []time.Duration{time.Second, 500 * time.Millisecond, 300 * time.Millisecond, time.Second}, clock.slept())
+	require.Equal(t, time.Unix(1013, 0), clock.Now())
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	require.ErrorIs(t, p.wait(canceled, 1), context.Canceled)
+}
+
+// The start pass sends the LRU at the keep-alive's rate at most.
+func TestCacheman_StartPassIsPaced(t *testing.T) {
+	ctx := context.Background()
+	oldBatch, oldPacer := localWriteStartPassBatch, newStartPassPacer
+	localWriteStartPassBatch = 2
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	newStartPassPacer = func() *keyPacer { return clock.pacer(localWriteStartPassRate) }
+	defer func() { localWriteStartPassBatch, newStartPassPacer = oldBatch, oldPacer }()
+
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	for _, content := range []string{"a", "b", "c", "d", "e"} {
+		fetchedBlob(t, c1, content)
+		putOnServer(t, r, content)
+	}
+	require.NoError(t, c1.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	c.startLocalWriteCheck(ctx)
+	waitForStartPass(t, c)
+	require.Equal(t, int64(5), c.Stats().RemoteChecks.StartPass)
+	require.Equal(t, int64(3), r.calls.Load())
+	// Two keys at 10,000 per second each time.
+	require.Equal(t, []time.Duration{200 * time.Microsecond, 200 * time.Microsecond}, clock.slept())
+}
+
+// A cacheman that stops during the start pass keeps eviction held at the batches answered so
+// far.
+func TestCacheman_StartPassStopped(t *testing.T) {
+	oldBatch, oldPacer := localWriteStartPassBatch, newStartPassPacer
+	localWriteStartPassBatch = 1
+	proceed := make(chan struct{})
+	clock := &fakeClock{now: time.Unix(1000, 0), onSleep: func() { <-proceed }}
+	newStartPassPacer = func() *keyPacer { return clock.pacer(localWriteStartPassRate) }
+	defer func() { localWriteStartPassBatch, newStartPassPacer = oldBatch, oldPacer }()
+
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	var hashes []entities.Hash
+	for i, content := range []string{"answered", "not sent", "not sent either"} {
+		h := fetchedBlob(t, c, content)
+		putOnServer(t, r, content)
+		setLRUTime(t, store, h, int64(100*(i+1)))
+		hashes = append(hashes, h)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c.startLocalWriteCheck(ctx)
+	require.Eventually(t, func() bool { return c.Stats().RemoteChecks.StartPass == 1 }, 5*time.Second, 10*time.Millisecond)
+	cancel()
+	close(proceed)
+	c.activeWorkers.Wait()
+	require.True(t, c.index.(*badgerIndex).gate.held.Load())
+	require.Equal(t, int64(1), r.calls.Load())
+	require.Equal(t, hashes[:1], evictAll(t, c))
+}
+
+// The start pass checks trees and objects as it checks blobs: it keeps those the server lacks
+// out of eviction and pushes them.
+func TestCacheman_StartPassChecksTreesAndObjects(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	blob := fetchedBlob(t, c1, "file content")
+	putOnServer(t, r, "file content")
+
+	var treeRaw bytes.Buffer
+	fmt.Fprintf(&treeRaw, "%o file.txt\x00", 0100644)
+	treeRaw.Write(blob[:])
+	var treeData bytes.Buffer
+	require.NoError(t, objects.WriteHeader(&treeData, "tree", int64(treeRaw.Len())))
+	treeData.Write(treeRaw.Bytes())
+	tree := objects.HashBytes(treeData.Bytes())
+	require.NoError(t, c1.store.PutTree(ctx, tree, treeData.Bytes(), entities.TreeMeta{Sizes: []int64{int64(len("file content"))}}))
+	_, err := c1.addFetchedObjectToIndex(tree, EntryTypeTree)
+	require.NoError(t, err)
+
+	commitRaw := fmt.Appendf(nil, "tree %s\nauthor A <a@example.com> 0 +0000\ncommitter A <a@example.com> 0 +0000\n\nmessage\n", tree)
+	var commitData bytes.Buffer
+	require.NoError(t, objects.WriteHeader(&commitData, "commit", int64(len(commitRaw))))
+	commitData.Write(commitRaw)
+	commit := objects.HashBytes(commitData.Bytes())
+	require.NoError(t, c1.store.PutObject(ctx, commit, commitData.Bytes()))
+	_, err = c1.addFetchedObjectToIndex(commit, EntryTypeObject)
+	require.NoError(t, err)
+	require.NoError(t, c1.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	release := r.holdPuts()
+	c.startLocalWriteCheck(ctx)
+	require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Pushed == 2 }, 5*time.Second, 10*time.Millisecond)
+	for _, h := range []entities.Hash{tree, commit} {
+		entry := c.index.Get(h)
+		require.True(t, entry.Local)
+		require.False(t, entry.Remote)
+		require.True(t, hasMarker(c, h))
+		require.False(t, inLRU(t, c, h))
+	}
+	require.NotContains(t, evictAll(t, c), tree)
+
+	release()
+	require.Eventually(t, func() bool {
+		return confirmed(c, tree) && confirmed(c, commit) && r.has(t, tree) && r.has(t, commit)
+	}, 5*time.Second, 10*time.Millisecond)
+	waitForStartPass(t, c)
+	stats := c.Stats().RemoteChecks
+	require.Equal(t, int64(3), stats.StartPass)
+	require.Zero(t, stats.Skipped)
+	require.Equal(t, EntryTypeTree, c.index.Get(tree).EntryType)
+	require.Equal(t, EntryTypeObject, c.index.Get(commit).EntryType)
+}
+
+// A batch of only ARI entries and RBE CAS blobs sends no call.
+func TestCacheman_StartPassSendsNoEmptyBatch(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	fetchARIAndCASBlob(t, c1)
+	require.NoError(t, c1.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	calls := r.calls.Load()
+	c.startLocalWriteCheck(ctx)
+	waitForStartPass(t, c)
+	require.Equal(t, int64(2), c.Stats().RemoteChecks.Skipped)
+	require.Equal(t, calls, r.calls.Load())
+}
+
+// Batches the checks leave out count as answered, so the watermark moves past them.
+func TestCacheman_StartPassWatermarkPassesSkippedBatches(t *testing.T) {
+	old := localWriteStartPassBatch
+	localWriteStartPassBatch = 1
+	defer func() { localWriteStartPassBatch = old }()
+
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	ariKey, casKey := fetchARIAndCASBlob(t, c)
+	answered := fetchedBlob(t, c, "answered")
+	waiting := fetchedBlob(t, c, "not answered")
+	putOnServer(t, r, "answered")
+	putOnServer(t, r, "not answered")
+	for i, h := range []entities.Hash{answered, ariKey, casKey, waiting} {
+		setLRUTime(t, store, h, int64(100*(i+1)))
+	}
+
+	releaseWaiting := r.holdKey(waiting)
+	c.startLocalWriteCheck(context.Background())
+	var evicted []entities.Hash
+	require.Eventually(t, func() bool {
+		evicted = append(evicted, evictAll(t, c)...)
+		return len(evicted) == 3
+	}, 5*time.Second, 10*time.Millisecond)
+	require.ElementsMatch(t, []entities.Hash{answered, ariKey, casKey}, evicted)
+	require.True(t, inLRU(t, c, waiting))
+
+	releaseWaiting()
+	waitForStartPass(t, c)
+	require.Equal(t, []entities.Hash{waiting}, evictAll(t, c))
+}
+
+// An entry whose file cannot be read for another reason than its absence is checked.
+func TestCacheman_StartPassChecksUnreadableEntries(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads files without permission")
+	}
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	h := fetchedBlob(t, c, "unreadable")
+	shard := filepath.Join(dir, "cache", "blobs", h.String()[:3])
+	require.DirExists(t, shard)
+	require.NoError(t, os.Chmod(shard, 0))
+	t.Cleanup(func() { require.NoError(t, os.Chmod(shard, 0755)) })
+
+	c.startLocalWriteCheck(context.Background())
+	waitForStartPass(t, c)
+	require.Equal(t, 1, r.askedFor(h))
+	require.Zero(t, c.Stats().RemoteChecks.Skipped)
+	require.True(t, hasMarker(c, h))
+	require.False(t, inLRU(t, c, h))
+}
+
+// ARI entries and RBE CAS blobs hold no object of the ABFS server: no check asks the server
+// about them, and they stay in the LRU, evictable.
+func TestCacheman_LocalWriteCheckLeavesARIAndCASBlobs(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	ariKey, casKey := fetchARIAndCASBlob(t, c1)
+	present := fetchedBlob(t, c1, "on the server")
+	putOnServer(t, r, "on the server")
+	deleted := fetchedBlob(t, c1, "deleted on the server")
+	require.NoError(t, c1.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	c.startLocalWriteCheck(ctx)
+	waitForStartPass(t, c)
+	stats := c.Stats().RemoteChecks
+	require.Equal(t, int64(2), stats.StartPass)
+	require.Equal(t, int64(2), stats.Skipped)
+	require.Zero(t, stats.LostBeforeIndex)
+	require.Zero(t, r.askedFor(ariKey))
+	require.Zero(t, r.askedFor(casKey))
+	requireEvictable(t, c, ariKey)
+	requireEvictable(t, c, casKey)
+	requireEvictable(t, c, present)
+	require.Eventually(t, func() bool { return confirmed(c, deleted) && r.has(t, deleted) }, 5*time.Second, 10*time.Millisecond)
+
+	// A missing answer from another check leaves them as well.
+	c.checkRemoteHeaders(ctx, []entities.Hash{ariKey, casKey}, []bool{false, false})
+	c.recheckCachedObject(ctx, casKey, EntryTypeBlob)
+	require.Equal(t, int64(4), c.Stats().RemoteChecks.Skipped)
+	requireEvictable(t, c, ariKey)
+	requireEvictable(t, c, casKey)
+
+	require.Subset(t, evictAll(t, c), []entities.Hash{ariKey, casKey, present, deleted})
+	has, err := c.store.HasARI(ctx, ariKey)
+	require.NoError(t, err)
+	require.False(t, has)
+}
+
+// An ARI entry or RBE CAS blob that a check took out of the LRU goes back at the next start,
+// once; a marked ABFS blob is checked as before.
+func TestCacheman_StartRestoresMarkedARIAndCASBlobs(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	ariKey, casKey := fetchARIAndCASBlob(t, c1)
+	blob := fetchedBlob(t, c1, "marked, on the server")
+	putOnServer(t, r, "marked, on the server")
+	idx := c1.index.(*badgerIndex)
+	for _, h := range []entities.Hash{ariKey, casKey, blob} {
+		_, cleared, _, err := idx.clearRemote(h, nil, nil)
+		require.NoError(t, err)
+		require.True(t, cleared)
+		require.False(t, inLRU(t, c1, h))
+	}
+	require.NoError(t, c1.Stop())
+
+	c2 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	release := r.holdHeaders()
+	c2.startLocalWriteCheck(ctx)
+	require.Equal(t, int64(2), c2.Stats().RemoteChecks.Restored)
+	requireEvictable(t, c2, ariKey)
+	requireEvictable(t, c2, casKey)
+	require.True(t, hasMarker(c2, blob))
+	require.False(t, inLRU(t, c2, blob))
+	release()
+	require.Eventually(t, func() bool { return confirmed(c2, blob) && inLRU(t, c2, blob) }, 5*time.Second, 10*time.Millisecond)
+	waitForStartPass(t, c2)
+	require.Zero(t, r.askedFor(ariKey))
+	require.Zero(t, r.askedFor(casKey))
+	require.NoError(t, c2.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	c.startLocalWriteCheck(ctx)
+	waitForStartPass(t, c)
+	require.Zero(t, c.Stats().RemoteChecks.Restored)
+	requireEvictable(t, c, ariKey)
+	requireEvictable(t, c, casKey)
+	require.Subset(t, evictAll(t, c), []entities.Hash{ariKey, casKey, blob})
 }
