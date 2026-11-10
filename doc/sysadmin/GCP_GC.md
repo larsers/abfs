@@ -13,7 +13,7 @@ Garbage collection is off by default. Three parts take part when it is on:
 **Roots.** The collector keeps everything that a root reaches:
 
 * every ref of every project, such as branches, tags and `HEAD`;
-* the refs that clients write in the project `abfs-meta`: live mount refs and workspace refs, snapshot refs for `--snapshot-retention` after their last write, and build and unmount refs within their retention; mount, workspace and snapshot refs also keep the commits that the pinned manifest of their mount names;
+* the refs that clients write in the project `abfs-meta`: mount refs within `--mount-idle` and workspace refs, snapshot refs for `--snapshot-retention` after their last write, and build and unmount refs within their retention; the mount refs of live mounts, workspace refs and snapshot refs also keep the commits that the pinned manifest of their mount names. The mount ref of a mount that `abfs unmount` ended keeps only its mount details, until it goes with its unmount ref after `--build-retention` or at `--mount-idle`, whichever comes first;
 * map rows, such as cached build results, within their retention;
 * every object written or used within the grace period (`--grace`, default `72h`).
 
@@ -163,6 +163,7 @@ abfs server gcp gc backfill --project <project> --instance <spanner-instance> --
 * `--dry-run` only counts the rows to write.
 * `--rate` limits the object rows scanned per second (0 means no limit).
 * The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
+* Do not run it while delete cycles run: stop the collector job, or run it without `--delete`, until the backfill has finished. A delete cycle checks that each object written during its consistency scan has a `gc` row, which only a server with `--gc` writes; a backfill that writes the row of such an object in between hides the server without `--gc` that wrote it.
 
 A row is current when its version of the edge rules is at least the one its object type requires; only the rows of types whose rules changed are rewritten. Version 2 gives each deep tree an edge to every deep tree nested in it: a directory with 1,000 or more entries below it is stored as a deep tree of its own, which only deep trees link. Version 1 gave deep trees no edges, so the dry run counted those nested deep trees as unreachable although mounts read them.
 
@@ -188,10 +189,10 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 
    The command deletes the `GcServers` rows whose last heartbeat and stop are older than the longest of a day, the largest `--grace` of any condemn or delete cycle plus an hour, and its own `--grace` plus an hour (`replicas.servers_removed`), and the `GcReplicas` rows not written for a day (`replicas.removed`). It records in `GcState` since when every read found `GcReplicas` empty (`replicas.legacy_servers_gone_time`).
 3. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
-4. For each live mount, reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
+4. For each live mount (see [Mounts and unmounts](#mounts-and-unmounts)), reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
 5. Scans the `gc` table twice in key ranges (`--shards`, default 16): first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
 6. Marks in memory everything the roots reach. It walks the roots one at a time in a fixed order: the refs of the classes source, workspaces, snapshots, mounts and unmount records, then the pinned revisions, builds, other `abfs-meta` refs, empty objects, recent objects and map rows, so that the report can name the root that reached an object first. Edges to objects without a `gc` row are skipped and counted. A `gc` row with an object type the binary does not know stops the run.
-7. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once.
+7. With `--consistency` (on by default), scans the `meta` family of the `objects` table to check that every object has a `gc` row and to sum the sizes (`meta:size`) of reachable and unreachable objects. This reads every object row once. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
 8. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
 
 ### Root classes
@@ -201,7 +202,7 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 | Source | every ref outside the classes below, such as branches, tags and `HEAD`; `abfs/project-status`, `abfs/pushed-packs`, `config` and `acl` are counted separately | while the ref exists |
 | Workspaces | `refs/abfs/ws/...` of the project `abfs-meta`, and the revisions of the pinned manifest of the mount each snapshot was taken from | while the ref exists |
 | Snapshots | `refs/abfs/snapshot/...` of `abfs-meta` (see [Snapshot refs](#snapshot-refs)), and the revisions of the pinned manifest of the mount each snapshot was taken from | `--snapshot-retention` (default `720h`) since the ref was written |
-| Mounts | `refs/abfs/mount/...` of `abfs-meta`, and the revisions of their pinned manifests | while the client rewrote the ref within `--mount-idle` (default `336h`) |
+| Mounts | `refs/abfs/mount/...` of `abfs-meta`, and for live mounts the revisions of their pinned manifests (see [Mounts and unmounts](#mounts-and-unmounts)) | while the client rewrote the ref within `--mount-idle` (default `336h`); the ref of an ended mount, which keeps only its mount details, until it goes with its unmount ref after `--build-retention` or at `--mount-idle`, whichever comes first |
 | Unmount records | `refs/abfs/unmount/...` of `abfs-meta`: the unmount details and the mount details they link | `--build-retention` since the ref was written |
 | Builds | `refs/abfs/build/...` and `refs/abfs/build-start/...` of `abfs-meta` | `--build-retention` (default `720h`) since the ref was written |
 | Eval map rows | the request and the result | `--map-retention` (default `720h`) since the row was written or used |
@@ -212,15 +213,23 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 
 Map rows with request types not listed are kept. A ref past its retention is no root; delete mode removes it (see [Ref removal](#ref-removal)). `--grace` must be at least `2 x --cycle + --cache-ttl + --longest-push` (defaults `24h`, `6h` and `3h`); the command refuses to run otherwise.
 
+#### Mounts and unmounts
+
+A mount writes the ref `refs/abfs/mount/<prefix>/<start>` when it starts, where `<prefix>` is its `--ref-prefix` (default `user/<user>`) and `<start>` its start time in nanoseconds. `abfs unmount` writes `refs/abfs/unmount/<prefix>/<start>` after it stopped the processes that used the mount point, the mount daemon among them, unmounted it and, with `--rm`, removed the workspace. It sees and stops only the processes of the user who runs it: a copy of the mount in another mount namespace that processes of another user use, such as a container running as root with a bind mount of the workspace, does not keep the unmount from succeeding and outlives it (see [Limits of the garbage collector](#limits-of-the-garbage-collector)). A failed or refused unmount writes none, nor does an unmount that cannot read the mount details at the mount point or runs with `--no-mount-details`.
+
+* A mount ref without an unmount ref of the same name in the same project is a live mount: the revisions of its pinned manifest are roots, the [client cache checks](#client-caches) count it, and it stays live while the client rewrote the ref within `--mount-idle`. A mount that ended without `abfs unmount`, such as a crashed client, a killed daemon or a deleted pod, stays live that long.
+* A mount ref with such an unmount ref is an ended mount. It stays a root of its mount details, but its revisions are no roots and it counts in none of the `live_mounts` fields, so it refuses no deletes in the [client cache checks](#client-caches). The report counts these refs in `refs.mount.ended`. Delete mode removes the mount ref together with its unmount ref once that ref is past `--build-retention`, or when the mount ref is past `--mount-idle`, whichever comes first.
+* A workspace keeps the revisions of its mount through its workspace ref, not through the mount ref, so ending the mount does not affect it. A later mount of the same workspace or revision writes its own mount ref.
+
 ### Report
 
 The report counts:
 
-* per class, the refs, tombstones, roots and refs past their retention (`refs_to_tombstone` in total);
+* per class, the refs, tombstones, roots and refs past their retention (`refs_to_tombstone` in total), and for mounts the roots that belong to ended mounts (`ended`);
 * roots whose object has no `gc` row (dangling roots);
 * objects and edges per type, reachable and unreachable, with up to 20 unreachable keys per type (`unreachable_sample`), and dangling edges with a few examples;
 * map rows live and expired per class;
-* the consistency result with the first objects missing a `gc` row. Objects written within a minute of the scan are not checked for a `gc` row (`too_new`), and `gc` rows without an object row (uploads in flight) are counted;
+* the consistency result with the first objects missing a `gc` row. Objects without a `gc` row that were written after the scan of the `gc` table started, less a minute, are counted apart (`too_new`): an upload during the scans lands there when its `gc` row was written after the scan of the `gc` table passed its key, so the count grows with the upload rate and is not an error. `gc` rows without an object row (uploads in flight) are counted too;
 * the time of each step and the peak heap;
 * while `GcState` names the list of a condemn or delete cycle, `delete.plan`: what a delete cycle would remove from it now, the candidates and `would_delete` per type with their bytes, the levels and the map rows (see [Delete mode](#delete-mode)). `delete.plan_error` says why the list could not be read.
 
@@ -228,7 +237,7 @@ The sections `live_mounts`, `workspaces` and `snapshots` report the pins:
 
 | Field | Counts |
 | --- | --- |
-| `live` | the live mount refs, workspace refs or snapshot refs |
+| `live` | the mount refs of live mounts, the workspace refs or the snapshot refs |
 | `without_pinned_manifest` | mount details without a pinned manifest, and workspace snapshots without mount details |
 | `without_keepalive` | mount details of clients without `gc-keepalive` or with one of its intervals `0` |
 | `without_local_write_check` | mount details with `gc-keepalive` whose cacheman does not keep locally written content until a server confirms it |
@@ -406,7 +415,9 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 | No ready backup of a table started after the list was completed | Take the [backups](#backups) between cycles, or pass `--no-backup-check` |
 | The removal of expired refs failed | The next cycle tries again |
 | Live mounts run without `gc-keepalive`; mounts with it run with a cacheman that does not check local writes; mounts touch their objects less often than the grace allows | See [Client caches](#client-caches) |
-| Objects written during the consistency scan have no `gc` row, more than 10,000 such objects to check, or their rows cannot be read | A server without `--gc` writes to the store; find and stop it |
+| Objects written during the consistency scan have no `gc` row; the reason names up to 10 of them | A server without `--gc` writes to the store; find and stop it |
+| The `gc` rows of the objects written during the consistency scan cannot be read | Check the collector's access to Bigtable and the load of its app profile; the next cycle checks again |
+| Only some of the objects written during the consistency scan were checked: the checks fell behind the writes, and the scan stopped waiting for them | Nothing; deletes resume in a later cycle with fewer writes during its scan (see [Planning figures](#planning-figures)) |
 | A server wrote no heartbeat with touch counts read after the snapshot in time | Check that server's heartbeat writes (`abfs.gcp.gc.heartbeat_failures`) |
 
 A crash, an out-of-memory kill, a preemption, a pause of a VM, a stop killed before it recorded itself, or one dropped or failed touch on any server stops deletes for about `--grace` plus 31 minutes, which is three daily cycles at the defaults.
@@ -415,11 +426,13 @@ A crash, an out-of-memory kill, a preemption, a pause of a VM, a stop killed bef
 
 A client cache can hold the only copy of content a client wrote, such as build outputs equal to an old, unreachable blob. A cacheman with `gc-keepalive` on in its own configuration keeps such content out of eviction until a server confirmed the object after the write, and pushes it when the server lacks it; the mount records this in its mount details. When `--delete-types` allows blobs, trees, eval requests or eval responses, the cycle refuses its deletes while:
 
-* a live mount runs without `gc-keepalive` or with one of its intervals `0` (`live_mounts.without_keepalive`). Turn `gc-keepalive` on as step 4 of [Enable or disable garbage collection](#enable-or-disable-garbage-collection) says. `--accept-mounts-without-keepalive` turns this check into a warning: content such mounts wrote and their cache evicted is then lost once deleted. A mount ref without keep-alive stays live for `--mount-idle` after its last write, so after the last such mount these deletes wait up to 14 days;
+* a live mount runs without `gc-keepalive` or with one of its intervals `0` (`live_mounts.without_keepalive`). Turn `gc-keepalive` on as step 4 of [Enable or disable garbage collection](#enable-or-disable-garbage-collection) says. `--accept-mounts-without-keepalive` turns this check into a warning: content such mounts wrote and their cache evicted is then lost once deleted. A mount without keep-alive writes its mount ref only when it starts, so it counts until `abfs unmount` ends it or for `--mount-idle` after it started, whichever comes first. After such a mount ended without `abfs unmount`, these deletes wait up to 14 days;
 * a live mount with `gc-keepalive` runs with a cacheman that does not check local writes (`live_mounts.without_local_write_check`): an older cacheman, or one started with `gc-keepalive` off. A cacheman restarted with `gc-keepalive` off under a live mount turns that mount's field false for good; restart the mount;
 * a live mount touches its objects less often than the grace allows (`live_mounts.touch_interval_too_long`): its `gc-keepalive-touch-interval` plus a tenth must be shorter than `--grace` less the longest touch interval and cache TTL of the servers and a minute.
 
-Cacheman reports its checks in `remote_checks` of its stats.
+At each start, cacheman runs a start pass: it goes through every entry it may evict, oldest first and at most 10,000 entries per second, and asks the server about the blobs, trees and objects among them. A cache of 10 million entries takes about 17 minutes. Until the pass ends, eviction takes only the entries the pass has checked; a cache at its eviction threshold with none of those left evicts unchecked entries. ARI entries, RBE CAS blobs and entries whose file is gone are not checked; eviction takes them as it does without `gc-keepalive`.
+
+Cacheman reports its checks in `remote_checks` of its stats. `skipped` counts the entries the checks left out, and `restored` counts such entries that an older cacheman kept out of eviction and that a start returned to it; the start logs up to 10 of their hashes. Both include blobs, trees and objects whose file is gone, which cacheman cannot tell from RBE CAS blobs.
 
 ### Map rows
 
@@ -470,7 +483,7 @@ Each delete cycle that passes the condemn checks removes the refs that were past
 
 | Class | Removed when not written within |
 | --- | --- |
-| mount refs | `--mount-idle` |
+| mount refs | `--mount-idle`; the ref of an ended mount also goes with its unmount ref, and is removed before it |
 | build, build-start and unmount refs | `--build-retention` |
 | snapshot refs | `--snapshot-retention` |
 
@@ -506,7 +519,7 @@ The section `delete` holds:
 | Field | Content |
 | --- | --- |
 | `refused`, `warnings` | why the cycle did not delete, and the checks that options turned into warnings |
-| `too_new` | the objects the consistency scan found without a `gc` row because they were written during it, read again |
+| `too_new` | the check of the objects the consistency scan found without a `gc` row because they were written during it: `keys` checked, which equals `consistency.too_new` unless the scan stopped waiting for the checks; `not_hashes`; `gone`, deleted again before the check; `without_gc_row`, with up to 10 `samples`, which are a sample and not the lowest keys. When the check failed, it counts the objects checked before, and the reason is in `refused` |
 | `plan` | what the cycle planned to delete |
 | `step` | the record prefix; the objects deleted per type and their bytes; `not_matched` with samples, each of which should have a rescue log line of a server; `gone`; `blocked` (below a key that was not deleted); `type_not_allowed`; keys of unknown outcome; `gc` rows and map rows deleted and kept; the time of the first 100 levels per key range |
 | `chunks` | the chunk step |
@@ -518,6 +531,8 @@ The section `delete` holds:
 * A delete step removes about 24,000 objects in about 19 seconds on one Bigtable node, about 0.8 ms per object. The default `--delete-rate` of 2,000 per second also bounds it: 10^6 candidates take at least about 8 minutes.
 * A condemn or delete cycle over about 71 million objects takes about 7 to 14 minutes on one node with autoscaling to 3.
 * Writing the markers of about 27,000 objects takes about 6 seconds at the default `--condemn-rate`.
+* A delete cycle checks each object written during its consistency scan while the scan runs: it reads the object's `gc` row, and its `objects` row only when the `gc` row is missing, in batches of 100 keys with 8 batches in flight, and keeps only counts and the batches in flight in memory. That is one row read per object. Bigtable rates one SSD node at up to 17,000 row reads per second ([performance](https://docs.cloud.google.com/bigtable/docs/performance)), so on a node with no other load than the collector 1 million objects written during a scan take about 1 minute of reads and 10 million about 10 minutes, less with more nodes. The collector reads at low priority, so a node busy with a seed checks slower.
+* When the checks fall behind, the scan waits for them, at most 15 minutes summed over its key ranges. The wait makes a delete cycle up to about 15 minutes longer than a condemn cycle, about the length of one more cycle at 71 million objects, and about 1 minute longer when all 16 key ranges wait at once. The checks share the node with the scan, so they also slow it. Past that wait the scan stops checking and cancels the reads in flight, finishes at full speed, and the cycle refuses its deletes. A cycle during a seed or a large catch-up of a git-pusher can refuse this way; deletes resume in a later cycle with fewer writes during its scan.
 * The step runs one level per link in a chain of unreachable objects: for a dropped branch of 10,000 commits, expect about 10,000 levels and an estimated 13 to 20 minutes of delete step and tens of thousands of delete records, which the next chunk step reads.
 * Deleted data is billed until it is gone: in backups for their retention, and soft-deleted chunks for the soft delete retention.
 
@@ -699,14 +714,16 @@ Metrics, as OpenTelemetry counters. Their names keep the dots when they are expo
 
 Mounts and pins:
 
-* A mount is kept alive only by a client with `gc-keepalive`. Mounts of clients without it, or of older clients, and mounts in remote read-only mode, which write no mount ref, are protected only by the refs they were mounted from and, for a mount that wrote its ref, for `--mount-idle` after the mount started. What they loaded can go once those refs move and `--grace` has passed.
+* A mount is kept alive only by a client with `gc-keepalive`. Mounts of clients without it, or of older clients, and mounts in remote read-only mode, which write no mount ref, are protected only by the refs they were mounted from and, for a mount that wrote its ref, until it was unmounted or for `--mount-idle` after it started, whichever comes first. What they loaded can go once those refs move and `--grace` has passed.
 * With `gc-keepalive`, `abfs ws mount-repo -b <branch>` (used by `abfs mount --ws` and `--tmp-ws`) pins `default.xml` of the branch when it mounts and records the pinned manifest in the mount details. `abfs ws mount` and a mount of a snapshot pass on the pin of the mount the snapshot was taken from, and mounts made from a manifest hash or a manifest file pin it.
 * This version resolves `-b <name>` for the pin as `refs/heads/<name>`, then `refs/tags/<name>`, then as the full ref `<name>`. A version whose pin resolves only `refs/heads/<name>` records no pin for a tag or a full ref name, which the mount still checks out.
 * No pin is recorded when a project of the manifest, in any group, does not resolve on the server, with `--smart-sync` or `--smart-tag`, or for a snapshot whose mount had none; the mount goes on and logs a warning. A mount without `-b`, which checks out the HEAD of the manifest project, gets no pin either and logs nothing. Such a mount ref keeps only the mount details, so the commits and trees the mount reads stay only while the branch reaches them or within `--grace`; a force push or a deleted branch can leave them unreachable. The report counts these mounts in `live_mounts.without_pinned_manifest`.
 * The pin does not follow the checkouts: a branch that moves between the pin and `repo sync`, and a later `repo sync` in the workspace, check out commits that only their branch keeps.
 * The pin of a mount holds the revisions of the projects in its manifest, not the commit of the manifest project itself. When the manifest branch is force-pushed, the manifest commit the mount checked out is kept only by the manifest branch and by `--grace`.
-* A workspace snapshot without a snapshot ref (taken without `gc-keepalive` or by an older client) is kept, with work tree content only it holds, only for `--grace` after its last use, and one with a ref for `--snapshot-retention` after its last `ws snapshot` or `--restore`. Use named workspaces for work that must stay.
+* A workspace snapshot without a snapshot ref (taken without `gc-keepalive` or by an older client) is kept, with work tree content only it holds, only for `--grace` after its last use, and one with a ref for `--snapshot-retention` after its last `ws snapshot` or `--restore`. For a snapshot without a ref, the commits its mount was pinned to stay pinned by the mount ref only until `abfs unmount` ends the mount, not for `--mount-idle` as in earlier versions. Use named workspaces for work that must stay.
 * A snapshot restored while a delete cycle runs, after its ref passed `--snapshot-retention`, can lose the commits its mount was pinned to; restore well within the retention.
+* An ended mount pins nothing from the time its unmount ref is written. `abfs unmount` sees and stops only the processes of the user who runs it, so a copy of the mount in another mount namespace that only processes of other users use, such as a container running as root with a bind mount of the workspace, outlives it. Those processes go on reading through cacheman. What they read is then protected only by the other roots and `--grace`, and each read touches what it reads; without the unmount ref, the pins of the mount kept it until `--mount-idle`. Stop containers and other users' processes that use the workspace before `abfs unmount`.
+* The collector matches a mount ref and an unmount ref by name: two mounts with the same `--ref-prefix` started in the same nanosecond share one name, and the unmount of either ends both.
 
 Servers:
 
@@ -720,9 +737,10 @@ Clients:
 * With `--accept-mounts-without-keepalive`, content that a mount without keep-alive wrote and its cache evicted is lost once deleted.
 * A mount whose keep-alive did not touch for longer than `--grace` less the server touch interval, such as a workspace unmounted for days or a stopped cacheman, loses content it wrote that its cache evicted.
 * Cacheman can evict a blob between casfs storing it and cacheman indexing it; it counts this in `remote_checks.lost_before_index` with the hash. A write whose notification casfs dropped is never indexed and is not protected.
+* Cacheman cannot push back a cached tree or eval response the server lacks when one of its children, at any depth, is in no local store, such as a child a lazy mount never read. It drops such a push at the first retry of that child once the child has been missing for 30 minutes, up to about two minutes after that, and counts this once per entry in `remote_checks.dropped`; the entry stays in the cache, and the next keep-alive touch or cacheman start pushes it again. It does not drop the push while an upload, a map result, a wait or a ref update needs the same child. While a mount is connected and the child stays missing, each keep-alive cycle can queue the push again, which then waits and is dropped again.
 * The keep-alive does not touch files under `.git` and `.ctrl` directories.
 * A cacheman restarted with `gc-keepalive` off under a live mount checks no local writes until the mount's next keep-alive tick, up to 15 minutes later, turns the mount's field false.
-* A cacheman that starts while the server cannot be reached and its cache is at its eviction threshold evicts before it checked its entries; it counts this in `remote_checks.evicted_unchecked`.
+* A cache that reaches its eviction threshold during the start pass evicts entries the pass has not checked when it fills faster than the pass goes through its entries, or when the server cannot be reached; cacheman counts them in `remote_checks.evicted_unchecked`.
 
 Builds and records:
 

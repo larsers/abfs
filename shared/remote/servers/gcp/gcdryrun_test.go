@@ -240,9 +240,9 @@ func TestDryRunGC_RetentionClasses(t *testing.T) {
 	f.ref(entities.ABFSMetaProject, "refs/abfs/build/user/u/b2", newBuild, recentRef)
 	// Unmount refs keep their details for the build retention.
 	oldUnmount := f.blob("old unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", oldUnmount, old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/3", oldUnmount, old)
 	newUnmount := f.blob("new unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/2", newUnmount, recentRef)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/4", newUnmount, recentRef)
 
 	// Eval maps: one unused past the map retention, one used recently.
 	env := f.object(&binding.EnvVars{Vars: map[string]string{"PATH": "/bin"}}, old)
@@ -653,6 +653,31 @@ func TestDryRunGC_ReadsLeaveCondemnMarkers(t *testing.T) {
 	require.True(isCondemned(t, f.s, details))
 	require.True(isCondemned(t, f.s, pinned))
 	require.False(objectTouched(t, f.s, details))
+}
+
+// A mount with an unmount ref is no live mount: it pins nothing and a mount
+// without the keep-alive that ended is not counted. Its mount ref keeps the
+// mount details and their pinned manifest until it goes.
+func TestDryRunGC_UnmountEndsMount(t *testing.T) {
+	require := require.New(t)
+	f := newGCFixture(t)
+	recent := f.now.Add(-time.Hour)
+	endedCommit := f.commit(f.tree(f.old, f.blob("ended file", f.old)), "ended", f.old)
+	endedDetails, endedPinned := f.mount("refs/abfs/mount/user/u/1", []string{endedCommit.String()}, recent)
+	unmount := f.blob("unmount details", f.old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", unmount, recent)
+	liveCommit := f.commit(f.tree(f.old, f.blob("live file", f.old)), "live", f.old)
+	liveDetails, _ := f.mount("refs/abfs/mount/user/u/2", []string{liveCommit.String()}, recent)
+
+	res := f.run(nil)
+	requireReachable(t, res, true, endedDetails, endedPinned, unmount, liveCommit)
+	requireReachable(t, res, false, endedCommit)
+	r := res.Report
+	require.Equal(&gc.RefCounts{Refs: 2, Roots: 2, Ended: 1}, r.Refs[gc.RefMount])
+	live := gc.MountSample{Details: liveDetails.String(), Host: "host-a", User: "u"}
+	require.Equal(gc.MountCounts{Live: 1, WithoutKeepAlive: 1, PinnedManifests: 1, Revisions: 1, Samples: map[string][]gc.MountSample{
+		"without_keepalive": {live},
+	}}, r.LiveMounts)
 }
 
 // Mount details or pinned manifests that are missing or cannot be read,

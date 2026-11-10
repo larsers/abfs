@@ -27,6 +27,11 @@ type RemoteCheckStats struct {
 	// pushed and stay in the cache.
 	Pushed     int64 `json:"pushed"`
 	Unpushable int64 `json:"unpushable"`
+	// Dropped counts the drops of entry pushes by dagsync, because an object they needed was
+	// in no local store and missing on the server. A drop counts once for each entry, also
+	// when later checks sent its push again while it waited. The entries stay local until a
+	// later check pushes them.
+	Dropped int64 `json:"dropped"`
 	// ClearRetries counts the retries of index transactions that took a local write out of
 	// the LRU after a conflict.
 	ClearRetries int64 `json:"clear_retries"`
@@ -45,4 +50,11 @@ type RemoteCheckStats struct {
 	LostBeforeIndex int64 `json:"lost_before_index"`
 	// PhonyConfirmed counts entries that a successful phony request confirmed.
 	PhonyConfirmed int64 `json:"phony_confirmed"`
+	// Skipped counts cached entries the checks left in the LRU without asking the server or
+	// after a missing answer, because the cache holds no blob, tree or object of the ABFS
+	// server under their key: ARI entries, RBE CAS blobs and entries whose content is gone.
+	Skipped int64 `json:"skipped"`
+	// Restored counts such entries that held a check marker and went back to the LRU at a
+	// start.
+	Restored int64 `json:"restored"`
 }

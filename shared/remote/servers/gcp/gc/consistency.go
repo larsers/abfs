@@ -32,9 +32,6 @@ const (
 	objectsMetaFamily = "meta"
 	objectsSizeColumn = "meta:size"
 	maxMissingKept    = 10
-	// maxTooNew is the largest number of objects written during the scan that
-	// a delete checks again; with more it refuses, so the scan keeps one more.
-	maxTooNew = 10000
 	// clockSkewMargin covers the skew between the clocks of the servers, which
 	// stamp object rows, and of the collector.
 	clockSkewMargin = time.Minute
@@ -50,7 +47,7 @@ type ConsistencyReport struct {
 	MissingGCRows int64    `json:"missing_gc_rows"`
 	FirstMissing  []string `json:"first_missing,omitempty"`
 	// TooNew counts objects without a gc row written too close to the scan to
-	// tell.
+	// tell. A delete cycle checks each of them again while the scan runs.
 	TooNew int64 `json:"too_new"`
 	// GCRowsWithoutObject counts gc rows without an object row: uploads in
 	// flight, or failed after the gc row was written.
@@ -76,30 +73,50 @@ type consistencyScan struct {
 	// seen holds the nodes that have an objects row.
 	seen bitmap
 	// unreachable lists the unreachable nodes that have an objects row, in
-	// key order, and tooNew up to maxTooNew+1 keys counted in TooNew, when the
-	// scan was asked to keep them.
+	// key order, when the scan was asked to keep them.
 	unreachable []sizedNode
-	tooNew      []string
+	// tooNew is the check of the objects counted in TooNew, when the scan was
+	// asked to run it, and tooNewErr why it failed.
+	tooNew    *TooNewReport
+	tooNewErr error
 }
 
 // checkConsistency scans the meta family of the table objects. It checks that
 // every object written before checkBefore has a node in g, and sums the sizes
 // of the reachable and unreachable objects. With keep it also lists the
-// unreachable nodes that have an objects row, and the keys of the objects
-// written too close to the scan to tell.
-func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []string, g *graph, live bitmap, checkBefore time.Time, keep bool) (*consistencyScan, error) {
+// unreachable nodes that have an objects row. With a check it sends the keys
+// of the objects written too close to the scan to tell to it, while the scan
+// runs. A failed or incomplete check does not fail the scan.
+func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []string, g *graph, live bitmap, checkBefore time.Time, keep bool, check *tooNewCheck) (*consistencyScan, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.LatestNFilter(1))
 	seen := newBitmap(g.size())
 	var mu sync.Mutex
 	report := &ConsistencyReport{Ran: true}
 	var sizes objectBytes
 	unreachable := make([][]sizedNode, len(bounds)-1)
-	tooNew := make([][]string, len(bounds)-1)
+	if check != nil {
+		check.start(ctx)
+	}
 	eg, gctx := errgroup.WithContext(ctx)
 	for i := range len(bounds) - 1 {
 		eg.Go(func() error {
 			var r ConsistencyReport
 			var b objectBytes
+			var pending []string
+			sendFailed := false
+			// send hands pending to the check and reports whether the scan
+			// goes on, which it does unless gctx ended. A batch the check
+			// does not take is dropped: the check then counts fewer keys
+			// than TooNew, which refuses the deletes.
+			send := func() bool {
+				check.send(gctx, pending)
+				pending = nil
+				if gctx.Err() != nil {
+					sendFailed = true
+					return false
+				}
+				return true
+			}
 			err := table.ReadRows(gctx, bigtable.NewRange(bounds[i], bounds[i+1]), func(row bigtable.Row) bool {
 				items := row[objectsMetaFamily]
 				if len(items) == 0 {
@@ -118,8 +135,11 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 						}
 					} else {
 						r.TooNew++
-						if keep && len(tooNew[i]) <= maxTooNew {
-							tooNew[i] = append(tooNew[i], row.Key())
+						if check != nil {
+							pending = append(pending, row.Key())
+							if len(pending) == tooNewBatch {
+								return send()
+							}
 						}
 					}
 					return true
@@ -141,6 +161,12 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 				}
 				return true
 			}, bigtable.RowFilter(filter))
+			if err == nil && !sendFailed && len(pending) > 0 {
+				send()
+			}
+			if err == nil && sendFailed {
+				err = gctx.Err()
+			}
 			if err != nil {
 				return fmt.Errorf("failed to scan the table objects from %q: %w", bounds[i], err)
 			}
@@ -155,18 +181,24 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 			return nil
 		})
 	}
-	if err := eg.Wait(); err != nil {
+	err := eg.Wait()
+	var tooNew *TooNewReport
+	var tooNewErr error
+	if check != nil {
+		if err != nil {
+			check.cancel()
+		}
+		tooNew, tooNewErr = check.wait()
+	}
+	if err != nil {
 		return nil, err
 	}
 	slices.Sort(report.FirstMissing)
 	report.FirstMissing = report.FirstMissing[:min(len(report.FirstMissing), maxMissingKept)]
 	report.GCRowsWithoutObject = int64(g.size()) - seen.count()
-	scan := &consistencyScan{report: report, sizes: sizes, seen: seen}
+	scan := &consistencyScan{report: report, sizes: sizes, seen: seen, tooNew: tooNew, tooNewErr: tooNewErr}
 	for _, nodes := range unreachable {
 		scan.unreachable = append(scan.unreachable, nodes...)
-	}
-	for _, keys := range tooNew {
-		scan.tooNew = append(scan.tooNew, keys[:min(len(keys), maxTooNew+1-len(scan.tooNew))]...)
 	}
 	return scan, nil
 }

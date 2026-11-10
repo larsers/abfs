@@ -51,9 +51,12 @@ type DryRunOpts struct {
 	// snapshot, and everything such an object reaches.
 	Grace time.Duration
 	// MountIdle is how long a mount ref stays a root after its last write.
+	// An ended mount ref, one with an unmount ref, keeps only its mount
+	// details and goes earlier when its unmount ref passes BuildRetention.
 	MountIdle time.Duration
 	// BuildRetention is how long build, build-start and unmount refs stay
-	// roots after their last write.
+	// roots after their last write. An ended mount ref goes with its unmount
+	// ref.
 	BuildRetention time.Duration
 	// SnapshotRetention is how long a snapshot ref stays a root after its
 	// last write.
@@ -265,10 +268,12 @@ type Result struct {
 	roots *rootTable
 	// unreachable lists, in key order, the unreachable nodes that the
 	// consistency scan found an objects row for: the ones a condemn marks.
-	// tooNew holds keys of objects that scan found without a gc row because
-	// they were written during it.
+	// tooNew is the check, in a delete cycle, of the objects that scan found
+	// without a gc row because they were written during it, and tooNewErr why
+	// it failed.
 	unreachable []sizedNode
-	tooNew      []string
+	tooNew      *TooNewReport
+	tooNewErr   error
 	// seen holds the nodes that the consistency scan found an objects row
 	// for.
 	seen bitmap
@@ -577,14 +582,19 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	res := &Result{Report: r, graph: g, live: m.live, first: m.first, roots: &rootTable{g: g, refs: refs.roots, revisions: revisions}, servers: servers, bounds: bounds, maps: maps, expiredRefs: refs.expired}
 	if o.Consistency {
 		step = time.Now()
-		scan, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin), d.keepUnreachable)
+		var check *tooNewCheck
+		if d.phase == PhaseDelete {
+			check = newTooNewCheck(d.bt, writeBudget{deadline: o.WriteDeadline})
+		}
+		scan, err := checkConsistency(ctx, d.bt.Open(objectsTable), bounds, g, m.live, scanStart.Add(-clockSkewMargin), d.keepUnreachable, check)
 		if err != nil {
 			return nil, err
 		}
 		r.Consistency = *scan.report
 		r.Objects.ReachableBytes = &scan.sizes.reachable
 		r.Objects.UnreachableBytes = &scan.sizes.unreachable
-		res.unreachable, res.tooNew, res.seen = scan.unreachable, scan.tooNew, scan.seen
+		res.unreachable, res.seen = scan.unreachable, scan.seen
+		res.tooNew, res.tooNewErr = scan.tooNew, scan.tooNewErr
 		r.Seconds.Consistency = time.Since(step).Seconds()
 	}
 	if len(o.Explain) > 0 {

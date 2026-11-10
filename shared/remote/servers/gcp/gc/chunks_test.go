@@ -798,7 +798,7 @@ func TestDeleteStep_ChunksOfDeletedKeysOnly(t *testing.T) {
 	}
 	g, _, err := scanNodes(ctx, f.client.Open(TableName), res.bounds, f.now.Add(-DefaultGrace))
 	require.NoError(err)
-	scan, err := checkConsistency(ctx, f.client.Open(objectsTable), res.bounds, g, newBitmap(g.size()), time.Now(), false)
+	scan, err := checkConsistency(ctx, f.client.Open(objectsTable), res.bounds, g, newBitmap(g.size()), time.Now(), false, nil)
 	require.NoError(err)
 	require.Zero(scan.report.MissingGCRows)
 }

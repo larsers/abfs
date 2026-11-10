@@ -164,13 +164,8 @@ func (d *deleter) check(ctx context.Context, lease *Lease, c *condemner, res *Re
 		return ev.refRemovalErr
 	}
 	ev.instance = readInstanceEvidence(ctx, d.checks, d.budget, d.opts)
-	if n := r.Consistency.TooNew; n > 0 && n <= maxTooNew {
-		ev.tooNew, ev.tooNewErr = checkTooNew(ctx, d.bt, writeBudget{deadline: d.opts.WriteDeadline}, res.tooNew)
-		if ev.tooNewErr != nil && ctx.Err() != nil {
-			return ev.tooNewErr
-		}
-		d.rep.TooNew = ev.tooNew
-	}
+	ev.tooNew, ev.tooNewErr = res.tooNew, res.tooNewErr
+	d.rep.TooNew = ev.tooNew
 	d.rep.Refused, d.rep.Warnings = deleteBlockers(r, ev, d.opts)
 	if res.plan == nil && len(d.rep.Refused) == 0 {
 		d.rep.Refused = append(d.rep.Refused, "the cycle has no plan of the keys to delete")

@@ -60,8 +60,8 @@ var metaRefClasses = []struct {
 }{
 	{"refs/abfs/ws/", RefWorkspace},
 	{"refs/abfs/snapshot/", RefSnapshot},
-	{"refs/abfs/mount/", RefMount},
-	{"refs/abfs/unmount/", RefUnmount},
+	{mountRefPrefix, RefMount},
+	{unmountRefPrefix, RefUnmount},
 	{"refs/abfs/build/", RefBuild},
 	{"refs/abfs/build-start/", RefBuildStart},
 }
@@ -69,6 +69,11 @@ var metaRefClasses = []struct {
 const (
 	configRef = "config"
 	aclRef    = "acl"
+
+	// A mount writes its mount ref when it starts and an unmount writes its
+	// unmount ref once the mount is gone, both named <prefix>/<start time>.
+	mountRefPrefix   = "refs/abfs/mount/"
+	unmountRefPrefix = "refs/abfs/unmount/"
 )
 
 func classifyRef(project, ref string) RefClass {
@@ -105,6 +110,9 @@ type RefCounts struct {
 	Expired int64 `json:"expired"`
 	// Malformed counts targets that are not hashes.
 	Malformed int64 `json:"malformed,omitempty"`
+	// Ended counts the mount refs among the roots that have an unmount ref:
+	// they keep their mount details but are no live mounts and pin nothing.
+	Ended int64 `json:"ended,omitempty"`
 }
 
 // refSnapshot holds the refs read at the snapshot time.
@@ -128,61 +136,111 @@ type refRoot struct {
 	updated      time.Time
 }
 
+// refRow is a row of the Refs table, with the host and name of its project.
+type refRow struct {
+	projectID          int64
+	host, project, ref string
+	updated            time.Time
+	target             spanner.NullString
+}
+
+// mountKey names a mount by the project of its refs and the end of their
+// names, which its mount ref and its unmount ref share.
+type mountKey struct {
+	projectID int64
+	name      string
+}
+
 // readRefs reads every ref at the snapshot time and sorts them by retention.
+// A mount ref with an unmount ref is ended: the unmount ref is written only
+// after the mount is gone. It stays a root of its mount details, but pins
+// nothing, and goes when the unmount ref does.
 func readRefs(ctx context.Context, client *spanner.Client, o *DryRunOpts, snapshot time.Time) (*refSnapshot, error) {
 	txn := client.ReadOnlyTransaction().WithTimestampBound(spanner.ReadTimestamp(snapshot))
 	defer txn.Close()
 	stmt := spanner.Statement{SQL: `SELECT r.ProjectId, p.Host, p.Project, r.Ref, r.UpdateTime, r.Target FROM Refs AS r JOIN Projects AS p ON p.ProjectId = r.ProjectId`}
 	snap := &refSnapshot{counts: make(map[RefClass]*RefCounts)}
+	var mounts []refRow
+	unmounted := make(map[mountKey]time.Time)
 	err := txn.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: spannerpb.RequestOptions_PRIORITY_LOW}).Do(func(row *spanner.Row) error {
-		var projectID int64
-		var host, project, ref string
-		var updated time.Time
-		var target spanner.NullString
-		if err := row.Columns(&projectID, &host, &project, &ref, &updated, &target); err != nil {
+		var r refRow
+		if err := row.Columns(&r.projectID, &r.host, &r.project, &r.ref, &r.updated, &r.target); err != nil {
 			return err
 		}
-		class := classifyRef(project, ref)
-		c := snap.counts[class]
-		if c == nil {
-			c = &RefCounts{}
-			snap.counts[class] = c
-		}
-		c.Refs++
-		if !target.Valid {
-			c.Null++
-			return nil
-		}
-		if o.refRetention(class, updated, snapshot) {
-			c.Expired++
-			snap.expired = append(snap.expired, expiredRef{class: class, projectID: projectID, host: host, project: project, ref: ref, updated: updated, target: target.StringVal})
-			return nil
-		}
-		if !entities.IsHash(target.StringVal) {
-			c.Malformed++
-			return nil
-		}
-		c.Roots++
-		h := entities.NewHash(target.StringVal)
-		snap.roots = append(snap.roots, refRoot{class: class, target: h, project: project, ref: ref, updated: updated})
+		class := classifyRef(r.project, r.ref)
 		switch class {
 		case RefMount:
-			snap.mounts = append(snap.mounts, h)
-		case RefWorkspace:
-			snap.workspaces = append(snap.workspaces, h)
-		case RefSnapshot:
-			snap.snapshots = append(snap.snapshots, h)
+			// Classified once every unmount ref is read.
+			mounts = append(mounts, r)
+			return nil
+		case RefUnmount:
+			if r.target.Valid {
+				unmounted[mountKey{r.projectID, strings.TrimPrefix(r.ref, unmountRefPrefix)}] = r.updated
+			}
 		}
+		snap.add(class, &r, o.refRetention(class, r.updated, snapshot), false)
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to read the refs at %s: %w", snapshot.UTC().Format(time.RFC3339Nano), err)
 	}
+	// The expired mount refs go first: a removal that stops between an ended
+	// mount ref and its unmount ref then leaves no mount ref live again.
+	others := snap.expired
+	snap.expired = nil
+	for i := range mounts {
+		r := &mounts[i]
+		expired := o.refRetention(RefMount, r.updated, snapshot)
+		unmountedAt, ended := unmounted[mountKey{r.projectID, strings.TrimPrefix(r.ref, mountRefPrefix)}]
+		if ended && o.refRetention(RefUnmount, unmountedAt, snapshot) {
+			expired = true
+		}
+		snap.add(RefMount, r, expired, ended)
+	}
+	snap.expired = append(snap.expired, others...)
 	return snap, nil
 }
 
+// add counts the ref r of class c and keeps its target as a root unless r is
+// a tombstone, expired or malformed. An ended mount ref is no live mount.
+func (s *refSnapshot) add(class RefClass, r *refRow, expired, ended bool) {
+	c := s.counts[class]
+	if c == nil {
+		c = &RefCounts{}
+		s.counts[class] = c
+	}
+	c.Refs++
+	if !r.target.Valid {
+		c.Null++
+		return
+	}
+	if expired {
+		c.Expired++
+		s.expired = append(s.expired, expiredRef{class: class, projectID: r.projectID, host: r.host, project: r.project, ref: r.ref, updated: r.updated, target: r.target.StringVal})
+		return
+	}
+	if !entities.IsHash(r.target.StringVal) {
+		c.Malformed++
+		return
+	}
+	c.Roots++
+	h := entities.NewHash(r.target.StringVal)
+	s.roots = append(s.roots, refRoot{class: class, target: h, project: r.project, ref: r.ref, updated: r.updated})
+	switch {
+	case class == RefMount && ended:
+		c.Ended++
+	case class == RefMount:
+		s.mounts = append(s.mounts, h)
+	case class == RefWorkspace:
+		s.workspaces = append(s.workspaces, h)
+	case class == RefSnapshot:
+		s.snapshots = append(s.snapshots, h)
+	}
+}
+
 // refRetention tells whether retention would tombstone a ref of class c last
-// written at updated. The target of every other ref is a root.
+// written at updated. The target of every other ref is a root. An ended mount
+// ref also goes with its unmount ref (see readRefs).
 func (o *DryRunOpts) refRetention(c RefClass, updated, snapshot time.Time) bool {
 	switch c {
 	case RefMount:

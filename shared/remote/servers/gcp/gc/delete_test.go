@@ -110,7 +110,7 @@ func (f *stepFixture) mark(allows func(string) bool) *Result {
 	maps, err := scanMaps(ctx, f.client.Open(mapsTableName), bounds, g)
 	require.NoError(f.t, err)
 	live := newBitmap(g.size())
-	scan, err := checkConsistency(ctx, f.client.Open(objectsTable), bounds, g, live, f.now.Add(-time.Minute), true)
+	scan, err := checkConsistency(ctx, f.client.Open(objectsTable), bounds, g, live, f.now.Add(-time.Minute), true, nil)
 	require.NoError(f.t, err)
 	res := &Result{
 		Report: &Report{Cycle: stepCycle, SnapshotTime: f.now},

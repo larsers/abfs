@@ -16,6 +16,7 @@ package dagsync
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/abfs/shared/entities"
 )
@@ -24,6 +25,10 @@ type newRequest struct {
 	request   Request
 	priority  RequestPriority
 	callbacks []Callback
+	// dropAfter is set for a request that may be dropped.
+	dropAfter time.Duration
+	// link is set for a request dagsync makes for a link the server reported missing.
+	link bool
 }
 
 func (m *newRequest) String() string {

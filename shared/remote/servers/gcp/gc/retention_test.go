@@ -291,6 +291,81 @@ func TestRemoveExpiredRefs_FailedTransaction(t *testing.T) {
 	require.Equal([]int{500, 500}, f.commits.deletes)
 }
 
+// A mount ref with an unmount ref of the same name in the same project is an
+// ended mount: a root of its mount details, but no live mount. A mount ref
+// without one, also one whose name differs only in the start time, whose
+// unmount ref is in another project or whose unmount ref is a tombstone,
+// stays live.
+func TestReadRefs_UnmountEndsMount(t *testing.T) {
+	require := require.New(t)
+	f := newRefsFixture(t)
+	const otherProject = retentionTestProject + 1
+	_, err := f.sp.Apply(context.Background(), []*spanner.Mutation{
+		spanner.Insert("Projects", []string{"ProjectId", "Host", "Project"}, []any{int64(otherProject), "other.example.com", entities.ABFSMetaProject}),
+	})
+	require.NoError(err)
+	ended, live, otherStart, otherHost := entities.NewHash("1111111111111111111111111111111111111111"), entities.NewHash("2222222222222222222222222222222222222222"), entities.NewHash("3333333333333333333333333333333333333333"), entities.NewHash("4444444444444444444444444444444444444444")
+	unmount, withTombstone := entities.NewHash("5555555555555555555555555555555555555555"), entities.NewHash("6666666666666666666666666666666666666666")
+	recent := time.Now().Add(-time.Hour)
+	f.write([]string{"refs/abfs/mount/user/u/100"}, recent, ended)
+	f.write([]string{"refs/abfs/mount/user/u/200"}, recent, live)
+	f.write([]string{"refs/abfs/mount/user/u/300"}, recent, otherStart)
+	f.write([]string{"refs/abfs/mount/user/u/400"}, recent, otherHost)
+	f.write([]string{"refs/abfs/mount/user/u/500"}, recent, withTombstone)
+	f.write([]string{"refs/abfs/unmount/user/u/500"}, recent, Hash{})
+	f.write([]string{"refs/abfs/unmount/user/u/100", "refs/abfs/unmount/user/u/301", "refs/abfs/unmount/user/v/200"}, recent, unmount)
+	snapshot, err := f.sp.Apply(context.Background(), []*spanner.Mutation{
+		spanner.Insert(refsTable, []string{"ProjectId", "Ref", "UpdateTime", "Target"}, []any{int64(otherProject), "refs/abfs/unmount/user/u/400", recent, unmount.String()}),
+	})
+	require.NoError(err)
+
+	o := DefaultDryRunOpts()
+	snap, err := readRefs(context.Background(), f.sp, &o, snapshot)
+	require.NoError(err)
+	require.ElementsMatch([]Hash{live, otherStart, otherHost, withTombstone}, snap.mounts)
+	require.Equal(&RefCounts{Refs: 5, Roots: 5, Ended: 1}, snap.counts[RefMount])
+	require.Equal(&RefCounts{Refs: 5, Null: 1, Roots: 4}, snap.counts[RefUnmount])
+	require.Empty(snap.expired)
+	var mountRoots []Hash
+	for _, r := range snap.roots {
+		if r.class == RefMount {
+			mountRoots = append(mountRoots, r.target)
+		}
+	}
+	require.ElementsMatch([]Hash{ended, live, otherStart, otherHost, withTombstone}, mountRoots)
+}
+
+// An ended mount ref goes with its unmount ref when that passes the build
+// retention, also when the mount ref was written again since the unmount.
+// Within that retention it stays, and past the mount idle time it goes
+// whether or not it has an unmount ref. Mount refs are removed before
+// unmount refs, so that a removal that stops in between leaves no ended
+// mount live again.
+func TestRemoveExpiredRefs_EndedMountGoesWithUnmount(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newRefsFixture(t)
+	details, unmount := entities.NewHash("1111111111111111111111111111111111111111"), entities.NewHash("2222222222222222222222222222222222222222")
+	recent := time.Now().Add(-time.Hour)
+	f.write([]string{"refs/abfs/unmount/user/u/1"}, f.old, unmount)
+	f.write([]string{"refs/abfs/mount/user/u/1", "refs/abfs/mount/user/u/2"}, recent, details)
+	f.write([]string{"refs/abfs/mount/user/u/3"}, f.old, details)
+	snapshot := f.write([]string{"refs/abfs/unmount/user/u/2", "refs/abfs/unmount/user/u/3"}, recent, unmount)
+
+	res := f.snapshot(4, snapshot)
+	var expired []string
+	for _, e := range res.expiredRefs {
+		expired = append(expired, e.ref)
+	}
+	require.ElementsMatch([]string{"refs/abfs/unmount/user/u/1", "refs/abfs/mount/user/u/1", "refs/abfs/mount/user/u/3"}, expired)
+	require.Equal("refs/abfs/unmount/user/u/1", expired[2])
+
+	rep, err := f.deleter().removeExpiredRefs(ctx, farLease(), res)
+	require.NoError(err)
+	require.Equal(map[RefClass]*RefRemovalCounts{RefMount: {Recorded: 2, Removed: 2}, RefUnmount: {Recorded: 1, Removed: 1}}, rep.Classes)
+	require.ElementsMatch([]string{"refs/abfs/mount/user/u/2", "refs/abfs/unmount/user/u/2", "refs/abfs/unmount/user/u/3"}, slices.Collect(maps.Keys(f.refs())))
+}
+
 // The pruning keeps the ref records of the newest cycles and those younger
 // than seven days, and leaves other names and other states alone.
 func TestPruneRefRecords(t *testing.T) {

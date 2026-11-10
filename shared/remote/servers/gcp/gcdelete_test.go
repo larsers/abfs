@@ -18,7 +18,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -531,6 +533,36 @@ func TestDeleteGC_RefusedCycleCondemns(t *testing.T) {
 	f.requireGone(key)
 }
 
+// A mount without the keep-alive that abfs unmount ended refuses no deletes
+// of blobs; a live one does.
+func TestDeleteGC_EndedMountWithoutKeepAlive(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	recent := time.Now().Add(-time.Hour)
+	f.mount("refs/abfs/mount/user/u/1", nil, recent)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", f.blob("unmount details", f.old), recent)
+	key := f.blob("unreachable file", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	f.age()
+
+	res := f.deletes(nil)
+	require.Equal(int64(1), res.Report.Refs[gc.RefMount].Ended)
+	require.Zero(res.Report.LiveMounts.WithoutKeepAlive)
+	require.Empty(res.Report.Delete.Warnings)
+	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
+	f.requireGone(key)
+
+	f.mount("refs/abfs/mount/user/u/2", nil, recent)
+	f.age()
+	res = f.delete(nil)
+	require.Equal(int64(1), res.Report.LiveMounts.WithoutKeepAlive)
+	require.True(slices.ContainsFunc(res.Report.Delete.Refused, func(s string) bool {
+		return strings.Contains(s, "1 live mounts run without the GC keep-alive")
+	}), "%q", res.Report.Delete.Refused)
+	require.Nil(res.Report.Delete.Step)
+}
+
 // The cycle runs its steps in order: a refusal of the condemn checks stops
 // the cycle before any delete check; the checks of the instance run before
 // the markers of live keys are cleared, the delete step after that and
@@ -759,10 +791,10 @@ func TestDeleteGC_EndToEnd(t *testing.T) {
 	f.ref(entities.ABFSMetaProject, "refs/abfs/build/user/u/b2", newBuild, recentRef)
 	keep(newLog, newBuild)
 	oldUnmount := f.blob("old unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/1", oldUnmount, old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/3", oldUnmount, old)
 	drop(oldUnmount)
 	newUnmount := f.blob("new unmount details", old)
-	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/2", newUnmount, recentRef)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/unmount/user/u/4", newUnmount, recentRef)
 	keep(newUnmount)
 
 	// Eval maps unused past the map retention and used recently.
@@ -865,4 +897,118 @@ func TestDeleteGC_EndToEnd(t *testing.T) {
 	res = f.run(nil)
 	requireReachable(t, res, true, live...)
 	require.Equal(int64(2), res.Report.Objects.Unreachable)
+}
+
+// pointReads calls read with the table and the row keys of each point read
+// of a client, and range with the table of each scan of a key range.
+func pointReads(read func(table string, keys [][]byte), ranges func(table string)) grpc.DialOption {
+	return grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		s, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil || !strings.HasSuffix(method, "/ReadRows") {
+			return s, err
+		}
+		return &readSeen{ClientStream: s, read: read, ranges: ranges}, nil
+	})
+}
+
+type readSeen struct {
+	grpc.ClientStream
+	read   func(table string, keys [][]byte)
+	ranges func(table string)
+}
+
+func (r *readSeen) SendMsg(m any) error {
+	if req, ok := m.(*bigtablepb.ReadRowsRequest); ok {
+		table := req.GetTableName()[strings.LastIndex(req.GetTableName(), "/")+1:]
+		if keys := req.GetRows().GetRowKeys(); len(keys) > 0 {
+			r.read(table, keys)
+		}
+		if len(req.GetRows().GetRowRanges()) > 0 {
+			r.ranges(table)
+		}
+	}
+	return r.ClientStream.SendMsg(m)
+}
+
+// Only a delete cycle checks the objects written during its consistency
+// scan, and it deletes when each of them has a gc row by the time it is
+// checked: then it reads only their gc rows. A condemn cycle and a dry run
+// count them and read nothing more.
+func TestDeleteGC_ChecksObjectsWrittenDuringTheScan(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newDeleteFixture(t)
+	dead := f.blob("deleted", f.old)
+	const n = 250
+	var written []entities.Hash
+	isWritten := make(map[string]bool)
+	for i := range n {
+		content := fmt.Sprintf("written during the scan %d", i)
+		key := objects.HashBlobBytes([]byte(content))
+		require.NoError(putRaw(f.s, key, fmt.Appendf(nil, "blob %d\x00%s", len(content), content)))
+		written = append(written, key)
+		isWritten[key.String()] = true
+	}
+
+	var mu sync.Mutex
+	reads := make(map[string]int)
+	var scanStarted func()
+	bt := newInterceptedClient(t, pointReads(func(table string, keys [][]byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, k := range keys {
+			if isWritten[string(k)] {
+				reads[table]++
+			}
+		}
+	}, func(table string) {
+		mu.Lock()
+		started := scanStarted
+		mu.Unlock()
+		if table == "objects" && started != nil {
+			started()
+		}
+	}))
+	readsOf := func() map[string]int {
+		mu.Lock()
+		defer mu.Unlock()
+		out := maps.Clone(reads)
+		clear(reads)
+		return out
+	}
+
+	res, err := gc.Condemn(ctx, f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), f.s, &f.deleteOpts().CondemnOpts)
+	require.NoError(err)
+	require.Equal(int64(n), res.Report.Consistency.TooNew)
+	require.Nil(res.Report.Delete)
+	require.Empty(readsOf())
+
+	o := f.deleteOpts().DryRunOpts
+	res, err = gc.DryRun(ctx, f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), f.s, &o)
+	require.NoError(err)
+	require.Equal(int64(n), res.Report.Consistency.TooNew)
+	require.Nil(res.Report.Delete.TooNew)
+	require.Empty(readsOf())
+
+	// The gc rows land once the scan of the table gc is done, as those of
+	// uploads during the cycle do; the scan of the objects waits for them.
+	f.age()
+	var once sync.Once
+	mu.Lock()
+	scanStarted = func() {
+		once.Do(func() {
+			for _, k := range written {
+				f.gcRow(k, "blob", nil, time.Now())
+			}
+		})
+	}
+	mu.Unlock()
+	res, err = f.deleteWith(bt, nil)
+	require.NoError(err)
+	require.Equal(int64(n), res.Report.Consistency.TooNew)
+	require.Equal(&gc.TooNewReport{Keys: n}, res.Report.Delete.TooNew)
+	require.Empty(res.Report.Delete.Refused)
+	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
+	require.Equal(map[string]int{gc.TableName: n}, readsOf())
+	f.requireGone(dead)
 }
