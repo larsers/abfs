@@ -17,6 +17,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
 	"io"
@@ -34,9 +35,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/shared/cacheman/protocol"
+	"github.com/google/abfs/shared/dagsync"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/objects"
+	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
@@ -892,4 +895,68 @@ func TestCacheman_RemoteHeadersLeavesMarkersToTheCheck(t *testing.T) {
 	c.checkRemoteHeaders(ctx, []entities.Hash{h}, []bool{true})
 	requireUnconfirmed(t, c, h)
 	require.Equal(t, int64(1), c.Stats().RemoteChecks.Queued)
+}
+
+// A push of a cached tree the server lacks, whose child is in no store and missing on the
+// server, is dropped after its wait. The entry stays local with its marker, and a later push
+// succeeds once the child is in the cache.
+func TestCacheman_DropsStuckPush(t *testing.T) {
+	old := unconfirmedPushDropAfter
+	unconfirmedPushDropAfter = 100 * time.Millisecond
+	t.Cleanup(func() { unconfirmedPushDropAfter = old })
+
+	ctx := context.Background()
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, period: time.Hour})
+	c.startLocalWriteCheck(ctx)
+
+	childContent := "never read by the mount, deleted on the server"
+	child := objects.HashBlobBytes([]byte(childContent))
+	content, err := gitobjects.EncodeTree([]entities.FileEntry{
+		{Name: "file", Mode: entities.FileModeRegular, Hash: child},
+	})
+	require.NoError(t, err)
+	tree := entities.Hash(sha1.Sum(content))
+	require.NoError(t, c.store.PutTree(ctx, tree, content, entities.TreeMeta{Sizes: []int64{int64(len(childContent))}}))
+	_, err = c.addFetchedObjectToIndex(tree, EntryTypeTree)
+	require.NoError(t, err)
+
+	busy := func() int64 {
+		var n int64
+		for state, counts := range c.getSync().Stats().States {
+			if state != dagsync.HolderState.String() {
+				for _, v := range counts {
+					n += v
+				}
+			}
+		}
+		return n
+	}
+	requireMarked := func() {
+		t.Helper()
+		entry := c.index.Get(tree)
+		require.NotNil(t, entry)
+		require.True(t, entry.Local)
+		require.False(t, entry.Remote)
+		require.True(t, hasMarker(c, tree))
+		has, err := c.store.HasObject(ctx, tree)
+		require.NoError(t, err)
+		require.True(t, has)
+	}
+
+	c.checkRemoteHeaders(ctx, []entities.Hash{tree}, []bool{false})
+	require.Eventually(t, func() bool {
+		s, _ := c.getSync().State(child.String())
+		return s == dagsync.FailedLinkBuildState
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Dropped == 1 }, 15*time.Second, 10*time.Millisecond)
+	require.Zero(t, busy())
+	requireMarked()
+	require.False(t, r.has(t, tree))
+
+	writeBlob(t, c, childContent)
+	c.checkRemoteHeaders(ctx, []entities.Hash{tree}, []bool{false})
+	require.Eventually(t, func() bool { return r.has(t, tree) && confirmed(c, tree) }, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, int64(2), c.Stats().RemoteChecks.Pushed)
+	require.Equal(t, int64(1), c.Stats().RemoteChecks.Dropped)
 }

@@ -32,6 +32,10 @@ import (
 
 var Debug = false
 
+// ErrDropped is passed to the callbacks of a request that dagsync dropped. They are not
+// called again after it.
+var ErrDropped = errors.New("request dropped")
+
 func debugLog(logger *log.Logger, format string, v ...any) {
 	if Debug {
 		logger.Printf(format, v...)
@@ -106,6 +110,14 @@ type node struct {
 	request   Request
 	priority  QueuePriority
 	callbacks []Callback
+	// keep is set once a request that may not be dropped names the node.
+	keep bool
+	// dropAfter is the longest wait of the requests for the node that may be dropped.
+	dropAfter time.Duration
+	// dropCallbacks is set once the node holds the callbacks of a request that may be dropped.
+	dropCallbacks bool
+	// missingSince is when the node first failed because no local store holds its object.
+	missingSince time.Time
 }
 
 func (n *node) String() string {
@@ -142,6 +154,9 @@ type DAGSync struct {
 	sizer            SizeProvider
 
 	pendingJobs sync.WaitGroup
+
+	// droppable is the number of nodes with a dropAfter.
+	droppable int64
 
 	MailboxDelay time.Duration
 }
@@ -555,6 +570,9 @@ func (d *DAGSync) delete(n *node) {
 	if n.state == RunningState {
 		d.runningCount--
 	}
+	if n.dropAfter > 0 {
+		d.droppable--
+	}
 	for _, rk := range refKeys(n.request) {
 		if d.lastRefNode[rk] == n {
 			delete(d.lastRefNode, rk)
@@ -633,7 +651,10 @@ func (d *DAGSync) handle(m Message) {
 	case *executed:
 		d.handleExecuted(r)
 	case *retryFailedNode:
-		d.handleRetryFailedNode(r)
+		// A scheduled retry can outlive a dropped node.
+		if d.nodes[r.node.tag] == r.node {
+			d.handleRetryFailedNode(r)
+		}
 	case *runMaintenance:
 		d.maintain()
 	default:
@@ -656,9 +677,26 @@ func (d *DAGSync) setPriorities(n *node, priority RequestPriority) {
 }
 
 func (d *DAGSync) handleNewRequest(r *newRequest) {
+	if r.link && d.nodes[r.request.String()] == nil {
+		// The node that waited for the link was dropped.
+		return
+	}
 	n := d.node(r.request)
 	d.setPriorities(n, r.priority)
-	n.callbacks = append(n.callbacks, r.callbacks...)
+	callbacks := r.callbacks
+	switch {
+	case r.dropAfter > 0:
+		d.setDropAfter(n, r.dropAfter)
+		// The same push can be sent again while it waits. Its first callbacks are called once
+		// for all of them.
+		if n.dropCallbacks {
+			callbacks = nil
+		}
+		n.dropCallbacks = true
+	case !r.link:
+		n.keep = true
+	}
+	n.callbacks = append(n.callbacks, callbacks...)
 
 	switch n.state {
 	case FailedState:
@@ -697,7 +735,11 @@ func (d *DAGSync) handleRequestLinked(r *requestLinked) {
 	if err != nil {
 		d.logger.Printf("failed to load links node %q, request %s (retried=%d), err: %s", n, n.request, n.retries, err)
 		n.retries++
+		noteMissing(n, err)
 		d.transit(n, FailedLinkBuildState)
+		if d.dropIfStuck(n) {
+			return
+		}
 		d.schedule(d.failedNodeCooldown(n), n, func() { d.linkRequest(n) })
 		return
 	}
@@ -711,6 +753,7 @@ func (d *DAGSync) handleRequestLinked(r *requestLinked) {
 	}
 
 	n.retries = 0
+	n.missingSince = time.Time{}
 	if len(links) > 0 {
 		n.deps = make(map[*node]int, len(links))
 	}
@@ -805,12 +848,18 @@ func (d *DAGSync) handleFailedExec(n *node, err error) {
 	var mismatchErr *remote.ErrRefMismatch
 	var tooLargeErr *remote.ErrMessageTooLarge
 	if errors.As(err, &linkErr) && len(linkErr.MissingLinks) > 0 {
+		n.missingSince = time.Time{}
 		d.handleMissingLinks(n, linkErr)
 	} else if errors.As(err, &mismatchErr) || errors.As(err, &tooLargeErr) {
 		d.cleanupNodeEdges(n)
 		d.delete(n)
 	} else {
+		noteMissing(n, err)
 		d.transit(n, FailedState)
+		if d.dropIfStuck(n) {
+			// The drop called the callbacks.
+			return
+		}
 		d.schedule(d.failedNodeCooldown(n), n, func() { d.Send(&retryFailedNode{n}) })
 	}
 	d.executedCallback(n, err)
@@ -857,12 +906,118 @@ func (d *DAGSync) handleMissingLinks(n *node, linkErr *remote.ErrObjectLinkValid
 		// if node m isn't in holder state, it is already in the graph but probably just wasn't properly
 		// linked to the current node
 		if m.state == HolderState {
-			d.Send(&newRequest{request: newReq, priority: n.priority.priority})
+			d.Send(&newRequest{request: newReq, priority: n.priority.priority, link: true})
 		}
 	}
 	// we want to send node to blocked state instead of calling d.activate() because the dependencies might need time to get out
 	// of the placeholder state. activate() would try to retry the node immediately since the degree hasn't yet incremented
 	d.transit(n, BlockedState)
+}
+
+// setDropAfter raises the wait of the requests for n that may be dropped to wait.
+func (d *DAGSync) setDropAfter(n *node, wait time.Duration) {
+	if n.dropAfter == 0 {
+		d.droppable++
+	}
+	n.dropAfter = max(n.dropAfter, wait)
+}
+
+func noteMissing(n *node, err error) {
+	if !entities.IsNotExist(err) {
+		n.missingSince = time.Time{}
+	} else if n.missingSince.IsZero() {
+		n.missingSince = time.Now()
+	}
+}
+
+// droppableState reports whether no work on a node in state s is in flight, apart from a
+// scheduled retry of a failed execution.
+func droppableState(s NodeState) bool {
+	switch s {
+	case HolderState, BlockedState, FailedState:
+		return true
+	default:
+		return false
+	}
+}
+
+// dropIfStuck drops n, which just failed, and the requests that wait for it when they may be
+// dropped and n has had no object in any local store for longer than their wait. Such a push
+// cannot finish, and it would otherwise stay in the graph for the life of the process. Nodes
+// that a request which may not be dropped needs stay, since their object can still arrive.
+func (d *DAGSync) dropIfStuck(n *node) bool {
+	if d.droppable == 0 || n.missingSince.IsZero() {
+		return false
+	}
+	group, wait := d.dropGroup(n)
+	if wait == 0 || time.Since(n.missingSince) < wait {
+		return false
+	}
+	err := fmt.Errorf("%w after %s: %s is in no local store", ErrDropped, wait, n)
+	var roots []*node
+	for _, m := range group {
+		if len(m.revDeps) == 0 {
+			roots = append(roots, m)
+		}
+	}
+	for _, m := range roots {
+		d.drop(m, wait, err)
+	}
+	// The cascade leaves n, whose failure is being handled, as if work on it were in flight.
+	d.drop(n, wait, err)
+	return true
+}
+
+// dropGroup returns n and every node that waits for it, with the longest wait of the
+// requests among them that may be dropped. The wait is zero when one of them may not be
+// dropped now.
+func (d *DAGSync) dropGroup(n *node) ([]*node, time.Duration) {
+	var wait time.Duration
+	seen := map[*node]bool{n: true}
+	group := []*node{n}
+	for i := 0; i < len(group); i++ {
+		m := group[i]
+		if m.keep || (m != n && !droppableState(m.state)) {
+			return nil, 0
+		}
+		wait = max(wait, m.dropAfter)
+		for p := range m.revDeps {
+			if !seen[p] {
+				seen[p] = true
+				group = append(group, p)
+			}
+		}
+	}
+	return group, wait
+}
+
+// drop removes n, which no node waits for, and then each node it waited for that nothing
+// else needs.
+func (d *DAGSync) drop(n *node, wait time.Duration, err error) {
+	if d.nodes[n.tag] != n {
+		return
+	}
+	children := n.deps
+	for m, c := range children {
+		m.revDeps[n] -= c
+		if m.revDeps[n] <= 0 {
+			delete(m.revDeps, n)
+		}
+	}
+	n.deps = nil
+	d.delete(n)
+	d.executedCallback(n, err)
+	for m := range children {
+		if d.nodes[m.tag] != m || m.keep || len(m.revDeps) > 0 {
+			continue
+		}
+		if droppableState(m.state) {
+			d.drop(m, wait, err)
+		} else {
+			// Work on it is in flight; it is dropped at a later failure if it is stuck too.
+			d.setDropAfter(m, wait)
+		}
+	}
 }
 
 func (d *DAGSync) Start(ctx context.Context) {
@@ -925,6 +1080,18 @@ func (d *DAGSync) PutTree(key entities.Hash) fmt.Stringer {
 func (d *DAGSync) PutObject(key entities.Hash) fmt.Stringer {
 	r := &PutObjectRequest{hash: key}
 	d.Send(&newRequest{request: r})
+	return r
+}
+
+// PutObjectOrDrop pushes key as PutBlob, PutTree or PutObject do for a blob, a tree or an
+// unknown type. dagsync drops the push and calls callback with ErrDropped once an object
+// it waits for has been in no local store for dropAfter, unless a request that may not be
+// dropped waits for the same object. A second call for key while the first push waits adds
+// no callback; the first callback is called for both. With a dropAfter of zero or less the
+// push is never dropped, as with PutObject, and callback is always added.
+func (d *DAGSync) PutObjectOrDrop(key entities.Hash, objType entities.ObjectType, dropAfter time.Duration, callback Callback) fmt.Stringer {
+	r := &PutObjectRequest{hash: key, objType: objType}
+	d.Send(&newRequest{request: r, dropAfter: dropAfter, callbacks: []Callback{callback}})
 	return r
 }
 

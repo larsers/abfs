@@ -17,8 +17,12 @@ package dagsync
 import (
 	"context"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/remote"
 )
 
 type dummyRequest struct {
@@ -122,4 +126,164 @@ func TestPreventStall_AddDependency(t *testing.T) {
 	if n.state != BlockedState {
 		t.Fatalf("expected n to transition to BlockedState, got %s", n.state)
 	}
+}
+
+// linksRequest is a request with fixed links.
+type linksRequest struct {
+	dummyRequest
+	links []entities.Hash
+}
+
+func (r *linksRequest) Links(accessor ObjectAccessor) ([]entities.Hash, error) {
+	return r.links, nil
+}
+
+// emptyAccessor holds no object.
+type emptyAccessor struct{}
+
+func (emptyAccessor) GetObject(ctx context.Context, key entities.Hash) ([]byte, error) {
+	return nil, entities.ErrNotExist
+}
+
+func (emptyAccessor) OpenBlob(ctx context.Context, key entities.Hash) (ReadSizeCloser, error) {
+	return nil, entities.ErrNotExist
+}
+
+func requireNoNodeCounted(t *testing.T, d *DAGSync) {
+	t.Helper()
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	for state, counts := range d.stateCounts {
+		for typ, c := range counts {
+			require.Zero(t, c, "%s %s", NodeState(state), typ)
+		}
+	}
+	require.Zero(t, d.droppable)
+}
+
+// A link request that the server's report sent for a node that a drop removed before the
+// request was handled makes no node.
+func TestDropIgnoresLinkRequestOfDroppedNode(t *testing.T) {
+	d := New(&DagSyncOpts{Accessor: emptyAccessor{}, WorkersCount: 0})
+	stuck := entities.Hash{1}
+	missing := entities.Hash{2}
+	tree := &linksRequest{dummyRequest: dummyRequest{tag: "tree"}, links: []entities.Hash{stuck}}
+
+	d.handle(&newRequest{request: tree, dropAfter: time.Minute})
+	d.lock.Lock()
+	n := d.nodes["tree"]
+	c := d.nodes[stuck.String()]
+	// The tree runs while its child fails to link, and the server reports a second child
+	// missing.
+	d.transit(c, InitialLinkBuildingState)
+	d.transit(n, RunningState)
+	d.lock.Unlock()
+	d.handle(&executed{node: n, err: &remote.ErrObjectLinkValidation{MissingLinks: []entities.Hash{missing}}})
+
+	// The child's next failure, after it has been missing for longer than the wait, drops
+	// the tree with both children before the link request is handled.
+	d.lock.Lock()
+	c.missingSince = time.Now().Add(-time.Hour)
+	d.lock.Unlock()
+	d.handle(&requestLinked{node: c, err: entities.ErrNotExist})
+	d.lock.Lock()
+	require.Empty(t, d.nodes)
+	d.lock.Unlock()
+
+	m := <-d.mailbox.Receive()
+	r, ok := m.(*newRequest)
+	require.True(t, ok)
+	require.True(t, r.link)
+	require.Equal(t, missing.String(), r.request.String())
+	d.handle(m)
+	d.lock.Lock()
+	require.Empty(t, d.nodes)
+	d.lock.Unlock()
+	requireNoNodeCounted(t, d)
+}
+
+// The count of nodes with a wait follows new requests, waits that a drop passes on and
+// deletes.
+func TestDropCountsDroppableNodes(t *testing.T) {
+	d := New(&DagSyncOpts{Accessor: emptyAccessor{}, WorkersCount: 0})
+	stuck := entities.Hash{1}
+	busy := entities.Hash{2}
+	tree := &linksRequest{dummyRequest: dummyRequest{tag: "tree"}, links: []entities.Hash{stuck, busy}}
+	droppable := func() int64 {
+		d.lock.Lock()
+		defer d.lock.Unlock()
+		return d.droppable
+	}
+
+	d.handle(&newRequest{request: tree, dropAfter: time.Minute})
+	d.handle(&newRequest{request: tree, dropAfter: time.Hour})
+	d.handle(&newRequest{request: &dummyRequest{tag: "kept"}})
+	require.Equal(t, int64(1), droppable())
+
+	// A push that may be dropped and succeeds is no longer counted.
+	pushed := &dummyRequest{tag: "pushed"}
+	d.handle(&newRequest{request: pushed, dropAfter: time.Minute})
+	require.Equal(t, int64(2), droppable())
+	d.lock.Lock()
+	p := d.nodes["pushed"]
+	d.transit(p, RunningState)
+	d.lock.Unlock()
+	d.handle(&executed{node: p})
+	require.Equal(t, int64(1), droppable())
+
+	// The tree, which waits for its children, is dropped at the failure of one child, and the
+	// other child, whose link building is in flight, takes over the wait.
+	d.lock.Lock()
+	d.transit(d.nodes["tree"], BlockedState)
+	s := d.nodes[stuck.String()]
+	b := d.nodes[busy.String()]
+	d.transit(s, InitialLinkBuildingState)
+	d.transit(b, InitialLinkBuildingState)
+	s.missingSince = time.Now().Add(-2 * time.Hour)
+	d.lock.Unlock()
+	d.handle(&requestLinked{node: s, err: entities.ErrNotExist})
+	d.lock.Lock()
+	require.Nil(t, d.nodes["tree"])
+	require.Nil(t, d.nodes[stuck.String()])
+	require.Same(t, b, d.nodes[busy.String()])
+	require.Equal(t, time.Hour, b.dropAfter)
+	d.lock.Unlock()
+	require.Equal(t, int64(1), droppable())
+
+	// The other child is dropped at its own failure.
+	d.lock.Lock()
+	b.missingSince = time.Now().Add(-2 * time.Hour)
+	d.lock.Unlock()
+	d.handle(&requestLinked{node: b, err: entities.ErrNotExist})
+	d.lock.Lock()
+	require.Nil(t, d.nodes[busy.String()])
+	require.NotNil(t, d.nodes["kept"])
+	d.lock.Unlock()
+	require.Zero(t, droppable())
+}
+
+// A push that is sent again while it waits adds no callback, and a drop at a failed
+// execution calls the callback once, with ErrDropped.
+func TestDropCallsCallbackOnce(t *testing.T) {
+	d := New(&DagSyncOpts{Accessor: emptyAccessor{}, WorkersCount: 0})
+	errs := make(chan error, 4)
+	callback := func(err error) { errs <- err }
+	blob := &dummyRequest{tag: "blob"}
+
+	d.handle(&newRequest{request: blob, dropAfter: time.Minute, callbacks: []Callback{callback}})
+	d.handle(&newRequest{request: blob, dropAfter: time.Minute, callbacks: []Callback{callback}})
+	d.lock.Lock()
+	n := d.nodes["blob"]
+	d.transit(n, RunningState)
+	n.missingSince = time.Now().Add(-time.Hour)
+	d.lock.Unlock()
+	d.handle(&executed{node: n, err: entities.ErrNotExist})
+
+	require.ErrorIs(t, <-errs, ErrDropped)
+	select {
+	case err := <-errs:
+		t.Fatalf("callback called again with %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	requireNoNodeCounted(t, d)
 }

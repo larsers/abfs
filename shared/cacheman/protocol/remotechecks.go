@@ -27,6 +27,11 @@ type RemoteCheckStats struct {
 	// pushed and stay in the cache.
 	Pushed     int64 `json:"pushed"`
 	Unpushable int64 `json:"unpushable"`
+	// Dropped counts the drops of entry pushes by dagsync, because an object they needed was
+	// in no local store and missing on the server. A drop counts once for each entry, also
+	// when later checks sent its push again while it waited. The entries stay local until a
+	// later check pushes them.
+	Dropped int64 `json:"dropped"`
 	// ClearRetries counts the retries of index transactions that took a local write out of
 	// the LRU after a conflict.
 	ClearRetries int64 `json:"clear_retries"`

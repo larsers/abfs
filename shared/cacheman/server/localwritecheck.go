@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"github.com/google/abfs/shared/dagsync"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
+	"github.com/google/abfs/shared/objects/gitobjects"
 )
 
 const (
@@ -45,6 +47,11 @@ var (
 	localWriteCheckPeriod = time.Second
 	// localWriteStartPassBatch is the number of keys per Headers call of the start pass.
 	localWriteStartPassBatch = localWriteCheckBatchSize
+	// unconfirmedPushDropAfter is how long a push of content the server lacks may wait for an
+	// object that is in no local store. dagsync retries such an object at waits that grow by
+	// 5 s per try, about 27 tries in this time, while content a mount writes reaches the store
+	// within seconds. The next keep-alive or start pushes a dropped entry again.
+	unconfirmedPushDropAfter = 30 * time.Minute
 )
 
 // localWriteCheck keeps content written locally in the cache until the server has confirmed
@@ -75,6 +82,7 @@ type localWriteCheck struct {
 	missing         atomic.Int64
 	pushed          atomic.Int64
 	unpushable      atomic.Int64
+	dropped         atomic.Int64
 	clearRetries    atomic.Int64
 	clearFailures   atomic.Int64
 	startPass       atomic.Int64
@@ -318,17 +326,25 @@ func (c *CacheMan) pushUnconfirmed(ctx context.Context, hash entities.Hash, entr
 		return
 	}
 	lw.pushed.Add(1)
+	var objType entities.ObjectType
 	switch entryType {
 	case EntryTypeBlob:
 		c.pushBlobsStat.Request.Add(1)
-		go sync.PutBlob(hash)
+		objType = entities.ObjectTypeBlob
 	case EntryTypeTree:
 		c.pushTreesStat.Request.Add(1)
-		go sync.PutTree(hash)
+		objType = gitobjects.ObjectTypeDir
 	default:
 		c.pushObjectsStat.Request.Add(1)
-		go sync.PutObject(hash)
 	}
+	// A child that is in no store and that the server lacks would hold the push in dagsync
+	// for good. The entry keeps its marker when the push is dropped.
+	go sync.PutObjectOrDrop(hash, objType, unconfirmedPushDropAfter, func(err error) {
+		if errors.Is(err, dagsync.ErrDropped) {
+			lw.dropped.Add(1)
+			c.printer.Printf("Dropped the push of %s %s, which the server lacks: %v\n", entryType, hash, err)
+		}
+	})
 }
 
 func (c *CacheMan) hasLocalCopy(ctx context.Context, hash entities.Hash, entryType EntryType) bool {
@@ -615,6 +631,7 @@ func (c *CacheMan) localWriteStats() *protocol.RemoteCheckStats {
 		Missing:                 lw.missing.Load(),
 		Pushed:                  lw.pushed.Load(),
 		Unpushable:              lw.unpushable.Load(),
+		Dropped:                 lw.dropped.Load(),
 		ClearRetries:            lw.clearRetries.Load(),
 		ClearFailures:           lw.clearFailures.Load(),
 		EvictSkippedUnconfirmed: idx.evictSkippedUnconfirmed(),
