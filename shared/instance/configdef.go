@@ -66,8 +66,10 @@ type Config struct {
 	GitPrefetchSymlinks bool `yaml:"git.prefetch-symlinks,omitempty" json:",omitempty" desc:"Prefetch Git symlinks"`
 
 	GCKeepAlive              bool          `yaml:"gc-keepalive,omitempty" json:",omitempty" desc:"Keep live mounts and workspace snapshots visible to the server GC: refresh the mount ref, touch the mount's objects and give each ws snapshot a ref"`
-	GCKeepAliveRefInterval   time.Duration `yaml:"gc-keepalive-ref-interval,omitempty" json:",omitempty" desc:"With gc-keepalive, interval between rewrites of a live mount's ref for the server GC; zero disables"`
 	GCKeepAliveTouchInterval time.Duration `yaml:"gc-keepalive-touch-interval,omitempty" json:",omitempty" desc:"With gc-keepalive, interval between Headers touches of a live mount's objects for the server GC; zero disables"`
+	// GCKeepAliveRefInterval is always GCKeepAliveRefInterval and cannot be
+	// configured; the mount details record it for the server GC.
+	GCKeepAliveRefInterval time.Duration `yaml:"-" json:",omitempty"`
 
 	SetupIgnoreEvalCacheRegex string  `yaml:"setup.ignore-eval-cache-regex,omitempty" json:",omitempty" desc:"Regex of targets to exclude from eval cache"`
 	SetupLogMismatches        bool    `yaml:"setup.log-mismatches,omitempty" json:",omitempty" desc:"Log eval cache mismatches"`
@@ -140,8 +142,11 @@ type ConfigOptional struct {
 	GitPrefetchSymlinks *bool `yaml:"git.prefetch-symlinks,omitempty" json:",omitempty"`
 
 	GCKeepAlive              *bool          `yaml:"gc-keepalive,omitempty" json:",omitempty"`
-	GCKeepAliveRefInterval   *time.Duration `yaml:"gc-keepalive-ref-interval,omitempty" json:",omitempty"`
 	GCKeepAliveTouchInterval *time.Duration `yaml:"gc-keepalive-touch-interval,omitempty" json:",omitempty"`
+	// ObsoleteGCKeepAliveRefInterval accepts the gc-keepalive-ref-interval key
+	// of older configs, so that they still load. The value is ignored: the
+	// interval is fixed at GCKeepAliveRefInterval.
+	ObsoleteGCKeepAliveRefInterval *time.Duration `yaml:"gc-keepalive-ref-interval,omitempty" json:"-"`
 
 	SetupIgnoreEvalCacheRegex *string  `yaml:"setup.ignore-eval-cache-regex,omitempty" json:",omitempty"`
 	SetupLogMismatches        *bool    `yaml:"setup.log-mismatches,omitempty" json:",omitempty"`

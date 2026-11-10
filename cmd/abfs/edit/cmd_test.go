@@ -106,6 +106,21 @@ servers:
 	}
 }
 
+// The central client configuration of an older version may still set
+// gc-keepalive-ref-interval, which is ignored now.
+func TestValidateFile_ClientsConfigsObsoleteKey(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "test.yaml")
+	content := "- select:\n  config:\n    gc-keepalive: true\n    gc-keepalive-ref-interval: 15m\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	hp, _ := hashpath.Parse("config:clients/configs")
+	c := &editCmd{hashPath: hp}
+	if err := c.validateFile(p); err != nil {
+		t.Errorf("expected client config with gc-keepalive-ref-interval to be valid, got err: %v", err)
+	}
+}
+
 func TestVimSpecs(t *testing.T) {
 	for _, raw := range []string{
 		"config:clients/configs",

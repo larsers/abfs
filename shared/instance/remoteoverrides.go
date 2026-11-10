@@ -88,5 +88,6 @@ func ResolveRemoteConfig(clientInfo ClientInfo, overrides *ConfigRemoteOverrides
 			config.Apply(&override.Config)
 		}
 	}
+	config.dropObsolete()
 	return config
 }

@@ -22,10 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"reflect"
 	"strings"
+	"sync/atomic"
 
 	"github.com/dustin/go-humanize"
 	"gopkg.in/yaml.v3"
@@ -163,7 +165,24 @@ func (c *ConfigOptional) Decode(r io.Reader) error {
 		// The yaml library expects to have at least one component
 		err = nil
 	}
+	if err == nil {
+		c.dropObsolete()
+	}
 	return err
+}
+
+// obsoleteLogged is set once the notice about an ignored key was logged.
+var obsoleteLogged atomic.Bool
+
+// dropObsolete clears the keys of older configs that are ignored now.
+func (c *ConfigOptional) dropObsolete() {
+	if c.ObsoleteGCKeepAliveRefInterval == nil {
+		return
+	}
+	c.ObsoleteGCKeepAliveRefInterval = nil
+	if !obsoleteLogged.Swap(true) {
+		log.Printf("Ignoring config key gc-keepalive-ref-interval: the interval is fixed at %v", GCKeepAliveRefInterval)
+	}
 }
 
 func (c *ConfigOptional) Validate() error {
