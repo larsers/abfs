@@ -692,45 +692,34 @@ func TestGCHooks_MapResults(t *testing.T) {
 	require.Equal(int64(1), st.MapRowsWritten)
 }
 
-// GCTouchedMapRows sizes the map row throttle, which the shards hold
-// together: a row forgotten by a full shard is touched again on its next use.
+// The map row throttle holds maxTouchedMapRows rows in its shards together:
+// a row forgotten by a full shard is touched again on its next use.
 func TestGCHooks_TouchedMapRows(t *testing.T) {
+	require := require.New(t)
 	var to entities.Hash
 	rows := []entities.Hash{offsetKey(1), offsetKey(2)}
-	for _, tt := range []struct {
-		size     int
-		perShard int
-		touches  int
-	}{
-		{0, DefaultGCTouchedMapRows / cacheShards, 2},
-		{cacheShards, 1, 3},
-		{2 * cacheShards, 2, 2},
-		{1, 1, 3},
-	} {
-		t.Run(fmt.Sprint(tt.size), func(t *testing.T) {
-			require := require.New(t)
-			s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour, GCTouchedMapRows: tt.size})
-			g := &s.gcHooks
-			g.toucher.Close()
-			fake := &fakeToucher{}
-			g.toucher = fake
-			// Both rows are in the shard of the first byte 0.
-			s.touchMapRow(rows[0], to)
-			s.touchMapRow(rows[1], to)
-			s.touchMapRow(rows[0], to)
-			require.Len(fake.mapRows, tt.touches)
+	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
+	g := &s.gcHooks
+	g.toucher.Close()
+	fake := &fakeToucher{}
+	g.toucher = fake
+	// Both rows are in the shard of the first byte 0.
+	s.touchMapRow(rows[0], to)
+	s.touchMapRow(rows[1], to)
+	s.touchMapRow(rows[0], to)
+	require.Len(fake.mapRows, 2)
 
-			shard := g.touchedMapRows[0]
-			for i := range tt.perShard + 1 {
-				var from entities.Hash
-				binary.BigEndian.PutUint32(from[1:], uint32(i))
-				shard.Add(mapRowKey{from: from}, 1)
-			}
-			require.Equal(tt.perShard, shard.Len())
-		})
+	require.Len(g.touchedMapRows, cacheShards)
+	perShard := maxTouchedMapRows / cacheShards
+	shard := g.touchedMapRows[0]
+	for i := range perShard {
+		var from entities.Hash
+		binary.BigEndian.PutUint32(from[1:], uint32(i))
+		shard.Add(mapRowKey{from: from}, 1)
 	}
-	s, _ := createTestServerWithCASDB(t)
-	require.ErrorContains(t, s.startGCHooks(context.Background(), &NewServerOpts{GC: true, GCTouchedMapRows: -1}), "invalid negative number of touched map rows")
+	require.Equal(perShard, shard.Len())
+	s.touchMapRow(rows[0], to)
+	require.Len(fake.mapRows, 3)
 }
 
 // A map row touch that the toucher dropped is tried again on the next use

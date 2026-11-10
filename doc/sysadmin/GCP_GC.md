@@ -610,7 +610,6 @@ The collector runs as a separate job. With `--gc`, the server records for it whi
 | `--gc` | off | Run the server side of the garbage collector. It needs the resources of `abfs server gcp init --gc`. Off, the server reads and writes only what a server without garbage collection does, and the flags below have no effect |
 | `--cache-ttl` | `6h` | With `--gc`, how long cached object headers and content are used before the server reads them again from Bigtable; `0` keeps them until they are evicted, which refuses condemn and delete cycles |
 | `--gc-touch-interval` | `36h` | With `--gc`, length of the period in which the server writes at most one touch per object and map row; `0` writes none, which refuses condemn and delete cycles |
-| `--gc-touched-map-rows` | `4000000` | With `--gc`, the number of map rows whose last touch the server remembers; about 225 bytes each, so about 225 MB per million and 900 MB at the default when full. `0` uses the default |
 | `--gc-heartbeat-interval` | `5m` | With `--gc`, time between two heartbeats of the server in the Spanner table `GcServers`; above 0 and at most `10m` |
 
 ### GC edges
@@ -655,7 +654,7 @@ When a call finds an object (`Headers`, `GetObject`, the existence check of `Put
 
 * Each server writes at most one touch per object in each period of `--gc-touch-interval`, so an object in use has a touch younger than the interval. The periods count from the server start, shifted for each object by an offset taken from its key, so the periods of different objects end at different times and their next touches spread over the interval.
 * `MapResults` also writes the cell of each map row it returns again, with the same limit, so the timestamp of a map row is the time it was last used. Map results therefore come back in the order of their last use, oldest first, instead of the order they were added. ninjago tries the newest result first, so builds are not affected.
-* Each server remembers the last touch of up to `--gc-touched-map-rows` map rows (default 4,000,000). A server that returns more distinct rows per touch period touches a row again once it was forgotten, so its map row touches follow the rate of `MapResults` calls rather than the period. The memory grows with the rows returned, about 225 bytes per row.
+* Each server remembers the last touch of up to 4,000,000 map rows, so that it rewrites each at most once per touch interval. A server that returns more distinct rows per touch period touches a row again once it was forgotten, so its map row touches follow the rate of `MapResults` calls rather than the period. The memory grows with the rows returned, about 225 bytes per row and 900 MB when full.
 
 Touches wait in a buffer of 100,000, and four workers write them in batches of up to 1,000, at least once a second:
 

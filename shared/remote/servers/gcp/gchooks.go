@@ -46,12 +46,14 @@ const (
 	DefaultCacheTTL            = gc.DefaultCacheTTL
 	DefaultGCTouchInterval     = 36 * time.Hour
 	DefaultGCHeartbeatInterval = 5 * time.Minute
-	DefaultGCTouchedMapRows    = 4 * 1000 * 1000
 	heartbeatTimeout           = 30 * time.Second
 	firstHeartbeatRetry        = 5 * time.Second
 	rescueWorkers              = 32
 	metricsScope               = "github.com/google/abfs/shared/remote/servers/gcp"
 )
+
+// maxTouchedMapRows is how many map row touches a server remembers, about 225 bytes each.
+const maxTouchedMapRows = 4 * 1000 * 1000
 
 // rescuePath is the server call that found an object, condemned or not.
 type rescuePath int
@@ -156,9 +158,6 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 	if opts.CacheTTL < 0 || opts.GCTouchInterval < 0 || opts.GCHeartbeatInterval < 0 {
 		return fmt.Errorf("invalid negative cache TTL %s, touch interval %s or heartbeat interval %s", opts.CacheTTL, opts.GCTouchInterval, opts.GCHeartbeatInterval)
 	}
-	if opts.GCTouchedMapRows < 0 {
-		return fmt.Errorf("invalid negative number of touched map rows %d", opts.GCTouchedMapRows)
-	}
 	// The collector sees the touches a server lost only through its
 	// heartbeat, so a server that rescues and touches must write one.
 	if !opts.GCReadOnly && (opts.GCHeartbeatInterval == 0 || opts.GCHeartbeatInterval > gc.MaxHeartbeatInterval) {
@@ -194,14 +193,10 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	}
 	if opts.GCTouchInterval > 0 && !opts.GCReadOnly {
 		g.touchInterval = seconds(opts.GCTouchInterval)
-		rows := opts.GCTouchedMapRows
-		if rows == 0 {
-			rows = DefaultGCTouchedMapRows
-		}
 		g.touchedMapRows = make([]*lru.Cache[mapRowKey, uint32], cacheShards)
 		for i := range g.touchedMapRows {
 			var err error
-			if g.touchedMapRows[i], err = lru.New[mapRowKey, uint32](max(1, (rows+cacheShards-1)/cacheShards)); err != nil {
+			if g.touchedMapRows[i], err = lru.New[mapRowKey, uint32](maxTouchedMapRows / cacheShards); err != nil {
 				return err
 			}
 		}

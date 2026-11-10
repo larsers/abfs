@@ -32,11 +32,9 @@ func TestGCPFlags_GCHooks(t *testing.T) {
 		args           []string
 		gc             bool
 		ttl, touch, hb time.Duration
-		mapRows        int
 	}{
-		{nil, false, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval, gcp.DefaultGCHeartbeatInterval, gcp.DefaultGCTouchedMapRows},
-		{[]string{"--gc", "--cache-ttl=0", "--gc-touch-interval=0", "--gc-heartbeat-interval=1m", "--gc-touched-map-rows=1000"}, true, 0, 0, time.Minute, 1000},
-		{[]string{"--gc", "--gc-touched-map-rows=0"}, true, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval, gcp.DefaultGCHeartbeatInterval, 0},
+		{nil, false, gcp.DefaultCacheTTL, gcp.DefaultGCTouchInterval, gcp.DefaultGCHeartbeatInterval},
+		{[]string{"--gc", "--cache-ttl=0", "--gc-touch-interval=0", "--gc-heartbeat-interval=1m"}, true, 0, 0, time.Minute},
 	}
 	for _, tt := range tests {
 		cmd := NewStandaloneGCPServerCmd(root.NewRootCommand())
@@ -47,7 +45,6 @@ func TestGCPFlags_GCHooks(t *testing.T) {
 		require.Equal(t, tt.ttl, cmd.gcpCmd.cacheTTL)
 		require.Equal(t, tt.touch, cmd.gcpCmd.gcTouchInterval)
 		require.Equal(t, tt.hb, cmd.gcpCmd.gcHeartbeatInterval)
-		require.Equal(t, tt.mapRows, cmd.gcpCmd.gcTouchedMapRows)
 	}
 }
 
