@@ -16,6 +16,7 @@ package gcp
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -45,7 +46,7 @@ const (
 	DefaultCacheTTL            = gc.DefaultCacheTTL
 	DefaultGCTouchInterval     = 36 * time.Hour
 	DefaultGCHeartbeatInterval = 5 * time.Minute
-	maxTouchedMapRows          = 256 * 1024
+	DefaultGCTouchedMapRows    = 4 * 1000 * 1000
 	heartbeatTimeout           = 30 * time.Second
 	firstHeartbeatRetry        = 5 * time.Second
 	rescueWorkers              = 32
@@ -107,11 +108,12 @@ type gcHooks struct {
 	touchedMapRows []*lru.Cache[mapRowKey, uint32]
 	stopHeartbeat  func()
 	// server is this process's heartbeat row in GcServers, which exists once
-	// hasRow is set. reportedLosses counts the touches lost when the last
-	// heartbeat was written.
-	server         gc.Server
-	hasRow         bool
-	reportedLosses int64
+	// hasRow is set. reportedLosses and reportedMapRowLosses count the
+	// object and map row touches lost when the last heartbeat was written.
+	server               gc.Server
+	hasRow               bool
+	reportedLosses       int64
+	reportedMapRowLosses int64
 	// heartbeatStale is the age in seconds of the last successful heartbeat,
 	// at lastHeartbeat on the cacheNow clock, beyond which the server stops
 	// serving; zero without a heartbeat.
@@ -154,6 +156,9 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 	if opts.CacheTTL < 0 || opts.GCTouchInterval < 0 || opts.GCHeartbeatInterval < 0 {
 		return fmt.Errorf("invalid negative cache TTL %s, touch interval %s or heartbeat interval %s", opts.CacheTTL, opts.GCTouchInterval, opts.GCHeartbeatInterval)
 	}
+	if opts.GCTouchedMapRows < 0 {
+		return fmt.Errorf("invalid negative number of touched map rows %d", opts.GCTouchedMapRows)
+	}
 	// The collector sees the touches a server lost only through its
 	// heartbeat, so a server that rescues and touches must write one.
 	if !opts.GCReadOnly && (opts.GCHeartbeatInterval == 0 || opts.GCHeartbeatInterval > gc.MaxHeartbeatInterval) {
@@ -189,10 +194,14 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	}
 	if opts.GCTouchInterval > 0 && !opts.GCReadOnly {
 		g.touchInterval = seconds(opts.GCTouchInterval)
+		rows := opts.GCTouchedMapRows
+		if rows == 0 {
+			rows = DefaultGCTouchedMapRows
+		}
 		g.touchedMapRows = make([]*lru.Cache[mapRowKey, uint32], cacheShards)
 		for i := range g.touchedMapRows {
 			var err error
-			if g.touchedMapRows[i], err = lru.New[mapRowKey, uint32](maxTouchedMapRows / cacheShards); err != nil {
+			if g.touchedMapRows[i], err = lru.New[mapRowKey, uint32](max(1, (rows+cacheShards-1)/cacheShards)); err != nil {
 				return err
 			}
 		}
@@ -225,8 +234,9 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 // stopGCHooks stops the heartbeat, writes the buffered touches and records in
 // the heartbeat row of this server that it stopped, and whether it lost
 // touches or was paused since its last heartbeat. The row stays: a row
-// without the stop tells the collector that the process crashed and its
-// touches may be lost.
+// without the stop, also after a failed write of the stop, tells the
+// collector that the process crashed and its object and map row touches may
+// be lost.
 func (s *GCPServer) stopGCHooks() {
 	g := &s.gcHooks
 	if g.stopped {
@@ -247,8 +257,8 @@ func (s *GCPServer) stopGCHooks() {
 		after := g.toucher.Stats()
 		// The metrics are gone by now, so the log has the counts of the stop.
 		dropped, failed := after.Dropped-before.Dropped, after.Failed-before.Failed
-		log.Printf("GC touches at stop: %d written, %d dropped and %d failed while stopping; %d written, %d dropped and %d failed since the start",
-			after.Written-before.Written, dropped, failed, after.Written, after.Dropped, after.Failed)
+		log.Printf("GC touches at stop: %d written, %d dropped and %d failed while stopping; %d written, %d dropped and %d failed since the start; map rows %d written, %d dropped and %d failed since the start",
+			after.Written-before.Written, dropped, failed, after.Written, after.Dropped, after.Failed, after.MapRowsWritten, after.MapRowsDropped, after.MapRowsFailed)
 	}
 	if g.rescueLog != nil {
 		g.rescueLog.flush()
@@ -264,23 +274,41 @@ func (s *GCPServer) stopGCHooks() {
 	}
 	lost := g.pausePending || g.losses() > g.reportedLosses
 	if lost {
-		log.Printf("Warning: recorded lost touches in the GC heartbeat row %s", g.server.ID)
+		log.Printf("Warning: recorded lost object touches in the GC heartbeat row %s", g.server.ID)
+	}
+	mapRowsLost := g.mapRowLosses() > g.reportedMapRowLosses
+	if mapRowsLost {
+		log.Printf("Warning: recorded lost map row touches in the GC heartbeat row %s", g.server.ID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatTimeout)
 	defer cancel()
-	if err := gc.StopServer(ctx, s.casdb.SpannerClient(), g.server.ID, lost); err != nil {
+	if err := gc.StopServer(ctx, s.casdb.SpannerClient(), g.server.ID, lost, mapRowsLost); err != nil {
 		log.Printf("Warning: %v", err)
 	}
 }
 
-// losses counts the touches this process lost so far: every touch that was
-// dropped or failed.
+// losses counts the object touches this process lost so far: every one that
+// was dropped or failed.
 func (g *gcHooks) losses() int64 {
 	if g.toucher == nil {
 		return 0
 	}
 	st := g.toucher.Stats()
 	return st.Dropped + st.Failed
+}
+
+// mapRowLosses counts the map row touches this process lost so far. They are
+// recorded apart from the object touches: a lost one only shortens the
+// retention of an eval map row, and the collector then requires mounts to
+// touch their objects often enough that the touch of the result, an object
+// touch of MapResults, keeps the outputs until a mount's keep-alive names
+// them.
+func (g *gcHooks) mapRowLosses() int64 {
+	if g.toucher == nil {
+		return 0
+	}
+	st := g.toucher.Stats()
+	return st.MapRowsDropped + st.MapRowsFailed
 }
 
 // touchesLate reports whether the toucher holds touches past the time at
@@ -338,7 +366,7 @@ func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32) CachedHeader {
 		shard.PeekOrAdd(hdr.Id, h)
 		return h
 	}
-	if old, ok := shard.Peek(hdr.Id); ok && s.gcHooks.touchInterval > 0 && s.gcHooks.touchedThisPeriod(old, h.Loaded) {
+	if old, ok := shard.Peek(hdr.Id); ok && s.gcHooks.touchInterval > 0 && s.gcHooks.touchedThisPeriod(hdr.Id, old, h.Loaded) {
 		h.Touched = old.Touched
 	}
 	shard.Add(hdr.Id, h)
@@ -496,19 +524,29 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 	return live, nil
 }
 
-// touchMark returns the CachedHeader.Touched value of a touch period. Periods
-// are --gc-touch-interval long and counted from the process start; the value
-// repeats every 255 periods, never zero.
-func touchMark(period uint32) uint8 {
+// touchMark returns the CachedHeader.Touched value of a touch period. The
+// value repeats every 255 periods, never zero.
+func touchMark(period uint64) uint8 {
 	return uint8(period%255) + 1
 }
 
-// touchedThisPeriod reports whether this server touched the object of h in the
-// current touch period. A touch is never older than the load of its entry, so
-// for entries loaded less than 255 periods ago the mark cannot have wrapped.
-func (g *gcHooks) touchedThisPeriod(h CachedHeader, now uint32) bool {
-	period := now / g.touchInterval
-	return h.Touched != 0 && period-h.Loaded/g.touchInterval < 255 && h.Touched == touchMark(period)
+// touchPeriod returns the touch period of the object key at now. Periods are
+// --gc-touch-interval long and counted from the process start, shifted by an
+// offset taken from the key, so that the periods of different objects end at
+// different times and their next touches do not all queue at once.
+func (g *gcHooks) touchPeriod(key entities.Hash, now uint32) uint64 {
+	interval := uint64(g.touchInterval)
+	offset := uint64(binary.BigEndian.Uint32(key[len(key)-4:])) % interval
+	return (uint64(now) + offset) / interval
+}
+
+// touchedThisPeriod reports whether this server touched the object key, whose
+// entry is h, in the current touch period. A touch is never older than the
+// load of its entry, so for entries loaded less than 255 periods ago the mark
+// cannot have wrapped.
+func (g *gcHooks) touchedThisPeriod(key entities.Hash, h CachedHeader, now uint32) bool {
+	period := g.touchPeriod(key, now)
+	return h.Touched != 0 && period-g.touchPeriod(key, h.Loaded) < 255 && h.Touched == touchMark(period)
 }
 
 // touchHit touches the object key, which the call path found, unless this
@@ -521,7 +559,7 @@ func (s *GCPServer) touchHit(path rescuePath, key entities.Hash, h CachedHeader)
 		return
 	}
 	now := cacheNow()
-	if g.touchedThisPeriod(h, now) {
+	if g.touchedThisPeriod(key, h, now) {
 		return
 	}
 	if !g.touch(path, key) {
@@ -531,7 +569,7 @@ func (s *GCPServer) touchHit(path rescuePath, key entities.Hash, h CachedHeader)
 	// so the TTL still bounds it.
 	shard := s.headers[key[0]]
 	if cur, ok := shard.Peek(key); ok && cur.Loaded == h.Loaded {
-		cur.Touched = touchMark(now / g.touchInterval)
+		cur.Touched = touchMark(g.touchPeriod(key, now))
 		if g.cacheTTL == 0 {
 			// Without a TTL the load time means nothing else; moving it keeps
 			// entries older than 255 periods from being touched on every hit.
@@ -553,7 +591,8 @@ func (g *gcHooks) touch(path rescuePath, key entities.Hash) bool {
 }
 
 // touchMapRow rewrites the cell of the map row from#to, so that its timestamp
-// is the last use, unless this replica did so within the touch interval.
+// is the last use, unless this replica did so within the touch interval. A
+// touch the toucher dropped is tried again on the next use.
 func (s *GCPServer) touchMapRow(from, to entities.Hash) {
 	g := &s.gcHooks
 	if g.toucher == nil {
@@ -697,9 +736,9 @@ func (s *GCPServer) heartbeat(ctx context.Context) error {
 		// A late touch leaves the toucher's slots only after its loss is
 		// counted, so the slots are read first.
 		late := g.touchesLate()
-		losses := g.losses()
-		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || late || losses > g.reportedLosses); err == nil {
-			g.reportedLosses = losses
+		losses, mapRowLosses := g.losses(), g.mapRowLosses()
+		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || late || losses > g.reportedLosses, mapRowLosses > g.reportedMapRowLosses); err == nil {
+			g.reportedLosses, g.reportedMapRowLosses = losses, mapRowLosses
 			g.pausePending = false
 			g.hasRow = true
 			g.lastHeartbeat.Store(start)
@@ -731,7 +770,7 @@ func (s *GCPServer) registerGCMetrics() (metric.Registration, error) {
 		return nil, err
 	}
 	touches, err := meter.Int64ObservableCounter("abfs.gcp.gc.touches",
-		metric.WithDescription("Touches of objects and map rows, by result: written, dropped because the buffer was full, or failed"))
+		metric.WithDescription("Touches of objects and map rows, by kind and result: written, dropped because the buffer was full (about half full for map rows), or failed"))
 	if err != nil {
 		return nil, err
 	}
@@ -763,9 +802,15 @@ func (s *GCPServer) registerGCMetrics() (metric.Registration, error) {
 		}
 		if g.toucher != nil {
 			st := g.toucher.Stats()
-			o.ObserveInt64(touches, st.Written, metric.WithAttributes(attribute.String("result", "written")))
-			o.ObserveInt64(touches, st.Dropped, metric.WithAttributes(attribute.String("result", "dropped")))
-			o.ObserveInt64(touches, st.Failed, metric.WithAttributes(attribute.String("result", "failed")))
+			for _, c := range []struct {
+				kind, result string
+				n            int64
+			}{
+				{"object", "written", st.Written}, {"object", "dropped", st.Dropped}, {"object", "failed", st.Failed},
+				{"map_row", "written", st.MapRowsWritten}, {"map_row", "dropped", st.MapRowsDropped}, {"map_row", "failed", st.MapRowsFailed},
+			} {
+				o.ObserveInt64(touches, c.n, metric.WithAttributes(attribute.String("kind", c.kind), attribute.String("result", c.result)))
+			}
 		}
 		o.ObserveInt64(expiries, g.headerExpiries.Load(), metric.WithAttributes(attribute.String("cache", "headers")))
 		o.ObserveInt64(expiries, g.contentExpiries.Load(), metric.WithAttributes(attribute.String("cache", "content")))

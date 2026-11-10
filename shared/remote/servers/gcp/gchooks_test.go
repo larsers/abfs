@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -420,12 +421,14 @@ func TestGCHooks_FailedRescueDoesNotStopTheBatch(t *testing.T) {
 }
 
 // fakeToucher records the touches of objects by whether the call waited for
-// room in a full buffer.
+// room in a full buffer, and drops the map row touches when dropMapRows is
+// set.
 type fakeToucher struct {
-	mu      sync.Mutex
-	waited  []entities.Hash
-	tried   []entities.Hash
-	mapRows []string
+	mu          sync.Mutex
+	waited      []entities.Hash
+	tried       []entities.Hash
+	mapRows     []string
+	dropMapRows bool
 }
 
 func (f *fakeToucher) TouchObject(key gc.Hash) bool {
@@ -446,7 +449,7 @@ func (f *fakeToucher) TouchMapRow(row string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.mapRows = append(f.mapRows, row)
-	return true
+	return !f.dropMapRows
 }
 
 func (f *fakeToucher) Stats() gc.TouchStats { return gc.TouchStats{} }
@@ -525,6 +528,8 @@ func TestGCHooks_TouchThrottle(t *testing.T) {
 	setCacheNow(t, &now)
 	s := newGCHooksServer(t, &NewServerOpts{CacheTTL: 10 * time.Minute, GCTouchInterval: time.Hour})
 	key := putBlob(t, s, "hello")
+	// Start at the start of the object's touch period.
+	now = periodEnd(&s.gcHooks, key, now)
 	written := func() int64 {
 		time.Sleep(10 * time.Millisecond)
 		s.gcHooks.toucher.Close()
@@ -682,7 +687,71 @@ func TestGCHooks_MapResults(t *testing.T) {
 	require.Greater(used, added, "the map row was not touched")
 	// The validation of AddMapResult touched the three objects, MapResults the
 	// map row of the result it returned.
-	require.Equal(int64(4), s.gcHooks.toucher.Stats().Written)
+	st := s.gcHooks.toucher.Stats()
+	require.Equal(int64(3), st.Written)
+	require.Equal(int64(1), st.MapRowsWritten)
+}
+
+// GCTouchedMapRows sizes the map row throttle, which the shards hold
+// together: a row forgotten by a full shard is touched again on its next use.
+func TestGCHooks_TouchedMapRows(t *testing.T) {
+	var to entities.Hash
+	rows := []entities.Hash{offsetKey(1), offsetKey(2)}
+	for _, tt := range []struct {
+		size     int
+		perShard int
+		touches  int
+	}{
+		{0, DefaultGCTouchedMapRows / cacheShards, 2},
+		{cacheShards, 1, 3},
+		{2 * cacheShards, 2, 2},
+		{1, 1, 3},
+	} {
+		t.Run(fmt.Sprint(tt.size), func(t *testing.T) {
+			require := require.New(t)
+			s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour, GCTouchedMapRows: tt.size})
+			g := &s.gcHooks
+			g.toucher.Close()
+			fake := &fakeToucher{}
+			g.toucher = fake
+			// Both rows are in the shard of the first byte 0.
+			s.touchMapRow(rows[0], to)
+			s.touchMapRow(rows[1], to)
+			s.touchMapRow(rows[0], to)
+			require.Len(fake.mapRows, tt.touches)
+
+			shard := g.touchedMapRows[0]
+			for i := range tt.perShard + 1 {
+				var from entities.Hash
+				binary.BigEndian.PutUint32(from[1:], uint32(i))
+				shard.Add(mapRowKey{from: from}, 1)
+			}
+			require.Equal(tt.perShard, shard.Len())
+		})
+	}
+	s, _ := createTestServerWithCASDB(t)
+	require.ErrorContains(t, s.startGCHooks(context.Background(), &NewServerOpts{GC: true, GCTouchedMapRows: -1}), "invalid negative number of touched map rows")
+}
+
+// A map row touch that the toucher dropped is tried again on the next use
+// of the row, and one it queued is not tried again within the period.
+func TestGCHooks_RetriesADroppedMapRowTouch(t *testing.T) {
+	require := require.New(t)
+	now := uint32(1)
+	setCacheNow(t, &now)
+	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
+	g := &s.gcHooks
+	g.toucher.Close()
+	fake := &fakeToucher{dropMapRows: true}
+	g.toucher = fake
+	from, to := offsetKey(1), offsetKey(2)
+	s.touchMapRow(from, to)
+	s.touchMapRow(from, to)
+	require.Len(fake.mapRows, 2)
+	fake.dropMapRows = false
+	s.touchMapRow(from, to)
+	s.touchMapRow(from, to)
+	require.Len(fake.mapRows, 3)
 }
 
 func TestGCHooks_ChunkMissingDuringRead(t *testing.T) {
@@ -736,19 +805,128 @@ func TestGCHooks_ChunkMissingObjectStoredAgain(t *testing.T) {
 	require.NoError(readObject(s, key))
 }
 
+// offsetKey returns a key whose touch periods start offset seconds before
+// those of a key with offset zero, for touch intervals above offset.
+func offsetKey(offset uint32) entities.Hash {
+	var key entities.Hash
+	binary.BigEndian.PutUint32(key[len(key)-4:], offset)
+	return key
+}
+
+// periodEnd returns the first time after now at which the touch period of key
+// is not the one at now.
+func periodEnd(g *gcHooks, key entities.Hash, now uint32) uint32 {
+	p := g.touchPeriod(key, now)
+	lo, hi := now, now+g.touchInterval
+	for hi-lo > 1 {
+		mid := lo + (hi-lo)/2
+		if g.touchPeriod(key, mid) == p {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return hi
+}
+
 // The touch mark of a period repeats every 255 periods; an entry loaded 255
 // or more periods ago is touched again even when its mark matches.
 func TestGCHooks_TouchMarkWraps(t *testing.T) {
 	require := require.New(t)
 	g := &gcHooks{touchInterval: 10}
-	h := CachedHeader{Loaded: 5, Touched: touchMark(0)}
-	require.True(g.touchedThisPeriod(h, 9))
-	require.False(g.touchedThisPeriod(h, 10))
-	require.Equal(touchMark(0), touchMark(255))
-	require.False(g.touchedThisPeriod(h, 2555), "a mark 255 periods old counts as this period")
-	h = CachedHeader{Loaded: 2545, Touched: touchMark(255)}
-	require.True(g.touchedThisPeriod(h, 2555))
-	require.False(g.touchedThisPeriod(CachedHeader{Loaded: 5}, 5), "an entry without a touch")
+	for _, off := range []uint32{0, 4} {
+		key := offsetKey(off)
+		mark := func(now uint32) CachedHeader {
+			return CachedHeader{Loaded: now, Touched: touchMark(g.touchPeriod(key, now))}
+		}
+		h := mark(5)
+		require.Equal(touchMark(g.touchPeriod(key, 5)), touchMark(g.touchPeriod(key, 5+2550)))
+		require.False(g.touchedThisPeriod(key, h, 5+2550), "a mark 255 periods old counts as this period")
+		h = mark(5 + 2550)
+		require.True(g.touchedThisPeriod(key, h, 5+2550))
+		require.False(g.touchedThisPeriod(key, CachedHeader{Loaded: 5}, 5), "an entry without a touch")
+	}
+
+	// The guard counts the periods of the object, shifted by its offset. An
+	// entry loaded at 6 is in period 1 with an offset of 4, and in period 0
+	// without it. A mark set in period 255 is 254 periods after the load and
+	// counts; one set at the load counts again in period 256, exactly 255
+	// periods later, and must not.
+	key := offsetKey(4)
+	require.Equal(uint64(1), g.touchPeriod(key, 6))
+	require.Equal(uint64(255), g.touchPeriod(key, 2546))
+	require.Equal(uint64(256), g.touchPeriod(key, 2556))
+	require.True(g.touchedThisPeriod(key, CachedHeader{Loaded: 6, Touched: touchMark(255)}, 2546))
+	require.Equal(touchMark(1), touchMark(256))
+	require.False(g.touchedThisPeriod(key, CachedHeader{Loaded: 6, Touched: touchMark(1)}, 2556))
+}
+
+// Each object's touch periods are shifted by an offset taken from its key, so
+// that marks set at the same time expire at different times. The periods keep
+// the touch interval as their length: a mark is current only within the
+// interval after its touch.
+func TestGCHooks_TouchPeriodOffset(t *testing.T) {
+	require := require.New(t)
+	g := &gcHooks{touchInterval: 10}
+	a, b := offsetKey(0), offsetKey(4)
+	ha := CachedHeader{Loaded: 5, Touched: touchMark(g.touchPeriod(a, 5))}
+	hb := CachedHeader{Loaded: 5, Touched: touchMark(g.touchPeriod(b, 5))}
+	require.True(g.touchedThisPeriod(a, ha, 5))
+	require.True(g.touchedThisPeriod(b, hb, 5))
+	require.True(g.touchedThisPeriod(a, ha, 9))
+	require.False(g.touchedThisPeriod(b, hb, 6), "b's period ends at 6")
+	require.True(g.touchedThisPeriod(a, ha, 9))
+	require.False(g.touchedThisPeriod(a, ha, 10), "a's period ends at 10")
+
+	g.touchInterval = 36 * 3600
+	ends := make(map[uint32]bool)
+	for i := range 1000 {
+		key := entities.Hash(sha1.Sum(fmt.Appendf(nil, "offset %d", i)))
+		for _, at := range []uint32{1, 12345, 1 << 30} {
+			end := periodEnd(g, key, at)
+			require.Equal(g.touchPeriod(key, at)+1, g.touchPeriod(key, end))
+			require.Equal(g.touchPeriod(key, end), g.touchPeriod(key, end+g.touchInterval-1), "a period shorter than the interval")
+			require.Equal(g.touchPeriod(key, end)+1, g.touchPeriod(key, end+g.touchInterval), "a period longer than the interval")
+			h := CachedHeader{Loaded: at, Touched: touchMark(g.touchPeriod(key, at))}
+			require.True(g.touchedThisPeriod(key, h, end-1))
+			require.False(g.touchedThisPeriod(key, h, end))
+		}
+		ends[periodEnd(g, key, 1)] = true
+	}
+	require.Greater(len(ends), 900, "the periods of most objects end at different times")
+}
+
+// A server touches again at the end of each object's own period, so two
+// objects first used at the same time get their next touches at different
+// times.
+func TestGCHooks_TouchPeriodsEndPerObject(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	now := uint32(1)
+	setCacheNow(t, &now)
+	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
+	a, b := putBlob(t, s, "first"), putBlob(t, s, "second")
+	g := &s.gcHooks
+	g.toucher.Close()
+	fake := &fakeToucher{}
+	g.toucher = fake
+	_, err := s.Headers(ctx, []entities.Hash{a, b})
+	require.NoError(err)
+	require.ElementsMatch([]entities.Hash{a, b}, fake.waited)
+
+	first, second := a, b
+	if periodEnd(g, b, now) < periodEnd(g, a, now) {
+		first, second = b, a
+	}
+	require.Less(periodEnd(g, first, now), periodEnd(g, second, now))
+	now = periodEnd(g, first, now)
+	_, err = s.Headers(ctx, []entities.Hash{a, b})
+	require.NoError(err)
+	require.ElementsMatch([]entities.Hash{a, b, first}, fake.waited)
+	now = periodEnd(g, second, now)
+	_, err = s.Headers(ctx, []entities.Hash{a, b})
+	require.NoError(err)
+	require.ElementsMatch([]entities.Hash{a, b, first, second}, fake.waited)
 }
 
 func TestGCHooks_ChunkMissingInBucket(t *testing.T) {
@@ -842,6 +1020,8 @@ func TestGCHooks_Metrics(t *testing.T) {
 	require.Equal(int64(0), got["abfs.gcp.gc.rescue_failures/headers"])
 	require.Contains(got, "abfs.gcp.gc.rescue_failures/headers")
 	require.Contains(got, "abfs.gcp.gc.touches/dropped")
+	require.Contains(got, "abfs.gcp.gc.touches/object")
+	require.Contains(got, "abfs.gcp.gc.touches/map_row")
 	require.Contains(got, "abfs.gcp.cache.ttl_expiries/content")
 	require.Contains(got, "abfs.gcp.gc.map_results_dropped")
 	require.Contains(got, "abfs.gcp.gc.heartbeat_failures")

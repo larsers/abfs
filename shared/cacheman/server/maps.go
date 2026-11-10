@@ -18,6 +18,8 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
+// DefaultTTLHours is how long a map result stays in the local copy. The GC of the
+// GCP server allows for it (clientMapReuse in shared/remote/servers/gcp/gc).
 const DefaultTTLHours = 8
 
 type MapsStore interface {

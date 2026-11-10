@@ -68,8 +68,8 @@ CREATE TABLE IF NOT EXISTS GcReplicas (
 -- the collector can check every process that ran in a time window. StatsTime
 -- is a Spanner read time taken before the process read the touch stats its
 -- last heartbeat recorded; TouchLossTime is set when a heartbeat or the stop
--- records lost touches, StoppedAt by a clean stop. A process that has neither
--- a recent heartbeat nor StoppedAt crashed.
+-- records lost object touches, StoppedAt by a clean stop. A process that has
+-- neither a recent heartbeat nor StoppedAt crashed.
 CREATE TABLE IF NOT EXISTS GcServers (
     ServerId STRING(MAX) NOT NULL,
     Version INT64 NOT NULL,
@@ -83,3 +83,8 @@ CREATE TABLE IF NOT EXISTS GcServers (
     TouchLossTime TIMESTAMP OPTIONS (allow_commit_timestamp=true),
     StoppedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true),
 ) PRIMARY KEY (ServerId);
+
+-- MapRowLossTime is set as TouchLossTime is, when a heartbeat or the stop
+-- records lost map row touches; servers of older versions leave it NULL and
+-- count those in TouchLossTime.
+ALTER TABLE GcServers ADD COLUMN IF NOT EXISTS MapRowLossTime TIMESTAMP OPTIONS (allow_commit_timestamp=true);

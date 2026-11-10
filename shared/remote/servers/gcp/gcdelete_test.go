@@ -67,7 +67,7 @@ func newDeleteFixture(t *testing.T) *deleteFixture {
 func (f *deleteFixture) server(id string, lost bool) {
 	f.t.Helper()
 	s := &gc.Server{ID: id, Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
-	require.NoError(f.t, gc.WriteServer(context.Background(), f.s.casdb.SpannerClient(), s, time.Now().Add(time.Hour), lost))
+	require.NoError(f.t, gc.WriteServer(context.Background(), f.s.casdb.SpannerClient(), s, time.Now().Add(time.Hour), lost, false))
 }
 
 // fakeChecks answers the checks of the Bigtable instance. hook runs once, at

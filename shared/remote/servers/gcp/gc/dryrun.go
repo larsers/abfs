@@ -452,6 +452,9 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	if !servers.legacyGone.IsZero() {
 		r.Replicas.LegacyServersGoneTime = &servers.legacyGone
 	}
+	if loss, lost := servers.mapRowLoss(snapshot, o.Grace); lost {
+		r.Replicas.MapRowLossTime = &loss.at
+	}
 	for _, w := range r.Replicas.Warnings {
 		log.Printf("Warning: %s", w)
 	}
@@ -459,8 +462,9 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		return nil, err
 	}
 	// A row of GcServers is evidence for every delete whose window holds it,
-	// so it stays for the largest grace of any condemn or delete cycle.
-	keep := max(staleReplicaAge, d.lease.MaxGrace+time.Hour, o.Grace+time.Hour)
+	// so it stays for the largest grace of any condemn or delete cycle, and
+	// for the time before the window in which a map row loss still counts.
+	keep := max(staleReplicaAge, max(d.lease.MaxGrace, o.Grace)+time.Hour+clientMapReuse+keepAlivePassAllowance)
 	if r.Replicas.ServersRemoved, err = PruneServers(ctx, d.sp, snapshot.Add(-keep)); err != nil {
 		return nil, err
 	}

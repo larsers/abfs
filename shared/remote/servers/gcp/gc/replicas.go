@@ -56,6 +56,12 @@ type ReplicaReport struct {
 	// A server of an older version keeps no row after it stops, so one that
 	// ran only between two reads is not seen.
 	LegacyServersGoneTime *time.Time `json:"legacy_servers_gone_time,omitempty"`
+	// MapRowLossTime is the latest time a server recorded lost map row
+	// touches that the keep-alive limit of the live mounts counts, or, for a
+	// server that crashed, the last time it may have run; nil when none did.
+	// The limit then also leaves out the time clients reuse map results and
+	// the time a keep-alive pass may take.
+	MapRowLossTime *time.Time `json:"map_row_loss_time,omitempty"`
 }
 
 // ReplicaHost returns the host name of a replica ID made by NewReplicaID.

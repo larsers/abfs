@@ -24,6 +24,18 @@ import (
 	"cloud.google.com/go/spanner"
 )
 
+const (
+	// clientMapReuse is how long cacheman answers map lookups from its copy
+	// of the results a server returned, without asking a server again
+	// (DefaultTTLHours in shared/cacheman/server).
+	clientMapReuse = 8 * time.Hour
+	// keepAlivePassAllowance is the time a keep-alive pass may take to reach
+	// an object of its mount, from the time the pass was due: a pass sends at
+	// most 10,000 hashes a second, so a mount of 10 million hashes takes
+	// about 17 minutes, and a failed pass is retried after 5 minutes.
+	keepAlivePassAllowance = time.Hour
+)
+
 // serverEvidence is what the collector knows of the server processes: the
 // heartbeat rows of both tables and the time GcReplicas was last found to
 // hold no row.
@@ -157,9 +169,105 @@ func (e *serverEvidence) longestCacheTTL(start time.Time) time.Duration {
 // TTL of the processes that may have run in its window, and the clock skew
 // margin. An answer from the header cache rests on a touch made when the
 // entry was looked up, up to the TTL before the answer.
+//
+// When a server lost a map row touch (see mapRowLoss), the limit also leaves
+// out clientMapReuse and keepAlivePassAllowance. Without the touch the eval
+// map row may no longer keep the outputs of a result, and a build can apply
+// the result clientMapReuse after the server returned it: until the next
+// keep-alive pass names the outputs, only the touch of that answer keeps
+// them.
 func (e *serverEvidence) keepAliveTouchLimit(snapshot time.Time, grace time.Duration) time.Duration {
 	start := windowStart(snapshot, grace)
-	return grace - e.longestTouchInterval(start) - e.longestCacheTTL(start) - clockSkewMargin
+	limit := grace - e.longestTouchInterval(start) - e.longestCacheTTL(start) - clockSkewMargin
+	if _, lost := e.mapRowLoss(snapshot, grace); lost {
+		limit -= clientMapReuse + keepAlivePassAllowance
+	}
+	return limit
+}
+
+// mapRowLossStart returns the time from which a lost map row touch counts for
+// a cycle whose snapshot is snapshot. The outputs of a result whose map row
+// touch was lost rest on the touch of the server's answer until a keep-alive
+// pass names them, up to clientMapReuse, the keep-alive interval plus a tenth
+// and keepAlivePassAllowance after the answer. For a mount whose interval
+// fits the limit without a loss, the pass after an earlier loss names them
+// early enough before the snapshot that its touch counts.
+func mapRowLossStart(snapshot time.Time, grace time.Duration) time.Time {
+	return windowStart(snapshot, grace).Add(-clientMapReuse - keepAlivePassAllowance)
+}
+
+// mapRowLossEvent is a map row loss that counts for a cycle.
+type mapRowLossEvent struct {
+	// server is the ID of the server that lost map row touches, and at the
+	// time it recorded the loss.
+	server string
+	at     time.Time
+	// crashed is set when the server did not record a stop and its last
+	// heartbeat is older than a live row may be: it may have lost map row
+	// touches it never recorded, up to at, the last time it may have run.
+	crashed bool
+}
+
+// mapRowLoss returns the latest map row loss since mapRowLossStart, and
+// whether there is one. A row of a server of an older version has no
+// MapRowLossTime: such a server records those losses in TouchLossTime. A
+// process that did not record a stop may have lost map row touches after its
+// last heartbeat, as it may have lost object touches, so it counts as a loss
+// at the last time it may have run.
+func (e *serverEvidence) mapRowLoss(snapshot time.Time, grace time.Duration) (mapRowLossEvent, bool) {
+	start := mapRowLossStart(snapshot, grace)
+	var latest mapRowLossEvent
+	found := false
+	for _, s := range e.inWindow(start) {
+		loss := mapRowLossEvent{server: s.ID, at: s.MapRowLossTime}
+		if e.crashed(&s) {
+			loss.at, loss.crashed = s.LastSeen.Add(liveReplicaAge), true
+		}
+		if !loss.at.IsZero() && !loss.at.Before(start) && (!found || loss.at.After(latest.at)) {
+			latest, found = loss, true
+		}
+	}
+	return latest, found
+}
+
+// describe says why loss counts.
+func (loss *mapRowLossEvent) describe() string {
+	if loss.crashed {
+		return fmt.Sprintf("server %s last wrote its heartbeat at %s and did not record a stop: it crashed and may have lost map row touches", loss.server, formatTime(loss.at.Add(-liveReplicaAge)))
+	}
+	return fmt.Sprintf("server %s lost map row touches at %s", loss.server, formatTime(loss.at))
+}
+
+// mapRowLossNote explains the part of the keep-alive limit that a map row
+// loss adds, or returns "" when there is none.
+func (e *serverEvidence) mapRowLossNote(snapshot time.Time, grace time.Duration) string {
+	loss, lost := e.mapRowLoss(snapshot, grace)
+	if !lost {
+		return ""
+	}
+	return fmt.Sprintf(", and less the %s for which clients reuse map results and the %s a keep-alive pass may take, since %s",
+		clientMapReuse, keepAlivePassAllowance, loss.describe())
+}
+
+// withoutKeepAliveMapRowLoss returns the reason why a cycle whose snapshot is
+// snapshot must not delete the types clients write while n live mounts run
+// without the GC keep-alive, which --accept-mounts-without-keepalive accepts,
+// or "" when no map row loss counts. samples names some of the mounts. Such a
+// mount touches nothing after the server's answer, so after a map row loss
+// the outputs of a map result it applies may not be recent at the mark.
+func (e *serverEvidence) withoutKeepAliveMapRowLoss(snapshot time.Time, grace time.Duration, n int64, samples string) string {
+	loss, lost := e.mapRowLoss(snapshot, grace)
+	if !lost {
+		return ""
+	}
+	return fmt.Sprintf("%d live mounts run without the GC keep-alive%s, and %s: such a mount may apply a map result whose outputs no map row keeps any more, which --accept-mounts-without-keepalive does not accept; set gc-keepalive in their config",
+		n, samples, loss.describe())
+}
+
+// crashed reports whether the process of s did not record a stop and its last
+// heartbeat is older than a live row may be at the read.
+func (e *serverEvidence) crashed(s *Server) bool {
+	return s.StoppedAt.IsZero() && e.readTime.Sub(s.LastSeen) > liveReplicaAge
 }
 
 // windowBlockers returns the reasons in e why a cycle whose snapshot is
@@ -177,8 +285,7 @@ func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []stri
 	slices.SortFunc(in, func(a, b Server) int { return cmp.Compare(a.ID, b.ID) })
 	for i := range in {
 		s := &in[i]
-		live := e.readTime.Sub(s.LastSeen) <= liveReplicaAge
-		if s.StoppedAt.IsZero() && !live {
+		if e.crashed(s) {
 			add("server %s last wrote its heartbeat at %s and did not record a stop: it crashed and its buffered touches may be lost; deletes wait until that is before the window start", s.ID, formatTime(s.LastSeen))
 		}
 		if !s.TouchLossTime.IsZero() && !s.TouchLossTime.Before(start) {

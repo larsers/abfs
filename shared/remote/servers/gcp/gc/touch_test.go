@@ -105,7 +105,7 @@ func TestToucher_WritesObjectAndMapRowTouches(t *testing.T) {
 	toucher.Close()
 	toucher.Close()
 
-	require.Equal(TouchStats{Written: 2}, toucher.Stats())
+	require.Equal(TouchStats{Written: 1, MapRowsWritten: 1}, toucher.Stats())
 	_, ok := cellTime(t, client, TableName, key.String(), TouchFamily, TouchColumn)
 	require.True(ok, "no touch in the gc row")
 	ts, ok := cellTime(t, client, mapsTableName, mapRow, mapsFamily, "")
@@ -174,7 +174,75 @@ func TestToucher_DropsTouchesAfterClose(t *testing.T) {
 	require.False(toucher.TouchObject(keys[1]))
 	require.False(toucher.TryTouchObject(keys[2]))
 	require.False(toucher.TouchMapRow(keys[2].String() + "#" + keys[2].String()))
-	require.Equal(TouchStats{Written: 1, Dropped: 3}, toucher.Stats())
+	require.Equal(TouchStats{Written: 1, Dropped: 2, MapRowsDropped: 1}, toucher.Stats())
+}
+
+// Map row touches are counted apart from object touches, and a late one is
+// counted as failed but never makes the Toucher late.
+func TestToucher_CountsMapRowTouchesApart(t *testing.T) {
+	require := require.New(t)
+	tc := newToucher(newHooksTestBigtable(t), 4)
+	tc.enqueueWait = time.Millisecond
+	var offset atomic.Int64
+	tc.now = func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+	keys := testHashes(3)
+	rows := []string{keys[0].String() + "#" + keys[1].String(), keys[1].String() + "#" + keys[2].String()}
+	require.True(tc.TouchMapRow(rows[0]))
+	require.True(tc.TouchMapRow(rows[1]))
+	require.False(tc.TouchMapRow(rows[0]))
+	require.Equal(TouchStats{MapRowsDropped: 1}, tc.Stats())
+
+	offset.Store(int64(10 * TouchDrainBound))
+	require.False(tc.Late(), "a late map row touch")
+	tc.flush(context.Background(), []touch{<-tc.queue, <-tc.queue})
+	require.Equal(TouchStats{MapRowsWritten: 2, MapRowsDropped: 1, MapRowsFailed: 2}, tc.Stats())
+
+	require.True(tc.TouchObject(keys[0]))
+	offset.Store(int64(20 * TouchDrainBound))
+	require.True(tc.Late())
+	tc.flush(context.Background(), []touch{<-tc.queue})
+	require.Equal(TouchStats{Written: 1, Failed: 1, MapRowsWritten: 2, MapRowsDropped: 1, MapRowsFailed: 2}, tc.Stats())
+}
+
+// Map row touches take at most half of the buffer and never wait, and a
+// dropped one does not stall the object touches: an object touch still gets
+// the room the map rows left, and still waits for room in a full buffer.
+func TestToucher_MapRowTouchesLeaveRoomForObjectTouches(t *testing.T) {
+	require := require.New(t)
+	tc := newToucher(newHooksTestBigtable(t), 4)
+	tc.enqueueWait = time.Hour
+	keys := testHashes(4)
+	for i := range 2 {
+		require.True(tc.TouchMapRow(keys[i].String() + "#" + keys[i].String()))
+	}
+	start := time.Now()
+	require.False(tc.TouchMapRow(keys[2].String() + "#" + keys[2].String()))
+	require.Less(time.Since(start), time.Second, "a map row touch waited")
+	require.False(tc.stalled.Load(), "a dropped map row touch stalled the object touches")
+	require.True(tc.TouchObject(keys[0]))
+	require.True(tc.TouchObject(keys[1]))
+
+	// The buffer is full: a map row touch is dropped at once, and an object
+	// touch waits for the room a worker makes.
+	require.False(tc.TouchMapRow(keys[3].String() + "#" + keys[3].String()))
+	require.False(tc.stalled.Load(), "a dropped map row touch stalled the object touches")
+	time.AfterFunc(50*time.Millisecond, func() { <-tc.queue })
+	require.True(tc.TouchObject(keys[2]))
+	require.Equal(TouchStats{MapRowsDropped: 2}, tc.Stats())
+
+	// After object touches stalled, a queued map row touch leaves them
+	// stalled until an object touch gets room.
+	tc.enqueueWait = time.Millisecond
+	require.False(tc.TouchObject(keys[3]))
+	require.True(tc.stalled.Load())
+	for range 4 {
+		<-tc.queue
+	}
+	require.True(tc.TouchMapRow(keys[3].String() + "#" + keys[3].String()))
+	require.True(tc.stalled.Load(), "a map row touch ended the stall of the object touches")
+	require.True(tc.TouchObject(keys[3]))
+	require.False(tc.stalled.Load())
+	require.Equal(TouchStats{Dropped: 1, MapRowsDropped: 2}, tc.Stats())
 }
 
 func TestToucher_WaitsForRoom(t *testing.T) {

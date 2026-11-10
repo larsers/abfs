@@ -35,6 +35,7 @@ import (
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
+	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
 func setupOpts(t *testing.T, dbID string) *SetupOpts {
@@ -227,6 +228,48 @@ func TestSetup_AddsGCStateListColumns(t *testing.T) {
 	require.NoError(row.Columns(&cycle, &complete))
 	require.Equal(int64(41), cycle)
 	require.False(complete.Valid)
+}
+
+// A database whose GcServers was created before MapRowLossTime existed stops
+// a server with --gc, and init --gc adds the column. The rows written before
+// have no map row loss time.
+func TestSetup_AddsGCServersMapRowLossColumn(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	var phase1 []string
+	for _, stmt := range casdb.GCSchemaStatements() {
+		if !strings.HasPrefix(stmt, "ALTER TABLE GcServers") {
+			phase1 = append(phase1, stmt)
+		}
+	}
+	require.Len(phase1, len(casdb.GCSchemaStatements())-1)
+	dbID := newEmulatorDatabaseWith(t, append(casdb.SchemaStatements(), phase1...))
+	newEmulatorBigtableWith(t, serverTables(true))
+	opts := setupOpts(t, dbID)
+	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
+	require.NoError(err)
+	defer client.Close()
+	_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcServers",
+		[]string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "StatsTime", "TouchLossTime"},
+		[]any{"old-0-aa", int64(1), true, int64(3600), int64(3600), int64(300), true, spanner.CommitTimestamp, time.Now(), spanner.CommitTimestamp})})
+	require.NoError(err)
+	serverOpts := &NewServerOpts{
+		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,
+		BtInstance: opts.BtInstance, BucketName: opts.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCHeartbeatInterval: time.Minute,
+	}
+	_, err = New(ctx, serverOpts)
+	require.ErrorContains(err, "init --gc")
+
+	opts.GC = true
+	require.NoError(Setup(ctx, opts))
+	servers, err := gc.ReadServers(ctx, client)
+	require.NoError(err)
+	require.Len(servers, 1)
+	require.NotZero(servers[0].TouchLossTime)
+	require.Zero(servers[0].MapRowLossTime)
+	s, err := New(ctx, serverOpts)
+	require.NoError(err)
+	require.NoError(s.Close())
 }
 
 func TestSetup_MissingBucket(t *testing.T) {

@@ -154,6 +154,45 @@ func TestGCHooks_HeartbeatRecordsLostTouches(t *testing.T) {
 	require.True(r.TouchLossTime.After(first))
 }
 
+// Lost map row touches are recorded apart, in MapRowLossTime: a map row touch
+// only keeps an eval map row within its retention, so the collector does not
+// count them as lost touches. A lost object touch still is one.
+func TestGCHooks_HeartbeatRecordsLostMapRowTouchesApart(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, st := newHeartbeatServer(t, time.Hour)
+	st.set(gc.TouchStats{Written: 5, MapRowsWritten: 5, MapRowsDropped: 3})
+	require.NoError(s.heartbeat(ctx))
+	r := readServer(t, s)
+	require.Zero(r.TouchLossTime)
+	require.Equal(r.LastSeen, r.MapRowLossTime)
+	first := r.MapRowLossTime
+
+	st.set(gc.TouchStats{Written: 5, Dropped: 1, MapRowsWritten: 5, MapRowsDropped: 3})
+	require.NoError(s.heartbeat(ctx))
+	r = readServer(t, s)
+	require.Equal(r.LastSeen, r.TouchLossTime)
+	require.Equal(first, r.MapRowLossTime)
+
+	st.set(gc.TouchStats{Written: 5, Dropped: 1, MapRowsWritten: 5, MapRowsDropped: 3, MapRowsFailed: 1})
+	require.NoError(s.heartbeat(ctx))
+	r = readServer(t, s)
+	require.True(r.TouchLossTime.Before(r.LastSeen))
+	require.Equal(r.LastSeen, r.MapRowLossTime)
+
+	// So does the stop.
+	s2, st2 := newHeartbeatServer(t, time.Hour)
+	st2.set(gc.TouchStats{MapRowsDropped: 1, MapRowsFailed: 1})
+	logged := captureLog(t)
+	s2.stopGCHooks()
+	r = readServer(t, s2)
+	require.NotZero(r.StoppedAt)
+	require.Zero(r.TouchLossTime)
+	require.Equal(r.StoppedAt, r.MapRowLossTime)
+	require.Contains(logged.String(), "recorded lost map row touches in the GC heartbeat row "+r.ID)
+	require.NotContains(logged.String(), "recorded lost object touches")
+}
+
 // A heartbeat records a loss while the toucher holds touches that it will
 // count as failed once it writes them, as after a freeze of the process.
 func TestGCHooks_HeartbeatRecordsLateTouches(t *testing.T) {
@@ -186,7 +225,7 @@ func TestGCHooks_HeartbeatRecordsAGap(t *testing.T) {
 	// until a heartbeat is written.
 	orig := writeServer
 	t.Cleanup(func() { writeServer = orig })
-	writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool) error {
+	writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool, bool) error {
 		return status.Error(codes.Unavailable, "injected")
 	}
 	now += bound + 1
@@ -215,7 +254,7 @@ func TestGCHooks_StopKeepsHeartbeatRow(t *testing.T) {
 			require.NotZero(r.StoppedAt)
 			if lose {
 				require.Equal(r.StoppedAt, r.TouchLossTime)
-				require.Contains(logged.String(), "recorded lost touches in the GC heartbeat row "+r.ID)
+				require.Contains(logged.String(), "recorded lost object touches in the GC heartbeat row "+r.ID)
 			} else {
 				require.Zero(r.TouchLossTime)
 			}
@@ -231,7 +270,7 @@ func TestGCHooks_FirstHeartbeatFailureStopsStart(t *testing.T) {
 	s := newEmulatorCASDBServer(t)
 	orig, origTimeout := writeServer, firstHeartbeatTimeout
 	t.Cleanup(func() { writeServer, firstHeartbeatTimeout = orig, origTimeout })
-	writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool) error {
+	writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool, bool) error {
 		return status.Error(codes.PermissionDenied, "injected")
 	}
 	firstHeartbeatTimeout = 200 * time.Millisecond
@@ -257,11 +296,11 @@ func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
 	var failing atomic.Bool
 	orig := writeServer
 	t.Cleanup(func() { writeServer = orig })
-	writeServer = func(ctx context.Context, c *spanner.Client, sv *gc.Server, statsTime time.Time, lost bool) error {
+	writeServer = func(ctx context.Context, c *spanner.Client, sv *gc.Server, statsTime time.Time, lost, mapRowsLost bool) error {
 		if failing.Load() {
 			return status.Error(codes.PermissionDenied, "injected")
 		}
-		return orig(ctx, c, sv, statsTime, lost)
+		return orig(ctx, c, sv, statsTime, lost, mapRowsLost)
 	}
 	// Every call that reads or writes the store, each with the code it got.
 	// The calls run in this order: PutRefs creates the server and project
