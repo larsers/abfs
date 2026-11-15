@@ -136,7 +136,7 @@ The tools that a build pod uses come from its node, not from the build image. A 
 
 ### GKE and Config Connector upgrades
 
-- **GKE.** The class `abfs-ci` holds back node upgrades of existing CI pools, because casfs does not build on every kernel series. A new CI pool still comes up at the control plane's version. After every control plane upgrade, run one canary build before CI resumes ([runbook](runbook.md#canary-after-every-control-plane-upgrade)). Server and pusher nodes take upgrades normally; the PodDisruptionBudgets keep all but one replica of each running.
+- **GKE.** The class `abfs-ci` holds back node upgrades of existing CI pools, because a new node image can change or drop the casfs module (and with `ci.casfs.provider: daemonset`, casfs does not build on every kernel series). A new CI pool still comes up at the control plane's version. After every control plane upgrade, run one canary build before CI resumes ([runbook](runbook.md#canary-after-every-control-plane-upgrade)). Server and pusher nodes take upgrades normally; the PodDisruptionBudgets keep all but one replica of each running.
 - **Config Connector** is installed by hand at a pinned version and upgraded with the operator file of the next version ([runbook](runbook.md#config-connector-upgrade-and-rollback)). Its upgrade does not touch the workloads.
 
 ## What to watch
@@ -145,7 +145,7 @@ The tools that a build pod uses come from its node, not from the build image. A 
 | --- | --- | --- |
 | Cache hit ratio of each build | the end of each ninja phase in the build log | whether builds reuse the store; a drop after an upgrade or a new target is expected, a drop without either is not |
 | Pending build pods and CI node count | `kubectl -n abfs-ci get pods`, the cluster autoscaler events | whether nodes keep up with the CI load, and stockouts of a machine family |
-| casfs loader state | `kubectl -n abfs-ci get pods -l app.kubernetes.io/component=casfs-loader` | a node whose kernel casfs does not build on; its builds fail after 15 minutes and must be retried elsewhere |
+| casfs loader state | `kubectl -n abfs-ci get pods -l app.kubernetes.io/component=casfs-loader` | a node whose image ships no matching casfs module, or with `daemonset` whose kernel casfs does not build on; its builds fail after 15 minutes and must be retried elsewhere |
 | Server CPU and replica count | the HPA, Cloud Monitoring | whether the servers sit at their maximum |
 | Bigtable CPU and node count | Cloud Monitoring | whether Bigtable sits at its cap, the first limit of a growing farm |
 | Store size | Bigtable storage, the bucket size | growth without garbage collection |

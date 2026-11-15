@@ -12,7 +12,7 @@ This folder deploys the open-source ABFS GCP server, the git-pushers and the CI 
   abfs-ci namespace (PSA privileged)       abfs namespace (PSA baseline)
   +-------------------------------+        +-------------------------------+
   | ComputeClass abfs-ci          |        | ComputeClass abfs-server      |
-  |  Ubuntu nodes, any zone       |  h2c   |  abfs-server Deployment, HPA  |---> Spanner (refs)
+  |  COS nodes, any zone          |  h2c   |  abfs-server Deployment, HPA  |---> Spanner (refs)
   |  casfs-loader DaemonSet       | -----> |  zone of the Bigtable cluster |---> Bigtable (objects)
   |  cacheman DaemonSet (hostPath)|  VIP   |  behind Gateway gke-l7-rilb   |---> Cloud Storage (blobs)
   |  build pods                   |        +-------------------------------+
@@ -26,7 +26,7 @@ This folder deploys the open-source ABFS GCP server, the git-pushers and the CI 
 - An internal Gateway (`gke-l7-rilb`) gives the servers one regional address. Pushers, cacheman and build pods use it.
 - The git-pushers fetch from Gerrit and push to the server. Each pusher has one PersistentVolumeClaim; nothing else in the deployment has one.
 - A Helm hook Job writes the pusher pool config and the central client config into the store.
-- On each CI node a DaemonSet builds and loads the casfs kernel module, and one cacheman serves every build pod on the node from a cache on the boot disk.
+- On each CI node a DaemonSet loads and checks the casfs kernel module of the COS node image, and one cacheman serves every build pod on the node from a cache on the boot disk.
 - Four ComputeClasses (`abfs-ci`, `abfs-server`, `abfs-pusher-seed`, `abfs-pusher-steady`) let GKE create the nodes, with a fallback over four machine families.
 
 ## Layout
@@ -111,6 +111,7 @@ The release bundle (`scripts/bundle.sh`) holds this README, `AGENTS.md`, the Mak
 ## Limits
 
 - GKE Standard only. Autopilot does not allow the privileged CI pods.
-- CI nodes run Ubuntu and build casfs on each node. The casfs commit in the image does not build on kernel series 6.14 and 6.19.
+- CI nodes run COS and use the casfs module of the node image. They need a GKE version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in GKE 1.37.2-gke.1325000 on the Rapid channel ([prerequisites](docs/prerequisites.md#gke-version-for-the-ci-nodes)).
+- `ci.casfs.provider: daemonset` runs the CI nodes on Ubuntu and builds casfs from the source in the loader image on each node instead. That casfs commit does not build on kernel series 6.14 and 6.19.
 - No TLS, no authentication, no garbage collection by default: the server's `--gc` is off, and the backend gets no garbage collector tables until it is turned on ([runbook](docs/runbook.md#garbage-collection)).
 - Terraform for Compute Engine VMs, Cloud Workstations and local SSD caches are not part of this folder.

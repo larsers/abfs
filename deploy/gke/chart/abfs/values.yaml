@@ -249,9 +249,10 @@ ci:
       limits:
         memory: 8Gi
   casfs:
-    # daemonset: build casfs 0.1.23 on each Ubuntu node. image: the node image ships casfs
-    # (COS 133 build 44-193 or later); load and check only.
-    provider: daemonset
+    # image: COS nodes; the node image ships casfs (COS 133 build 44-193 or later ships
+    # 0.1.24), the loader loads and checks it. daemonset: Ubuntu nodes; the loader builds
+    # casfs from the source in its image on each node.
+    provider: image
     # Build pods per node plus 2 for remounts. Read-only after load.
     maxMounts: 4
     # Kernel slab per active workspace. An active full-tree workspace holds a few GB of
@@ -265,8 +266,8 @@ ci:
       # Source tree in the casfs-loader image.
       path: /usr/src/casfs
       commit: c946f8e
-      # Module version the loader expects (prefix match); empty skips the check. With
-      # provider image, set the version the node image ships or leave it empty.
+      # Module version the loader builds and expects (prefix match) with provider
+      # daemonset; empty skips the check. Provider image checks the interface only.
       version: 0.1.23
     resources:
       requests:

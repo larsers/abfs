@@ -166,12 +166,12 @@ The chart reads `pusher.pool.manifest` also with `pusher.enabled: false`, so a r
 | `ci.cacheman.fsyncObjects` | `true` | |
 | `ci.cacheman.toolDir` | `/opt/abfs/bin` | Tool set in the `abfs-client` image |
 | `ci.cacheman.resources` | 2 CPU, 4Gi request, 8Gi limit | No CPU limit and no `GOMAXPROCS`: the node's one cacheman may use every core for the build pods it serves. The CPU request is a scheduling floor. |
-| `ci.casfs.provider` | `daemonset` | `daemonset`: build casfs on each Ubuntu node. `image`: the node image ships casfs; load and check only. |
+| `ci.casfs.provider` | `image` | `image`: COS CI nodes; the node image ships casfs (COS 133 build 44-193 or later), the loader loads and checks it. `daemonset`: Ubuntu CI nodes; the loader builds casfs on each node. |
 | `ci.casfs.maxMounts` | `4` | `casfs_max_mounts`: build pods per node plus 2. Read-only after load. |
 | `ci.casfs.mountGbPerWorkspace` | `6` | Kernel memory per active workspace, for the slab budget. An active full-tree workspace holds a few GB of casfs slab ([sizing](ci-job.md#sizing)); 6 keeps a margin. |
 | `ci.casfs.maxRamShare` | `0.4` | Upper bound: the loader lowers `maxMounts` until `maxMounts` x `mountGbPerWorkspace` fits this share of `MemTotal` |
 | `ci.casfs.interfaceVersion` | `1.5.0` | Interface the client needs |
-| `ci.casfs.source.path`, `.commit`, `.version` | `/usr/src/casfs`, `c946f8e`, `0.1.23` | Source in the loader image and the module version the loader expects (prefix match; empty skips the check) |
+| `ci.casfs.source.path`, `.commit`, `.version` | `/usr/src/casfs`, `c946f8e`, `0.1.23` | Source in the loader image and, with `daemonset`, the module version the loader builds and expects (prefix match; empty skips the check). `image` checks the interface only. |
 | `ci.casfs.resources` | 100m CPU, 256Mi request, 2Gi limit | Loader container |
 | `ci.localSsd.enabled` | `false` | Not implemented; `true` fails the render |
 | `ci.exampleJob.enabled` | `false` | Render the example build Job ([ci-job.md](ci-job.md)) |
@@ -199,7 +199,7 @@ The chart reads `pusher.pool.manifest` also with `pusher.enabled: false`, so a r
 | `computeClasses.pusherSeed.families`, `.minCores`, `.minMemoryGb` | `[n4, n4d, c4d, c4]`, `32`, `240` | Highmem shapes for the seed |
 | `computeClasses.pusherSteady.families` | `[n4, n4d, c4d, c4]` | No size floor |
 
-Every class sets `whenUnsatisfiable: DoNotScaleUp` and uses Hyperdisk Balanced boot disks. The CI class uses `ubuntu_containerd` with secure boot off and `maintenanceExclusion: UNTIL_END_OF_SUPPORT`; the others use `cos_containerd`. Servers and pushers never run on Spot.
+Every class sets `whenUnsatisfiable: DoNotScaleUp` and uses Hyperdisk Balanced boot disks. The CI class sets `maintenanceExclusion: UNTIL_END_OF_SUPPORT` and uses `cos_containerd` with `ci.casfs.provider: image`, or `ubuntu_containerd` with secure boot off with `daemonset`; the others use `cos_containerd`. Servers and pushers never run on Spot.
 
 ## otel, pdb, networkPolicy, alerts, tests
 

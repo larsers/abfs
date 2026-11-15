@@ -280,7 +280,7 @@ Recycle the CI nodes as well, so that every node cache starts empty (see [Upgrad
 
 ### Canary after every control plane upgrade
 
-The `abfs-ci` class holds back upgrades of its existing node pools with `maintenanceExclusion: UNTIL_END_OF_SUPPORT`. The exclusion covers existing CI pools only. A new CI pool, for a new shape or a stockout fallback, comes up on the control plane's newer patch version and can bring a newer kernel. casfs does not build on every kernel series (6.14 and 6.19 fail).
+The `abfs-ci` class holds back upgrades of its existing node pools with `maintenanceExclusion: UNTIL_END_OF_SUPPORT`. The exclusion covers existing CI pools only. A new CI pool, for a new shape or a stockout fallback, comes up on the control plane's newer patch version and its COS image. The casfs module of that image can differ from the one the client needs, and the COS image of a new minor version can ship an older casfs or none; the cluster's `no_minor_upgrades` exclusion ([prerequisites](prerequisites.md#hold-minor-upgrades)) holds minor versions back. With `ci.casfs.provider: daemonset` the new pool can bring a newer Ubuntu kernel, and casfs does not build on every kernel series (6.14 and 6.19 fail).
 
 After every control plane upgrade, run one build pod before CI resumes, and record the versions it ran on:
 
@@ -294,7 +294,7 @@ kubectl get nodes -l cloud.google.com/compute-class=abfs-ci \
   -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion,KERNEL:.status.nodeInfo.kernelVersion
 ```
 
-Any CI build pod in your CI system serves as the canary as well. When the loader cannot build or load the module on a node, it stays in CrashLoopBackOff and the build pods on that node fail after `ci.waitForCasfsTimeout` (15 minutes), so the CI system retries them elsewhere. Watch for it:
+Any CI build pod in your CI system serves as the canary as well. When the loader cannot load a matching module on a node, it stays in CrashLoopBackOff and the build pods on that node fail after `ci.waitForCasfsTimeout` (15 minutes), so the CI system retries them elsewhere. Watch for it:
 
 ```sh
 kubectl -n abfs-ci get pods -l app.kubernetes.io/component=casfs-loader -o wide
@@ -350,7 +350,7 @@ Without `--wait`, as for the install. The bootstrap Job runs again after each up
 
 - Server: a rolling update with one extra replica, never one fewer. Each pod drains for 120 s before SIGTERM (`server.preStopSleepSeconds`). The pod gets 240 s in all (`server.terminationGracePeriodSeconds`): the 120 s, up to 105 s for the server's own stop with `server.gc.enabled`, and 15 s of margin.
 - Pushers: a rolling update, one pod at a time, so two releases run in the pool for a while. Pushers are not checked against each other. When the new release changes how pushers split the projects or read the pool config, stop the pool first: `helm upgrade` with `--set pusher.enabled=false`, then the upgrade with the new images and `pusher.enabled` true. The PVCs stay.
-- casfs loader: a rolling update. A loaded module stays loaded: it cannot be removed while a casfs filesystem exists, and `casfs_max_mounts` is read-only after load. A new casfs version or a new `ci.casfs.maxMounts` takes effect on new nodes only.
+- casfs loader: a rolling update. A loaded module stays loaded: it cannot be removed while a casfs filesystem exists, and `casfs_max_mounts` is read-only after load. A new casfs version (from a new node image, or from a new loader image with `daemonset`) or a new `ci.casfs.maxMounts` takes effect on new nodes only.
 - cacheman: `updateStrategy: OnDelete`. A stopped cacheman makes every mount on its node refuse reads and writes, so the DaemonSet never restarts it by itself. Drain or recycle the CI nodes: either cordon a node, wait until its builds end and delete its cacheman pod as in [Cache reset](#cache-reset) (without the reset pod), or cordon the old nodes and let the autoscaler remove them once they are empty. Each cacheman pod copies its tool set to `/var/lib/abfs/bin` when it starts, so the tools on a node always match its cacheman.
 
 ### Spanner schema changes
@@ -475,6 +475,6 @@ Other points:
 
 - Only the server's Google service account holds Google roles: `roles/spanner.databaseUser`, `roles/bigtable.user` and `roles/storage.objectUser` on the three resources. `init` runs with the admin's own credentials.
 - The Gerrit credentials live in one Secret, mounted only into the pushers.
-- The casfs loader (privileged, host root, host network) and the build pods (privileged) run in `abfs-ci`. cacheman runs there unprivileged, with a root init container for its directories. The server, the pushers and the bootstrap Job run without privileges in `abfs`; the pushers run as root, which the `baseline` level allows.
+- The casfs loader (privileged, host root, and the host network with `ci.casfs.provider: daemonset` only) and the build pods (privileged) run in `abfs-ci`. cacheman runs there unprivileged, with a root init container for its directories. The server, the pushers and the bootstrap Job run without privileges in `abfs`; the pushers run as root, which the `baseline` level allows.
 - Every build on a CI node reads the same cache, and the kernel trusts cached content by name. Give each tenant its own CI class and node pools.
 - The server's HTTP debug port listens on 127.0.0.1 only, and the pushers' `/info` port is not behind the Gateway.

@@ -23,8 +23,9 @@
 # toleration to those pods.
 {{- if .Values.ci.enabled }}
 ---
-# CI build nodes: Ubuntu for the casfs build, secure boot off for the unsigned module,
-# upgrades of existing pools held back.
+# CI build nodes: COS with the casfs module of the node image, or Ubuntu with secure boot
+# off for the module the loader builds. Upgrades of existing pools are held back, because
+# a new node image or kernel can change or drop the module.
 apiVersion: cloud.google.com/v1
 kind: ComputeClass
 metadata:
@@ -52,13 +53,15 @@ spec:
     {{- end }}
     {{- end }}
   nodePoolConfig:
-    imageType: ubuntu_containerd
+    imageType: {{ ternary "ubuntu_containerd" "cos_containerd" (eq .Values.ci.casfs.provider "daemonset") }}
     serviceAccount: {{ $cc.nodeServiceAccount }}
     maintenanceExclusion: UNTIL_END_OF_SUPPORT
   nodePoolAutoCreation:
     enabled: true
+    {{- if eq .Values.ci.casfs.provider "daemonset" }}
     shieldedInstanceConfig:
       enableSecureBoot: false
+    {{- end }}
   autoscalingPolicy:
     consolidationDelayMinutes: {{ $cc.ci.consolidationDelayMinutes }}
     {{- if ne (toString $cc.ci.consolidationThreshold) "" }}
