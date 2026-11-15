@@ -14,7 +14,7 @@ GKE Standard with a regional control plane. Autopilot does not allow the privile
 
 | Item | Setting |
 | --- | --- |
-| GKE version | 1.36.4-gke.1082000 or later (the ComputeClass `maintenanceExclusion` field). HPA rightsizing, a Preview option, needs 1.36.3-gke.1630000 or later. |
+| GKE version | a version whose COS image ships casfs 0.1.24 or later, for the CI nodes: COS 133 from build 44-193, first in 1.37.2-gke.1325000 on the Rapid channel. See [GKE version for the CI nodes](#gke-version-for-the-ci-nodes). With `ci.casfs.provider: daemonset` (Ubuntu CI nodes), 1.36.4-gke.1082000 or later (the ComputeClass `maintenanceExclusion` field). HPA rightsizing, a Preview option, needs 1.36.3-gke.1630000 or later. |
 | Gateway API | channel `standard` |
 | Workload Identity | `workloadPool: <project>.svc.id.goog`, GKE metadata server on every node pool |
 | Managed OpenTelemetry | scope `COLLECTION_AND_INSTRUMENTATION_COMPONENTS`, GKE 1.34.1-gke.2178000 or later. The chart sets the OTLP environment itself and uses no Instrumentation resource. |
@@ -32,7 +32,7 @@ Create a cluster with these settings:
 ```sh
 gcloud container clusters create abfs \
   --project example-project --region europe-west4 \
-  --release-channel regular --cluster-version 1.36.4-gke.1082000 \
+  --release-channel rapid --cluster-version 1.37.2-gke.1325000 \
   --network example-network --subnetwork example-subnet --enable-ip-alias \
   --workload-pool example-project.svc.id.goog \
   --gateway-api standard \
@@ -86,6 +86,33 @@ done
 `networkConfig.gatewayApiConfig` shows `channel: CHANNEL_STANDARD`. GKE prints nothing for `addonsConfig.httpLoadBalancing` and `addonsConfig.horizontalPodAutoscaling` when the add-ons are on; they must not show `disabled: true`.
 
 The Gateway controller installs the `gke-l7-*` classes a few minutes after the control plane is up, so right after `clusters create` returns, `kubectl get gatewayclass gke-l7-rilb` prints `NotFound` with the add-ons on. A test cluster had the class about 4 minutes after the create started. The loop waits up to 10 minutes. Only a `NotFound` after that points at the HTTP load balancing add-on ([troubleshooting](troubleshooting.md#gateway-waits-for-its-controller)).
+
+### GKE version for the CI nodes
+
+With the default `ci.casfs.provider: image`, the CI nodes run COS and the loader uses the casfs module of the node image. The client tools of this release need casfs interface 1.5.0, which casfs 0.1.24 and later implement. Older COS images ship casfs 0.1.14 or no casfs; the loader refuses them, and build pods on such a node never start.
+
+Each GKE version uses one COS image. The GKE release notes list the image of each version, for example `cos-133-19999-44-193` for 1.37.2-gke.1325000. The casfs version of an image is in its package list, under the build number with dots:
+
+```sh
+gcloud storage cat gs://cos-tools/19999.44.193/cos-package-info.json \
+  | jq -c '.installedPackages[] | select(.name == "casfs")'
+```
+
+`ebuild_version` must be 0.1.24 or later. COS 133 ships 0.1.24 from build 44-193. When the cluster's release channel has no such version yet, use the Rapid channel, which has no GKE SLA, or `ci.casfs.provider: daemonset` with Ubuntu CI nodes, which build casfs on each node and need [egress](#egress-for-the-ci-nodes).
+
+### Hold minor upgrades
+
+Hold minor upgrades after the cluster is created, so the control plane and new CI pools stay on a minor version whose COS image ships a matching casfs:
+
+```sh
+gcloud container clusters update abfs --project example-project --region europe-west4 \
+  --add-maintenance-exclusion-name abfs-no-minor \
+  --add-maintenance-exclusion-scope no_minor_upgrades \
+  --add-maintenance-exclusion-start "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --add-maintenance-exclusion-until-end-of-support
+```
+
+Patch upgrades still run. Remove the exclusion (`--remove-maintenance-exclusion abfs-no-minor`) only when the COS image of the next minor version ships casfs 0.1.24 or later.
 
 ### Wait for cluster operations
 
@@ -244,7 +271,7 @@ In a Shared VPC the controller does not create that rule: the host-project owner
 
 ### Egress for the CI nodes
 
-The casfs loader installs the kernel headers for `uname -r`, `build-essential` and `gettext-base` from the node's apt sources on every new CI node. It runs in the node's network namespace, so it uses the node's DNS resolver and routes. The CI nodes need egress to the Ubuntu archive or to an internal mirror of it. A private cluster needs Cloud NAT for the region, or that mirror.
+Only with `ci.casfs.provider: daemonset`. COS CI nodes need no egress beyond Artifact Registry. The casfs loader installs the kernel headers for `uname -r`, `build-essential` and `gettext-base` from the node's apt sources on every new CI node. It runs in the node's network namespace, so it uses the node's DNS resolver and routes. The CI nodes need egress to the Ubuntu archive or to an internal mirror of it. A private cluster needs Cloud NAT for the region, or that mirror.
 
 ```sh
 gcloud compute routers create abfs-nat-router --project example-project \
@@ -295,11 +322,10 @@ gcloud container node-pools create abfs-ci-iops \
   --project example-project --cluster abfs --region europe-west4 \
   --node-locations europe-west4-a,europe-west4-b,europe-west4-c \
   --machine-type n4-standard-32 \
-  --image-type UBUNTU_CONTAINERD \
+  --image-type COS_CONTAINERD \
   --disk-type hyperdisk-balanced --disk-size 1000 \
   --boot-disk-provisioned-iops 40000 \
   --boot-disk-provisioned-throughput 1000 \
-  --no-shielded-secure-boot \
   --service-account abfs-nodes@example-project.iam.gserviceaccount.com \
   --workload-metadata GKE_METADATA \
   --add-maintenance-exclusion-until-end-of-support \
@@ -308,7 +334,7 @@ gcloud container node-pools create abfs-ci-iops \
   --node-taints cloud.google.com/compute-class=abfs-ci:NoSchedule
 ```
 
-`--min-nodes` and `--max-nodes` count per zone. The provisioned IOPS and throughput are examples; the machine type's Hyperdisk limits cap them. Then list the pool in the chart values, and the class tries it before the auto-created shapes:
+`--min-nodes` and `--max-nodes` count per zone. With `ci.casfs.provider: daemonset`, use `--image-type UBUNTU_CONTAINERD` and add `--no-shielded-secure-boot`. The provisioned IOPS and throughput are examples; the machine type's Hyperdisk limits cap them. Then list the pool in the chart values, and the class tries it before the auto-created shapes:
 
 ```yaml
 computeClasses:
@@ -329,6 +355,7 @@ gcloud compute disks describe <node name> --project example-project --zone <zone
 
 These are part of the [runbook](runbook.md#install) and listed here so nothing is missed:
 
+- a GKE version whose COS image ships casfs 0.1.24 or later, and the `no_minor_upgrades` exclusion ([GKE version for the CI nodes](#gke-version-for-the-ci-nodes)), unless `ci.casfs.provider` is `daemonset`;
 - no namespace `abfs-ci` from elsewhere: the chart creates it with Pod Security level `privileged` (the KCC base creates only `abfs`), unless `namespaces.createCi` is false;
 - the Secret `gerrit-credentials` in `abfs` with the key `.netrc` (and `.gitcookies` when `pusher.gerrit.cookies` is true);
 - the images pushed, with their digests from `images.txt`;

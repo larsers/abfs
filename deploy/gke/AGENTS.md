@@ -17,7 +17,7 @@ The open-source ABFS (Android Build File System) on GKE Standard, for CI builds 
 
 - `abfs-server`: the content-addressable store over gRPC. Refs in Spanner, objects in Bigtable, large blobs in Cloud Storage. Behind an internal regional Gateway. The only workload with Google credentials (Workload Identity).
 - git-pushers (StatefulSet, one PVC each): fetch from Gerrit and push into the store.
-- CI nodes (Ubuntu): a DaemonSet builds and loads the casfs kernel module; one cacheman per node serves every build pod from a cache on the boot disk. Build pods mount a workspace that loads file content on read.
+- CI nodes (COS): a DaemonSet loads and checks the casfs kernel module of the node image; one cacheman per node serves every build pod from a cache on the boot disk. Build pods mount a workspace that loads file content on read.
 - A bootstrap Job writes the pusher pool config and the central client config into the store.
 
 Google Cloud resources come from Config Connector (KCC, `kcc/`), workloads from a Helm chart (`chart/abfs`). The diagram and the parts are in `README.md`; how a build uses the store is in `docs/usage.md`.
@@ -90,7 +90,8 @@ Install and apply steps are in `docs/runbook.md` in order; follow it rather than
 - **`abfs server gcp init` runs with admin credentials from a workstation**, through the `abfs` binary of the `abfs-server` image, never as the server's service account (it holds only runtime roles). It creates what is missing and changes nothing else; it is also the conformance check of a backend.
 - **Images are referenced by digest.** The chart refuses an empty digest unless `image.allowTag=true` (development only). Take the digests from `load-images.sh` or `images.txt`.
 - **cacheman is never restarted under running builds.** Its DaemonSet uses `OnDelete`; a stopped cacheman stops every mount on its node. Upgrades recycle CI nodes (`docs/runbook.md`, "Upgrades").
-- **Client tools and the casfs module come from the same release.** They speak one interface version. The CI nodes take both from this bundle's images; do not mix in packages from other ABFS releases or from a node image.
+- **The client tools and the casfs module must speak one interface version.** The client tools come from this bundle's images. With the default `ci.casfs.provider: image` the module comes from the COS node image, which needs a GKE version whose COS image ships casfs 0.1.24 or later (`docs/prerequisites.md`); the loader refuses any other module, and a loaded module cannot be removed, so such a node must be replaced. With `daemonset` (Ubuntu nodes) the loader builds the module from this bundle's source. Do not install client packages from other ABFS releases.
+- **Hold minor upgrades of the cluster** with a `no_minor_upgrades` maintenance exclusion until the COS image of the next GKE minor version ships casfs 0.1.24 or later. New CI pools come up at the control plane version (`docs/runbook.md`, "Canary after every control plane upgrade").
 - **The pusher count is fixed** for a pool: each pusher owns a hash share of the projects and keeps their clones on its PVC (`docs/runbook.md`, "The pusher count is fixed").
 - **No authentication, no TLS.** The internal Gateway address and the NetworkPolicy are the only boundary. Do not expose the address beyond the CI nodes and admin hosts (`docs/runbook.md`, "Security").
 - **Config Connector is installed by hand** from its operator bundle at a pinned version, not as the GKE add-on (`docs/prerequisites.md`).

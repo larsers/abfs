@@ -202,7 +202,7 @@ The Airflow workers must reach the cluster's control plane endpoint.
 | Setting | Value | Why |
 | --- | --- | --- |
 | `namespace` | `abfs-ci` | Pod Security level `privileged` |
-| `startup_timeout_seconds` | 1800 or more | the pod waits for a new node, the casfs build and cacheman; the init containers alone may wait 15 minutes each |
+| `startup_timeout_seconds` | 1800 or more | the pod waits for a new node, the casfs loader and cacheman; the init containers alone may wait 15 minutes each |
 | `retries` | 1 or more | a pod whose node never loads casfs fails after 15 minutes and must run again on another node |
 | `deferrable` | `True` | a build takes up to hours; a deferred task does not hold a worker slot while it waits |
 | `get_logs` | `True` | the build log in the task log |
