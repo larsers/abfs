@@ -13,9 +13,10 @@
 # limitations under the License.
 
 {{- if .Values.ci.enabled }}
-# Loads casfs on every abfs-ci node. Privileged with the host root at /host and the host
-# network: it installs build tools from the host's apt sources, builds the module against
-# the running kernel and loads it. It needs no RBAC on nodes.
+# Loads casfs on every abfs-ci node. Privileged with the host root at /host. With provider
+# image it loads the module of the node image. With provider daemonset it also uses the
+# host network: it installs build tools from the host's apt sources and builds the module
+# against the running kernel first. It needs no RBAC on nodes.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -39,12 +40,14 @@ spec:
         checksum/script: {{ include (print $.Template.BasePath "/casfs-loader-configmap.yaml") . | sha256sum }}
     spec:
       automountServiceAccountToken: false
+      {{- if eq .Values.ci.casfs.provider "daemonset" }}
       # Host network: apt-get runs in a chroot of the host and resolves names with the
       # host's /etc/resolv.conf, which on Ubuntu points at the systemd-resolved stub on
       # 127.0.0.53. That address answers only in the host network namespace. The loader
       # listens on no port. cacheman and the build pods stay in the pod network.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- include "abfs.ci.scheduling" . | nindent 6 }}
       containers:
         - name: casfs-loader

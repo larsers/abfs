@@ -56,14 +56,17 @@ data:
 
     check() {
       local p=/sys/module/casfs/parameters have_impl have_req have_max have_ver
+      have_ver="$(cat /sys/module/casfs/version 2>/dev/null || echo unknown)"
+      # casfs 0.1.14 and earlier have no interface parameters.
+      [ -e "$p/implemented_interface_version" ] ||
+        die "module version $have_ver has no interface version, the client needs interface $WANT_IFACE"
       have_impl="$(cat "$p/implemented_interface_version")"
       have_req="$(cat "$p/required_interface_version")"
       have_max="$(cat "$p/casfs_max_mounts")"
-      have_ver="$(cat /sys/module/casfs/version 2>/dev/null || echo unknown)"
       log "loaded: version $have_ver, interface implemented $have_impl required $have_req, casfs_max_mounts $have_max, kernel $KVER"
       vge "$have_impl" "$WANT_IFACE" || die "module implements interface $have_impl, the client needs $WANT_IFACE"
       vge "$WANT_IFACE" "$have_req" || die "module requires interface $have_req, the client implements $WANT_IFACE"
-      if [ -n "$WANT_VERSION" ]; then
+      if [ "$PROVIDER" = daemonset ] && [ -n "$WANT_VERSION" ]; then
         case "$have_ver" in
           "$WANT_VERSION"*) ;;
           *) die "module version $have_ver, expected $WANT_VERSION" ;;
@@ -111,6 +114,8 @@ data:
           install -D -m 0644 "$B/casfs.ko" "/lib/modules/$KVER/extra/casfs/casfs.ko"
           depmod "$KVER"
         ' || die "build failed on kernel $KVER"
+    else
+      chroot /host modinfo casfs >/dev/null 2>&1 || die "the node image ships no casfs module (kernel $KVER)"
     fi
     chroot /host modprobe casfs casfs_max_mounts="$MAX_MOUNTS" || die "modprobe casfs failed on kernel $KVER"
     [ -d /sys/module/casfs ] || die "casfs did not load"
