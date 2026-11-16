@@ -13,12 +13,18 @@
 # limitations under the License.
 
 # Overlay on seed-values.yaml: the example build Job, with a command of more than one
-# line.
+# line. The eviction threshold of cacheman is 90 % of its 400Gi reservation, 360 GiB.
+# expect: --evict-threshold 386547056640
+# expect: ephemeral-storage: 400Gi
+# expect:           - type: DisruptionTarget
+# expect:   activeDeadlineSeconds: 43200
+# expect:               set +u
+# expect:                 lunch "$TARGET" &&
 ci:
   exampleJob:
     enabled: true
     image: europe-west4-docker.pkg.dev/example-project/ci/android-build@sha256:5555555555555555555555555555555555555555555555555555555555555555
     command: |
-      source build/envsetup.sh
-      lunch "$TARGET"
-      m
+      source build/envsetup.sh &&
+        lunch "$TARGET" &&
+        m

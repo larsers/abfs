@@ -14,11 +14,13 @@
 
 {{- if and .Values.pusher.enabled (eq .Values.pusher.phase "steady") }}
 {{- $v := .Values.pusher.vpa }}
-{{- if not (has $v.mode (list "Initial" "Recreate")) }}
-{{- fail "pusher.vpa.mode must be Initial or Recreate" }}
+{{- if not (has $v.mode (list "Initial" "Recreate" "InPlaceOrRecreate")) }}
+{{- fail "pusher.vpa.mode must be Initial, Recreate or InPlaceOrRecreate" }}
 {{- end }}
 # Steady phase only, so the history never holds the seed peak. Memory only: the CPU request
-# sets GOMAXPROCS.
+# sets GOMAXPROCS. The pusher sets no GOMEMLIMIT, so an in-place memory change needs no
+# restart. Initial applies the recommendation only to a new pod, never to a container that
+# restarts after an OOM kill.
 apiVersion: autoscaling.k8s.io/v1
 kind: VerticalPodAutoscaler
 metadata:

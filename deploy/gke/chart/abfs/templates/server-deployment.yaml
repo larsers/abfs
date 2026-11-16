@@ -18,7 +18,10 @@
 {{- $mem := include "abfs.bytes" $s.memoryLimit | int64 }}
 # Stateless GCP-backed server. Readiness follows gRPC health, which turns NOT_SERVING on a
 # backend outage and while draining; liveness is TCP only, so a backend outage does not
-# restart every replica.
+# restart every replica. The port opens only after the server has reached Spanner,
+# Bigtable and the bucket (and with gc written its first heartbeat, up to a minute), so a
+# TCP startup probe holds liveness back until then. The server never calls the Kubernetes
+# API, so the pod gets no service account token; Workload Identity needs none in the pod.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,8 +50,20 @@ spec:
         {{- include "abfs.selectorLabels" "server" | nindent 8 }}
     spec:
       serviceAccountName: {{ include "abfs.server.name" . }}
+      automountServiceAccountToken: false
       nodeSelector:
         cloud.google.com/compute-class: abfs-server
+      # One replica per node where the nodes allow it, so a node loss or a drain stops one
+      # replica. Only class nodes the pod can be placed on count.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          nodeAffinityPolicy: Honor
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              {{- include "abfs.selectorLabels" "server" | nindent 14 }}
       terminationGracePeriodSeconds: {{ $s.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
@@ -96,6 +111,8 @@ spec:
           ports:
             - name: grpc
               containerPort: {{ include "abfs.server.port" . }}
+          startupProbe:
+            {{- include "abfs.probe" (dict "cfg" $s.probes.startup "type" "tcpSocket" "port" (include "abfs.server.port" . | int)) | trim | nindent 12 }}
           readinessProbe:
             {{- include "abfs.probe" (dict "cfg" $s.probes.readiness "type" "grpc" "port" (include "abfs.server.port" . | int)) | trim | nindent 12 }}
           livenessProbe:

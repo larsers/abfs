@@ -1,12 +1,12 @@
 # ABFS on GKE / Prerequisites
 
-The cluster exists before the deployment. Config Connector runs inside it and manages Google Cloud resources only; it does not create the cluster. This page lists what must be in place before `kubectl apply -k` and `helm install`, with a gcloud command and a check for each item.
+The cluster exists before the deployment. Config Connector runs inside it and manages Google Cloud resources only; it does not create the cluster. This page lists what must be in place before `kubectl apply -k` and `helm install`. The commands and checks, in order, are in [install](install.md).
 
 The examples use the project `example-project`, the region `europe-west4`, the cluster `abfs`, the network `example-network` and the subnet `example-subnet`. Replace them with yours.
 
 ## Tools
 
-On the admin workstation: `gcloud`, `kubectl` (with kustomize), `helm` (the chart is checked with Helm 4), and `docker`, for the image build and for the backend check. The backend check runs the `abfs` binary of the `abfs-server` image with the admin's own credentials (`gcloud auth application-default login`); see the [runbook](runbook.md#conformance-check).
+On the admin workstation: `gcloud`, `kubectl` (with kustomize), `helm` (checked with Helm 4), `skopeo`, `jq`, `make`, and `docker` for image builds and the backend check. The backend check runs the `abfs` binary of the `abfs-server` image with the admin's own credentials (`gcloud auth application-default login`); see the [runbook](runbook.md#conformance-check). [Install step 1](install.md#1-tools-on-the-admin-workstation) has the checks.
 
 ## Cluster
 
@@ -14,43 +14,36 @@ GKE Standard with a regional control plane. Autopilot does not allow the privile
 
 | Item | Setting |
 | --- | --- |
-| GKE version | a version whose COS image ships casfs 0.1.24 or later, for the CI nodes: COS 133 from build 44-193, first in 1.37.2-gke.1325000 on the Rapid channel. See [GKE version for the CI nodes](#gke-version-for-the-ci-nodes). With `ci.casfs.provider: daemonset` (Ubuntu CI nodes), 1.36.4-gke.1082000 or later (the ComputeClass `maintenanceExclusion` field). HPA rightsizing, a Preview option, needs 1.36.3-gke.1630000 or later. |
+| GKE version | a version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in 1.37.2-gke.1325000 on the Rapid channel ([GKE version for the CI nodes](#gke-version-for-the-ci-nodes)). With `ci.casfs.provider: daemonset`, 1.36.4-gke.1082000 or later (the ComputeClass `maintenanceExclusion` field). HPA rightsizing (Preview) needs 1.36.3-gke.1630000 or later. |
 | Gateway API | channel `standard` |
 | Workload Identity | `workloadPool: <project>.svc.id.goog`, GKE metadata server on every node pool |
 | Managed OpenTelemetry | scope `COLLECTION_AND_INSTRUMENTATION_COMPONENTS`, GKE 1.34.1-gke.2178000 or later. The chart sets the OTLP environment itself and uses no Instrumentation resource. |
 | Managed Service for Prometheus | on |
 | Vertical Pod Autoscaling | on (the chart creates VerticalPodAutoscaler objects) |
+| Image streaming | on, set at creation (`--enable-image-streaming`) ([Image streaming](#image-streaming)) |
 | Dataplane V2 | on (the chart's NetworkPolicy is inert without it) |
 | Autoscaling profile | `optimize-utilization` |
-| Add-ons | the defaults, HTTP load balancing and horizontal pod autoscaling, on. The Gateway class `gke-l7-rilb` needs the first, the server HPA the second. |
-| Config Connector | manual operator install from the release bundle, pinned version 1.130.1 or later (the tree is checked against 1.160.0), namespaced mode. Not the GKE add-on. See [Config Connector](#config-connector). |
-| Node pool auto-creation | through the ComputeClasses; no cluster-level node auto-provisioning is needed from 1.33.3-gke.1136000 |
-| System pool | one small manual COS pool for Config Connector and the GKE system workloads. No chart pod runs there (see [Node service account](#node-service-account)). |
+| Add-ons | the defaults on: HTTP load balancing (for the Gateway class `gke-l7-rilb`), horizontal pod autoscaling (the server HPA), the Compute Engine Persistent Disk CSI driver (the pusher data disks). NodeLocal DNSCache is on by default from 1.34.1-gke.3720000 and optional. |
+| Config Connector | manual operator install, pinned version 1.130.1 or later, namespaced mode, not the GKE add-on ([Config Connector](#config-connector)) |
+| Node pool auto-creation | through the ComputeClasses, from 1.33.3-gke.1136000. Leave cluster-level node auto-provisioning off ([Cluster-level node auto-provisioning](#cluster-level-node-auto-provisioning)). |
+| System pool | one small manual COS pool (`n4-standard-4`, Hyperdisk Balanced) for Config Connector and the GKE system workloads, with its own node service account ([Node service account](#node-service-account)). No chart pod runs there. |
+| Private nodes | on (`--enable-private-nodes`); public nodes work too ([Private nodes and egress](#private-nodes-and-egress)) |
+| Control plane access | DNS-based endpoint only (`--enable-dns-access`, `--no-enable-ip-access`) ([Control plane access](#control-plane-access)) |
+| Control plane to nodes | Private Service Connect ([Control plane to node traffic](#control-plane-to-node-traffic)) |
+| Maintenance window | a recurring window in the quiet hours of your CI ([Node upgrades](#node-upgrades)) |
+| Cloud Monitoring | `--monitoring SYSTEM` ([Monitoring packages](#monitoring-packages)) |
 
-Create a cluster with these settings:
+Before the cluster is created: the Container File System API ([install step 2](install.md#2-access-and-project-apis)), the system pool's node service account ([install step 5](install.md#5-system-node-service-account)), and with private nodes the network of [Private nodes and egress](#private-nodes-and-egress). [Install step 6](install.md#6-create-the-cluster) creates the cluster and checks it.
 
-```sh
-gcloud container clusters create abfs \
-  --project example-project --region europe-west4 \
-  --release-channel rapid --cluster-version 1.37.2-gke.1325000 \
-  --network example-network --subnetwork example-subnet --enable-ip-alias \
-  --workload-pool example-project.svc.id.goog \
-  --gateway-api standard \
-  --enable-dataplane-v2 \
-  --enable-managed-prometheus \
-  --managed-otel-scope COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
-  --enable-vertical-pod-autoscaling \
-  --autoscaling-profile optimize-utilization \
-  --logging SYSTEM,WORKLOAD --monitoring SYSTEM \
-  --machine-type e2-standard-4 --num-nodes 1 \
-  --image-type COS_CONTAINERD --workload-metadata GKE_METADATA
-```
+`--num-nodes 1` in a regional cluster gives one system node per zone. N4 machines take Hyperdisk boot disks only, hence `--disk-type hyperdisk-balanced`.
 
-`--num-nodes 1` in a regional cluster gives one system node per zone.
+The days of the maintenance window are UTC days. GKE needs at least 48 hours of maintenance availability in 92 days, in windows of 4 hours or more.
 
-The command has no `--addons` flag on purpose. `--addons` enables the add-ons it names and disables all others, so `--addons ConfigConnector` alone turns off HTTP load balancing and horizontal pod autoscaling. The cluster then has no `gke-l7-*` Gateway class, the Gateway stays `Waiting for controller`, and nothing acts on the server HPA. If you need `--addons` for another add-on, list `HttpLoadBalancing,HorizontalPodAutoscaling` in it too.
+Do not pass `--addons`: it turns off every add-on it does not name. `--addons ConfigConnector` alone leaves no `gke-l7-*` Gateway class (the Gateway stays `Waiting for controller`), no server HPA and no disks for the pusher PVCs. If you need `--addons`, list `HttpLoadBalancing,HorizontalPodAutoscaling,GcePersistentDiskCsiDriver` in it too, and `NodeLocalDNS` to keep NodeLocal DNSCache.
 
-For a cluster that exists, each setting except Dataplane V2 can be turned on with `gcloud container clusters update`. Dataplane V2 is set at creation only; without it, set `networkPolicy.enabled=false` in the chart and protect the server address with firewall rules.
+Right after `clusters create` returns, `kubectl get gatewayclass gke-l7-rilb` prints `NotFound`. The class appears about 4 minutes after the create starts. The check of install step 6 waits up to 10 minutes. Only a `NotFound` after that points at the HTTP load balancing add-on ([troubleshooting](troubleshooting.md#gateway-waits-for-its-controller)).
+
+For an existing cluster, each setting except Dataplane V2 can be turned on with `gcloud container clusters update`. Dataplane V2 is set at creation only; without it, set `networkPolicy.enabled=false` in the chart and protect the server address with firewall rules. Turning on image streaming later recreates nodes ([Image streaming](#image-streaming)).
 
 ```sh
 C="abfs --project example-project --region europe-west4"
@@ -59,74 +52,69 @@ gcloud container clusters update $C --workload-pool example-project.svc.id.goog
 gcloud container clusters update $C --enable-managed-prometheus
 gcloud container clusters update $C --managed-otel-scope COLLECTION_AND_INSTRUMENTATION_COMPONENTS
 gcloud container clusters update $C --enable-vertical-pod-autoscaling
+gcloud container clusters update $C --enable-image-streaming
 gcloud container clusters update $C --autoscaling-profile optimize-utilization
-gcloud container clusters update $C --update-addons HttpLoadBalancing=ENABLED,HorizontalPodAutoscaling=ENABLED
+gcloud container clusters update $C \
+  --update-addons HttpLoadBalancing=ENABLED,HorizontalPodAutoscaling=ENABLED,GcePersistentDiskCsiDriver=ENABLED
 gcloud container node-pools update default-pool --cluster $C --workload-metadata GKE_METADATA
+gcloud container clusters update $C --maintenance-window-start 2026-01-03T00:00:00Z \
+  --maintenance-window-duration 8H --maintenance-window-recurrence 'FREQ=WEEKLY;BYDAY=SA,SU'
 ```
 
-If the cluster runs the Config Connector add-on, move it to the manual install first ([Moving from the Config Connector add-on](#moving-from-the-config-connector-add-on)).
-
-Check:
+To move to the DNS-based endpoint, turn it on, switch `kubectl` to it, and only then turn the IP-based endpoints off. The old kubeconfig entry stops working:
 
 ```sh
-gcloud container clusters describe abfs --project example-project --region europe-west4 \
-  --format 'yaml(currentMasterVersion, networkConfig.gatewayApiConfig, workloadIdentityConfig,
-    networkConfig.datapathProvider, verticalPodAutoscaling, autoscaling.autoscalingProfile,
-    addonsConfig.httpLoadBalancing, addonsConfig.horizontalPodAutoscaling,
-    monitoringConfig.managedPrometheusConfig)'
-kubectl get crd computeclasses.cloud.google.com gateways.gateway.networking.k8s.io \
-  verticalpodautoscalers.autoscaling.k8s.io
-end=$(( $(date +%s) + 600 ))
-until kubectl get gatewayclass gke-l7-rilb; do
-  [ "$(date +%s)" -ge "$end" ] && { echo "no gke-l7-rilb after 10 minutes" >&2; break; }
-  sleep 15
-done
+gcloud container clusters update $C --enable-dns-access
+gcloud container clusters get-credentials $C --dns-endpoint
+gcloud container clusters update $C --no-enable-ip-access
 ```
 
-`networkConfig.gatewayApiConfig` shows `channel: CHANNEL_STANDARD`. GKE prints nothing for `addonsConfig.httpLoadBalancing` and `addonsConfig.horizontalPodAutoscaling` when the add-ons are on; they must not show `disabled: true`.
+`gcloud container clusters update --enable-private-nodes` applies to new node pools only. To move the system pool to private nodes, the N4 machine type and its own node account, create a new pool (`gcloud container node-pools create` with `--enable-private-nodes`, `--machine-type`, `--disk-type`, `--service-account` and `--workload-metadata`), then delete the old one. If the cluster runs the Config Connector add-on, move to the manual install first ([Moving from the Config Connector add-on](#moving-from-the-config-connector-add-on)).
 
-The Gateway controller installs the `gke-l7-*` classes a few minutes after the control plane is up, so right after `clusters create` returns, `kubectl get gatewayclass gke-l7-rilb` prints `NotFound` with the add-ons on. A test cluster had the class about 4 minutes after the create started. The loop waits up to 10 minutes. Only a `NotFound` after that points at the HTTP load balancing add-on ([troubleshooting](troubleshooting.md#gateway-waits-for-its-controller)).
+### Image streaming
+
+The chart turns image streaming on for the four ComputeClasses (`computeClasses.imageStreaming`; the class field `nodePoolConfig.imageStreaming` needs 1.34.1-gke.1279000). The cluster flag covers the system pool and hand-made pools. It needs:
+
+- the Container File System API (`containerfilesystem.googleapis.com`), enabled in install step 2 and by the KCC base;
+- images in Artifact Registry;
+- `roles/serviceusage.serviceUsageConsumer` for every node service account, in the project that holds the images ([Node service account](#node-service-account));
+- with private nodes, Private Google Access on the node subnet.
+
+Set it when the cluster is created. Turning it on or off later recreates the nodes of every pool that follows the cluster setting, and a recreated CI node loses its node cache. A change of `computeClasses.imageStreaming` applies to new node pools only. Check: a node carries the label `cloud.google.com/gke-image-streaming: "true"`, and a streamed container gets the event `ImageStreaming` with `is backed by image streaming`.
 
 ### GKE version for the CI nodes
 
-With the default `ci.casfs.provider: image`, the CI nodes run COS and the loader uses the casfs module of the node image. The client tools of this release need casfs interface 1.5.0, which casfs 0.1.24 and later implement. Older COS images ship casfs 0.1.14 or no casfs; the loader refuses them, and build pods on such a node never start.
+With the default `ci.casfs.provider: image`, the CI nodes run COS and load the casfs module of the node image. The client tools need casfs 0.1.24 or later (interface 1.5.0). The loader refuses older modules, and build pods on such a node never start.
 
-Each GKE version uses one COS image. The GKE release notes list the image of each version, for example `cos-133-19999-44-193` for 1.37.2-gke.1325000. The casfs version of an image is in its package list, under the build number with dots:
+Each GKE version uses one COS image; the GKE release notes name it, for example `cos-133-19999-44-193` for 1.37.2-gke.1325000. [Install step 3](install.md#3-gke-version-for-the-ci-nodes) reads its casfs version (`ebuild_version`), which must be 0.1.24 or later. If your channel has no such version, use the Rapid channel (no GKE SLA), or `ci.casfs.provider: daemonset` with Ubuntu CI nodes, which needs [egress](#egress-for-the-ci-nodes).
+
+### Secure boot on the CI nodes
+
+With `ci.casfs.provider: image` the CI class turns secure boot on; COS loads the casfs module of its own image with it on. With `daemonset` the class turns it off, because secure boot refuses the self-built module. The class field `nodePoolAutoCreation.shieldedInstanceConfig` needs GKE 1.36.3-gke.1244000 or later. A change applies only to CI pools GKE creates afterwards. A hand-made pool sets it at creation ([IOPS fallback node pool for CI](#iops-fallback-node-pool-for-ci)). Check a node with `gcloud compute instances describe <node> --zone <zone> --format 'value(shieldedInstanceConfig.enableSecureBoot)'`.
+
+### Move to the Regular channel
+
+Move from Rapid to Regular once Regular offers the cluster's minor version at a version whose COS image ships casfs 0.1.24 or later. GKE refuses the change otherwise. List the versions and check the COS image of each as above:
 
 ```sh
-gcloud storage cat gs://cos-tools/19999.44.193/cos-package-info.json \
-  | jq -c '.installedPackages[] | select(.name == "casfs")'
+gcloud container get-server-config --location europe-west4 --project example-project \
+  --flatten channels --filter 'channels.channel=REGULAR' \
+  --format 'yaml(channels.channel, channels.validVersions)'
+gcloud container clusters update abfs --project example-project --region europe-west4 \
+  --release-channel regular
 ```
 
-`ebuild_version` must be 0.1.24 or later. COS 133 ships 0.1.24 from build 44-193. When the cluster's release channel has no such version yet, use the Rapid channel, which has no GKE SLA, or `ci.casfs.provider: daemonset` with Ubuntu CI nodes, which build casfs on each node and need [egress](#egress-for-the-ci-nodes).
+Keep the `no_minor_upgrades` exclusion. Run the [canary](runbook.md#canary-after-every-control-plane-upgrade) after the next control plane upgrade.
 
 ### Hold minor upgrades
 
-Hold minor upgrades after the cluster is created, so the control plane and new CI pools stay on a minor version whose COS image ships a matching casfs:
-
-```sh
-gcloud container clusters update abfs --project example-project --region europe-west4 \
-  --add-maintenance-exclusion-name abfs-no-minor \
-  --add-maintenance-exclusion-scope no_minor_upgrades \
-  --add-maintenance-exclusion-start "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --add-maintenance-exclusion-until-end-of-support
-```
-
-Patch upgrades still run. Remove the exclusion (`--remove-maintenance-exclusion abfs-no-minor`) only when the COS image of the next minor version ships casfs 0.1.24 or later.
+After the create, add the maintenance exclusion `abfs-no-minor` of scope `no_minor_upgrades` until the end of support ([install step 7](install.md#7-hold-minor-upgrades)). Patch upgrades still run. Remove it (`--remove-maintenance-exclusion abfs-no-minor`) only when the COS image of the next minor version ships casfs 0.1.24 or later.
 
 ### Wait for cluster operations
 
-A cluster operation that runs, such as a `clusters update`, blocks node pool creation. Node pool auto-creation for the ComputeClasses then fails with `Cluster is running incompatible operation`, and the pods stay Pending. Enabling Managed OpenTelemetry on an existing cluster takes about 10 minutes, and an add-on change about as long. Finish every `clusters update` before the KCC apply and the Helm install, and check that none runs:
+A running cluster operation, such as a `clusters update`, blocks node pool creation: auto-creation fails with `Cluster is running incompatible operation`, and pods stay Pending. Enabling Managed OpenTelemetry or changing an add-on takes about 10 minutes. Finish every `clusters update` before the KCC apply and the Helm install, and check that none runs ([install step 8](install.md#8-wait-for-cluster-operations)). Run later updates while no ABFS node needs to be created, for example outside CI hours.
 
-```sh
-gcloud container operations list --project example-project --location europe-west4 \
-  --filter '(targetLink~/clusters/abfs$ OR targetLink~/clusters/abfs/) AND status!=DONE'
-gcloud container operations wait <operation> --project example-project --location europe-west4
-```
-
-The list must be empty. The same holds for later updates: run them while no ABFS node needs to be created, for example outside CI hours.
-
-A blocked creation also costs money afterwards. The autoscaler moves on to other shapes of the class after each failed attempt, and the classes set only a floor, or no size at all. When the operation ends, the shapes that have not failed yet are created, which can be a 64-vCPU highmem node for pods that need a fraction of it. A test cluster got an n4-highmem-64 node for two server pods sized for two n4-standard-8 nodes, at about five times the cost per hour. The ComputeClass has no upper size bound per family; only a `machineType` rule fixes the shape. If oversized nodes came up, cordon them and restart the workload, so the autoscaler creates right-sized nodes and removes the empty ones:
+After a blocked creation, the autoscaler can create much larger nodes than the pods need. Cordon them and restart the workload:
 
 ```sh
 kubectl get nodes -l cloud.google.com/compute-class -L node.kubernetes.io/instance-type
@@ -134,91 +122,75 @@ kubectl cordon <node>
 kubectl -n abfs rollout restart deployment/abfs-server
 ```
 
+### Cluster-level node auto-provisioning
+
+ABFS does not need it. Leave it off; the console offers it at cluster creation under the advanced settings. If it is on, its CPU and memory limits count the ABFS nodes too, and pods stay Pending at the limit. Its defaults also apply to the auto-created pools wherever a ComputeClass sets no value. Raise the maximums above the peak of all nodes together: the system pool, `pusher.count` seed nodes of at least 32 vCPU and 240 GB, a node per server replica up to `server.replicas.max`, and the CI nodes of your largest build load.
+
+The cluster check of [install step 6](install.md#6-create-the-cluster) prints `autoscaling`. `enableNodeAutoprovisioning` missing or `false` means off. `resourceLimits` lists the `minimum` and `maximum` of `cpu` (vCPUs) and `memory` (GB). Turn it off, or raise the maximums:
+
+```sh
+gcloud container clusters update abfs --project example-project --region europe-west4 \
+  --no-enable-autoprovisioning
+gcloud container clusters update abfs --project example-project --region europe-west4 \
+  --set-nap-resource-limits resourceType=cpu,maximum=<vCPUs> \
+  --set-nap-resource-limits resourceType=memory,maximum=<GB>
+```
+
+### Node upgrades
+
+CI nodes hold version upgrades through the class maintenance exclusion (`maintenanceExclusion: UNTIL_END_OF_SUPPORT` on `abfs-ci`). Node auto-repair and some node changes still replace CI nodes in the middle of a build. The CI system must retry a build whose pod was evicted or whose node went away.
+
+### Control plane access
+
+The cluster has the DNS-based endpoint only. IAM decides who connects: the caller needs `container.clusters.connect`. `roles/container.clusterViewer` includes it and grants nothing inside the cluster; `roles/container.viewer`, `roles/container.developer` and `roles/container.admin` include it with rights on Kubernetes objects. GKE allows a request that either IAM or Kubernetes RBAC allows. The install creates cluster-scoped objects, so the admin needs `roles/container.admin` or an equivalent RBAC binding; `roles/container.developer` does not create cluster roles.
+
+`get-credentials` uses the DNS-based endpoint when the IP-based endpoints are off; `--dns-endpoint` makes it explicit. Check: in `controlPlaneEndpointsConfig`, `dnsEndpointConfig` shows `allowExternalTraffic: true` and an `endpoint` under `gke.goog`, and `ipEndpointsConfig` shows `enabled: false`.
+
+An admin host inside the VPC without an external address reaches the endpoint through Private Google Access on its subnet (the node subnet has it), Cloud NAT, or the Private Service Connect endpoint with a `gke.goog` zone. The nodes do not use this endpoint.
+
+If a tool needs the IP-based endpoints, leave out `--no-enable-ip-access` and restrict them with `--enable-master-authorized-networks --master-authorized-networks <CIDR>,...`, and `--enable-private-endpoint` to turn the external endpoint off. `get-credentials` then picks the IP-based endpoint, and `--internal-ip` its internal address.
+
+### CI access to the control plane
+
+A CI system outside the cluster connects to the DNS-based endpoint with the Google credentials of a service account. Kubernetes ServiceAccount tokens and client certificates do not work. Give the account `roles/container.clusterViewer` on the project and a Role and RoleBinding in `abfs-ci`, as for [Airflow](ci-job.md#airflow-as-the-ci-system). The RBAC subject is `kind: User` with the account's email.
+
+- **Runner in Google Cloud**: attach the account to the VM with the `userinfo-email` scope (without it GKE sees the numeric ID, not the email), or use Workload Identity Federation for GKE.
+- **Runner outside Google Cloud**: impersonate the account with Workload Identity Federation. Do not use service account keys.
+
+The runner needs `gcloud` and `gke-gcloud-auth-plugin`, and runs `gcloud container clusters get-credentials abfs --project example-project --region europe-west4 --dns-endpoint`. The endpoint has a certificate from a public Google CA, so the kubeconfig carries no cluster CA. The runner reaches the endpoint the way it reaches Google APIs. Details: [Authenticate to the Kubernetes API server](https://cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication) and [Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation). [Check CI access to the control plane](install.md#check-ci-access-to-the-control-plane) tests the grants.
+
+### Control plane to node traffic
+
+Clusters created on GKE 1.29 or later use Private Service Connect between the control plane and the nodes. Nothing needs to be set. In the cluster check of [install step 6](install.md#6-create-the-cluster), `privateClusterConfig` must show no `peeringName`; one means the cluster uses VPC Network Peering. `privateEndpoint` is empty with `--no-enable-ip-access`. `publicEndpoint` can hold an address that accepts no connections.
+
+### Monitoring packages
+
+`--monitoring SYSTEM` is enough for the chart's alerts and costs nothing. The packages `POD`, `DEPLOYMENT`, `STATEFULSET`, `DAEMONSET`, `HPA`, `JOBSET`, `CADVISOR` and `KUBELET` are optional and are charged as Managed Service for Prometheus samples. `--monitoring` replaces the earlier list, so name every package:
+
+```sh
+gcloud container clusters update abfs --project example-project --region europe-west4 \
+  --monitoring SYSTEM,POD,DEPLOYMENT,STATEFULSET,DAEMONSET,HPA
+```
+
 ## Config Connector
 
-Install Config Connector with its operator from the release bundle, at a pinned version, in namespaced mode. Do not use the GKE add-on (`--addons ConfigConnector`): its version follows the GKE version and lags the open-source releases by 12 months or more. The add-on of GKE 1.36.4-gke.2046003 runs 1.126.0, whose SpannerInstance has no `spec.labels`, so the `backend-new` apply fails with `strict decoding error: unknown field "spec.labels"`.
-
-The tree needs Config Connector 1.130.1 or later; its kinds and fields are checked against 1.160.0. Use the newest published release. 1.160.0 is the newest at the time of writing; check `gs://configconnector-operator/` for newer version folders (a git tag of the project can exist before its bundle is published).
+Install Config Connector with its operator from the release bundle, at a pinned version, 1.130.1 or later (the tree is checked against 1.160.0), in namespaced mode. Use the newest version folder in `gs://configconnector-operator/`; a git tag can exist before its bundle is published. Do not use the GKE add-on (`--addons ConfigConnector`): its version lags, and the add-on of GKE 1.36.4-gke.2046003 (1.126.0) has no SpannerInstance `spec.labels`, so the `backend-new` apply fails with `strict decoding error: unknown field "spec.labels"`.
 
 ### Install the operator
 
-Download the bundle and keep it: the uninstall needs the same files.
-
-```sh
-V=1.160.0
-gcloud storage cp gs://configconnector-operator/$V/release-bundle.tar.gz release-bundle-$V.tar.gz
-mkdir kcc-$V && tar -C kcc-$V -zxf release-bundle-$V.tar.gz
-kubectl apply -f kcc-$V/operator-system/configconnector-operator.yaml
-```
-
-That file is for GKE Standard. Then set the operator to namespaced mode:
-
-```sh
-kubectl apply -f - <<EOF
-apiVersion: core.cnrm.cloud.google.com/v1beta1
-kind: ConfigConnector
-metadata:
-  name: configconnector.core.cnrm.cloud.google.com
-spec:
-  mode: namespaced
-  stateIntoSpec: Absent
-EOF
-```
-
-The operator then installs the resource CRDs and the Config Connector webhook. Wait for both before the first KCC apply, then check the version:
-
-```sh
-until kubectl get crd spannerinstances.spanner.cnrm.cloud.google.com >/dev/null 2>&1; do sleep 10; done
-until kubectl -n cnrm-system get deployment cnrm-webhook-manager >/dev/null 2>&1; do sleep 10; done
-kubectl -n cnrm-system wait --for=condition=Available deployment/cnrm-webhook-manager --timeout=10m
-until kubectl get mutatingwebhookconfiguration mutating-webhook.cnrm.cloud.google.com >/dev/null 2>&1; do sleep 10; done
-kubectl get ns cnrm-system -o jsonpath='{.metadata.annotations.cnrm\.cloud\.google\.com/version}{"\n"}'
-```
-
-The webhook sets the project of each object when it is created. An object created before the webhook exists never gets it, and a later update does not add it; see [troubleshooting](troubleshooting.md#kcc-objects-created-before-the-webhook).
+[Install step 9](install.md#9-install-config-connector) has the commands. Keep the downloaded bundle: the uninstall needs the same files. Use `operator-system/configconnector-operator.yaml`, the file for GKE Standard. The `ConfigConnector` object sets namespaced mode with `stateIntoSpec: Absent`. Wait for the resource CRDs and the webhook before the first KCC apply; an object created before the webhook never gets its project ([troubleshooting](troubleshooting.md#kcc-objects-created-before-the-webhook)).
 
 ### Service account of the namespace
 
-The KCC tree applies its objects to the namespace `abfs`. Config Connector reconciles them as one Google service account, named in `settings.yaml` as `kccServiceAccount`. Create that account, give it the roles to create the deployment's resources and to write Config Connector's own metrics, and bind it to the namespace's controller:
+Config Connector reconciles the namespace `abfs` as the Google service account `kccServiceAccount` of `settings.yaml`. [Install step 9](install.md#9-install-config-connector) creates it (`kcc-abfs`) with `roles/serviceusage.serviceUsageAdmin`, `roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/compute.networkAdmin`, `roles/spanner.admin`, `roles/bigtable.admin`, `roles/storage.admin` and `roles/monitoring.metricWriter` (for Config Connector's own metrics), and binds it to `cnrm-system/cnrm-controller-manager-abfs` with `roles/iam.workloadIdentityUser`.
 
-```sh
-P=example-project
-gcloud iam service-accounts create kcc-abfs --project $P --display-name "Config Connector for abfs"
-for r in roles/serviceusage.serviceUsageAdmin roles/iam.serviceAccountAdmin \
-    roles/resourcemanager.projectIamAdmin roles/compute.networkAdmin \
-    roles/spanner.admin roles/bigtable.admin roles/storage.admin \
-    roles/monitoring.metricWriter; do
-  gcloud projects add-iam-policy-binding $P \
-    --member serviceAccount:kcc-abfs@$P.iam.gserviceaccount.com --role $r
-done
-gcloud iam service-accounts add-iam-policy-binding kcc-abfs@$P.iam.gserviceaccount.com \
-  --project $P --role roles/iam.workloadIdentityUser \
-  --member "serviceAccount:$P.svc.id.goog[cnrm-system/cnrm-controller-manager-abfs]"
-```
+With `backend-existing`, `roles/spanner.admin`, `roles/bigtable.admin` and `roles/storage.admin` can be replaced by roles that allow `setIamPolicy` on the three resources. In a Shared VPC the account also needs `roles/compute.networkUser` on the cluster's subnet, and with `network/proxy-subnet` `roles/compute.networkAdmin` on the network project. Install step 9 grants both.
 
-`roles/monitoring.metricWriter` on the cluster's project lets Config Connector publish its Prometheus metrics. With `backend-existing`, the account only grants roles on the backend; `roles/spanner.admin`, `roles/bigtable.admin` and `roles/storage.admin` can then be replaced by roles that allow `setIamPolicy` on the three resources. When the network is in another project, grant `roles/compute.networkAdmin` there (only needed for the proxy-subnet component).
-
-The APIs `serviceusage.googleapis.com` and `cloudresourcemanager.googleapis.com` must be enabled by hand; the KCC base enables the others:
-
-```sh
-gcloud services enable serviceusage.googleapis.com cloudresourcemanager.googleapis.com --project $P
-```
-
-The `ConfigConnectorContext` of the namespace is part of the KCC base. After the first apply, check that the operator created the namespace's Kubernetes service account and that its controller runs:
-
-```sh
-kubectl get serviceaccount/cnrm-controller-manager-abfs -n cnrm-system
-kubectl wait -n cnrm-system --for=condition=Ready pod --timeout=10m \
-  -l cnrm.cloud.google.com/component=cnrm-controller-manager,cnrm.cloud.google.com/scoped-namespace=abfs
-```
-
-Upgrade and rollback are in the [runbook](runbook.md#config-connector-upgrade-and-rollback).
+Enable `serviceusage.googleapis.com` and `cloudresourcemanager.googleapis.com` by hand ([install step 2](install.md#2-access-and-project-apis)); the KCC base enables the others. The `ConfigConnectorContext` is part of the KCC base; [install step 10](install.md#10-apply-the-kcc-overlay) checks its service account and controller. Upgrade and rollback are in the [runbook](runbook.md#config-connector-upgrade-and-rollback).
 
 ### Moving from the Config Connector add-on
 
-On a cluster that runs the add-on, switch to the manual install without losing the KCC objects:
-
-1. Disable the add-on, but do not delete the `ConfigConnector` or `ConfigConnectorContext` objects. The update fails with `CLUSTER_ALREADY_HAS_OPERATION` while another cluster or node pool operation runs; it took about 8 minutes on a regional cluster.
+1. Disable the add-on. Do not delete the `ConfigConnector` or `ConfigConnectorContext` objects. The update fails with `CLUSTER_ALREADY_HAS_OPERATION` while another operation runs.
 
    ```sh
    kubectl get ns cnrm-system -o jsonpath='{.metadata.annotations.cnrm\.cloud\.google\.com/version}{"\n"}'
@@ -226,15 +198,15 @@ On a cluster that runs the add-on, switch to the manual install without losing t
      --update-addons ConfigConnector=DISABLED
    ```
 
-2. Install the operator as in [Install the operator](#install-the-operator), at the version the add-on ran or a later one. An older operator can fail CRD validation, because the add-on may have upgraded CRDs already. Apply the `ConfigConnector` object of that section too, as on a new install.
+2. Install the operator as in [install step 9](install.md#9-install-config-connector), at the version the add-on ran or later; an older operator can fail CRD validation. Apply the `ConfigConnector` object of that step too.
 
-3. Check the controller as above, and that every object is still Ready:
+3. Check the controller as in [install step 10](install.md#10-apply-the-kcc-overlay), and that every object is still Ready:
 
    ```sh
    kubectl -n abfs wait --for=condition=Ready --all gcp --timeout=30m
    ```
 
-Disabling the add-on deletes the `namespace-id` ConfigMap in `configconnector-operator-system`, so the operator recreates the `cnrm-controller-manager` StatefulSets. The `ConfigConnectorContext`, its Kubernetes service account and the Workload Identity binding stay. As a precaution, set `cnrm.cloud.google.com/deletion-policy: abandon` on KCC objects that lack it before the move, and remove it afterwards; the tree sets it on every data resource, the APIs and the Gateway address, not on the service accounts and IAM members:
+Disabling the add-on deletes the `namespace-id` ConfigMap in `configconnector-operator-system`, and the operator recreates the `cnrm-controller-manager` StatefulSets. The `ConfigConnectorContext`, its Kubernetes service account and the Workload Identity binding stay. Before the move, set `cnrm.cloud.google.com/deletion-policy: abandon` on KCC objects that lack it, and remove it afterwards. The tree sets it on every data resource, the APIs and the Gateway address, not on the service accounts and IAM members:
 
 ```sh
 kubectl -n abfs get gcp -o custom-columns='KIND:.kind,NAME:.metadata.name,POLICY:.metadata.annotations.cnrm\.cloud\.google\.com/deletion-policy'
@@ -245,85 +217,81 @@ kubectl -n abfs annotate <kind>/<name> cnrm.cloud.google.com/deletion-policy-
 
 ## Network
 
-A plain VPC is enough; a Shared VPC is not required. The VPC needs a subnet for the cluster in the region and a proxy-only subnet for the internal Application Load Balancer of the Gateway.
+A plain VPC is enough; a Shared VPC is not required. It needs a subnet for the cluster in the region and a proxy-only subnet. With private nodes it also needs a Private Service Connect endpoint for Google APIs with its DNS zones, Private Google Access on the node subnet and Cloud NAT in the region.
+
+### Private nodes and egress
+
+- Google APIs (Artifact Registry, image streaming, Spanner, Bigtable, Cloud Storage, Cloud Monitoring, Cloud Logging, the Workload Identity token services) go to the [Private Service Connect endpoint](#private-service-connect-endpoint-for-google-apis) through Cloud DNS private zones.
+- Cloud NAT carries the rest: `gerrit.googlesource.com` for the patched `repo` tool ([install](install.md#check-the-patched-repo-tool)), a Gerrit outside the VPC, and with `ci.casfs.provider: daemonset` the Ubuntu archive. A Gerrit inside the VPC, or reached through Cloud VPN or Cloud Interconnect, needs no NAT.
+
+Keep Private Google Access on for the node subnet; VMs without external addresses use the endpoint only from such a subnet. Set up the subnet flag and Cloud NAT before the cluster is created: [install step 4.1](install.md#41-private-google-access-and-cloud-nat) creates the router `abfs-nat-router` and the gateway `abfs-nat` with `--auto-allocate-nat-external-ips` and `--nat-all-subnet-ip-ranges`.
+
+`--nat-all-subnet-ip-ranges` gives every subnet of the network in the region internet egress, and only one gateway can serve a subnet range. Where the region has other subnets or a gateway ([install step 4.0](install.md#40-check-what-the-network-has)), reuse a gateway that serves the cluster's subnet, or use `--nat-custom-subnet-ip-ranges <subnet>:ALL`. Check after step 6: every node shows `<none>` under `EXTERNAL-IP`; the ComputeClass pools follow the cluster setting.
+
+Public nodes work too: leave out `--enable-private-nodes`. They need no Cloud NAT and use the endpoint without Private Google Access. The chart, the KCC tree and the internal Gateway address do not change. Keep the VPC firewall closed to inbound traffic from outside.
+
+### Private Service Connect endpoint for Google APIs
+
+The endpoint is a global internal address with a forwarding rule to the bundle `all-apis`. It serves `*.googleapis.com`, `pkg.dev`, `gcr.io` and `gke.goog`, not `*.rep.googleapis.com`.
+
+- APIs: Compute Engine, Service Directory and Cloud DNS. Admin roles: `roles/compute.networkAdmin`, `roles/dns.admin`, `roles/servicedirectory.editor`.
+- Address: a single IPv4 address outside every primary and secondary range of the VPC and of peered networks (example `10.100.0.5`).
+- Name: 1 to 20 lower-case letters and digits, starting with a letter.
+- `--service-directory-registration` sets the Service Directory region; the default is `us-central1`. All endpoints for Google APIs of one network share one region.
+- Zones: a Cloud DNS private zone, visible to the VPC, for `googleapis.com` (APIs and image streaming), `pkg.dev` (Artifact Registry) and `gcr.io` (`gcr.io` and `*.gcr.io`), each with an `A` record for the zone name to the endpoint and a `CNAME` for `*.<zone>` to the zone name. Add `gke.goog` for admin hosts in the VPC that use the [DNS-based endpoint](#control-plane-access); nodes do not need it.
+
+[Install step 4.2](install.md#42-private-service-connect-endpoint-for-google-apis) creates the address `abfs-apis-psc`, the endpoint `abfsapis` and the zones `psc-googleapis-com`, `psc-pkg-dev` and `psc-gcr-io`. The zones apply to every VM and cluster of the network. A client there that uses `*.rep.googleapis.com` then reaches the endpoint, which does not serve those names. The network can have such zones already, for example to `private.googleapis.com` or `restricted.googleapis.com` ([install step 4.0](install.md#40-check-what-the-network-has) says when to reuse them). Agree the zones with the network owner. If the VPC has a private zone for `p.googleapis.com` and no endpoint, delete that zone first, or the endpoint creation fails. In a Shared VPC, create the address, endpoint and zones in the host project; install step 4 runs there with `$NET_P`.
+
+Check ([install step 4](install.md#check-the-network)): the forwarding rule shows `IPAddress: 10.100.0.5` and `target: all-apis`. In [install step 14](install.md#14-install-the-chart), a pod of the `abfs-client` image runs `getent hosts`, and every API name resolves to `10.100.0.5`; a public address means the zone is missing or not visible to the network. From a VM in the VPC, `curl -v 10.100.0.5/generate_204` answers HTTP `204`. The endpoint does not answer ping.
 
 ### Proxy-only subnet
 
-One per network and region, purpose `REGIONAL_MANAGED_PROXY`, role `ACTIVE`, a `/23` recommended. Check whether the network has one:
+One per network and region, purpose `REGIONAL_MANAGED_PROXY`, role `ACTIVE`, a `/23` recommended. [Install step 4.3](install.md#43-proxy-only-subnet) checks for one.
 
-```sh
-gcloud compute networks subnets list --project example-project --network example-network \
-  --filter 'purpose=REGIONAL_MANAGED_PROXY AND region:europe-west4'
-```
-
-If it has none, add the component `network/proxy-subnet` to the overlay and set `proxySubnetRange` in `settings.yaml`. If it has one, leave the component out and use its range. Either way, set the chart value `networkPolicy.proxyOnlySubnetCidr` to that range.
+If there is none, add the component `network/proxy-subnet` to the overlay and set `proxySubnetRange` in `settings.yaml`. If there is one, leave the component out and use its range. Either way, set `networkPolicy.proxyOnlySubnetCidr` to that range.
 
 ### Firewall
 
-In a plain VPC the Gateway controller creates its own firewall rule `gkegw1-<id>-l7-<network>-<region>` when the first Gateway is created. `<id>` is a short id of the cluster, which the controller also puts into the names of its backend services (`gkegw1-<id>-abfs-...`). The rule allows the health check ranges `35.191.0.0/16` and `130.211.0.0/22` and the proxy-only subnet, TCP 0-65535, to all instances. Check it after the install:
-
-```sh
-gcloud compute firewall-rules list --project example-project \
-  --filter 'name~^gkegw1-.*-l7-example-network-europe-west4$'
-```
-
-In a Shared VPC the controller does not create that rule: the host-project owner must create the Gateway's health-check and proxy rule by hand, as Google's GKE firewall rules page describes.
+In a plain VPC the Gateway controller creates the rule `gkegw1-<id>-l7-<network>-<region>` with the first Gateway. `<id>` is a short cluster id. The rule allows `35.191.0.0/16`, `130.211.0.0/22` and the proxy-only subnet, TCP 0-65535, to all instances. The check of [install step 14](install.md#14-install-the-chart) lists it. In a Shared VPC the controller does not create it: the host-project owner creates the health-check and proxy rule by hand, as Google's GKE firewall rules page describes.
 
 ### Egress for the CI nodes
 
-Only with `ci.casfs.provider: daemonset`. COS CI nodes need no egress beyond Artifact Registry. The casfs loader installs the kernel headers for `uname -r`, `build-essential` and `gettext-base` from the node's apt sources on every new CI node. It runs in the node's network namespace, so it uses the node's DNS resolver and routes. The CI nodes need egress to the Ubuntu archive or to an internal mirror of it. A private cluster needs Cloud NAT for the region, or that mirror.
-
-```sh
-gcloud compute routers create abfs-nat-router --project example-project \
-  --region europe-west4 --network example-network
-gcloud compute routers nats create abfs-nat --project example-project \
-  --region europe-west4 --router abfs-nat-router \
-  --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges
-```
+Only with `ci.casfs.provider: daemonset`; COS CI nodes need only the Google APIs and the store. The loader installs the kernel headers for `uname -r`, `build-essential` and `gettext-base` from the node's apt sources on every new CI node, with the node's DNS resolver and routes. The CI nodes need egress to the Ubuntu archive, through the Cloud NAT of [Private nodes and egress](#private-nodes-and-egress), or an internal mirror.
 
 ## Node service account
 
-The KCC base creates the account `abfs-nodes@<project>.iam.gserviceaccount.com` with `roles/container.defaultNodeServiceAccount` and `roles/artifactregistry.reader` on the project. The chart value `computeClasses.nodeServiceAccount` names it, and every ComputeClass uses it for the nodes it creates.
+The KCC base creates `abfs-nodes@<project>.iam.gserviceaccount.com` with `roles/container.defaultNodeServiceAccount`, `roles/artifactregistry.reader` and `roles/serviceusage.serviceUsageConsumer` (for [image streaming](#image-streaming)). `computeClasses.nodeServiceAccount` names it for every ComputeClass.
 
-The system pool of the create command runs with the Compute Engine default service account, which often has no `roles/artifactregistry.reader`, so a pod there cannot pull the ABFS images (`403 Forbidden` on the registry token, then `ImagePullBackOff`). The chart therefore places every pod on a class node: the bootstrap Job and the server health test on `abfs-server` (`bootstrap.computeClass`, `tests.computeClass`), the CI pods on `abfs-ci`. If you set either value to empty, grant the system pool's node account the reader role on the repository, or create the system pool with a node account that has it.
+The system pool runs as `abfs-system-nodes`, with `roles/container.defaultNodeServiceAccount` and `roles/serviceusage.serviceUsageConsumer` and no other role; without the second, it pulls its images in full. Neither account can pull the ABFS images: a pod on the system pool fails with `403 Forbidden` on the registry token, then `ImagePullBackOff`. The chart therefore places the bootstrap Job and the server health test on `abfs-server` (`bootstrap.computeClass`, `tests.computeClass`) and the CI pods on `abfs-ci`. If you set either value to empty, grant `abfs-system-nodes` `roles/artifactregistry.reader` on the repository.
 
-When the Artifact Registry repository is in another project, grant the reader role there:
+When the repository is in another project, grant both roles there:
 
 ```sh
 gcloud artifacts repositories add-iam-policy-binding abfs --project <registry project> \
   --location europe-west4 --role roles/artifactregistry.reader \
   --member serviceAccount:abfs-nodes@example-project.iam.gserviceaccount.com
+gcloud projects add-iam-policy-binding <registry project> \
+  --role roles/serviceusage.serviceUsageConsumer \
+  --member serviceAccount:abfs-nodes@example-project.iam.gserviceaccount.com
 ```
 
-Check after the KCC apply:
-
-```sh
-gcloud projects get-iam-policy example-project --flatten 'bindings[].members' \
-  --filter 'bindings.members:abfs-nodes@' --format 'value(bindings.role)'
-```
+The checks of [install step 5](install.md#5-system-node-service-account) and [install step 10](install.md#10-apply-the-kcc-overlay) list the roles of both accounts.
 
 ## Artifact Registry
 
-A Docker repository for the four images, in the region of the cluster:
-
-```sh
-gcloud artifacts repositories create abfs --project example-project \
-  --location europe-west4 --repository-format docker
-```
+A Docker repository for the four images, in the region of the cluster. The KCC tree does not create it; [install step 11](install.md#11-upload-the-images) creates it with `gcloud artifacts repositories create`.
 
 ## IOPS fallback node pool for CI
 
-A ComputeClass has no field for boot disk IOPS. An auto-created CI node gets the Hyperdisk Balanced defaults for its size: at 1,000 GiB about 9,000 IOPS and 1,640 MiB/s. If builds are limited by boot disk speed, create CI node pools by hand with provisioned IOPS and list them first in the class.
-
-GKE applies the class's `nodePoolConfig` only to the pools it creates, and a `nodepools` rule takes no other field, so the hand-made pool sets every class setting itself. Create it after the KCC apply, because it uses the node service account:
+A ComputeClass sets no boot disk IOPS: an auto-created CI node gets the Hyperdisk Balanced defaults for its size. If builds are limited by boot disk speed, create CI node pools by hand with provisioned IOPS and list them first in the class. GKE applies the class's `nodePoolConfig` only to pools it creates, and a `nodepools` rule takes no other field, so the pool sets every class setting itself. Create it after the KCC apply, because it uses the node service account:
 
 ```sh
 gcloud container node-pools create abfs-ci-iops \
   --project example-project --cluster abfs --region europe-west4 \
   --node-locations europe-west4-a,europe-west4-b,europe-west4-c \
   --machine-type n4-standard-32 \
-  --image-type COS_CONTAINERD \
-  --disk-type hyperdisk-balanced --disk-size 1000 \
+  --image-type COS_CONTAINERD --shielded-secure-boot \
+  --disk-type hyperdisk-balanced --disk-size 1100 \
   --boot-disk-provisioned-iops 40000 \
   --boot-disk-provisioned-throughput 1000 \
   --service-account abfs-nodes@example-project.iam.gserviceaccount.com \
@@ -334,7 +302,7 @@ gcloud container node-pools create abfs-ci-iops \
   --node-taints cloud.google.com/compute-class=abfs-ci:NoSchedule
 ```
 
-`--min-nodes` and `--max-nodes` count per zone. With `ci.casfs.provider: daemonset`, use `--image-type UBUNTU_CONTAINERD` and add `--no-shielded-secure-boot`. The provisioned IOPS and throughput are examples; the machine type's Hyperdisk limits cap them. Then list the pool in the chart values, and the class tries it before the auto-created shapes:
+`--min-nodes` and `--max-nodes` count per zone. With `ci.casfs.provider: daemonset`, use `--image-type UBUNTU_CONTAINERD` and `--no-shielded-secure-boot` in place of `--shielded-secure-boot`. The IOPS and throughput are examples; the machine type caps them. Give the pool at least `computeClasses.ci.bootDiskGb`: the render check does not see hand-made pools, and on a smaller disk the cache reservation and a build do not fit ([node disk](ci-job.md#node-disk)). The pool follows the cluster's image streaming setting. List the pool in the chart values; the class tries it before the auto-created shapes:
 
 ```yaml
 computeClasses:
@@ -353,11 +321,14 @@ gcloud compute disks describe <node name> --project example-project --zone <zone
 
 ## Before the Helm install
 
-These are part of the [runbook](runbook.md#install) and listed here so nothing is missed:
+These are steps of the [install](install.md):
 
 - a GKE version whose COS image ships casfs 0.1.24 or later, and the `no_minor_upgrades` exclusion ([GKE version for the CI nodes](#gke-version-for-the-ci-nodes)), unless `ci.casfs.provider` is `daemonset`;
 - no namespace `abfs-ci` from elsewhere: the chart creates it with Pod Security level `privileged` (the KCC base creates only `abfs`), unless `namespaces.createCi` is false;
 - the Secret `gerrit-credentials` in `abfs` with the key `.netrc` (and `.gitcookies` when `pusher.gerrit.cookies` is true);
-- the images pushed, with their digests from `images.txt`;
+- the images in Artifact Registry, with their digests in `values-images.yaml` or `images.txt`;
 - the IP of the Gateway address for `gateway.vip`;
-- no cluster operation running ([Wait for cluster operations](#wait-for-cluster-operations)).
+- no cluster operation running ([Wait for cluster operations](#wait-for-cluster-operations));
+- cluster-level node auto-provisioning off, or its limits above the peak of all nodes ([Cluster-level node auto-provisioning](#cluster-level-node-auto-provisioning));
+- with private nodes, the Private Service Connect endpoint for Google APIs and its DNS zones, Private Google Access on the node subnet, and Cloud NAT ([Private nodes and egress](#private-nodes-and-egress));
+- `kubectl` on the DNS-based endpoint, with an account that may create cluster-scoped objects ([Control plane access](#control-plane-access)).

@@ -73,8 +73,14 @@ server:
   hpa:
     enabled: true
     cpuTarget: 60
+    # Scale-down only; scale-up keeps the Kubernetes HPA default. A replica that stops
+    # takes its filled caches with it, so the HPA waits this long after the load drops
+    # and then removes at most one replica per scaleDownPeriodSeconds.
+    scaleDownStabilizationSeconds: 1800
+    scaleDownPeriodSeconds: 300
   # Entry counts, not bytes: headers about 180 B each, contents up to about 49 KB each.
-  # The render fails when both bounds plus 6 GiB exceed memoryLimit.
+  # The render fails when both bounds plus 6 GiB (7 GiB with gc.enabled) exceed
+  # memoryLimit.
   caches:
     headers: 100000000
     contents: 400000
@@ -108,6 +114,15 @@ server:
   terminationGracePeriodSeconds: 240
   minReadySeconds: 60
   probes:
+    # TCP on 50051 until the port opens; liveness and readiness start after it passes.
+    # periodSeconds x failureThreshold is the time a start may take, 5 minutes: setup of
+    # the backend clients and the resource check, and with gc the first heartbeat, which
+    # the server retries for up to a minute. Raise it when the server log shows slower
+    # starts.
+    startup:
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 30
     readiness:
       periodSeconds: 5
       timeoutSeconds: 2
@@ -162,8 +177,11 @@ pusher:
       memory: 32Gi
     limits:
       memory: 32Gi
-  # Steady phase only, memory only. Initial applies the recommendation when a pusher
-  # restarts for another reason; Recreate also evicts.
+  # Steady phase only, memory only. Initial applies the recommendation only when a pusher
+  # pod is created: a container that was OOMKilled restarts in the same pod at the old
+  # limit, so delete the pod (docs/configuration.md). Recreate also evicts on drift.
+  # InPlaceOrRecreate (Preview, GKE 1.34.0-gke.2201000 or later) resizes the memory in
+  # place and raises it after an OOM kill.
   vpa:
     mode: Initial
     minMemory: 16Gi
@@ -234,9 +252,15 @@ ci:
   hostCacheDir: /var/lib/abfs
   # Build pods fail after this, so the CI system retries them on another node.
   waitForCasfsTimeout: 15m
+  # Disk of one build pod: the ephemeral-storage request every build pod sets, for the
+  # outputs it writes into the node cache. No limit: the outputs live in the hostPath,
+  # which kubelet does not count (docs/ci-job.md, "Node disk").
+  buildDisk: 400Gi
   cacheman:
-    # 80 % of the boot disk minus the out/ budget (runbook).
-    evictThreshold: 500GB
+    # Disk reserved for the node cache, as the ephemeral-storage request of cacheman.
+    # Its eviction threshold is 90 % of it. The render fails when this plus buildDisk exceeds
+    # the allocatable ephemeral storage of computeClasses.ci.bootDiskGb.
+    cacheDisk: 400Gi
     fsyncObjects: true
     # Directory of the static tool set in the abfs-client image.
     toolDir: /opt/abfs/bin
@@ -284,9 +308,13 @@ ci:
     image: ""
     branch: main
     target: aosp_cf_x86_64_phone-trunk_staging-userdebug
+    # Runs in bash in the mounted tree after set +u, with -e and pipefail (docs/ci-job.md).
     command: "source build/envsetup.sh && lunch \"$TARGET\" && m"
+    # activeDeadlineSeconds of the Job, retries included: 12 hours.
+    deadlineSeconds: 43200
     # Fits one pod on a 32-vCPU, 128 GB node of the class floor: the node's vCPUs minus
     # the GKE reservation, cacheman, the loader and the GKE system DaemonSets (docs/ci-job.md).
+    # The chart adds the ephemeral-storage request ci.buildDisk.
     resources:
       requests:
         cpu: "28"
@@ -298,11 +326,18 @@ computeClasses:
   enabled: true
   # Node service account of every class (KCC base).
   nodeServiceAccount: ""
+  # Image streaming on the nodes of every class. Needs the Container File System API and
+  # roles/serviceusage.serviceUsageConsumer for the node account (KCC base). A change
+  # applies to new node pools only.
+  imageStreaming: true
   ci:
     families: [n4, n4d, c4d, c4]
     minCores: 32
     minMemoryGb: 120
-    bootDiskGb: 1000
+    # GiB. Holds the node cache and the build outputs; it also sets the default Hyperdisk
+    # IOPS and throughput. 1100 fits ci.cacheman.cacheDisk plus one ci.buildDisk; two
+    # builds per node need 1600 (docs/ci-job.md, "Node disk").
+    bootDiskGb: 1100
     # Spot rules before the on-demand ones. Only if the CI retries preempted builds.
     spot: false
     consolidationDelayMinutes: 30
@@ -311,6 +346,15 @@ computeClasses:
     activeMigration: false
     # gcloud-created pools with provisioned boot disk IOPS, tried first.
     nodepools: []
+    # Preview, GKE 1.36.2-gke.2064000 or later: a CapacityQuota that caps the nodes of the
+    # class, and with cpu also their vCPUs. The cluster autoscaler enforces it, and not
+    # strictly. Without it the project's Compute Engine quota is the only bound.
+    capacityQuota:
+      enabled: false
+      # Required when enabled.
+      nodes: 0
+      # Empty sets no CPU limit.
+      cpu: ""
   server:
     families: [n4, n4d, c4d, c4]
     # Empty means backend.zone.
@@ -339,11 +383,15 @@ networkPolicy:
   healthCheckCidrs:
     - 35.191.0.0/16
 
-# Managed Service for Prometheus Rules for the pusher guards. Off by default: the rules read
-# the OTLP metrics the managed collector stores, which is not checked on a cluster yet.
+# Managed Service for Prometheus rules. Off by default: the pusher pool rules read the OTLP
+# metrics the managed collector stores, which is not checked on a cluster yet. The node
+# disk and pusher restart rules read GKE system metrics through a GlobalRules object.
 alerts:
   enabled: false
   for: 30m
+  # Name of this GKE cluster, required with enabled. The GlobalRules object filters on
+  # it; without the filter it would match every cluster in the project's metrics scope.
+  clusterName: ""
 
 tests:
   enabled: true

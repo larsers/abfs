@@ -40,6 +40,8 @@ spec:
         checksum/script: {{ include (print $.Template.BasePath "/casfs-loader-configmap.yaml") . | sha256sum }}
     spec:
       automountServiceAccountToken: false
+      # Preempts build pods on its node, which cannot run a build without it.
+      priorityClassName: {{ include "abfs.ciPriorityClass" . }}
       {{- if eq .Values.ci.casfs.provider "daemonset" }}
       # Host network: apt-get runs in a chroot of the host and resolves names with the
       # host's /etc/resolv.conf, which on Ubuntu points at the systemd-resolved stub on

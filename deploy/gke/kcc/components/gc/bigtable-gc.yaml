@@ -16,6 +16,8 @@
 # creates them: the table gc and the family g of the table objects, each
 # family keeping one version. The Spanner tables of the garbage collector are
 # not here; `init --gc` adds them (docs/runbook.md, Garbage collection).
+# Also the app profile abfs-gc of the collector, which `init` does not create:
+# the `gc` commands take it with --bt-app-profile abfs-gc.
 ---
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableTable
@@ -82,3 +84,25 @@ spec:
   maxVersion:
     - number: 1
   deletionPolicy: ABANDON
+---
+# The collector's scans and writes are batch work: single-cluster routing with
+# single-row transactions, which `gc run --delete` checks, at low priority. The
+# servers keep their own profile. Abandon, as every other object here: deleting
+# the object leaves the profile, which a running `gc` command may still use.
+apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
+kind: BigtableAppProfile
+metadata:
+  name: abfs-gc
+  namespace: abfs
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  resourceID: abfs-gc
+  description: ABFS GC collector
+  instanceRef:
+    name: abfs-objects
+  singleClusterRouting:
+    clusterId: BIGTABLE_CLUSTER
+    allowTransactionalWrites: true
+  standardIsolation:
+    priority: PRIORITY_LOW

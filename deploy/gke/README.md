@@ -1,6 +1,6 @@
 # ABFS on GKE
 
-This folder deploys the open-source ABFS GCP server, the git-pushers and the CI build node setup on GKE Standard. Google Cloud resources come from Config Connector (KCC), workloads from a Helm chart.
+This folder deploys the open-source ABFS GCP server, the git-pushers and the CI build node setup on GKE Standard. Google Cloud resources come from Config Connector (KCC), workloads from a Helm chart. Coding agents start at [AGENTS.md](AGENTS.md).
 
 > [!WARNING]
 > The server has no authentication and no TLS by default. Any host that reaches the Gateway address can read and write the whole store. The network is the only boundary. See [Security](docs/runbook.md#security).
@@ -22,81 +22,29 @@ This folder deploys the open-source ABFS GCP server, the git-pushers and the CI 
                                            +-------------------------------+
 ```
 
-- The server (`abfs-server`) keeps refs in Spanner, objects in Bigtable and large blobs in a Cloud Storage bucket. It is the only workload with Google credentials (Workload Identity).
-- An internal Gateway (`gke-l7-rilb`) gives the servers one regional address. Pushers, cacheman and build pods use it.
-- The git-pushers fetch from Gerrit and push to the server. Each pusher has one PersistentVolumeClaim; nothing else in the deployment has one.
-- A Helm hook Job writes the pusher pool config and the central client config into the store.
-- On each CI node a DaemonSet loads and checks the casfs kernel module of the COS node image, and one cacheman serves every build pod on the node from a cache on the boot disk.
-- Four ComputeClasses (`abfs-ci`, `abfs-server`, `abfs-pusher-seed`, `abfs-pusher-steady`) let GKE create the nodes, with a fallback over four machine families.
+- `abfs-server` keeps refs in Spanner, objects in Bigtable and large blobs in Cloud Storage. It is the only workload with Google credentials (Workload Identity).
+- An internal Gateway (`gke-l7-rilb`) gives the servers one regional address for pushers, cacheman and build pods.
+- The git-pushers fetch from Gerrit and push to the server. Each has one PersistentVolumeClaim.
+- A Helm hook Job writes the pusher pool config and the client config into the store.
+- On each CI node a DaemonSet loads the casfs module of the COS node image, and one cacheman serves every build pod from a cache on the boot disk.
+- Four ComputeClasses (`abfs-ci`, `abfs-server`, `abfs-pusher-seed`, `abfs-pusher-steady`) let GKE create the nodes.
 
-## Layout
+## Prerequisites
 
-```
-deploy/gke/
-  AGENTS.md          orientation for anyone working in this tree: layout, checks, rules
-  README.md          this file
-  Makefile           lint, template, kustomize, ddl, ddl-check, images, bundle
-  chart/abfs/        Helm chart; values.yaml, values-example.yaml, ci/ test values
-  kcc/
-    base/            namespace, APIs, service accounts, Workload Identity, Gateway address
-    components/
-      backend-new/       Spanner, Bigtable, tables, bucket and the server's roles
-      backend-existing/  the server's roles on a backend that already exists
-      gc/                the garbage collector's Bigtable parts, with backend-new, only when GC is on
-      network/proxy-subnet/  the proxy-only subnet, for a network without one
-      settings/          fills the base from the overlay's settings.yaml
-    overlays/example/  a worked example
-  images/            Dockerfiles of abfs-server, abfs-pusher, abfs-client, casfs-loader
-  scripts/           gen-ddl.sh, check-ddl.sh (with ddl-lib.sh), build-images.sh, bundle.sh, load-images.sh
-  docs/              usage, prerequisites, runbook, configuration, troubleshooting, ci-job
-```
+Details in [prerequisites.md](docs/prerequisites.md); the install order in [install.md](docs/install.md).
 
-## Quick start
-
-1. Prepare the cluster, the network, Config Connector (installed by hand from its operator bundle at a pinned version, 1.130.1 or later, not the GKE add-on) and its identity: [prerequisites](docs/prerequisites.md).
-2. Put the images into your Artifact Registry. From a release bundle, copy its image archives and keep the printed digest values:
-
-   ```sh
-   scripts/load-images.sh europe-west4-docker.pkg.dev/<project>/abfs >values-images.yaml
-   ```
-
-   From a source tree, build and push them instead, and keep `images.txt`:
-
-   ```sh
-   scripts/build-images.sh --casfs <abfs-casfs repo> --push \
-     europe-west4-docker.pkg.dev/<project>/abfs <commit>
-   ```
-
-3. Copy `kcc/overlays/example`, set `settings.yaml`, pick one backend component, and apply it. Wait until every object is Ready:
-
-   ```sh
-   kubectl apply -k kcc/overlays/<name>
-   kubectl -n abfs wait --for=condition=Ready --all gcp --timeout=30m
-   ```
-
-4. Copy `chart/abfs/values-example.yaml`, set the digests (or pass `-f values-images.yaml` after your values file), `gateway.vip` and the Gerrit manifest, create the Gerrit Secret, and install without `--wait`:
-
-   ```sh
-   helm install abfs chart/abfs -n abfs -f <values.yaml> --timeout 30m
-   helm test abfs -n abfs
-   ```
-
-5. On a new store, check that the bootstrap Job seeded the patched `repo` tool, which every `mount -b` needs: [runbook](docs/runbook.md#6-check-the-patched-repo-tool).
-
-The [runbook](docs/runbook.md) has every step with its checks, and the seed, steady state, upgrades and teardown.
-
-## Documents
-
-- [usage.md](docs/usage.md): how ABFS is meant to be used here: the parts, how a build uses the store and the node cache, the first days and steady state, scaling and upgrades. Read it first.
-- [prerequisites.md](docs/prerequisites.md): cluster settings, network, identities, the IOPS fallback node pool.
-- [runbook.md](docs/runbook.md): install order, seed and steady phase, upgrades, cache reset, backend replacement, teardown, security.
-- [configuration.md](docs/configuration.md): every chart value with its default, the KCC to chart name table, right-sizing.
-- [ci-job.md](docs/ci-job.md): the build pod contract for any CI system, the example Job, Airflow, node sizing.
-- [troubleshooting.md](docs/troubleshooting.md): known failures and their causes.
+- GKE Standard with a regional control plane. Autopilot does not allow the privileged CI pods.
+- A GKE version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in GKE 1.37.2-gke.1325000 on the Rapid channel ([prerequisites](docs/prerequisites.md#gke-version-for-the-ci-nodes)). `ci.casfs.provider: daemonset` instead runs Ubuntu CI nodes that build casfs on each node; it does not build on kernel series 6.14 and 6.19.
+- Config Connector installed by hand from its operator bundle, 1.130.1 or later, not the GKE add-on.
+- A VPC with a proxy-only subnet. With private nodes: a Private Service Connect endpoint for Google APIs with its DNS zones, Private Google Access and Cloud NAT.
+- Control plane access through the DNS-based endpoint only.
+- Spanner, Bigtable and Cloud Storage, new or existing; an Artifact Registry repository for the four images.
+- Tools: `gcloud`, `kubectl` with kustomize, Helm 4, `skopeo`, `jq`, `make`; `docker` for the backend check and image builds.
+- Garbage collection is off by default ([runbook](docs/runbook.md#garbage-collection)). Terraform for Compute Engine VMs, Cloud Workstations and local SSD caches are not part of this folder.
 
 ## Checks
 
-The Makefile runs the offline checks. They need `helm` and `kubectl`; a schema source given as a commit also needs `git`:
+The offline checks need `helm` and `kubectl`; a schema source given as a commit also needs `git`:
 
 ```sh
 make check        # lint, template, kustomize, ddl-check against the hash in the ddl file
@@ -106,12 +54,14 @@ make images CASFS=<abfs-casfs repo> COMMIT=<commit>   # local build, no push; ne
 make bundle CASFS=<abfs-casfs repo> COMMIT=<commit>  # after make images; needs docker
 ```
 
-The release bundle (`scripts/bundle.sh`) holds this README, `AGENTS.md`, the Makefile, `chart/`, `kcc/`, `docs/`, `scripts/`, the four images as OCI archives, `images.txt`, the source of the ABFS and abfs-casfs commits in `source/`, `SHA256SUMS` and the commit id ([runbook](docs/runbook.md#bundle-and-source-tree)).
+From a source tree, build the images instead of loading them ([runbook](docs/runbook.md#bundle-and-source-tree)).
 
-## Limits
+## Documents
 
-- GKE Standard only. Autopilot does not allow the privileged CI pods.
-- CI nodes run COS and use the casfs module of the node image. They need a GKE version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in GKE 1.37.2-gke.1325000 on the Rapid channel ([prerequisites](docs/prerequisites.md#gke-version-for-the-ci-nodes)).
-- `ci.casfs.provider: daemonset` runs the CI nodes on Ubuntu and builds casfs from the source in the loader image on each node instead. That casfs commit does not build on kernel series 6.14 and 6.19.
-- No TLS, no authentication, no garbage collection by default: the server's `--gc` is off, and the backend gets no garbage collector tables until it is turned on ([runbook](docs/runbook.md#garbage-collection)).
-- Terraform for Compute Engine VMs, Cloud Workstations and local SSD caches are not part of this folder.
+- [install.md](docs/install.md): the install in one order, every command and check, the tests, and the seed of your manifest.
+- [usage.md](docs/usage.md): how ABFS is used here. Read it first.
+- [prerequisites.md](docs/prerequisites.md): cluster, network, identities and Config Connector.
+- [runbook.md](docs/runbook.md): backend modes, garbage collection, seed and steady phase, upgrades, cache reset, teardown, security, the bundle.
+- [configuration.md](docs/configuration.md): every chart value and the KCC to chart name table.
+- [ci-job.md](docs/ci-job.md): the build pod contract, the example Job, Airflow, node sizing.
+- [troubleshooting.md](docs/troubleshooting.md): known failures and their causes.

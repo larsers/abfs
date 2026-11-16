@@ -51,3 +51,56 @@ spec:
           annotations:
             summary: No pusher reports metrics.
 {{- end }}
+{{- if and .Values.alerts.enabled (or .Values.ci.enabled .Values.pusher.enabled) }}
+{{- if not .Values.alerts.clusterName }}
+{{- fail "alerts.clusterName is required with alerts.enabled: the GlobalRules object would otherwise match the nodes and containers of every cluster in the project's metrics scope" }}
+{{- end }}
+{{- $cluster := printf ", cluster_name=%q" .Values.alerts.clusterName }}
+---
+# Rules on GKE system metrics, which only a GlobalRules object can read. A GlobalRules
+# object is cluster-scoped and sees every cluster in the project's metrics scope, so the
+# rules filter on alerts.clusterName.
+apiVersion: monitoring.googleapis.com/v1
+kind: GlobalRules
+metadata:
+  name: {{ .Release.Name }}-gke-metrics
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+spec:
+  groups:
+    {{- if .Values.ci.enabled }}
+    # The build outputs and the node cache share the boot disk. kubelet starts image
+    # garbage collection at 85 % and evicts pods at 90 %; the outputs of running builds
+    # cannot be evicted from the cache (docs/ci-job.md, "Node disk"). The node metrics
+    # carry no label of the node's class, so the rule covers every node of the cluster.
+    - name: abfs-node-disk
+      interval: 60s
+      rules:
+        - alert: AbfsNodeDiskHigh
+          expr: >-
+            kubernetes_io:node_ephemeral_storage_used_bytes{monitored_resource="k8s_node"{{ $cluster }}}
+            / kubernetes_io:node_ephemeral_storage_total_bytes{monitored_resource="k8s_node"{{ $cluster }}}
+            > 0.85
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: The boot disk of a node is over 85 % full; kubelet evicts pods at 90 %.
+    {{- end }}
+    {{- if .Values.pusher.enabled }}
+    # An OOM kill is the usual reason a pusher container restarts. In the steady phase with
+    # pusher.vpa.mode Initial the container restarts at its old limit; delete the pod so
+    # the VPA applies its raised recommendation (docs/configuration.md, "Right-sizing").
+    - name: abfs-pusher-restarts
+      interval: 60s
+      rules:
+        - alert: AbfsPusherRestarted
+          expr: >-
+            increase(kubernetes_io:container_restart_count{monitored_resource="k8s_container",
+            namespace_name="{{ .Release.Namespace }}", container_name="git-pusher"{{ $cluster }}}[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A git-pusher container restarted; check its last state for OOMKilled.
+    {{- end }}
+{{- end }}

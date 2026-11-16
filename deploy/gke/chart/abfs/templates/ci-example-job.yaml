@@ -27,6 +27,14 @@
 #     entry for it.
 #   - The tools come from the node: <hostCacheDir>/bin first on PATH, the host path at the
 #     same path as in cacheman.
+#   - An ephemeral-storage request of ci.buildDisk and no limit: the build outputs go into
+#     the node cache in the hostPath, which kubelet does not count.
+#   - The ABFS steps run under set -euo pipefail. ci.exampleJob.command runs after set +u,
+#     since build/envsetup.sh, lunch and m read unset variables; -e and pipefail stay.
+#   - A pod that was preempted, lost its node or was evicted by kubelet under node pressure
+#     (condition DisruptionTarget) does not count against backoffLimit; the Job starts a new
+#     pod. Build failures do count. activeDeadlineSeconds ends the Job, retries included, so
+#     a pod that stays Pending or is evicted again and again does not run forever.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -37,6 +45,12 @@ metadata:
     {{- include "abfs.selectorLabels" "example-build" | nindent 4 }}
 spec:
   backoffLimit: 2
+  activeDeadlineSeconds: {{ int $j.deadlineSeconds }}
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
   template:
     metadata:
       labels:
@@ -87,6 +101,7 @@ spec:
               abfs -i ci mount -b "$BRANCH" -f "$WORK/pinned.xml" -r "ci/$JOB_ID" --tmp-ws "$WORK/src"
               trap 'cd /; abfs -i ci unmount "$WORK/src"' EXIT
               cd "$WORK/src"
+              set +u
               {{- $j.command | trim | nindent 14 }}
           env:
             - name: BRANCH
@@ -112,7 +127,10 @@ spec:
             runAsUser: {{ int $ci.uid }}
             runAsGroup: {{ int $ci.gid }}
           resources:
-            {{- toYaml $j.resources | nindent 12 }}
+            {{- include "abfs.ci.ephemeralRequest" (dict "res" $j.resources "what" "ci.exampleJob.resources" "value" "ci.buildDisk") }}
+            {{- $res := deepCopy $j.resources }}
+            {{- $_ := set $res "requests" (merge (dict "ephemeral-storage" $ci.buildDisk) ($res.requests | default dict)) }}
+            {{- toYaml $res | nindent 12 }}
           volumeMounts:
             - name: abfs
               mountPath: {{ $ci.hostCacheDir }}

@@ -29,6 +29,9 @@ replacements:
       - select: {kind: IAMPolicyMember, name: abfs-nodes-artifact-reader}
         fieldPaths: [spec.resourceRef.external]
         options: {delimiter: /, index: 1}
+      - select: {kind: IAMPolicyMember, name: abfs-nodes-service-usage-consumer}
+        fieldPaths: [spec.resourceRef.external]
+        options: {delimiter: /, index: 1}
   - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.kccServiceAccount}
     targets:
       - select: {kind: ConfigConnectorContext}

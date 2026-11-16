@@ -13,6 +13,8 @@
 # limitations under the License.
 
 # Overlay on seed-values.yaml: Ubuntu CI nodes that build casfs from source.
+# expect:     imageType: ubuntu_containerd
+# expect:       enableSecureBoot: false
 ci:
   casfs:
     provider: daemonset

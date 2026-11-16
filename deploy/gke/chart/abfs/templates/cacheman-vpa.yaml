@@ -1,0 +1,38 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.ci.enabled }}
+# Recommendations only: Off never changes a cacheman pod, which must not restart under
+# running builds. Memory only, so ci.cacheman.resources can be set from a measured value
+# (docs/configuration.md, "Right-sizing").
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: abfs-cacheman
+  namespace: {{ .Values.ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "cacheman" | nindent 4 }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: DaemonSet
+    name: abfs-cacheman
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: cacheman
+        controlledResources: ["memory"]
+{{- end }}

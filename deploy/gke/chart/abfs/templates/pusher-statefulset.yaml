@@ -113,6 +113,18 @@ spec:
           ports:
             - name: http
               containerPort: {{ $p.port }}
+          # The pusher opens its HTTP port when it first applies the pool config, and /info
+          # answers 503 until the config is applied, then 200. The rolling update moves on
+          # to the next pusher only when this one is ready. No liveness probe: a pusher
+          # whose store is unreachable gains nothing from a restart, and a restart in the
+          # middle of a long push loses that push.
+          readinessProbe:
+            httpGet:
+              path: /info
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
           resources:
             {{- toYaml (ternary $p.seedResources $p.steadyResources (eq $p.phase "seed")) | nindent 12 }}
           securityContext:
