@@ -76,7 +76,9 @@
           "type": "object",
           "properties": {
             "enabled": {"type": "boolean"},
-            "cpuTarget": {"type": "integer", "minimum": 1, "maximum": 100}
+            "cpuTarget": {"type": "integer", "minimum": 1, "maximum": 100},
+            "scaleDownStabilizationSeconds": {"type": "integer", "minimum": 0, "maximum": 3600},
+            "scaleDownPeriodSeconds": {"type": "integer", "minimum": 1, "maximum": 1800}
           }
         },
         "caches": {
@@ -149,7 +151,7 @@
         "vpa": {
           "type": "object",
           "properties": {
-            "mode": {"enum": ["Initial", "Recreate"]},
+            "mode": {"enum": ["Initial", "Recreate", "InPlaceOrRecreate"]},
             "minMemory": {"$ref": "#/definitions/quantity"},
             "maxMemory": {"$ref": "#/definitions/quantity"}
           }
@@ -224,10 +226,12 @@
         "gid": {"type": "integer", "minimum": 1},
         "hostCacheDir": {"type": "string", "pattern": "^/"},
         "waitForCasfsTimeout": {"type": "string", "pattern": "^[0-9]+(s|m|h)$"},
+        "buildDisk": {"$ref": "#/definitions/quantity"},
         "cacheman": {
           "type": "object",
+          "required": ["cacheDisk"],
           "properties": {
-            "evictThreshold": {"type": "string", "pattern": "^[0-9]+(B|KB|MB|GB|TB)?$"},
+            "cacheDisk": {"$ref": "#/definitions/quantity"},
             "fsyncObjects": {"type": "boolean"},
             "toolDir": {"type": "string", "pattern": "^/"},
             "resources": {"$ref": "#/definitions/resources"}
@@ -262,6 +266,7 @@
             "branch": {"type": "string", "minLength": 1},
             "target": {"type": "string"},
             "command": {"type": "string", "minLength": 1},
+            "deadlineSeconds": {"type": "integer", "minimum": 60},
             "resources": {"$ref": "#/definitions/resources"}
           }
         }
@@ -272,6 +277,7 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "nodeServiceAccount": {"type": "string"},
+        "imageStreaming": {"type": "boolean"},
         "ci": {
           "type": "object",
           "properties": {
@@ -283,7 +289,15 @@
             "consolidationDelayMinutes": {"type": "integer", "minimum": 1, "maximum": 1440},
             "consolidationThreshold": {"type": ["integer", "string"], "pattern": "^$|^[0-9]+$"},
             "activeMigration": {"type": "boolean"},
-            "nodepools": {"type": "array", "items": {"type": "string"}}
+            "nodepools": {"type": "array", "items": {"type": "string"}},
+            "capacityQuota": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "nodes": {"type": "integer", "minimum": 0},
+                "cpu": {"type": ["integer", "string"], "pattern": "^$|^[0-9]+$"}
+              }
+            }
           }
         },
         "server": {
@@ -329,7 +343,8 @@
       "type": "object",
       "properties": {
         "enabled": {"type": "boolean"},
-        "for": {"type": "string"}
+        "for": {"type": "string"},
+        "clusterName": {"type": "string", "pattern": "^$|^[a-z][-a-z0-9]{0,39}$"}
       }
     },
     "tests": {

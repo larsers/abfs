@@ -248,6 +248,21 @@ seccompProfile:
   type: RuntimeDefault
 {{- end -}}
 
+{{/* PriorityClass of the CI node DaemonSets (ci-priorityclass.yaml). */}}
+{{- define "abfs.ciPriorityClass" -}}
+{{ .Release.Name }}-ci-node
+{{- end -}}
+
+{{/*
+The ephemeral-storage request of a CI pod comes from a value of its own. Fails when the
+resources set one. Arg: dict "res" <resources> "what" <values path> "value" <the value>.
+*/}}
+{{- define "abfs.ci.ephemeralRequest" -}}
+{{- if hasKey (.res.requests | default dict) "ephemeral-storage" -}}
+{{- fail (printf "%s.requests.ephemeral-storage is set; the chart sets it from %s, so set that instead" .what .value) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Toleration of the abfs-ci class taint, for DaemonSets. */}}
 {{- define "abfs.ci.scheduling" -}}
 nodeSelector:
@@ -319,7 +334,29 @@ ci.waitForCasfsTimeout, then fails the pod so the CI system retries it elsewhere
 {{- end -}}
 
 {{/*
-Checks that do not belong to one object: the backend names and the server memory bound.
+Allocatable ephemeral storage, in bytes, of a node whose boot disk has the given size in
+GiB. GKE reserves the eviction threshold, 10 % of the file system, and the system
+reservation, the least of 50 % of the disk, 35 % of the disk plus 6 GiB, and 100 GiB.
+The file system is smaller than the disk: the GKE example has 94.3 GiB on a 100 GiB
+disk. This helper takes it as 3 % plus 5 GiB smaller, which covers that example and
+larger disks. Arg: boot disk size in GiB.
+*/}}
+{{- define "abfs.allocatableEphemeral" -}}
+{{- $gib := 1073741824 -}}
+{{- $disk := mul (int64 .) $gib -}}
+{{- $fs := sub (div (mul $disk 97) 100) (mul 5 $gib) -}}
+{{- $sys := min (div $disk 2) (add (div (mul $disk 35) 100) (mul 6 $gib)) (mul 100 $gib) -}}
+{{- sub (sub $fs (div $fs 10)) $sys -}}
+{{- end -}}
+
+{{/* cacheman's --evict-threshold in bytes: 90 % of ci.cacheman.cacheDisk. */}}
+{{- define "abfs.cachemanEvictThreshold" -}}
+{{- div (mul (include "abfs.bytes" .Values.ci.cacheman.cacheDisk | int64) 9) 10 -}}
+{{- end -}}
+
+{{/*
+Checks that do not belong to one object: the backend names, the server memory bound and
+the CI node disk.
 */}}
 {{- define "abfs.validate" -}}
 {{- $b := .Values.backend -}}
@@ -330,13 +367,39 @@ Checks that do not belong to one object: the backend names and the server memory
 {{- end -}}
 {{- end -}}
 {{- $c := .Values.server.caches -}}
-{{- $need := add (mul (int64 $c.headers) 180) (mul (int64 $c.contents) 49000) 6442450944 -}}
+{{- $base := 6442450944 -}}
+{{- $what := "6 GiB" -}}
+{{- if .Values.server.gc.enabled -}}
+{{- /* The garbage collector's touch buffers: about 870 MB at the map row cap. */ -}}
+{{- $base = 7516192768 -}}
+{{- $what = "7 GiB with server.gc.enabled" -}}
+{{- end -}}
+{{- $need := add (mul (int64 $c.headers) 180) (mul (int64 $c.contents) 49000) $base -}}
 {{- $limit := include "abfs.bytes" .Values.server.memoryLimit | int64 -}}
 {{- if gt $need $limit -}}
-{{- fail (printf "server.memoryLimit %s (%d bytes) is below the cache bounds plus 6 GiB (%d bytes): headers %d x 180 B, contents %d x 49 KB" (toString .Values.server.memoryLimit) $limit $need (int64 $c.headers) (int64 $c.contents)) -}}
+{{- fail (printf "server.memoryLimit %s (%d bytes) is below the cache bounds plus %s (%d bytes): headers %d x 180 B, contents %d x 49 KB" (toString .Values.server.memoryLimit) $limit $what $need (int64 $c.headers) (int64 $c.contents)) -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.ci.localSsd.enabled -}}
 {{- fail "ci.localSsd.enabled is not implemented in this chart version" -}}
+{{- end -}}
+{{- /* A null value, as --set ci.cacheman.evictThreshold=null leaves it, counts as removed. */ -}}
+{{- if and (hasKey .Values.ci.cacheman "evictThreshold") (not (kindIs "invalid" .Values.ci.cacheman.evictThreshold)) -}}
+{{- fail "ci.cacheman.evictThreshold was removed: the eviction threshold of cacheman is 90 % of ci.cacheman.cacheDisk, the disk reserved for the node cache (docs/ci-job.md, \"Node disk\")" -}}
+{{- end -}}
+{{- if .Values.ci.enabled -}}
+{{- /* cacheman takes an eviction threshold of 0 as no bound. */ -}}
+{{- if lt (include "abfs.bytes" .Values.ci.cacheman.cacheDisk | int64) 10737418240 -}}
+{{- fail (printf "ci.cacheman.cacheDisk %s is below 10Gi; cacheman's eviction threshold is 90 %% of it, and 0 would turn eviction off (docs/ci-job.md, \"Node disk\")" (toString .Values.ci.cacheman.cacheDisk)) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.ci.enabled .Values.computeClasses.enabled -}}
+{{- $cache := include "abfs.bytes" .Values.ci.cacheman.cacheDisk | int64 -}}
+{{- $build := include "abfs.bytes" .Values.ci.buildDisk | int64 -}}
+{{- $gb := .Values.computeClasses.ci.bootDiskGb -}}
+{{- $alloc := include "abfs.allocatableEphemeral" $gb | int64 -}}
+{{- if gt (add $cache $build) $alloc -}}
+{{- fail (printf "ci.cacheman.cacheDisk %s plus ci.buildDisk %s (%d GiB) exceed the allocatable ephemeral storage of a CI node with computeClasses.ci.bootDiskGb %d (about %d GiB); GKE would create no node for a build pod. Raise bootDiskGb or lower the two requests (docs/ci-job.md, \"Node disk\")" (toString .Values.ci.cacheman.cacheDisk) (toString .Values.ci.buildDisk) (div (add $cache $build) 1073741824) (int64 $gb) (div $alloc 1073741824)) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}

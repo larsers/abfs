@@ -1,0 +1,160 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The manifest host of the smoke test (docs/install.md, step 15). It serves a manifest
+# repository with two small AOSP projects, read-only over plain HTTP inside the cluster,
+# so the smoke test needs no repository of yours. The pushers read it at
+#   http://abfs-smoke-manifest.abfs.svc.cluster.local:8080/manifest
+# which docs/examples/values-smoke.yaml sets as pusher.pool.manifest.url. The pushers
+# fetch the two projects from android.googlesource.com.
+#
+# The image needs git and python3: replace <build image> with your CI build image
+# (docs/install.md shows the command), or any image with both that the class nodes
+# can pull. The bundle's abfs-client image has git but no python3.
+#
+# The repository is a bare clone with the files of the git "dumb" HTTP protocol
+# (git update-server-info), served by python3 -m http.server. It holds one branch,
+# main, with default.xml. Delete the three objects after the smoke test.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: abfs-smoke-manifest
+  namespace: abfs
+  labels:
+    app.kubernetes.io/name: abfs-smoke-manifest
+data:
+  # Two small AOSP projects, pinned to a release tag that does not move. Both are
+  # in the AAOS release manifests.
+  default.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <manifest>
+      <remote name="aosp" fetch="https://android.googlesource.com" />
+      <default revision="refs/tags/android-15.0.0_r36" remote="aosp" />
+      <project path="tools/repohooks" name="platform/tools/repohooks" />
+      <project path="external/jsmn" name="platform/external/jsmn" />
+    </manifest>
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: abfs-smoke-manifest
+  namespace: abfs
+  labels:
+    app.kubernetes.io/name: abfs-smoke-manifest
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  terminationGracePeriodSeconds: 5
+  # A node of the server class, like the bootstrap Job: the system pool's node service
+  # account may not pull from Artifact Registry, the class nodes use abfs-nodes, which can.
+  nodeSelector:
+    cloud.google.com/compute-class: abfs-server
+  tolerations:
+    - key: cloud.google.com/compute-class
+      operator: Equal
+      value: abfs-server
+      effect: NoSchedule
+  # The namespace enforces the Pod Security level baseline; this pod also meets restricted.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: git-http
+      image: <build image>
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          for tool in git python3; do
+            command -v "$tool" >/dev/null ||
+              { echo "the image has no $tool; use an image with git and python3" >&2; exit 1; }
+          done
+          git init -q /srv/work
+          git -C /srv/work symbolic-ref HEAD refs/heads/main
+          cp /manifest/default.xml /srv/work/
+          git -C /srv/work add default.xml
+          git -C /srv/work commit -q -m "Smoke test manifest"
+          git clone -q --bare /srv/work /srv/git/manifest
+          git -C /srv/git/manifest update-server-info
+          git -C /srv/git/manifest log --oneline main
+          cd /srv/git
+          exec python3 -m http.server 8080
+      env:
+        - name: HOME
+          value: /srv
+        - name: TMPDIR
+          value: /srv
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: GIT_AUTHOR_NAME
+          value: abfs-smoke
+        - name: GIT_AUTHOR_EMAIL
+          value: abfs-smoke@localhost
+        - name: GIT_COMMITTER_NAME
+          value: abfs-smoke
+        - name: GIT_COMMITTER_EMAIL
+          value: abfs-smoke@localhost
+      ports:
+        - name: http
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /manifest/info/refs
+          port: http
+        periodSeconds: 5
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+          ephemeral-storage: 1Gi
+        limits:
+          memory: 256Mi
+          ephemeral-storage: 1Gi
+      volumeMounts:
+        - name: manifest
+          mountPath: /manifest
+          readOnly: true
+        - name: srv
+          mountPath: /srv
+  volumes:
+    - name: manifest
+      configMap:
+        name: abfs-smoke-manifest
+    - name: srv
+      emptyDir:
+        sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: abfs-smoke-manifest
+  namespace: abfs
+  labels:
+    app.kubernetes.io/name: abfs-smoke-manifest
+spec:
+  selector:
+    app.kubernetes.io/name: abfs-smoke-manifest
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

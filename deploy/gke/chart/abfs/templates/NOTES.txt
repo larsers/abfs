@@ -45,6 +45,7 @@ CI nodes (namespace {{ .Values.ci.namespace }}, class abfs-ci, provider {{ .Valu
   kubectl -n {{ .Values.ci.namespace }} logs ds/abfs-casfs-loader
   kubectl -n {{ .Values.ci.namespace }} get pods -l app.kubernetes.io/component=cacheman -o wide
 cacheman uses OnDelete: drain a node before deleting its cacheman pod.
+Build pods request ephemeral-storage {{ .Values.ci.buildDisk }} each (ci.buildDisk), cacheman {{ .Values.ci.cacheman.cacheDisk }}.
 {{- end }}
 {{- if .Values.tests.enabled }}
 

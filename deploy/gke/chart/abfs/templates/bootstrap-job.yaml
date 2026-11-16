@@ -100,7 +100,7 @@ spec:
               # or the store has no such server. Any other answer is a read error, and a read
               # error never replaces the ref.
               MISSING='^ *\(not exists\) refs/heads/stable-abfs$|the server "gerrit\.googlesource\.com" not found'
-              OFF="to skip this step, set bootstrap.repoSetup.enabled=false and seed the ref by hand (see the runbook)"
+              OFF="to skip this step, set bootstrap.repoSetup.enabled=false and seed the ref by hand (docs/install.md, Check the patched repo tool)"
               getref() { echo refs/heads/stable-abfs | "${A[@]}" test-client get-ref "${G[@]}" 2>&1; }
               res=$(getref || true)
               have=$(printf '%s\n' "$res" | grep -E "$REF" || true)

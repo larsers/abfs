@@ -20,7 +20,9 @@
 # One cacheman per CI node, cache on the boot disk, shared by every build pod on the node.
 # It runs as ci.uid:ci.gid, unprivileged and without hostPID: it listens on a unix socket
 # and starts no mount. Build pods use the same host path and the tools this pod copies to
-# <hostCacheDir>/bin, so a node's tools always match its cacheman.
+# <hostCacheDir>/bin, so a node's tools always match its cacheman. The cache lives in the
+# hostPath, which kubelet does not count, so its ephemeral-storage request only reserves
+# the disk at scheduling time; there is no limit.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -44,6 +46,8 @@ spec:
         {{- include "abfs.selectorLabels" "cacheman" | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      # Preempts build pods on its node, which cannot run a build without it.
+      priorityClassName: {{ include "abfs.ciPriorityClass" . }}
       {{- include "abfs.ci.scheduling" . | nindent 6 }}
       initContainers:
         # Root: copies the static tools with their file capabilities (cp -a keeps the
@@ -100,7 +104,7 @@ spec:
             - |
               set -euo pipefail
               abfs -i ci {{ include "abfs.clientFlags" $vip }} \
-                --evict-threshold {{ $ci.cacheman.evictThreshold }} \
+                --evict-threshold {{ include "abfs.cachemanEvictThreshold" . }} \
                 --fsync-objects={{ $ci.cacheman.fsyncObjects }} \
                 {{- range $k, $v := fromYaml (include "abfs.clientManifest" .) }}
                 --kv {{ printf "%s=%s" $k $v | quote }} \
@@ -126,7 +130,10 @@ spec:
           securityContext:
             {{- include "abfs.restrictedSecurityContext" (dict "uid" $ci.uid "gid" $ci.gid) | nindent 12 }}
           resources:
-            {{- toYaml $ci.cacheman.resources | nindent 12 }}
+            {{- include "abfs.ci.ephemeralRequest" (dict "res" $ci.cacheman.resources "what" "ci.cacheman.resources" "value" "ci.cacheman.cacheDisk") }}
+            {{- $res := deepCopy $ci.cacheman.resources }}
+            {{- $_ := set $res "requests" (merge (dict "ephemeral-storage" $ci.cacheman.cacheDisk) ($res.requests | default dict)) }}
+            {{- toYaml $res | nindent 12 }}
           volumeMounts:
             # Same path as in the build pods: the kernel reconnects to <cache>/socket by
             # its host path.

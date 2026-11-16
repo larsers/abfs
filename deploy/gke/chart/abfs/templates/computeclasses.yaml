@@ -20,12 +20,14 @@
 # Custom ComputeClasses: a fallback order over four machine families per role, node pool
 # auto-creation, and nodes that follow the pod requests. Pods select a class with the
 # cloud.google.com/compute-class node selector; GKE taints the class nodes and adds the
-# toleration to those pods.
+# toleration to those pods. Image streaming follows computeClasses.imageStreaming on the
+# nodes GKE creates; a change applies to new node pools only.
 {{- if .Values.ci.enabled }}
 ---
-# CI build nodes: COS with the casfs module of the node image, or Ubuntu with secure boot
-# off for the module the loader builds. Upgrades of existing pools are held back, because
-# a new node image or kernel can change or drop the module.
+# CI build nodes: COS with secure boot on and the casfs module of the node image, or Ubuntu
+# with secure boot off for the module the loader builds. The shielded instance settings
+# apply to new CI node pools only. Upgrades of existing pools are held back, because a new
+# node image or kernel can change or drop the module.
 apiVersion: cloud.google.com/v1
 kind: ComputeClass
 metadata:
@@ -55,13 +57,13 @@ spec:
   nodePoolConfig:
     imageType: {{ ternary "ubuntu_containerd" "cos_containerd" (eq .Values.ci.casfs.provider "daemonset") }}
     serviceAccount: {{ $cc.nodeServiceAccount }}
+    imageStreaming:
+      enabled: {{ $cc.imageStreaming }}
     maintenanceExclusion: UNTIL_END_OF_SUPPORT
   nodePoolAutoCreation:
     enabled: true
-    {{- if eq .Values.ci.casfs.provider "daemonset" }}
     shieldedInstanceConfig:
-      enableSecureBoot: false
-    {{- end }}
+      enableSecureBoot: {{ ne .Values.ci.casfs.provider "daemonset" }}
   autoscalingPolicy:
     consolidationDelayMinutes: {{ $cc.ci.consolidationDelayMinutes }}
     {{- if ne (toString $cc.ci.consolidationThreshold) "" }}
@@ -70,6 +72,32 @@ spec:
   activeMigration:
     optimizeRulePriority: {{ $cc.ci.activeMigration }}
   whenUnsatisfiable: DoNotScaleUp
+{{- with $cc.ci.capacityQuota }}
+{{- if .enabled }}
+{{- if lt (int .nodes) 1 }}
+{{- fail "computeClasses.ci.capacityQuota.nodes is required with capacityQuota.enabled: the most CI nodes the autoscaler may create" }}
+{{- end }}
+---
+# Preview: caps the CI nodes. Only the cluster autoscaler enforces it, and not strictly; it
+# counts every node with the class label, hand-made pools included.
+apiVersion: autoscaling.x-k8s.io/v1beta1
+kind: CapacityQuota
+metadata:
+  name: {{ $.Release.Name }}-ci
+  labels:
+    {{- include "abfs.labels" $ | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      cloud.google.com/compute-class: abfs-ci
+  limits:
+    resources:
+      nodes: {{ int .nodes }}
+      {{- if ne (toString .cpu) "" }}
+      cpu: {{ int .cpu }}
+      {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if .Values.server.enabled }}
 ---
@@ -94,6 +122,8 @@ spec:
   nodePoolConfig:
     imageType: cos_containerd
     serviceAccount: {{ $cc.nodeServiceAccount }}
+    imageStreaming:
+      enabled: {{ $cc.imageStreaming }}
   nodePoolAutoCreation:
     enabled: true
   activeMigration:
@@ -122,6 +152,8 @@ spec:
   nodePoolConfig:
     imageType: cos_containerd
     serviceAccount: {{ $cc.nodeServiceAccount }}
+    imageStreaming:
+      enabled: {{ $cc.imageStreaming }}
   nodePoolAutoCreation:
     enabled: true
   activeMigration:
@@ -146,6 +178,8 @@ spec:
   nodePoolConfig:
     imageType: cos_containerd
     serviceAccount: {{ $cc.nodeServiceAccount }}
+    imageStreaming:
+      enabled: {{ $cc.imageStreaming }}
   nodePoolAutoCreation:
     enabled: true
   activeMigration:

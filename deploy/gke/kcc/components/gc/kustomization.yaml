@@ -13,10 +13,11 @@
 # limitations under the License.
 
 # Garbage collection, off by default. List it after backend-new to add the
-# Bigtable table gc and the family objects:g; then run `abfs server gcp init
-# --gc` for the Spanner tables, and set server.gc.enabled (docs/runbook.md,
-# Garbage collection). It patches a backend-new object, so it does not build
-# with backend-existing, where `init --gc` creates every GC resource.
+# Bigtable table gc, the family objects:g and the collector's app profile
+# abfs-gc; then run `abfs server gcp init --gc` for the Spanner tables, and set
+# server.gc.enabled (docs/runbook.md, Garbage collection). It patches a
+# backend-new object, so it does not build with backend-existing, where `init
+# --gc` creates every GC resource and gcloud the app profile.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 resources:
@@ -44,3 +45,10 @@ replacements:
         fieldPaths: [spec.instanceRef.name]
       - select: {kind: BigtableGCPolicy, name: abfs-gc-policy-objects-g}
         fieldPaths: [spec.instanceRef.name]
+      - select: {kind: BigtableAppProfile, name: abfs-gc}
+        fieldPaths: [spec.instanceRef.name]
+  # The app profile routes to the one cluster of the instance.
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bigtableCluster}
+    targets:
+      - select: {kind: BigtableAppProfile, name: abfs-gc}
+        fieldPaths: [spec.singleClusterRouting.clusterId]

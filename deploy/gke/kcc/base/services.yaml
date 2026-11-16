@@ -125,3 +125,14 @@ metadata:
     cnrm.cloud.google.com/deletion-policy: abandon
 spec:
   resourceID: artifactregistry.googleapis.com
+---
+# Image streaming of the node images (computeClasses.imageStreaming in the chart).
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: containerfilesystem.googleapis.com
+  namespace: abfs
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  resourceID: containerfilesystem.googleapis.com

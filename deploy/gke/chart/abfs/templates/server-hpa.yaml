@@ -34,4 +34,13 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.server.hpa.cpuTarget }}
+  # Scale-up keeps the Kubernetes HPA default. Scale-down waits for the stabilization window and then
+  # removes one replica per period, so the filled caches of the others stay.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.server.hpa.scaleDownStabilizationSeconds }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: {{ .Values.server.hpa.scaleDownPeriodSeconds }}
 {{- end }}

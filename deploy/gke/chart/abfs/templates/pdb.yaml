@@ -14,6 +14,10 @@
 
 {{- if .Values.pdb.enabled }}
 {{- if .Values.server.enabled }}
+# AlwaysAllow: a drain may evict a pod that is not ready. A backend outage makes every
+# server replica not ready at once, and a pusher is not ready until it has applied its
+# config. With the default policy no such pod could be evicted, and a node drain would
+# wait for up to an hour.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -23,6 +27,7 @@ metadata:
     {{- include "abfs.selectorLabels" "server" | nindent 4 }}
 spec:
   maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels:
       {{- include "abfs.selectorLabels" "server" | nindent 6 }}
@@ -38,6 +43,7 @@ metadata:
     {{- include "abfs.selectorLabels" "pusher" | nindent 4 }}
 spec:
   maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels:
       {{- include "abfs.selectorLabels" "pusher" | nindent 6 }}
