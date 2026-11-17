@@ -67,4 +67,4 @@ computeClasses:
 # settings.yaml: proxySubnetRange, or the range of the proxy-only subnet the
 # network already has.
 networkPolicy:
-  proxyOnlySubnetCidr: 10.129.0.0/23
+  proxyOnlySubnetCidr: 172.16.0.0/23

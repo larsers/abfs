@@ -248,7 +248,7 @@ Check ([install step 4](install.md#check-the-network)): the forwarding rule show
 
 One per network and region, purpose `REGIONAL_MANAGED_PROXY`, role `ACTIVE`, a `/23` recommended. [Install step 4.3](install.md#43-proxy-only-subnet) checks for one.
 
-If there is none, add the component `network/proxy-subnet` to the overlay and set `proxySubnetRange` in `settings.yaml`. If there is one, leave the component out and use its range. Either way, set `networkPolicy.proxyOnlySubnetCidr` to that range.
+If there is none, add the component `network/proxy-subnet` to the overlay and set `proxySubnetRange` in `settings.yaml`. In a plain VPC, pick that range outside `10.0.0.0/8`: a cluster create without `--cluster-ipv4-cidr` or `--cluster-secondary-range-name` gets a `/14` Pod range that GKE picks at random from `10.0.0.0/8`, and the component creates the subnet after the cluster, so a range in `10.0.0.0/8` can collide with it. In a Shared VPC, pick it outside the Pod and Service secondary ranges of the host project. A free range also avoids the control-plane ranges of older private clusters on the network, often in `172.16.0.0/12`. If there is one, leave the component out and use its range. Either way, set `networkPolicy.proxyOnlySubnetCidr` to that range.
 
 ### Firewall
 

@@ -205,6 +205,18 @@ gcloud compute backend-services get-health <backend service> --project example-p
 - Every server reports `NOT_SERVING`: Spanner, Bigtable or the bucket fails. The server log names it: a missing role, a `backend.*` name that differs from the KCC name, or a missing table or family.
 - Pods not Ready: `kubectl -n abfs describe pod <server pod>`.
 
+## Proxy-only subnet fails with "conflicts with"
+
+`kubectl -n abfs describe computesubnetwork abfs-proxy-only` shows `UpdateFailed` and `Invalid IPCidrRange: <range> conflicts with ...`. The range overlaps another range of the network, often the Pod range GKE picked for the cluster. List the ranges in use:
+
+```sh
+gcloud compute networks subnets list --project $NET_P --network $NET \
+  --format 'table(name,region.basename(),ipCidrRange,secondaryIpRanges[].ipCidrRange)'
+gcloud network-connectivity internal-ranges list --project $NET_P
+```
+
+Pick a free `/23` outside them and set it as `proxySubnetRange` in `settings.yaml`, then run `kubectl apply -k kcc/overlays/<name>` again. Set the same range as `networkPolicy.proxyOnlySubnetCidr` in step 13; if the chart is already installed, run `helm upgrade` with the files of step 14.
+
 ## StatefulSet update forbidden on a volumeClaimTemplate change
 
 `helm upgrade` fails with `StatefulSet.apps "abfs-pusher" is invalid: spec: Forbidden: updates to statefulset spec for fields other than ...`: `pusher.dataDisk.size` and `pusher.dataDisk.storageClass` change the immutable `volumeClaimTemplates`. To grow the disks:
