@@ -290,7 +290,8 @@ gcloud container node-pools create abfs-ci-iops \
   --project example-project --cluster abfs --region europe-west4 \
   --node-locations europe-west4-a,europe-west4-b,europe-west4-c \
   --machine-type n4-standard-32 \
-  --image-type COS_CONTAINERD --shielded-secure-boot \
+  --image-type COS_CONTAINERD \
+  --shielded-secure-boot --shielded-integrity-monitoring \
   --disk-type hyperdisk-balanced --disk-size 1100 \
   --boot-disk-provisioned-iops 40000 \
   --boot-disk-provisioned-throughput 1000 \
@@ -302,7 +303,7 @@ gcloud container node-pools create abfs-ci-iops \
   --node-taints cloud.google.com/compute-class=abfs-ci:NoSchedule
 ```
 
-`--min-nodes` and `--max-nodes` count per zone. With `ci.casfs.provider: daemonset`, use `--image-type UBUNTU_CONTAINERD` and `--no-shielded-secure-boot` in place of `--shielded-secure-boot`. The IOPS and throughput are examples; the machine type caps them. Give the pool at least `computeClasses.ci.bootDiskGb`: the render check does not see hand-made pools, and on a smaller disk the cache reservation and a build do not fit ([node disk](ci-job.md#node-disk)). The pool follows the cluster's image streaming setting. List the pool in the chart values; the class tries it before the auto-created shapes:
+`--min-nodes` and `--max-nodes` count per zone. With `ci.casfs.provider: daemonset`, use `--image-type UBUNTU_CONTAINERD` and `--no-shielded-secure-boot --shielded-integrity-monitoring` in place of `--shielded-secure-boot --shielded-integrity-monitoring`. The IOPS and throughput are examples; the machine type caps them. Give the pool at least `computeClasses.ci.bootDiskGb`: the render check does not see hand-made pools, and on a smaller disk the cache reservation and a build do not fit ([node disk](ci-job.md#node-disk)). The pool follows the cluster's image streaming setting. List the pool in the chart values; the class tries it before the auto-created shapes:
 
 ```yaml
 computeClasses:
