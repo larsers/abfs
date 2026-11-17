@@ -15,7 +15,7 @@ Set each pair together; the chart cannot read the KCC objects.
 | `settings.yaml` `bigtableCluster` | `abfs-objects-c1` | none; the chart uses the instance's default app profile, or `backend.bigtableAppProfile` |
 | `settings.yaml` `bucket` | `example-project-abfs-blobs` | `backend.bucket` |
 | `settings.yaml` `zone` (the Bigtable cluster's) | `europe-west4-b` | `backend.zone`; the server class places its nodes there unless `computeClasses.server.zone` is set |
-| `settings.yaml` `proxySubnetRange`, or the network's existing proxy-only subnet | `10.129.0.0/23` | `networkPolicy.proxyOnlySubnetCidr` |
+| `settings.yaml` `proxySubnetRange`, or the network's existing proxy-only subnet | `172.16.0.0/23` | `networkPolicy.proxyOnlySubnetCidr` |
 | IAMServiceAccount `abfs-server` (base) | `abfs-server@example-project.iam.gserviceaccount.com` | `server.gcpServiceAccount`; empty means this name |
 | IAMServiceAccount `abfs-nodes` (base) | `abfs-nodes@example-project.iam.gserviceaccount.com` | `computeClasses.nodeServiceAccount` |
 | ComputeAddress `abfs-gateway` (base) | `abfs-gateway` | `gateway.addressName` |

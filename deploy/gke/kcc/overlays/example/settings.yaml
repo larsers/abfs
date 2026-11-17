@@ -33,7 +33,7 @@ data:
   # The cluster's subnetwork, for the Gateway address.
   subnetwork: example-subnet
   # Used only by the network components.
-  proxySubnetRange: 10.129.0.0/23
+  proxySubnetRange: 172.16.0.0/23
   # The Google service account of Config Connector for the namespace abfs.
   kccServiceAccount: kcc-abfs@example-project.iam.gserviceaccount.com
   # Always serviceAccount:<project>.svc.id.goog[abfs/abfs-server].

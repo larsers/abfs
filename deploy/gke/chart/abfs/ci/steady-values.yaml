@@ -38,7 +38,7 @@ pusher:
 computeClasses:
   nodeServiceAccount: abfs-nodes@example-project.iam.gserviceaccount.com
 networkPolicy:
-  proxyOnlySubnetCidr: 10.129.0.0/23
+  proxyOnlySubnetCidr: 172.16.0.0/23
 alerts:
   enabled: true
   clusterName: abfs

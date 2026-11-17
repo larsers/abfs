@@ -42,7 +42,7 @@ Ask for each; say which defaults they may keep.
 - Project, region, zone of the Bigtable cluster and servers.
 - VPC network, subnet, network project (`NET_P`) and its owner; in a Shared VPC the Pods and Services secondary ranges.
 - What the network has (step 4.0): private zones for `googleapis.com`, `pkg.dev`, `gcr.io`, endpoints for Google APIs, a Cloud NAT gateway; whether other subnets may get NAT egress.
-- An existing proxy-only subnet, or a free `/23`.
+- An existing proxy-only subnet, or a free `/23` (outside `10.0.0.0/8` in a plain VPC; outside the cluster's Pod and Service ranges in a Shared VPC).
 - A free IP for the Private Service Connect endpoint; whether admin hosts need the `gke.goog` zone.
 - Cluster name, GKE version and channel (default `1.37.2-gke.1325000`, Rapid), maintenance window.
 - The admin account, and who gets cluster access with which role.

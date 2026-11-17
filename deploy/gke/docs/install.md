@@ -181,7 +181,7 @@ gcloud compute networks subnets list --project $NET_P --network $NET \
   --filter "purpose=REGIONAL_MANAGED_PROXY AND region:$REGION"
 ```
 
-If one exists, note its range for `networkPolicy.proxyOnlySubnetCidr`. If not, step 10 creates it with `network/proxy-subnet`; pick a free `/23` for `proxySubnetRange` ([Proxy-only subnet](prerequisites.md#proxy-only-subnet)).
+If one exists, note its range for `networkPolicy.proxyOnlySubnetCidr`. If not, step 10 creates it with `network/proxy-subnet`; pick a free `/23` for `proxySubnetRange` ([Proxy-only subnet](prerequisites.md#proxy-only-subnet)). In a plain VPC, pick it outside `10.0.0.0/8`, such as `172.16.0.0/23`: step 6 lets GKE pick the cluster's Pod range from `10.0.0.0/8`. In a Shared VPC, pick it outside the Pod and Service ranges that `gcloud container subnets list-usable` shows in step 6.
 
 ### Check the network
 
@@ -469,7 +469,7 @@ kubectl -n abfs get computeaddress abfs-gateway -o jsonpath='{.status.observedSt
 
 Expected: every object `READY True`. `abfs-nodes` has `roles/container.defaultNodeServiceAccount`, `roles/artifactregistry.reader` and `roles/serviceusage.serviceUsageConsumer`. The last command prints the Gateway address (`gateway.vip` in step 13).
 
-If it fails: `kubectl -n abfs describe <kind> <name>` shows why. `cannot resolve project` on every object: [KCC objects created before the webhook](troubleshooting.md#kcc-objects-created-before-the-webhook).
+If it fails: `kubectl -n abfs describe <kind> <name>` shows why. `cannot resolve project` on every object: [KCC objects created before the webhook](troubleshooting.md#kcc-objects-created-before-the-webhook). `abfs-proxy-only` with `conflicts with`: [Proxy-only subnet fails](troubleshooting.md#proxy-only-subnet-fails-with-conflicts-with).
 
 ## 11. Upload the images
 
