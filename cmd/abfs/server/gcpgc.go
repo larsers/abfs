@@ -77,7 +77,7 @@ func (c *gcpGCBackfillCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "backfill",
 		Usage: "--project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--start <key>] [--shards <n>] [--rate <n>] [--dry-run]",
-		Desc: `Write the GC edges of existing objects to the Bigtable table gc.
+		Desc: `Write the GC edges of existing objects to the Bigtable table abfsgc.
 Scans the objects table and writes the gc row of every object whose row is missing or
 was written by an older edge extractor, reading and decoding every such object that is
 not a blob. Objects that a server with --gc added have their rows already. The scan can
@@ -166,14 +166,14 @@ func (c *gcpGCRunCmd) Spec() cmd.CmdSpec {
 		Name:  "run",
 		Usage: "(--dry-run | (--condemn | --delete) (--expected-replicas <n> | --min-replicas <n> [--max-replicas <n>])) --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>] [--report <file>] [--explain <key>[,<key>]]",
 		Desc: `Run one garbage collection cycle and report it as JSON. Both modes take the GC lease,
-read the refs at one snapshot, scan the gc and maps tables and mark what the roots, the
+read the refs at one snapshot, scan the abfsgc and maps tables and mark what the roots, the
 retention rules and the grace keep. The cycle also scans the meta family of the objects
 table to check that every object has a gc row.
 
 --dry-run reports what a collection would remove and writes nothing but the garbage
 collector state in Spanner. --condemn also clears the markers of live objects and marks the
 unreachable objects that hold no marker of a complete list with the cycle number, after it
-wrote their list to the bucket and its row to the Spanner table GcLists; once every marker
+wrote their list to the bucket and its row to the Spanner table AbfsGcLists; once every marker
 is written it completes that row. A marker of a complete list is never written again. It
 deletes nothing, and servers with --gc clear the marker of any marked object they read. It
 refuses, and writes no marker and no list, unless every check of the cycle passed:
@@ -181,14 +181,14 @@ refuses, and writes no marker and no list, unless every check of the cycle passe
 --max-replicas, write a GC heartbeat, with settings that fit the timing rules; --grace
 covers the largest cache TTL of the servers plus --longest-push; no object lacks a gc row;
 and no pin or root could not be read. An object without a gc row shows that servers ran
-without --gc, so the cycle first deletes every row of GcLists, and later cycles write each
+without --gc, so the cycle first deletes every row of AbfsGcLists, and later cycles write each
 marker again with a hold of its own. --explain adds, per key, the root that keeps it.
 
 --delete runs a condemn cycle that first deletes the unreachable objects whose marker is of
 a complete list whose hold has ended: the grace plus 16h after the list was completed, or
 longer when the cache TTL recorded with the list and the keep-alive interval of the live
 mounts need it. It deletes the map rows that name them first, then each object after every
-parent of it, each batch recorded in the bucket under gc/deleted/ before its deletes, each
+parent of it, each batch recorded in the bucket under abfsgc/deleted/ before its deletes, each
 delete conditional on the marker the cycle read. It deletes only when every delete check
 passed, and else only condemns and lists the reasons in the report: the list records are
 readable; no server that may have run within the grace ran without link validation or with
@@ -431,7 +431,7 @@ func (c *gcpGCWalkCmd) Spec() cmd.CmdSpec {
 		Usage: "--mount-details <hash>[,<hash>] --key <hash>[,<hash>] --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
 		Desc: `Tell whether keys are in the content of the checkouts of mounts. Reads each mount
 details object and its pinned manifest, and walks the commit and the trees of every
-pinned revision from object content, without the gc table, so a gap in the GC edges
+pinned revision from object content, without the abfsgc table, so a gap in the GC edges
 does not hide a key. Prints, per key, whether the walk reached it and the first path
 that did. It reads trees only to list their entries, so a blob need not exist to be
 found. Its reads rescue and touch nothing; it takes no lease and writes nothing. Fails

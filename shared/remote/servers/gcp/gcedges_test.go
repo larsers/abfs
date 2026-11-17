@@ -33,7 +33,7 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// createGCTable creates the table gc in the in-process Bigtable of
+// createGCTable creates the table abfsgc in the in-process Bigtable of
 // createTestServerWithCASDB.
 func createGCTable(t *testing.T) {
 	t.Helper()
@@ -125,7 +125,7 @@ func TestPutObject_FailedGCRowFailsPut(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	s, rec := newRecordingServer(t)
-	// The table gc does not exist, so its row cannot be written.
+	// The table abfsgc does not exist, so its row cannot be written.
 	s.gcEdges = gc.NewEdgeWriter(s.casdb.BTClient())
 	added := false
 	s.addObject = func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error {

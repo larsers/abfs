@@ -37,14 +37,14 @@ const (
 )
 
 // serverEvidence is what the collector knows of the server processes: their
-// heartbeat rows in GcServers.
+// heartbeat rows in AbfsGcServers.
 type serverEvidence struct {
-	// servers are the rows of GcServers, read at readTime.
+	// servers are the rows of AbfsGcServers, read at readTime.
 	servers  []Server
 	readTime time.Time
 }
 
-// readServerEvidence reads GcServers.
+// readServerEvidence reads AbfsGcServers.
 func readServerEvidence(ctx context.Context, client *spanner.Client) (*serverEvidence, error) {
 	servers, read, err := readServers(ctx, client)
 	if err != nil {
@@ -70,7 +70,7 @@ func (s *Server) mayHaveRun(start time.Time) bool {
 	return !s.LastSeen.Add(liveReplicaAge).Before(start)
 }
 
-// inWindow returns the rows of GcServers whose process may have run since
+// inWindow returns the rows of AbfsGcServers whose process may have run since
 // start.
 func (e *serverEvidence) inWindow(start time.Time) []Server {
 	var in []Server

@@ -113,7 +113,7 @@ func (f *deleteFixture) metaRefs(prefix string) []string {
 
 func (f *deleteFixture) refRecords() []string {
 	f.t.Helper()
-	return slices.DeleteFunc(f.listNames(), func(name string) bool { return !strings.HasPrefix(name, "gc/refs/") })
+	return slices.DeleteFunc(f.listNames(), func(name string) bool { return !strings.HasPrefix(name, "abfsgc/refs/") })
 }
 
 // A delete cycle removes a build ref past its retention, after it recorded
@@ -138,7 +138,7 @@ func TestDeleteGC_RemovesExpiredRefs(t *testing.T) {
 	res := f.deleteOn(sp)
 	r := res.Report
 	refs := r.Delete.Refs
-	require.Equal("gc/refs/default/"+strconv.FormatInt(r.Cycle, 10), refs.Record)
+	require.Equal("abfsgc/refs/default/"+strconv.FormatInt(r.Cycle, 10), refs.Record)
 	require.Equal([]string{refs.Record}, recordsAtRemoval)
 	require.Equal(map[gc.RefClass]*gc.RefRemovalCounts{gc.RefBuild: {Recorded: 2, Removed: 1, Changed: 1}}, refs.Classes)
 	require.Equal([]string{"refs/abfs/build/user/u/b2"}, f.metaRefs("refs/abfs/build/"))
@@ -241,7 +241,7 @@ func TestDeleteGC_RemovesRefsOnlyInDeleteCycles(t *testing.T) {
 	require.NoError(err)
 	require.Equal(expired, f.metaRefs("refs/abfs/mount/"))
 
-	_, err = f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Delete("GcServers", spanner.AllKeys())})
+	_, err = f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Delete("AbfsGcServers", spanner.AllKeys())})
 	require.NoError(err)
 	_, err = f.deleteWith(f.s.casdb.BTClient(), nil)
 	var refused *gc.ErrCondemnRefused

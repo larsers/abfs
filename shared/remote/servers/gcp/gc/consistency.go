@@ -43,7 +43,7 @@ type ConsistencyReport struct {
 	Ran     bool  `json:"ran"`
 	Objects int64 `json:"objects"`
 	// MissingGCRows counts objects without a gc row, written before the scan
-	// of the table gc started. Any of them stops a later condemn.
+	// of the table abfsgc started. Any of them stops a later condemn.
 	MissingGCRows int64    `json:"missing_gc_rows"`
 	FirstMissing  []string `json:"first_missing,omitempty"`
 	// TooNew counts objects without a gc row written too close to the scan to

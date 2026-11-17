@@ -25,13 +25,13 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// The garbage collector condemns an object by setting the cell g:condemned of
+// The garbage collector condemns an object by setting the cell abfsgc:condemned of
 // its objects row; package gc owns these names. With EnableGC, header reads
 // include the family, so that the server can rescue a condemned object that is
 // still used.
 const (
 	headerFamily    = "meta"
-	condemnedFamily = "g"
+	condemnedFamily = "abfsgc"
 	condemnedColumn = condemnedFamily + ":condemned"
 	gcHeaderFamily  = headerFamily + "|" + condemnedFamily
 )
@@ -67,12 +67,12 @@ func (c *CASDB) headerFamilies() string {
 }
 
 // CheckGCSchema checks that the garbage collector tables a server uses are
-// readable, with the columns added after they were first created. GcLists is
+// readable, with the columns added after they were first created. AbfsGcLists is
 // the collector's alone.
 func (c *CASDB) CheckGCSchema(ctx context.Context) error {
 	for _, q := range []struct{ table, columns string }{
-		{"GcState", "ListLocation, ListSnapshotTime, ListComplete, ListCompleteTime, MaxGraceSeconds"},
-		{"GcServers", "HeartbeatIntervalSeconds, LinkValidation, TouchLossTime, StoppedAt, MapRowLossTime"},
+		{"AbfsGcState", "ListLocation, ListSnapshotTime, ListComplete, ListCompleteTime, MaxGraceSeconds"},
+		{"AbfsGcServers", "HeartbeatIntervalSeconds, LinkValidation, TouchLossTime, StoppedAt, MapRowLossTime"},
 	} {
 		err := c.dbClient.Single().Query(ctx, spanner.Statement{SQL: "SELECT " + q.columns + " FROM " + q.table + " LIMIT 1"}).Do(func(*spanner.Row) error { return nil })
 		if err != nil {
@@ -82,7 +82,7 @@ func (c *CASDB) CheckGCSchema(ctx context.Context) error {
 	return nil
 }
 
-// condemnedValue returns the newest g:condemned value of row, or nil when the
+// condemnedValue returns the newest abfsgc:condemned value of row, or nil when the
 // row has none or GC is off.
 func (c *CASDB) condemnedValue(row bigtable.Row) []byte {
 	if !c.gc {

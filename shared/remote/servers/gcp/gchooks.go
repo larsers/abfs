@@ -109,7 +109,7 @@ type gcHooks struct {
 	// byte of from.
 	touchedMapRows []*lru.Cache[mapRowKey, uint32]
 	stopHeartbeat  func()
-	// server is this process's heartbeat row in GcServers, which exists once
+	// server is this process's heartbeat row in AbfsGcServers, which exists once
 	// hasRow is set. reportedLosses and reportedMapRowLosses count the
 	// object and map row touches lost when the last heartbeat was written.
 	server               gc.Server
@@ -626,7 +626,7 @@ func (s *GCPServer) touchHit(path rescuePath, key entities.Hash, h CachedHeader)
 // touch queues a touch of key. Headers and MapResults, the calls of the client
 // keep-alive and of builds, wait for room in a full buffer, so that a burst of
 // them slows down instead of losing touches. The other calls do not wait, so
-// that reads and uploads do not slow down when the gc table does.
+// that reads and uploads do not slow down when the abfsgc table does.
 func (g *gcHooks) touch(path rescuePath, key entities.Hash) bool {
 	if path == pathHeaders || path == pathMapResults {
 		return g.toucher.TouchObject(key)

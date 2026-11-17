@@ -28,7 +28,7 @@ const (
 	// TouchColumn holds the last touch of an object in its gc row: the cell
 	// timestamp, in server time. The value is empty.
 	TouchColumn = "touch"
-	// CondemnedColumn in the family g of an objects row marks the object as
+	// CondemnedColumn in the family abfsgc of an objects row marks the object as
 	// condemned; the value is the number of the cycle that condemned it.
 	CondemnedColumn    = "condemned"
 	touchBatchSize     = 1000

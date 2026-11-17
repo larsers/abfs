@@ -372,7 +372,7 @@ func TestPruneRefRecords(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	bucket := newTestBucket(t)
-	names := []string{"gc/refs/default/1", "gc/refs/default/2", "gc/refs/default/10", "gc/refs/default/11", "gc/refs/default/notes", "gc/refs/other/1"}
+	names := []string{"abfsgc/refs/default/1", "abfsgc/refs/default/2", "abfsgc/refs/default/10", "abfsgc/refs/default/11", "abfsgc/refs/default/notes", "abfsgc/refs/other/1"}
 	for _, name := range names {
 		w := bucket.Object(name).NewWriter(ctx)
 		_, err := w.Write([]byte("{}"))

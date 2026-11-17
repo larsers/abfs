@@ -32,11 +32,11 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// A ref record is the JSON object gc/refs/<state>/<cycle> in the server
+// A ref record is the JSON object abfsgc/refs/<state>/<cycle> in the server
 // bucket, written by a delete cycle before it removes the refs past their
 // retention, so that an operator can put a ref back while its target exists.
 const (
-	refRecordPrefix = "gc/refs/"
+	refRecordPrefix = "abfsgc/refs/"
 	refsTable       = "Refs"
 	// refRemovalBatch is the number of refs one transaction removes. It keeps
 	// each transaction short, because the refs it locks may be written by a

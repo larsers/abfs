@@ -823,16 +823,16 @@ func TestPruneRecords(t *testing.T) {
 		kept       bool
 	}
 	records := []record{
-		{"gc/deleted/default/3/0-0-0", chunksDoneMetadata, true},
-		{"gc/deleted/default/3/1-0-0", "", true},
-		{"gc/deleted/default/4/1-2-0", chunksDoneMetadata, false},
-		{"gc/deleted/default/4/1-3-0", chunksDoneMetadata, false},
-		{"gc/deleted/default/5/1-0-0", chunksDoneMetadata, false},
-		{"gc/deleted/default/6/1-0-0", gcRowsDoneMetadata, true},
-		{"gc/deleted/default/7/1-0-0", chunksDoneMetadata, true},
-		{"gc/deleted/default/8/1-0-0", chunksDoneMetadata, true},
-		{"gc/deleted/default/notes", chunksDoneMetadata, true},
-		{"gc/deleted/other/1/1-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/3/0-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/3/1-0-0", "", true},
+		{"abfsgc/deleted/default/4/1-2-0", chunksDoneMetadata, false},
+		{"abfsgc/deleted/default/4/1-3-0", chunksDoneMetadata, false},
+		{"abfsgc/deleted/default/5/1-0-0", chunksDoneMetadata, false},
+		{"abfsgc/deleted/default/6/1-0-0", gcRowsDoneMetadata, true},
+		{"abfsgc/deleted/default/7/1-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/8/1-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/notes", chunksDoneMetadata, true},
+		{"abfsgc/deleted/other/1/1-0-0", chunksDoneMetadata, true},
 	}
 	for _, r := range records {
 		write(r.name, r.flag)
@@ -909,7 +909,7 @@ func TestPruneRecords_RetentionCountsFromTheFlag(t *testing.T) {
 	// The flag write moves the update time of the record.
 	ctx := context.Background()
 	bucket := newTestBucket(t)
-	obj := bucket.Object("gc/deleted/default/3/0-0-0")
+	obj := bucket.Object("abfsgc/deleted/default/3/0-0-0")
 	require.NoError(obj.NewWriter(ctx).Close())
 	time.Sleep(10 * time.Millisecond)
 	attrs, err := obj.Update(ctx, storage.ObjectAttrsToUpdate{Metadata: flagged})

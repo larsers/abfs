@@ -84,7 +84,7 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVar(&c.clientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
 	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
 	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
-	fl.BoolVar(&c.gc, "gc", false, "Run the server side of the garbage collector: write the GC edges of new objects to the Bigtable table gc, rescue condemned objects that are used, apply --cache-ttl and --gc-touch-interval, and write a heartbeat to the Spanner table GcServers every 5m, which the garbage collector reads. The server does not start without its first heartbeat and answers Unavailable while its last successful one is older than 10m30s. Needs the resources of 'abfs server gcp init --gc'")
+	fl.BoolVar(&c.gc, "gc", false, "Run the server side of the garbage collector: write the GC edges of new objects to the Bigtable table abfsgc, rescue condemned objects that are used, apply --cache-ttl and --gc-touch-interval, and write a heartbeat to the Spanner table AbfsGcServers every 5m, which the garbage collector reads. The server does not start without its first heartbeat and answers Unavailable while its last successful one is older than 10m30s. Needs the resources of 'abfs server gcp init --gc'")
 	fl.DurationVar(&c.cacheTTL, "cache-ttl", gcp.DefaultCacheTTL, "With --gc, how long cached object headers and content are used before they are read again from Bigtable; above 0. The garbage collector's --grace must cover it and its --longest-push")
 	fl.DurationVar(&c.gcTouchInterval, "gc-touch-interval", gcp.DefaultGCTouchInterval, "With --gc, length of the period in which the server records at most one use of each object and map row for the garbage collector; above 0 and at most half the garbage collector's --grace")
 }
@@ -155,7 +155,7 @@ func (c *gcpInitCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.opts.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.opts.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.opts.BucketName, "bucket", "", "The GCS Bucket Name (required)")
-	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table gc, the column family g of the table objects and the Spanner tables GcState, GcServers and GcLists")
+	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table abfsgc, the column family abfsgc of the table objects and the Spanner tables AbfsGcState, AbfsGcServers and AbfsGcLists")
 }
 
 func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {

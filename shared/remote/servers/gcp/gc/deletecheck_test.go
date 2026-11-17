@@ -667,7 +667,7 @@ func TestInstanceChecks_ProbeConditionalWrite(t *testing.T) {
 
 // The consistency scan of a delete cycle checks every object written during
 // it, however many, and only those: with a gc row written after the scan of
-// the table gc, the delete goes ahead; one object without a gc row refuses
+// the table abfsgc, the delete goes ahead; one object without a gc row refuses
 // it. A check that fails does not fail the scan, and refuses the delete.
 func TestCheckConsistency_ChecksTooNewKeys(t *testing.T) {
 	require := require.New(t)
@@ -709,7 +709,7 @@ func TestCheckConsistency_ChecksTooNewKeys(t *testing.T) {
 	bounds = prefixBounds(bounds)
 	g, _, err := scanNodes(ctx, client.Open(TableName), bounds, time.Now().Add(-72*time.Hour))
 	require.NoError(err)
-	// The gc rows of the new objects land after the scan of the table gc, as
+	// The gc rows of the new objects land after the scan of the table abfsgc, as
 	// those of uploads during a cycle do; one object has none.
 	without := keys[n/2].String()
 	bulk(TableName, slices.DeleteFunc(slices.Clone(keys[2:]), func(k Hash) bool { return k.String() == without }), edges)
@@ -804,7 +804,7 @@ func (r *hookedRead) RecvMsg(m any) error {
 // tooNewScan is a store of objects written just now without a gc row in the
 // mark, split into four key ranges. Their gc rows are written after the mark,
 // as those of uploads during a cycle are. Once on is set, gcRead runs before
-// each read of the table gc and objectsRange before each scan of a range of
+// each read of the table abfsgc and objectsRange before each scan of a range of
 // the table objects.
 type tooNewScan struct {
 	t            *testing.T

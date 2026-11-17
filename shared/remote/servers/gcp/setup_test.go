@@ -147,14 +147,14 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	defer adm.Close()
 	tables, err := adm.Tables(ctx)
 	require.NoError(err)
-	require.NotContains(tables, "gc")
+	require.NotContains(tables, "abfsgc")
 	info, err := adm.TableInfo(ctx, "objects")
 	require.NoError(err)
 	require.ElementsMatch([]string{"meta", "data"}, info.Families)
 	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
 	require.NoError(err)
 	defer client.Close()
-	for _, table := range []string{"GcState", "GcServers", "GcLists"} {
+	for _, table := range []string{"AbfsGcState", "AbfsGcServers", "AbfsGcLists"} {
 		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
 		require.Error(err, table)
 	}
@@ -168,7 +168,7 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 		require.NoError(err)
 		require.ElementsMatch(table.families, info.Families, table.name)
 	}
-	info, err = adm.TableInfo(ctx, "gc")
+	info, err = adm.TableInfo(ctx, "abfsgc")
 	require.NoError(err)
 	for _, f := range info.FamilyInfos {
 		require.Equal("versions() > 1", f.GCPolicy, f.Name)
@@ -176,7 +176,7 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	row, err := btClient.Open("objects").ReadRow(ctx, "kept")
 	require.NoError(err)
 	require.NotEmpty(row)
-	for _, table := range []string{"GcState", "GcServers", "GcLists"} {
+	for _, table := range []string{"AbfsGcState", "AbfsGcServers", "AbfsGcLists"} {
 		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
 		require.NoError(err, table)
 	}
@@ -188,7 +188,7 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	require.NoError(s.Close())
 }
 
-// A database whose GcState was created before the condemned list columns
+// A database whose AbfsGcState was created before the condemned list columns
 // existed stops a server with --gc with a message that names init --gc, and
 // init --gc adds the columns and keeps the state.
 func TestSetup_AddsGCStateListColumns(t *testing.T) {
@@ -196,7 +196,7 @@ func TestSetup_AddsGCStateListColumns(t *testing.T) {
 	ctx := context.Background()
 	var phase1 []string
 	for _, stmt := range casdb.GCSchemaStatements() {
-		if !strings.HasPrefix(stmt, "ALTER TABLE GcState") {
+		if !strings.HasPrefix(stmt, "ALTER TABLE AbfsGcState") {
 			phase1 = append(phase1, stmt)
 		}
 	}
@@ -206,7 +206,7 @@ func TestSetup_AddsGCStateListColumns(t *testing.T) {
 	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
 	require.NoError(err)
 	defer client.Close()
-	_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcState",
+	_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("AbfsGcState",
 		[]string{"Name", "Cycle", "LeaseEpoch", "UpdateTime"}, []any{"default", int64(41), int64(5), spanner.CommitTimestamp})})
 	require.NoError(err)
 	serverOpts := &NewServerOpts{
@@ -221,7 +221,7 @@ func TestSetup_AddsGCStateListColumns(t *testing.T) {
 	s, err := New(ctx, serverOpts)
 	require.NoError(err)
 	require.NoError(s.Close())
-	row, err := client.Single().ReadRow(ctx, "GcState", spanner.Key{"default"}, []string{"Cycle", "ListComplete"})
+	row, err := client.Single().ReadRow(ctx, "AbfsGcState", spanner.Key{"default"}, []string{"Cycle", "ListComplete"})
 	require.NoError(err)
 	var cycle int64
 	var complete spanner.NullBool
@@ -230,7 +230,7 @@ func TestSetup_AddsGCStateListColumns(t *testing.T) {
 	require.False(complete.Valid)
 }
 
-// A database whose GcServers was created before MapRowLossTime existed stops
+// A database whose AbfsGcServers was created before MapRowLossTime existed stops
 // a server with --gc, and init --gc adds the column. The rows written before
 // have no map row loss time.
 func TestSetup_AddsGCServersMapRowLossColumn(t *testing.T) {
@@ -238,7 +238,7 @@ func TestSetup_AddsGCServersMapRowLossColumn(t *testing.T) {
 	ctx := context.Background()
 	var phase1 []string
 	for _, stmt := range casdb.GCSchemaStatements() {
-		if !strings.HasPrefix(stmt, "ALTER TABLE GcServers") {
+		if !strings.HasPrefix(stmt, "ALTER TABLE AbfsGcServers") {
 			phase1 = append(phase1, stmt)
 		}
 	}
@@ -249,7 +249,7 @@ func TestSetup_AddsGCServersMapRowLossColumn(t *testing.T) {
 	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
 	require.NoError(err)
 	defer client.Close()
-	_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcServers",
+	_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("AbfsGcServers",
 		[]string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "TouchLossTime"},
 		[]any{"old-0-aa", int64(1), true, int64(3600), int64(3600), int64(300), true, spanner.CommitTimestamp, spanner.CommitTimestamp})})
 	require.NoError(err)
@@ -304,17 +304,17 @@ func TestNew_ChecksResources(t *testing.T) {
 			wantErr: "init --gc",
 		},
 		{
-			name: "GC without table gc",
+			name: "GC without table abfsgc",
 			prepare: func(t *testing.T) *SetupOpts {
 				newEmulatorBigtableWith(t, serverTables(false))
 				o := setupOpts(t, newEmulatorDatabase(t))
 				o.GC = true
 				return o
 			},
-			wantErr: "Bigtable table gc",
+			wantErr: "Bigtable table abfsgc",
 		},
 		{
-			name: "GC without family g",
+			name: "GC without family abfsgc",
 			prepare: func(t *testing.T) *SetupOpts {
 				tables := serverTables(true)
 				tables[0].families = []string{"meta", "data"}
@@ -323,7 +323,7 @@ func TestNew_ChecksResources(t *testing.T) {
 				o.GC = true
 				return o
 			},
-			wantErr: "column family g",
+			wantErr: "column family abfsgc",
 		},
 		{
 			name: "missing bucket",

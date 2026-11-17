@@ -72,7 +72,7 @@ func TestList_WriteReadAndCreateOnce(t *testing.T) {
 	}
 	h := &listHeader{cycle: 7, snapshot: time.UnixMicro(time.Now().UnixMicro()), holder: "gc-host-1", epoch: 3, count: int64(len(recs)), types: typeNames}
 	name := listObjectName("default", 7)
-	require.Equal("gc/condemned/default/7", name)
+	require.Equal("abfsgc/condemned/default/7", name)
 	require.NoError(writeList(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, h, listOf(recs)))
 
 	l, err := readList(ctx, bucket, name)
@@ -104,7 +104,7 @@ func TestPruneLists(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	bucket := newTestBucket(t)
-	names := []string{"gc/condemned/default/9", "gc/condemned/default/9.live", "gc/condemned/default/10", "gc/condemned/default/11", "gc/condemned/default/11.live", "gc/condemned/default/notes", "gc/condemned/other/1"}
+	names := []string{"abfsgc/condemned/default/9", "abfsgc/condemned/default/9.live", "abfsgc/condemned/default/10", "abfsgc/condemned/default/11", "abfsgc/condemned/default/11.live", "abfsgc/condemned/default/notes", "abfsgc/condemned/other/1"}
 	for _, n := range names {
 		w := bucket.Object(n).NewWriter(ctx)
 		require.NoError(w.Close())

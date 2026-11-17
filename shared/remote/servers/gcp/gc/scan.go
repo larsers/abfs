@@ -61,7 +61,7 @@ func knownTypes() ([]string, map[string]uint8) {
 	return names, index
 }
 
-// graph is the object graph of one scan of the table gc. Nodes are the row
+// graph is the object graph of one scan of the table abfsgc. Nodes are the row
 // keys, numbered in key order across the scan shards; the edges of each node
 // are in compressed sparse rows, one segment per scan shard. The keys stay in
 // the arrays their shards filled, so the scan never copies them.
@@ -239,7 +239,7 @@ type nodeShard struct {
 }
 
 // scanNodes reads the key, type, first write and touch of every row of the
-// table gc, without the edges. A row is recent when it was written or touched
+// table abfsgc, without the edges. A row is recent when it was written or touched
 // after recentAfter. An object type this binary does not know stops the scan.
 func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, recentAfter time.Time) (*graph, nodeStats, error) {
 	filter := bigtable.ChainFilters(bigtable.LatestNFilter(1), bigtable.InterleaveFilters(
@@ -288,7 +288,7 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 				err = rowErr
 			}
 			if err != nil {
-				return fmt.Errorf("failed to scan the table gc from %q: %w", bounds[i], err)
+				return fmt.Errorf("failed to scan the table abfsgc from %q: %w", bounds[i], err)
 			}
 			return nil
 		})
@@ -309,7 +309,7 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 		}
 	}
 	if uint64(n) >= uint64(noNode) {
-		return nil, stats, fmt.Errorf("the table gc has %d rows, more than one mark can hold", n)
+		return nil, stats, fmt.Errorf("the table abfsgc has %d rows, more than one mark can hold", n)
 	}
 	if len(shards) > 1<<16 {
 		return nil, stats, fmt.Errorf("too many scan shards: %d", len(shards))
@@ -327,7 +327,7 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 	for i := range shards {
 		s := &shards[i]
 		if !slices.IsSortedFunc(s.keys, compareHash) || (last != nil && len(s.keys) > 0 && compareHash(*last, s.keys[0]) >= 0) {
-			return nil, stats, fmt.Errorf("the scan of the table gc returned keys out of order")
+			return nil, stats, fmt.Errorf("the scan of the table abfsgc returned keys out of order")
 		}
 		if len(s.keys) > 0 {
 			last = &s.keys[len(s.keys)-1]
@@ -447,7 +447,7 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 				err = rowErr
 			}
 			if err != nil {
-				return fmt.Errorf("failed to scan the edges of the table gc from %q: %w", bounds[i], err)
+				return fmt.Errorf("failed to scan the edges of the table abfsgc from %q: %w", bounds[i], err)
 			}
 			for ; next < len(ks.keys); next++ {
 				s.seg.add(nil)

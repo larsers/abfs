@@ -29,12 +29,12 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// serverRow writes a row of GcServers as a server process with the given
+// serverRow writes a row of AbfsGcServers as a server process with the given
 // times left it; a zero stop or loss time leaves the column NULL.
 func (f *gcFixture) serverRow(id string, touch time.Duration, lastSeen, stopped, loss time.Time) {
 	f.t.Helper()
 	null := func(t time.Time) spanner.NullTime { return spanner.NullTime{Time: t, Valid: !t.IsZero()} }
-	_, err := f.s.casdb.SpannerClient().Apply(context.Background(), []*spanner.Mutation{spanner.InsertOrUpdate("GcServers",
+	_, err := f.s.casdb.SpannerClient().Apply(context.Background(), []*spanner.Mutation{spanner.InsertOrUpdate("AbfsGcServers",
 		[]string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "TouchLossTime", "StoppedAt"},
 		[]any{id, gc.ExtractorVersion, true, int64(touch / time.Second), int64(6 * time.Hour / time.Second), int64(300), true, lastSeen, null(loss), null(stopped)})})
 	require.NoError(f.t, err)
@@ -52,7 +52,7 @@ func (f *gcFixture) serverIDs() []string {
 	return ids
 }
 
-// A row of GcServers tells which processes ran in the window of a cycle, so
+// A row of AbfsGcServers tells which processes ran in the window of a cycle, so
 // every mode keeps it for the largest grace of any condemn or delete cycle
 // and its own grace, plus an hour and the 9 h before the window in which a
 // lost map row touch is still reported; crash rows, which have no stop time,
@@ -210,7 +210,7 @@ func TestCondemnGC_OlderServerLeavesNoRecord(t *testing.T) {
 	require.Equal([][]byte{marker(2)}, f.markerCells(k))
 	require.False(f.listRecord(2).Complete())
 
-	_, err = sp.Apply(ctx, []*spanner.Mutation{spanner.Delete("GcServers", spanner.Key{old.ID})})
+	_, err = sp.Apply(ctx, []*spanner.Mutation{spanner.Delete("AbfsGcServers", spanner.Key{old.ID})})
 	require.NoError(err)
 	res, err = f.condemn(o)
 	require.NoError(err)

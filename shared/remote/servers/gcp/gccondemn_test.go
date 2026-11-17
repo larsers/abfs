@@ -74,10 +74,10 @@ func (f *condemnFixture) heartbeat(id string) {
 	require.NoError(f.t, gc.WriteServer(context.Background(), f.s.casdb.SpannerClient(), s, false, false))
 }
 
-// listRecord returns the row of GcLists of cycle, nil when there is none.
+// listRecord returns the row of AbfsGcLists of cycle, nil when there is none.
 func (f *condemnFixture) listRecord(cycle int64) *gc.ListRecord {
 	f.t.Helper()
-	row, err := f.s.casdb.SpannerClient().Single().ReadRow(context.Background(), "GcLists", spanner.Key{gc.DefaultStateName, cycle}, []string{"Cycle", "Location", "CompleteTime", "CacheTTLSeconds", "Markers"})
+	row, err := f.s.casdb.SpannerClient().Single().ReadRow(context.Background(), "AbfsGcLists", spanner.Key{gc.DefaultStateName, cycle}, []string{"Cycle", "Location", "CompleteTime", "CacheTTLSeconds", "Markers"})
 	if spanner.ErrCode(err) == codes.NotFound {
 		return nil
 	}
@@ -108,7 +108,7 @@ func (f *condemnFixture) condemn(o *gc.CondemnOpts) (*gc.Result, error) {
 	return f.s.CondemnGC(context.Background(), f.bucket, o)
 }
 
-// markerCells returns the values of every cell of g:condemned of key, all
+// markerCells returns the values of every cell of abfsgc:condemned of key, all
 // versions.
 func (f *condemnFixture) markerCells(key entities.Hash) [][]byte {
 	f.t.Helper()
@@ -127,7 +127,7 @@ func marker(cycle byte) []byte {
 
 func (f *condemnFixture) listState() (location spanner.NullString, complete spanner.NullBool) {
 	f.t.Helper()
-	row, err := f.s.casdb.SpannerClient().Single().ReadRow(context.Background(), "GcState", spanner.Key{gc.DefaultStateName}, []string{"ListLocation", "ListComplete"})
+	row, err := f.s.casdb.SpannerClient().Single().ReadRow(context.Background(), "AbfsGcState", spanner.Key{gc.DefaultStateName}, []string{"ListLocation", "ListComplete"})
 	require.NoError(f.t, err)
 	require.NoError(f.t, row.Columns(&location, &complete))
 	return location, complete
@@ -136,7 +136,7 @@ func (f *condemnFixture) listState() (location spanner.NullString, complete span
 func (f *condemnFixture) listNames() []string {
 	f.t.Helper()
 	var names []string
-	it := f.s.storage.Bucket(f.bucket).Objects(context.Background(), &storage.Query{Prefix: "gc/"})
+	it := f.s.storage.Bucket(f.bucket).Objects(context.Background(), &storage.Query{Prefix: "abfsgc/"})
 	for {
 		attrs, err := it.Next()
 		if errors.Is(err, iterator.Done) {
@@ -149,7 +149,7 @@ func (f *condemnFixture) listNames() []string {
 
 // A condemn cycle marks exactly the unreachable objects that have an object
 // row with its number, never creates an object row for a gc row without one,
-// and completes its list in GcLists with the largest cache TTL of the
+// and completes its list in AbfsGcLists with the largest cache TTL of the
 // servers. The next cycle keeps the markers of keys still unreachable: a
 // recorded marker is never written again.
 func TestCondemnGC_MarksUnreachableObjects(t *testing.T) {
@@ -186,13 +186,13 @@ func TestCondemnGC_MarksUnreachableObjects(t *testing.T) {
 	require.NoError(err)
 	require.Empty(row)
 
-	require.Equal("gc/condemned/default/1", r.Condemn.List)
-	require.Equal([]string{"gc/condemned/default/1"}, f.listNames())
+	require.Equal("abfsgc/condemned/default/1", r.Condemn.List)
+	require.Equal([]string{"abfsgc/condemned/default/1"}, f.listNames())
 	location, complete := f.listState()
-	require.Equal("gc/condemned/default/1", location.StringVal)
+	require.Equal("abfsgc/condemned/default/1", location.StringVal)
 	require.True(complete.Bool)
 	rec := f.listRecord(1)
-	require.Equal("gc/condemned/default/1", rec.Location)
+	require.Equal("abfsgc/condemned/default/1", rec.Location)
 	require.True(rec.Complete())
 	require.Equal(6*time.Hour, rec.CacheTTL)
 	require.Equal(int64(3), rec.Markers)
@@ -205,7 +205,7 @@ func TestCondemnGC_MarksUnreachableObjects(t *testing.T) {
 	for _, k := range []entities.Hash{gone, goneTree, goneBlob} {
 		require.Equal([][]byte{marker(1)}, f.markerCells(k), k)
 	}
-	require.Equal([]string{"gc/condemned/default/1", "gc/condemned/default/2"}, f.listNames())
+	require.Equal([]string{"abfsgc/condemned/default/1", "abfsgc/condemned/default/2"}, f.listNames())
 	require.Zero(f.listRecord(2).Markers)
 	require.Equal(int64(3), res.Report.Delete.Plan.Held)
 	require.Zero(res.Report.Delete.Plan.Candidates)
@@ -276,7 +276,7 @@ func TestCondemnGC_NoMarkerWithoutList(t *testing.T) {
 	f := newCondemnFixture(t)
 	f.heartbeat("srv-0-aa")
 	blob := f.blob("unreachable file", f.old)
-	w := f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/1").NewWriter(ctx)
+	w := f.s.storage.Bucket(f.bucket).Object("abfsgc/condemned/default/1").NewWriter(ctx)
 	w.Metadata = map[string]string{"abfs-gc-run": "another-collector#9"}
 	require.NoError(w.Close())
 
@@ -304,7 +304,7 @@ func TestCondemnGC_ClearsLiveKeysBeforeItsList(t *testing.T) {
 	require.Equal([][]byte{marker(1)}, f.markerCells(live))
 
 	f.ref("platform/a", "refs/heads/main", f.tree(f.old, live), f.old)
-	w := f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/2").NewWriter(ctx)
+	w := f.s.storage.Bucket(f.bucket).Object("abfsgc/condemned/default/2").NewWriter(ctx)
 	w.Metadata = map[string]string{"abfs-gc-run": "another-collector#9"}
 	require.NoError(w.Close())
 	_, err = f.condemn(nil)
@@ -312,18 +312,18 @@ func TestCondemnGC_ClearsLiveKeysBeforeItsList(t *testing.T) {
 	require.Empty(f.markerCells(live))
 	require.Equal([][]byte{marker(1)}, f.markerCells(still))
 	location, complete := f.listState()
-	require.Equal("gc/condemned/default/1", location.StringVal)
+	require.Equal("abfsgc/condemned/default/1", location.StringVal)
 	require.True(complete.Bool)
 	require.Nil(f.listRecord(2))
 
 	res, err := f.condemn(nil)
 	require.NoError(err)
-	require.Equal("gc/condemned/default/1", res.Report.PreviousList.Location)
+	require.Equal("abfsgc/condemned/default/1", res.Report.PreviousList.Location)
 	require.Zero(res.Report.Condemn.Cleared)
 	require.Equal([][]byte{marker(1)}, f.markerCells(still))
 }
 
-// The list in GcState serves only the report: a cycle runs on when it is gone
+// The list in AbfsGcState serves only the report: a cycle runs on when it is gone
 // or cannot be read, and the markers of what is still unreachable stay.
 func TestCondemnGC_MissingPreviousList(t *testing.T) {
 	require := require.New(t)
@@ -333,19 +333,19 @@ func TestCondemnGC_MissingPreviousList(t *testing.T) {
 	k := f.blob("unreachable file", f.old)
 	_, err := f.condemn(nil)
 	require.NoError(err)
-	require.NoError(f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/1").Delete(ctx))
+	require.NoError(f.s.storage.Bucket(f.bucket).Object("abfsgc/condemned/default/1").Delete(ctx))
 
 	res, err := f.condemn(nil)
 	require.NoError(err)
 	prev := res.Report.PreviousList
-	require.Equal("gc/condemned/default/1", prev.Location)
+	require.Equal("abfsgc/condemned/default/1", prev.Location)
 	require.Equal("not found", prev.Error)
 	require.Zero(res.Report.Condemn.Condemned)
 	require.Equal([][]byte{marker(1)}, f.markerCells(k))
 	location, _ := f.listState()
-	require.Equal("gc/condemned/default/2", location.StringVal)
+	require.Equal("abfsgc/condemned/default/2", location.StringVal)
 
-	w := f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/2").NewWriter(ctx)
+	w := f.s.storage.Bucket(f.bucket).Object("abfsgc/condemned/default/2").NewWriter(ctx)
 	_, err = w.Write([]byte("not a list"))
 	require.NoError(err)
 	require.NoError(w.Close())
@@ -391,11 +391,11 @@ func ageList(t *testing.T, s *GCPServer, cycle int64, d time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 	sp := s.casdb.SpannerClient()
-	row, err := sp.Single().ReadRow(ctx, "GcLists", spanner.Key{gc.DefaultStateName, cycle}, []string{"CompleteTime"})
+	row, err := sp.Single().ReadRow(ctx, "AbfsGcLists", spanner.Key{gc.DefaultStateName, cycle}, []string{"CompleteTime"})
 	require.NoError(t, err)
 	var complete time.Time
 	require.NoError(t, row.Columns(&complete))
-	_, err = sp.Apply(ctx, []*spanner.Mutation{spanner.Update("GcLists", []string{"Name", "Cycle", "CompleteTime"}, []any{gc.DefaultStateName, cycle, complete.Add(-d)})})
+	_, err = sp.Apply(ctx, []*spanner.Mutation{spanner.Update("AbfsGcLists", []string{"Name", "Cycle", "CompleteTime"}, []any{gc.DefaultStateName, cycle, complete.Add(-d)})})
 	require.NoError(t, err)
 }
 
@@ -471,13 +471,13 @@ func TestCondemnGC_ListsLiveKeysOfPreviousList(t *testing.T) {
 	require.Equal([][]byte{marker(1)}, f.markerCells(still))
 
 	prev := res.Report.PreviousList
-	require.Equal("gc/condemned/default/1", prev.Location)
+	require.Equal("abfsgc/condemned/default/1", prev.Location)
 	require.Equal(int64(1), prev.Cycle)
 	require.True(prev.Complete)
 	require.Equal(int64(4), prev.Keys)
 	cr := res.Report.Condemn
 	require.Equal(int64(2), cr.Cleared)
-	require.Equal("gc/condemned/default/2.live", cr.LiveList)
+	require.Equal("abfsgc/condemned/default/2.live", cr.LiveList)
 	require.Equal(int64(2), res.Report.Consistency.MarkedLive)
 	blobs := prev.Types["blob"]
 	require.Equal(int64(1), blobs.StillUnreachable)
@@ -533,7 +533,7 @@ func TestCondemnGC_CrashMidwayLeavesNoOldMarker(t *testing.T) {
 	require.Equal([][]byte{marker(1)}, f.markerCells(keys[1]))
 	require.Empty(f.markerCells(keys[2]))
 	location, complete := f.listState()
-	require.Equal("gc/condemned/default/1", location.StringVal)
+	require.Equal("abfsgc/condemned/default/1", location.StringVal)
 	require.False(complete.Bool)
 	require.False(f.listRecord(1).Complete())
 
@@ -655,14 +655,14 @@ func TestCondemnGC_ListTTLReadAfterMarkers(t *testing.T) {
 	require.Equal([][]byte{marker(1)}, f.markerCells(key))
 }
 
-// failingListRead fails every read of the Spanner table GcLists.
+// failingListRead fails every read of the Spanner table AbfsGcLists.
 type failingListRead struct {
 	grpc.ClientStream
 	failed bool
 }
 
 func (r *failingListRead) SendMsg(m any) error {
-	if req, ok := m.(*spannerpb.ReadRequest); ok && req.GetTable() == "GcLists" {
+	if req, ok := m.(*spannerpb.ReadRequest); ok && req.GetTable() == "AbfsGcLists" {
 		r.failed = true
 	}
 	return r.ClientStream.SendMsg(m)
@@ -732,7 +732,7 @@ func TestCondemnGC_UnreadableListRecords(t *testing.T) {
 	require.Equal([][]byte{marker(4)}, f.markerCells(unrecorded))
 }
 
-// A condemn or delete cycle on a store without GcLists fails before it
+// A condemn or delete cycle on a store without AbfsGcLists fails before it
 // writes anything, with an error that names the init that creates the
 // table; a dry run reports the error.
 func TestCondemnGC_MissingListTable(t *testing.T) {
@@ -743,7 +743,7 @@ func TestCondemnGC_MissingListTable(t *testing.T) {
 	dc, err := database.NewDatabaseAdminClient(ctx)
 	require.NoError(err)
 	defer dc.Close()
-	op, err := dc.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{Database: f.s.casdb.SpannerClient().DatabaseName(), Statements: []string{"DROP TABLE GcLists"}})
+	op, err := dc.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{Database: f.s.casdb.SpannerClient().DatabaseName(), Statements: []string{"DROP TABLE AbfsGcLists"}})
 	require.NoError(err)
 	require.NoError(op.Wait(ctx))
 
