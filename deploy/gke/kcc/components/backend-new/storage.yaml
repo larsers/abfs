@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # The blob store for the parts of large objects past the first 1 MiB. The
-# location is set because the CRD default is US. The server never deletes
-# objects, so soft delete would only add cost.
+# location is set because the CRD default is US. Soft delete stays off:
+# without garbage collection nothing is deleted, and with it the collector
+# keeps deleted chunks for its own undo window of 7 days.
 apiVersion: storage.cnrm.cloud.google.com/v1beta1
 kind: StorageBucket
 metadata:
