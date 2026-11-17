@@ -384,7 +384,7 @@ To enable faster source control operations, ABFS requires a slightly patched ver
     echo refs/heads/stable-abfs | abfs test-client get-ref -s gerrit.googlesource.com -p git-repo
     ```
 
-To update `repo` later, repeat these steps.
+The patches apply to a fixed `repo` commit, so these steps give the same `repo` code every time. A newer ABFS release can move that commit; repeat these steps after upgrading to update `repo`.
 
 [Manifests and tree layouts](MANIFESTS.md) lists the manifest elements ABFS applies and the
 known limits of `repo sync` and `repo-hooks` inside a mount.
