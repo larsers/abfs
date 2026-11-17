@@ -323,14 +323,10 @@ func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle
 // because the chunks it names may still be to delete, and so do the other
 // records of its cycle, so that an undo of the cycle finds all of them.
 func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
-	retention, err := recordRetention(ctx, b, bucket)
-	if err != nil {
-		return 0, err
-	}
 	prefix := recordPrefixOf(state)
 	records := make(map[int64][]string)
 	kept := make(map[int64]bool)
-	oldest := wallNow().Add(-retention)
+	oldest := wallNow().Add(-recordRetention)
 	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
 	for {
 		attrs, err := it.Next()
@@ -370,9 +366,9 @@ func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHand
 }
 
 // flaggedBefore reports whether the delete record with attrs was flagged
-// before oldest. The chunks it names enter soft delete when the step flags
-// it, which can be long after the record was written, and the flag write
-// updates the record.
+// before oldest. The step flags it when it deleted the chunks it names, which
+// can be long after the record was written, and the flag write updates the
+// record.
 func flaggedBefore(attrs *storage.ObjectAttrs, oldest time.Time) bool {
 	return attrs.Metadata[chunksDoneMetadata] != "" && attrs.Updated.Before(oldest)
 }

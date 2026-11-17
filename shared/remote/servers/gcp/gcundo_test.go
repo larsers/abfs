@@ -34,49 +34,6 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// copiedAt holds, per fixture, when copyTables last copied the tables.
-var copiedAt sync.Map
-
-// copiedSources tells that each table <table><suffix> was restored from a
-// backup of <table> that ended when copyTables copied it.
-type copiedSources struct {
-	suffix string
-	end    time.Time
-}
-
-func (s copiedSources) RestoredFrom(_ context.Context, table string) (*gc.RestoredBackup, error) {
-	return &gc.RestoredBackup{Backup: "copy", SourceTable: strings.TrimSuffix(table, s.suffix), Start: s.end, End: s.end}, nil
-}
-
-// copyTables copies every row of the server tables to <table><suffix>, cell
-// times included, as a restore of backups taken now would.
-func (f *deleteFixture) copyTables(suffix string) {
-	f.t.Helper()
-	ctx := context.Background()
-	adm, err := bigtable.NewAdminClient(ctx, emulatorProject, emulatorBigtable)
-	require.NoError(f.t, err)
-	defer adm.Close()
-	bt := f.s.casdb.BTClient()
-	for _, table := range serverTables(true) {
-		require.NoError(f.t, adm.CreateTable(ctx, table.name+suffix))
-		for _, family := range table.families {
-			require.NoError(f.t, adm.CreateColumnFamily(ctx, table.name+suffix, family))
-		}
-		require.NoError(f.t, bt.Open(table.name).ReadRows(ctx, bigtable.InfiniteRange(""), func(row bigtable.Row) bool {
-			mut := bigtable.NewMutation()
-			for family, items := range row {
-				for _, item := range items {
-					mut.Set(family, strings.TrimPrefix(item.Column, family+":"), item.Timestamp, item.Value)
-				}
-			}
-			require.NoError(f.t, bt.Open(table.name+suffix).Apply(ctx, row.Key(), mut))
-			return true
-		}))
-	}
-	// Before the records written after it, whose times Cloud Storage sets.
-	copiedAt.Store(f, time.Now().Add(-time.Second))
-}
-
 // staleLease records in GcState a lease of another holder that expired ten
 // minutes ago, as a collector that crashed leaves it, so that the fence of
 // the next lease has passed.
@@ -87,9 +44,8 @@ func (f *deleteFixture) staleLease() {
 	require.NoError(f.t, err)
 }
 
-// undo runs gc undo of the cycles first to last from the tables with the
-// suffix -r, with a Bigtable client that records the keys of the objects
-// rows it writes, in order.
+// undo runs gc undo of the cycles first to last with a Bigtable client that
+// records the keys of the objects rows it writes, in order.
 func (f *deleteFixture) undo(first, last int64) (*gc.UndoReport, []string) {
 	f.t.Helper()
 	var mu sync.Mutex
@@ -103,23 +59,20 @@ func (f *deleteFixture) undo(first, last int64) (*gc.UndoReport, []string) {
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}))
 	o := gc.DefaultUndoOpts()
-	o.Cycle, o.Through, o.FromSuffix = first, last, "-r"
+	o.Cycle, o.Through = first, last
 	f.staleLease()
-	end, ok := copiedAt.Load(f)
-	require.True(f.t, ok)
-	rep, err := gc.Undo(context.Background(), f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), copiedSources{suffix: "-r", end: end.(time.Time)}, &o)
+	rep, err := gc.Undo(context.Background(), f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), &o)
 	require.NoError(f.t, err)
 	return rep, rows
 }
 
-// Objects that delete cycles removed come back from tables restored from
-// backups taken before the first of them: children before parents across
-// the cycles of the range, and each object only once every chunk of its
-// content exists, so that no read finds a row whose chunks are missing. Each
-// is readable through the server, carries no condemn marker and is recent
-// for the next cycle, which condemns none of them. A map row that expired
-// comes back with a new time and survives the next cycle. The undo lease
-// does not stop the next cycle from deleting.
+// Objects that delete cycles removed come back from their delete records
+// alone: children before parents across the cycles of the range, each with
+// the chunks that the chunk step keeps for the undo window. Each is readable
+// through the server, carries no condemn marker and is recent for the next
+// cycle, whose scan reads the restored gc rows and which condemns none of
+// them. A map row that expired comes back with a new time and survives the
+// next cycle. The undo lease does not stop the next cycle from deleting.
 func TestUndoGC_RestoresDeletedRows(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -152,23 +105,15 @@ func TestUndoGC_RestoresDeletedRows(t *testing.T) {
 	}
 	require.Len(chunks, 2)
 	require.Equal([]string{"bigtable", "bucket"}, []string{chunks[0].Depot, chunks[1].Depot})
-	bucketChunk := f.s.storage.Bucket(f.bucket).Object(chunks[1].ID)
-	r, err := bucketChunk.NewReader(ctx)
-	require.NoError(err)
-	chunkBytes, err := io.ReadAll(r)
-	require.NoError(err)
-	require.NoError(r.Close())
-
 	// The blob is recent in the first mark, so that cycle 2 deletes its
 	// parents and cycle 3 the blob.
 	f.touch(blob, time.Now())
-	_, err = f.condemn(nil)
+	_, err := f.condemn(nil)
 	require.NoError(err)
 	mut := bigtable.NewMutation()
 	mut.DeleteCellsInFamily(gc.TouchFamily)
 	require.NoError(f.s.casdb.BTClient().Open(gc.TableName).Apply(ctx, blob.String(), mut))
 	f.age()
-	f.copyTables("-r")
 	res := f.deletes(nil)
 	require.Equal(int64(3), res.Report.Delete.Step.Deleted)
 	require.Equal(int64(1), res.Report.Delete.Step.MapRowsDeleted)
@@ -177,39 +122,19 @@ func TestUndoGC_RestoresDeletedRows(t *testing.T) {
 	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
 	f.requireGone(commit, tree, small, blob)
 	require.Empty(mapRow())
-	// The chunks of the blob are gone, as after the chunk step.
-	mut = bigtable.NewMutation()
-	mut.DeleteRow()
-	require.NoError(f.s.casdb.BTClient().Open("chunks").Apply(ctx, chunks[0].ID, mut))
-	require.NoError(bucketChunk.Delete(ctx))
-
-	// The blob waits for its bucket chunk and keeps its parents from coming
-	// back; the small file and the map row come back.
-	rep, rows := f.undo(2, 3)
-	require.Equal([]string{chunks[1].ID}, rep.MissingBucketObjects)
-	require.Equal(int64(1), rep.WaitingForBucketObjects)
-	require.Equal(int64(2), rep.BlockedByChild)
-	require.Equal(int64(1), rep.Restored)
-	require.Equal(int64(1), rep.MapRowsRestored)
-	require.NotEmpty(mapRow())
-	require.Equal([]string{small.String()}, rows)
-	for _, k := range []entities.Hash{blob, tree, commit} {
-		require.Empty(f.row("objects", k), k)
-	}
-	f.requirePresent(small)
-
-	// Restored from soft delete, the bucket chunk lets the rest come back,
-	// the blob first.
-	w := bucketChunk.NewWriter(ctx)
-	_, err = w.Write(chunkBytes)
+	// The chunk steps of these cycles keep the chunks for the undo window.
+	chunkRow, err := f.s.casdb.BTClient().Open("chunks").ReadRow(ctx, chunks[0].ID)
 	require.NoError(err)
-	require.NoError(w.Close())
-	rep, rows = f.undo(2, 3)
-	require.Equal(int64(3), rep.Restored)
-	require.Equal(int64(1), rep.Present)
-	require.Equal(int64(1), rep.MapRowsPresent)
+	require.NotEmpty(chunkRow)
+	_, err = f.s.storage.Bucket(f.bucket).Object(chunks[1].ID).Attrs(ctx)
+	require.NoError(err)
+
+	rep, rows := f.undo(2, 3)
+	require.Equal(int64(4), rep.Restored)
+	require.Equal(int64(1), rep.MapRowsRestored)
 	require.Zero(rep.NotRestored())
-	require.Equal([]string{blob.String(), tree.String(), commit.String()}, rows)
+	require.Equal([]string{blob.String(), small.String(), tree.String(), commit.String()}, rows)
+	require.NotEmpty(mapRow())
 	f.requirePresent(commit, tree, small, blob, req, resp)
 	got, err := f.s.GetObject(ctx, blob)
 	require.NoError(err)

@@ -18,13 +18,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
+	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/storage"
 
 	"github.com/google/abfs/shared/entities"
@@ -33,14 +34,18 @@ import (
 // A delete record is the object gc/deleted/<state>/<cycle>/<level>-<range>-<batch>
 // in the server bucket, written by the delete step before it deletes the rows
 // of one batch, so that the chunks of every deleted object can be found after
-// its row is gone. It holds a header, then one entry per key of the batch:
-// for an object, the 20-byte key and the length and bytes of its
-// data:content descriptor, empty when every chunk is inline; for a map row,
-// the keys of its two ends. Integers are big-endian.
+// its row is gone, and an undo can write the rows back. It holds a header,
+// then a key section with the kind and the 20-byte key of each entry, and
+// for a map row the key of its other end, then a row section with, per
+// object in the order of the key section, the newest cell of each column of
+// the families meta and data of its objects row, and the newest value of
+// each column of the family e of its gc row, none when it had no gc row.
+// Readers that need only the keys stop after the key section. Integers are
+// big-endian.
 const (
 	recordPrefix        = "gc/deleted/"
 	recordMagic         = "ABFSGCD\n"
-	recordFormatVersion = 1
+	recordFormatVersion = 2
 	recordObject        = 1
 	recordMapRow        = 2
 	// inlineDepot is the depot of the server that keeps content in the
@@ -51,12 +56,20 @@ const (
 	// the cycle fails instead of finding nothing to restore. It carries the
 	// flag of a done record, so that the chunk step skips it.
 	prunedMarker = "pruned"
-	// undoWindow is the shortest time delete and ref records are kept. It is
-	// the shortest soft delete retention under which the chunk step deletes
-	// bucket chunks, the time a deleted chunk can come back, and no shorter
-	// than the retention of the backups an undo restores from.
+	// undoWindow is how long after its record the chunk step deletes the
+	// chunks of a deleted object, so the time in which an undo restores every
+	// object it deleted. Later an undo restores the objects whose content is
+	// inline, and the map rows, while the records exist.
 	undoWindow = 7 * 24 * time.Hour
+	// recordRetention is how long ref records are kept after they were
+	// written, and delete records after they were flagged, so that an undo
+	// finds them.
+	recordRetention = undoWindow
 )
+
+// maxRecordBytes is the most bytes of entries in one delete record; the
+// delete step writes a larger batch as several records. Tests change it.
+var maxRecordBytes = 16 << 20
 
 // recordPrefixOf returns the prefix of the delete records of the garbage
 // collector state.
@@ -76,28 +89,6 @@ func prunedMarkerName(state string, cycle int64) string {
 	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + prunedMarker
 }
 
-// recordRetention returns how long ref records are kept after they were
-// written, and delete records after they were flagged: as long as the bucket
-// keeps a deleted chunk in soft delete,
-// and at least undoWindow, so that an undo finds them while it can restore
-// what they name. The read runs within the deadline of b.
-func recordRetention(ctx context.Context, b writeBudget, bucket *storage.BucketHandle) (time.Duration, error) {
-	var attrs *storage.BucketAttrs
-	err := retryWith(ctx, firstRetryWait, writeBudget{deadline: b.deadline}, func(actx context.Context) error {
-		var err error
-		attrs, err = bucket.Attrs(actx)
-		return err
-	})
-	if err != nil {
-		return 0, fmt.Errorf("failed to read the soft delete retention of the bucket: %w", err)
-	}
-	keep := undoWindow
-	if p := attrs.SoftDeletePolicy; p != nil {
-		keep = max(keep, p.RetentionDuration)
-	}
-	return keep, nil
-}
-
 // recordHeader is the header of a delete record.
 type recordHeader struct {
 	cycle int64
@@ -106,39 +97,99 @@ type recordHeader struct {
 	// e:links cell is newer belongs to an object written again after the
 	// mark, and stays.
 	gcRowsAfter time.Time
-	// listComplete is the newest completion time of a list, at or after the
-	// completion of every list the cycle deleted from.
-	listComplete time.Time
-	count        int64
+	count       int64
 }
 
-// recordEntry is an entry of a delete record: an object and its content
-// descriptor, or a map row from key to mapTo.
+// recordCell is a cell of a row kept in a delete record.
+type recordCell struct {
+	family, column string
+	ts             bigtable.Timestamp
+	value          []byte
+}
+
+// recordEntry is an entry of a delete record: an object with the cells of
+// its objects row and the values of the edges family of its gc row, or a map
+// row from key to mapTo. An object without edges had no gc row.
 type recordEntry struct {
-	kind    uint8
-	key     Hash
-	mapTo   Hash
-	content []byte
+	kind  uint8
+	key   Hash
+	mapTo Hash
+	cells []recordCell
+	edges []recordCell
 }
 
-func (h *recordHeader) write(w io.Writer) error {
+// objectEntry returns the record entry of the object key whose objects row
+// and gc row were read as object and gc.
+func objectEntry(key Hash, object, gc bigtable.Row) recordEntry {
+	e := recordEntry{kind: recordObject, key: key}
+	for _, family := range []string{objectsMetaFamily, objectsDataFamily} {
+		for _, item := range object[family] {
+			e.cells = append(e.cells, recordCell{family: family, column: strings.TrimPrefix(item.Column, family+":"), ts: item.Timestamp, value: item.Value})
+		}
+	}
+	for _, item := range gc[EdgesFamily] {
+		e.edges = append(e.edges, recordCell{family: EdgesFamily, column: strings.TrimPrefix(item.Column, EdgesFamily+":"), value: item.Value})
+	}
+	return e
+}
+
+// content returns the data:content descriptor of the object e.
+func (e *recordEntry) content() []byte {
+	for _, c := range e.cells {
+		if c.family == objectsDataFamily && c.column == objectsContentColumn {
+			return c.value
+		}
+	}
+	return nil
+}
+
+// edge returns the value of the column of the edges of the object e.
+func (e *recordEntry) edge(column string) ([]byte, bool) {
+	for _, c := range e.edges {
+		if c.column == column {
+			return c.value, true
+		}
+	}
+	return nil, false
+}
+
+// size returns the number of bytes of e in a record.
+func (e *recordEntry) size() int {
+	n := 1 + entities.HashSize
+	if e.kind == recordMapRow {
+		return n + entities.HashSize
+	}
+	n += 2 + 1
+	for _, c := range e.cells {
+		n += 2 + len(c.family) + 2 + len(c.column) + 8 + 4 + len(c.value)
+	}
+	for _, c := range e.edges {
+		n += 2 + len(c.column) + 4 + len(c.value)
+	}
+	return n
+}
+
+func (h *recordHeader) write(w io.Writer) (int, error) {
 	b := []byte(recordMagic)
 	b = binary.BigEndian.AppendUint32(b, recordFormatVersion)
 	b = binary.BigEndian.AppendUint64(b, uint64(h.cycle))
 	b = appendString(b, h.runID)
 	b = binary.BigEndian.AppendUint64(b, uint64(h.gcRowsAfter.UnixMicro()))
-	b = binary.BigEndian.AppendUint64(b, uint64(h.listComplete.UnixMicro()))
 	b = binary.BigEndian.AppendUint64(b, uint64(h.count))
-	_, err := w.Write(b)
-	return err
+	return w.Write(b)
 }
 
 // writeRecord writes the delete record name with the header h and entries,
-// only if no object of that name exists or this run wrote it.
-func writeRecord(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *recordHeader, entries []recordEntry) error {
+// only if no object of that name exists or this run wrote it, and returns
+// its size.
+func writeRecord(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *recordHeader, entries []recordEntry) (int64, error) {
 	h.count = int64(len(entries))
-	return createObject(ctx, b, bucket, name, h.runID, "application/octet-stream", func(w io.Writer) error {
-		if err := h.write(w); err != nil {
+	var size int64
+	err := createObject(ctx, b, bucket, name, h.runID, "application/octet-stream", func(w io.Writer) error {
+		size = 0
+		n, err := h.write(w)
+		size += int64(n)
+		if err != nil {
 			return err
 		}
 		var buf []byte
@@ -148,28 +199,72 @@ func writeRecord(ctx context.Context, b writeBudget, bucket *storage.BucketHandl
 			buf = append(buf, e.key[:]...)
 			switch e.kind {
 			case recordObject:
-				buf = binary.BigEndian.AppendUint32(buf, uint32(len(e.content)))
-				buf = append(buf, e.content...)
 			case recordMapRow:
 				buf = append(buf, e.mapTo[:]...)
 			default:
 				return fmt.Errorf("invalid delete record entry kind %d", e.kind)
 			}
-			if _, err := w.Write(buf); err != nil {
+			n, err := w.Write(buf)
+			size += int64(n)
+			if err != nil {
+				return err
+			}
+		}
+		for i := range entries {
+			e := &entries[i]
+			if e.kind != recordObject {
+				continue
+			}
+			if len(e.cells) > 1<<16-1 || len(e.edges) > 1<<8-1 {
+				return fmt.Errorf("the object %s has too many cells for a delete record", e.key)
+			}
+			buf = binary.BigEndian.AppendUint16(buf[:0], uint16(len(e.cells)))
+			for _, c := range e.cells {
+				buf = appendString(appendString(buf, c.family), c.column)
+				buf = binary.BigEndian.AppendUint64(buf, uint64(c.ts))
+				buf = appendBytes(buf, c.value)
+			}
+			buf = append(buf, uint8(len(e.edges)))
+			for _, c := range e.edges {
+				buf = appendBytes(appendString(buf, c.column), c.value)
+			}
+			n, err := w.Write(buf)
+			size += int64(n)
+			if err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	return size, err
+}
+
+func appendBytes(b, v []byte) []byte {
+	return append(binary.BigEndian.AppendUint32(b, uint32(len(v))), v...)
 }
 
 // readRecord reads the delete record name.
-func readRecord(ctx context.Context, bucket *storage.BucketHandle, name string) (_ *recordHeader, _ []recordEntry, retErr error) {
+func readRecord(ctx context.Context, bucket *storage.BucketHandle, name string) (*recordHeader, []recordEntry, error) {
+	return readRecordSections(ctx, bucket, name, true)
+}
+
+// readRecordKeys reads the header and the key section of the delete record
+// name, so its entries hold no cells.
+func readRecordKeys(ctx context.Context, bucket *storage.BucketHandle, name string) (*recordHeader, []recordEntry, error) {
+	return readRecordSections(ctx, bucket, name, false)
+}
+
+func readRecordSections(ctx context.Context, bucket *storage.BucketHandle, name string, rows bool) (_ *recordHeader, _ []recordEntry, retErr error) {
 	r, err := bucket.Object(name).NewReader(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read the delete record %s: %w", name, err)
 	}
-	defer entities.CloseErrCheck(r, &retErr)
+	if rows {
+		defer entities.CloseErrCheck(r, &retErr)
+	} else {
+		// Closed before the end, the reader stops the download.
+		defer func() { _ = r.Close() }()
+	}
 	br := bufio.NewReader(r)
 	h, err := readRecordHeader(br)
 	if err != nil {
@@ -177,11 +272,23 @@ func readRecord(ctx context.Context, bucket *storage.BucketHandle, name string) 
 	}
 	entries := make([]recordEntry, 0, h.count)
 	for range h.count {
-		e, err := readRecordEntry(br)
+		e, err := readRecordKey(br)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read the delete record %s after %d entries: %w", name, len(entries), err)
+			return nil, nil, fmt.Errorf("failed to read the delete record %s after %d keys: %w", name, len(entries), err)
 		}
 		entries = append(entries, e)
+	}
+	if !rows {
+		return h, entries, nil
+	}
+	for i := range entries {
+		e := &entries[i]
+		if e.kind != recordObject {
+			continue
+		}
+		if err := readRecordRow(br, e); err != nil {
+			return nil, nil, fmt.Errorf("failed to read the row of %s in the delete record %s: %w", e.key, name, err)
+		}
 	}
 	if _, err := br.ReadByte(); err != io.EOF {
 		return nil, nil, fmt.Errorf("the delete record %s has more than the %d entries its header counts", name, h.count)
@@ -213,18 +320,17 @@ func readRecordHeader(r io.Reader) (*recordHeader, error) {
 		return nil, err
 	}
 	var times struct {
-		GCRowsAfter  int64
-		ListComplete int64
-		Count        int64
+		GCRowsAfter int64
+		Count       int64
 	}
 	if err := binary.Read(r, binary.BigEndian, &times); err != nil {
 		return nil, err
 	}
-	h.gcRowsAfter, h.listComplete, h.count = time.UnixMicro(times.GCRowsAfter), time.UnixMicro(times.ListComplete), times.Count
+	h.gcRowsAfter, h.count = time.UnixMicro(times.GCRowsAfter), times.Count
 	return h, nil
 }
 
-func readRecordEntry(r io.Reader) (recordEntry, error) {
+func readRecordKey(r io.Reader) (recordEntry, error) {
 	var e recordEntry
 	kind := make([]byte, 1+entities.HashSize)
 	if _, err := io.ReadFull(r, kind); err != nil {
@@ -233,16 +339,6 @@ func readRecordEntry(r io.Reader) (recordEntry, error) {
 	e.kind, e.key = kind[0], Hash(kind[1:])
 	switch e.kind {
 	case recordObject:
-		var n uint32
-		if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-			return e, err
-		}
-		if n > 0 {
-			e.content = make([]byte, n)
-			if _, err := io.ReadFull(r, e.content); err != nil {
-				return e, err
-			}
-		}
 	case recordMapRow:
 		to := make([]byte, entities.HashSize)
 		if _, err := io.ReadFull(r, to); err != nil {
@@ -255,21 +351,56 @@ func readRecordEntry(r io.Reader) (recordEntry, error) {
 	return e, nil
 }
 
-// recordedContent returns the descriptor of data:content that a delete
-// record keeps for an object: the descriptor when a chunk of it is outside
-// the inline depot, else nil. A descriptor that does not parse is kept as it
-// is.
-func recordedContent(content []byte) []byte {
-	var chunks []struct {
-		Depot string `json:"depot"`
+func readRecordRow(r io.Reader, e *recordEntry) error {
+	var cells uint16
+	if err := binary.Read(r, binary.BigEndian, &cells); err != nil {
+		return err
 	}
-	if err := json.Unmarshal(content, &chunks); err != nil {
-		return content
-	}
-	for _, c := range chunks {
-		if c.Depot != inlineDepot {
-			return content
+	for range cells {
+		var c recordCell
+		var err error
+		if c.family, err = readString(r); err != nil {
+			return err
 		}
+		if c.column, err = readString(r); err != nil {
+			return err
+		}
+		var ts int64
+		if err := binary.Read(r, binary.BigEndian, &ts); err != nil {
+			return err
+		}
+		c.ts = bigtable.Timestamp(ts)
+		if c.value, err = readBytes(r); err != nil {
+			return err
+		}
+		e.cells = append(e.cells, c)
+	}
+	var edges uint8
+	if err := binary.Read(r, binary.BigEndian, &edges); err != nil {
+		return err
+	}
+	for range edges {
+		c := recordCell{family: EdgesFamily}
+		var err error
+		if c.column, err = readString(r); err != nil {
+			return err
+		}
+		if c.value, err = readBytes(r); err != nil {
+			return err
+		}
+		e.edges = append(e.edges, c)
 	}
 	return nil
+}
+
+func readBytes(r io.Reader) ([]byte, error) {
+	var n uint32
+	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
+		return nil, err
+	}
+	b := make([]byte, n)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return nil, err
+	}
+	return b, nil
 }

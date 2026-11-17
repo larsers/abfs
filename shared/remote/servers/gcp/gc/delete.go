@@ -38,10 +38,6 @@ import (
 const (
 	DefaultDeleteRate    = 2000
 	DefaultDeleteWorkers = 32
-	DefaultChunkDelay    = 15 * time.Minute
-	// signedURLLifetime is the lifetime of the signed URLs of bucket chunks
-	// that the server hands out.
-	signedURLLifetime = 10 * time.Minute
 	// deleteReadBatch is the number of row keys of one read of the delete
 	// step, the most Bigtable recommends for one ReadRows request, and
 	// deleteReadsInFlight how many such reads run at once.
@@ -78,10 +74,11 @@ func Delete(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket
 
 // DeleteStepReport reports the delete step of a cycle.
 type DeleteStepReport struct {
-	// Records is the prefix of the delete records of the cycle and
-	// RecordsWritten their number.
+	// Records is the prefix of the delete records of the cycle,
+	// RecordsWritten their number and RecordBytes their size.
 	Records        string `json:"records"`
 	RecordsWritten int64  `json:"records_written"`
+	RecordBytes    int64  `json:"record_bytes"`
 	// Deleted counts the objects deleted, per type in Types, and their size.
 	Deleted      int64            `json:"deleted"`
 	DeletedBytes int64            `json:"deleted_bytes"`
@@ -143,9 +140,6 @@ type deleter struct {
 	checks InstanceChecks
 	budget writeBudget
 	rep    *DeleteReport
-	// listComplete is the newest completion time of a list, at or after the
-	// completion of every list the cycle deletes from.
-	listComplete time.Time
 }
 
 // check removes the refs past their retention and runs the checks of
@@ -160,13 +154,12 @@ func (d *deleter) check(ctx context.Context, lease *Lease, c *condemner, res *Re
 	}
 	r.Delete = d.rep
 	d.budget = c.budget
-	d.listComplete = res.holds.newest()
 	ev := newDeleteEvidence(lease, res)
 	d.rep.Refs, ev.refRemovalErr = d.removeExpiredRefs(ctx, lease, res)
 	if stops(ctx, ev.refRemovalErr) {
 		return ev.refRemovalErr
 	}
-	ev.instance = readInstanceEvidence(ctx, d.checks, d.budget, d.opts)
+	ev.instance = readInstanceEvidence(ctx, d.checks, d.budget)
 	ev.tooNew, ev.tooNewErr = res.tooNew, res.tooNewErr
 	d.rep.TooNew = ev.tooNew
 	d.rep.Refused, d.rep.Warnings = deleteBlockers(r, ev, d.opts)
@@ -267,10 +260,9 @@ func (d *deleter) deleteStep(ctx context.Context, lease *Lease, res *Result) (bi
 		gcTable: d.bt.Open(TableName),
 		maps:    d.bt.Open(mapsTableName),
 		header: recordHeader{
-			cycle:        r.Cycle,
-			runID:        runID(o.Holder, lease.Epoch),
-			gcRowsAfter:  r.SnapshotTime.Add(-o.Grace),
-			listComplete: d.listComplete,
+			cycle:       r.Cycle,
+			runID:       runID(o.Holder, lease.Epoch),
+			gcRowsAfter: r.SnapshotTime.Add(-o.Grace),
 		},
 		rep: &DeleteStepReport{Records: recordPrefixOf(o.StateName) + fmt.Sprint(r.Cycle) + "/", Types: make(map[string]int64)},
 	}
@@ -463,7 +455,8 @@ func (s *step) runMapLevel(ctx context.Context) {
 	}
 	failed := make([][]int32, len(items))
 	s.runRanges(0, items, func(rng int, its []int32) error {
-		for b, lo := 0, 0; lo < len(its); b, lo = b+1, lo+s.d.opts.BatchSize {
+		records := 0
+		for lo := 0; lo < len(its); lo += s.d.opts.BatchSize {
 			batch := its[lo:min(lo+s.d.opts.BatchSize, len(its))]
 			if s.stop.Load() {
 				failed[rng] = append(failed[rng], its[lo:]...)
@@ -479,7 +472,7 @@ func (s *step) runMapLevel(ctx context.Context) {
 				entries[k] = recordEntry{kind: recordMapRow}
 				entries[k].key, entries[k].mapTo = mapRowEnds(m.key)
 			}
-			if err := s.writeRecord(ctx, 0, rng, b, entries); err != nil {
+			if err := s.writeRecords(ctx, 0, rng, &records, entries); err != nil {
 				failed[rng] = append(failed[rng], its[lo:]...)
 				return err
 			}
@@ -540,7 +533,8 @@ func (s *step) runObjectLevel(ctx context.Context, l int) {
 		items[rng] = append(items[rng], i)
 	}
 	s.runRanges(l, items, func(rng int, its []int32) error {
-		for b, lo := 0, 0; lo < len(its); b, lo = b+1, lo+s.d.opts.BatchSize {
+		records := 0
+		for lo := 0; lo < len(its); lo += s.d.opts.BatchSize {
 			if s.stop.Load() {
 				return nil
 			}
@@ -548,7 +542,7 @@ func (s *step) runObjectLevel(ctx context.Context, l int) {
 			if err := s.lim.wait(ctx, len(batch)); err != nil {
 				return err
 			}
-			if err := s.deleteBatch(ctx, l, rng, b, batch); err != nil {
+			if err := s.deleteBatch(ctx, l, rng, &records, batch); err != nil {
 				return err
 			}
 		}
@@ -577,12 +571,33 @@ func (s *step) readRows(ctx context.Context, rows []string) (map[string]rowState
 // of the objects table, in reads of deleteReadBatch keys, a few at a time,
 // each attempt within the budget b.
 func readObjectRows(ctx context.Context, objects *bigtable.Table, b writeBudget, rows []string) (map[string]rowState, error) {
-	filter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.LatestNFilter(1), bigtable.InterleaveFilters(
+	filter := bigtable.ChainFilters(bigtable.LatestNFilter(1), bigtable.InterleaveFilters(
 		bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.StripValueFilter()),
 		bigtable.ChainFilters(bigtable.FamilyFilter(ObjectsFamily), bigtable.ColumnFilter(CondemnedColumn)),
 		bigtable.ChainFilters(bigtable.FamilyFilter(objectsDataFamily), bigtable.ColumnFilter(objectsContentColumn)),
-	)))
+	))
 	states := make(map[string]rowState, len(rows))
+	err := readRowList(ctx, objects, b, rows, filter, func(row bigtable.Row) {
+		var st rowState
+		st.present = len(row[objectsMetaFamily]) > 0
+		for _, item := range row[ObjectsFamily] {
+			st.marker = item.Value
+		}
+		for _, item := range row[objectsDataFamily] {
+			st.content = item.Value
+		}
+		states[row.Key()] = st
+	})
+	if err != nil {
+		return nil, err
+	}
+	return states, nil
+}
+
+// readRowList reads rows of table with filter, in reads of deleteReadBatch
+// keys, a few at a time, each attempt within the budget b, and calls keep
+// with each row, one call at a time.
+func readRowList(ctx context.Context, table *bigtable.Table, b writeBudget, rows []string, filter bigtable.Filter, keep func(bigtable.Row)) error {
 	var mu sync.Mutex
 	var eg errgroup.Group
 	eg.SetLimit(deleteReadsInFlight)
@@ -590,61 +605,75 @@ func readObjectRows(ctx context.Context, objects *bigtable.Table, b writeBudget,
 		chunk := rows[lo:min(lo+deleteReadBatch, len(rows))]
 		eg.Go(func() error {
 			return retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
-				return objects.ReadRows(actx, bigtable.RowList(chunk), func(row bigtable.Row) bool {
-					var st rowState
-					st.present = len(row[objectsMetaFamily]) > 0
-					for _, item := range row[ObjectsFamily] {
-						st.marker = item.Value
-					}
-					for _, item := range row[objectsDataFamily] {
-						st.content = item.Value
-					}
+				return table.ReadRows(actx, bigtable.RowList(chunk), func(row bigtable.Row) bool {
 					mu.Lock()
-					states[row.Key()] = st
+					keep(row)
 					mu.Unlock()
 					return true
-				}, filter)
+				}, bigtable.RowFilter(filter))
 			})
 		})
 	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
+	return eg.Wait()
+}
+
+// readDeleteRows reads, of the objects rows, the newest cell of each column
+// of the families meta and data and the newest condemn marker, and of the gc
+// rows the newest cell of each column of the edges family.
+func (s *step) readDeleteRows(ctx context.Context, rows []string) (objects, gcRows map[string]bigtable.Row, err error) {
+	objects = make(map[string]bigtable.Row, len(rows))
+	gcRows = make(map[string]bigtable.Row, len(rows))
+	filter := bigtable.ChainFilters(bigtable.LatestNFilter(1), bigtable.InterleaveFilters(
+		bigtable.FamilyFilter(objectsMetaFamily+"|"+objectsDataFamily),
+		bigtable.ChainFilters(bigtable.FamilyFilter(ObjectsFamily), bigtable.ColumnFilter(CondemnedColumn)),
+	))
+	if err := readRowList(ctx, s.objects, s.reads, rows, filter, func(row bigtable.Row) { objects[row.Key()] = row }); err != nil {
+		return nil, nil, err
 	}
-	return states, nil
+	filter = bigtable.ChainFilters(bigtable.FamilyFilter(EdgesFamily), bigtable.LatestNFilter(1))
+	if err := readRowList(ctx, s.gcTable, s.reads, rows, filter, func(row bigtable.Row) { gcRows[row.Key()] = row }); err != nil {
+		return nil, nil, err
+	}
+	return objects, gcRows, nil
 }
 
 // deleteBatch runs the delete of one batch of candidates of a range: it
 // reads their rows, fails those whose marker is no longer the one the scan
-// read, records the rest with their content descriptors, and then deletes
-// each whose newest marker is still that one, and its gc row.
-func (s *step) deleteBatch(ctx context.Context, level, rng, batch int, items []int32) error {
+// read, records the rest with their objects and gc rows in the records
+// numbered from *records on, and then deletes each whose newest marker is
+// still that one, and its gc row.
+func (s *step) deleteBatch(ctx context.Context, level, rng int, records *int, items []int32) error {
 	p := s.p
 	rows := make([]string, len(items))
 	for k, i := range items {
 		rows[k] = s.g.key(p.cands[i]).String()
 	}
-	states, err := s.readRows(ctx, rows)
+	objects, gcRows, err := s.readDeleteRows(ctx, rows)
 	if err != nil {
 		return fmt.Errorf("failed to read the objects to delete: %w", err)
 	}
 	var left []int32
 	var entries []recordEntry
 	for k, i := range items {
-		st := states[rows[k]]
+		row := objects[rows[k]]
+		var marker []byte
+		for _, item := range row[ObjectsFamily] {
+			marker = item.Value
+		}
 		switch {
-		case !st.present:
+		case len(row[objectsMetaFamily]) == 0:
 			p.outcome[i] = outcomeGone
-		case !slices.Equal(st.marker, p.values[p.markers[i]-1]):
+		case !slices.Equal(marker, p.values[p.markers[i]-1]):
 			p.outcome[i] = outcomeNotMatched
 		default:
 			left = append(left, i)
-			entries = append(entries, recordEntry{kind: recordObject, key: s.g.key(p.cands[i]), content: recordedContent(st.content)})
+			entries = append(entries, objectEntry(s.g.key(p.cands[i]), row, gcRows[rows[k]]))
 		}
 	}
 	if len(left) == 0 || s.stop.Load() {
 		return nil
 	}
-	if err := s.writeRecord(ctx, level, rng, batch, entries); err != nil {
+	if err := s.writeRecords(ctx, level, rng, records, entries); err != nil {
 		return err
 	}
 	return s.inFlight(left, func(i int32) error {
@@ -700,16 +729,29 @@ func (s *step) deleteKey(ctx context.Context, i int) error {
 	return nil
 }
 
-// writeRecord writes the delete record of one batch, before any delete of it.
-func (s *step) writeRecord(ctx context.Context, level, rng, batch int, entries []recordEntry) error {
-	h := s.header
-	name := recordObjectName(s.state, h.cycle, level, rng, batch)
-	if err := writeRecord(ctx, s.d.budget, s.d.bucket, name, &h, entries); err != nil {
-		return err
+// writeRecords writes the delete records of one batch of a range, before any
+// delete of it: a record per maxRecordBytes of entries, numbered from *next
+// on, so that the names stay unique within the range.
+func (s *step) writeRecords(ctx context.Context, level, rng int, next *int, entries []recordEntry) error {
+	for len(entries) > 0 {
+		n, size := 1, entries[0].size()
+		for n < len(entries) && size+entries[n].size() <= maxRecordBytes {
+			size += entries[n].size()
+			n++
+		}
+		h := s.header
+		name := recordObjectName(s.state, h.cycle, level, rng, *next)
+		written, err := writeRecord(ctx, s.d.budget, s.d.bucket, name, &h, entries[:n])
+		if err != nil {
+			return err
+		}
+		*next++
+		entries = entries[n:]
+		s.mu.Lock()
+		s.rep.RecordsWritten++
+		s.rep.RecordBytes += written
+		s.mu.Unlock()
 	}
-	s.mu.Lock()
-	s.rep.RecordsWritten++
-	s.mu.Unlock()
 	return nil
 }
 

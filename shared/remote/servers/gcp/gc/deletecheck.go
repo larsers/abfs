@@ -58,26 +58,15 @@ type DeleteOpts struct {
 	// while live mounts run without the GC keep-alive, whose caches may hold
 	// the only copy of such an object. The check then only warns.
 	AcceptMountsWithoutKeepAlive bool
-	// NoBackupCheck deletes without a backup of the tables taken after the
-	// newest list was complete.
-	NoBackupCheck bool
 	// DeleteRate is the maximum number of objects deleted per second; zero
 	// means no limit.
 	DeleteRate float64
 	// DeleteWorkers is the number of conditional deletes in flight, split
 	// evenly over the key ranges of the scan; at least one per range.
 	DeleteWorkers int
-	// ChunkDelay is how long after its record the chunks of a deleted object
-	// are deleted. It must exceed the lifetime of the signed URLs of chunks
-	// that a server hands out by twice the clock skew margin.
-	ChunkDelay time.Duration
 	// ChunkRate is the maximum number of chunks deleted per second; zero
 	// means no limit.
 	ChunkRate float64
-	// AllowNoSoftDelete deletes bucket chunks although the bucket keeps
-	// deleted objects for less than seven days, or not at all, so that they
-	// cannot be restored.
-	AllowNoSoftDelete bool
 	// StartDelay pauses the cycle before the delete step, for tests that use
 	// an object in between.
 	StartDelay time.Duration
@@ -86,7 +75,7 @@ type DeleteOpts struct {
 // DefaultDeleteOpts returns the default options; the replica counts have no
 // default.
 func DefaultDeleteOpts() DeleteOpts {
-	return DeleteOpts{CondemnOpts: DefaultCondemnOpts(), DeleteRate: DefaultDeleteRate, DeleteWorkers: DefaultDeleteWorkers, ChunkDelay: DefaultChunkDelay, ChunkRate: DefaultChunkRate}
+	return DeleteOpts{CondemnOpts: DefaultCondemnOpts(), DeleteRate: DefaultDeleteRate, DeleteWorkers: DefaultDeleteWorkers, ChunkRate: DefaultChunkRate}
 }
 
 // Validate checks the options.
@@ -108,10 +97,6 @@ func (o *DeleteOpts) Validate() error {
 		return fmt.Errorf("invalid number of delete workers %d", o.DeleteWorkers)
 	case o.DeleteWorkers < o.Shards:
 		return fmt.Errorf("%d delete workers are fewer than the %d key ranges, each of which keeps at least one delete in flight", o.DeleteWorkers, o.Shards)
-	case o.ChunkDelay < signedURLLifetime+2*clockSkewMargin:
-		// The servers date the URLs by their clocks, the step the records by
-		// its own.
-		return fmt.Errorf("chunk delay %s is not longer than the %s lifetime of the signed URLs of chunks by twice the clock skew margin %s", o.ChunkDelay, signedURLLifetime, clockSkewMargin)
 	case o.StartDelay < 0:
 		return fmt.Errorf("invalid delete start delay %s", o.StartDelay)
 	}
@@ -198,11 +183,7 @@ func deleteBlockers(r *Report, ev *deleteEvidence, o *DeleteOpts) (reasons, warn
 	} else {
 		reasons = append(reasons, windowBlockers(ev.servers, ev.snapshot, &o.DryRunOpts)...)
 	}
-	var newest time.Time
-	if ev.holds != nil {
-		newest = ev.holds.newest()
-	}
-	reasons = append(reasons, instanceBlockers(&ev.instance, newest)...)
+	reasons = append(reasons, instanceBlockers(&ev.instance)...)
 	if ev.refRemovalErr != nil {
 		add("the removal of expired refs failed: %v", ev.refRemovalErr)
 	}
