@@ -13,37 +13,37 @@
 # limitations under the License.
 
 # Garbage collection, off by default. List it after backend-new to add the
-# Bigtable table gc, the family objects:g and the collector's app profile
-# abfs-gc; then run `abfs server gcp init --gc` for the Spanner tables, and set
-# server.gc.enabled (docs/runbook.md, Garbage collection). It patches a
+# Bigtable table abfsgc, the family objects:abfsgc and the collector's app
+# profile abfs-gc; then run `abfs server gcp init --gc` for the Spanner tables,
+# and set server.gc.enabled (docs/runbook.md, Garbage collection). It patches a
 # backend-new object, so it does not build with backend-existing, where `init
 # --gc` creates every GC resource and gcloud the app profile.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 resources:
   - bigtable-gc.yaml
-# Appends the family g to the families of the table objects, so that a family
-# that backend-new adds later stays. Config Connector deletes a family of a
+# Appends the family abfsgc to the families of the table objects, so that a
+# family that backend-new adds later stays. Config Connector deletes a family of a
 # table that the object does not list.
 patches:
   - target: {group: bigtable.cnrm.cloud.google.com, kind: BigtableTable, name: abfs-table-objects}
     patch: |-
       - op: add
         path: /spec/columnFamily/-
-        value: {family: g}
-# The table gc and its policies go into the Bigtable instance of the table
+        value: {family: abfsgc}
+# The table abfsgc and its policies go into the Bigtable instance of the table
 # objects. The source exists only with backend-new, so the build fails with
 # backend-existing.
 replacements:
   - source: {kind: BigtableTable, name: abfs-table-objects, fieldPath: spec.instanceRef.name}
     targets:
-      - select: {kind: BigtableTable, name: abfs-table-gc}
+      - select: {kind: BigtableTable, name: abfs-table-abfsgc}
         fieldPaths: [spec.instanceRef.name]
-      - select: {kind: BigtableGCPolicy, name: abfs-gc-policy-gc-e}
+      - select: {kind: BigtableGCPolicy, name: abfs-gc-policy-abfsgc-e}
         fieldPaths: [spec.instanceRef.name]
-      - select: {kind: BigtableGCPolicy, name: abfs-gc-policy-gc-t}
+      - select: {kind: BigtableGCPolicy, name: abfs-gc-policy-abfsgc-t}
         fieldPaths: [spec.instanceRef.name]
-      - select: {kind: BigtableGCPolicy, name: abfs-gc-policy-objects-g}
+      - select: {kind: BigtableGCPolicy, name: abfs-gc-policy-objects-abfsgc}
         fieldPaths: [spec.instanceRef.name]
       - select: {kind: BigtableAppProfile, name: abfs-gc}
         fieldPaths: [spec.instanceRef.name]

@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # The tables and column families of `abfs server gcp init`. The garbage
-# collector's table gc and family objects:g are in components/gc, listed only
-# when GC is turned on. Each family keeps one version, as init sets it.
+# collector's table abfsgc and family objects:abfsgc are in components/gc, listed
+# only when GC is turned on. Each family keeps one version, as init sets it.
 ---
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableTable

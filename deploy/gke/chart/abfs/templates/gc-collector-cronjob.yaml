@@ -1,0 +1,132 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.gcCollector.enabled }}
+{{- include "abfs.gcCollector.validate" . }}
+{{- $g := .Values.gcCollector }}
+{{- $b := .Values.backend }}
+{{- $mem := include "abfs.bytes" $g.memoryLimit | int64 }}
+# One garbage collector cycle per run, `abfs server gcp gc run --<mode>`, under the
+# server's Google service account. It writes its report as one JSON line to stdout,
+# which Cloud Logging keeps. The lease in Spanner refuses a second cycle, a refused
+# cycle refuses again on a retry, and a killed run's lease blocks a retry for 5 minutes,
+# so there is no retry and no overlap.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: abfs-gc-collector
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "gc-collector" | nindent 4 }}
+spec:
+  schedule: {{ $g.schedule | quote }}
+  timeZone: Etc/UTC
+  suspend: {{ $g.suspend }}
+  concurrencyPolicy: Forbid
+  # A missed cycle costs only its own deletes.
+  startingDeadlineSeconds: {{ include "abfs.gcCollector.startingDeadlineSeconds" . }}
+  # A week of Job status and exit codes.
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 7
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "abfs.labels" . | nindent 8 }}
+        {{- include "abfs.selectorLabels" "gc-collector" | nindent 8 }}
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ $g.deadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "abfs.labels" . | nindent 12 }}
+            {{- include "abfs.selectorLabels" "gc-collector" | nindent 12 }}
+          annotations:
+            # Consolidation must not stop a cycle midway.
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "abfs.server.name" . }}
+          automountServiceAccountToken: false
+          {{- with include "abfs.placement" (dict "root" . "cfg" $g "what" "gcCollector") | trim }}
+          {{- . | nindent 10 }}
+          {{- end }}
+          # A Bigtable write attempt (30 s), the lease release, the report and the
+          # telemetry flush (15 s) after SIGTERM.
+          terminationGracePeriodSeconds: 90
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: gc-collector
+              image: {{ include "abfs.image" (dict "root" . "image" "server") }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # The image entrypoint is abfs-server; the gc commands are in abfs.
+              command:
+                - /usr/local/bin/abfs
+                {{- if .Values.otel.enabled }}
+                - --kv
+                - metrics-provider=otel
+                - --kv
+                - record-client-metrics=true
+                {{- end }}
+                - server
+                - gcp
+                - gc
+                - run
+                - --{{ $g.mode }}
+                - --project={{ $b.project }}
+                - --instance={{ $b.spannerInstance }}
+                - --db={{ $b.spannerDatabase }}
+                - --bt-instance={{ $b.bigtableInstance }}
+                - --bucket={{ $b.bucket }}
+                - --bt-app-profile={{ $g.bigtableAppProfile }}
+                {{- if ne $g.mode "dry-run" }}
+                # The PodDisruptionBudget lets one server stop.
+                - --min-replicas={{ sub (int .Values.server.replicas.min) 1 }}
+                {{- end }}
+                {{- if eq $g.mode "delete" }}
+                - --delete-types={{ join "," $g.deleteTypes }}
+                {{- end }}
+              env:
+                {{- include "abfs.gomaxprocsEnv" . | nindent 16 }}
+                - name: GOMEMLIMIT
+                  value: {{ div (mul $mem 9) 10 | quote }}
+                - name: HOME
+                  value: /tmp
+                # abfs needs a user name; the image has no passwd entry for 65532.
+                - name: USER
+                  value: abfs-gc
+                {{- include "abfs.otelEnv" (dict "root" . "queue" 0 "traces" false) | trim | nindent 16 }}
+              resources:
+                requests:
+                  cpu: {{ $g.cpuRequest | quote }}
+                  memory: {{ $g.memoryLimit | quote }}
+                limits:
+                  memory: {{ $g.memoryLimit | quote }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
+{{- end }}

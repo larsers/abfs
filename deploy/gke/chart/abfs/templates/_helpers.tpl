@@ -403,3 +403,38 @@ the CI node disk.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+startingDeadlineSeconds of the garbage collector's CronJob, which the GC alert window
+includes.
+*/}}
+{{- define "abfs.gcCollector.startingDeadlineSeconds" -}}
+7200
+{{- end -}}
+
+{{/*
+Checks of the garbage collector's CronJob, with gcCollector.enabled.
+*/}}
+{{- define "abfs.gcCollector.validate" -}}
+{{- $g := .Values.gcCollector -}}
+{{- if not (and .Values.server.enabled .Values.server.gc.enabled) -}}
+{{- fail "gcCollector.enabled needs server.enabled and server.gc.enabled: the collector refuses to run while the servers record no GC edges" -}}
+{{- end -}}
+{{- if has $g.mode (list "condemn" "delete") -}}
+{{- if lt (int .Values.server.replicas.min) 2 -}}
+{{- fail (printf "gcCollector.mode %s passes --min-replicas server.replicas.min - 1, which must be at least 1; server.replicas.min is %d" $g.mode (int .Values.server.replicas.min)) -}}
+{{- end -}}
+{{- if not .Values.pdb.enabled -}}
+{{- fail (printf "gcCollector.mode %s needs pdb.enabled: --min-replicas assumes the PodDisruptionBudget stops at most one server at a time" $g.mode) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq $g.mode "delete") (not $g.deleteTypes) -}}
+{{- fail "gcCollector.mode delete needs gcCollector.deleteTypes: empty would delete every type; widen it from the top of the graph down (docs/runbook.md, \"Garbage collection\")" -}}
+{{- end -}}
+{{- if not $g.bigtableAppProfile -}}
+{{- fail "gcCollector.bigtableAppProfile is required: the collector's Bigtable app profile of components/gc, abfs-gc" -}}
+{{- end -}}
+{{- if and .Values.alerts.enabled (not .Values.otel.enabled) -}}
+{{- fail "gcCollector with alerts.enabled needs otel.enabled: the GC alerts read the collector's OTLP metrics" -}}
+{{- end -}}
+{{- end -}}

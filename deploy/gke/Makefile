@@ -66,7 +66,8 @@ lint:
 
 # Helm 4 `lint --strict` reports a template fail() only as information and does
 # not fail on it, so the render checks and the expected failures are here. An
-# overlay's "# expect: <text>" lines name text its render must contain.
+# overlay's "# expect: <text>" lines name text its render must contain, and a fail
+# overlay's "# expect-error: <text>" lines name text its error must contain.
 template:
 	@mkdir -p $(OUT)/template
 	@for v in $(CI_VALUES); do \
@@ -168,12 +169,27 @@ template:
 	  if helm template abfs $(CHART) -n abfs -f $(CI)/seed-values.yaml -f $$o >/dev/null 2>$(OUT)/template/fail.err; then \
 	    echo "FAIL: seed-values + $$o rendered, but must fail" >&2; exit 1; \
 	  fi; \
+	  while IFS= read -r want; do \
+	    grep -qF -- "$$want" $(OUT)/template/fail.err || { echo "FAIL: $$o: the error lacks '$$want': $$(cat $(OUT)/template/fail.err)" >&2; exit 1; }; \
+	  done < <(sed -n 's/^# expect-error: //p' $$o); \
 	  echo "OK: seed-values + $$o fails as expected: $$(sed -n 's/^Error: execution error at ([^)]*): //p' $(OUT)/template/fail.err | head -n 1)"; \
 	done
 	@if helm template abfs $(CHART) -n abfs -f $(CI)/seed-values.yaml --set image.server.digest= >/dev/null 2>$(OUT)/template/fail.err; then \
 	  echo "FAIL: an empty digest rendered, but must fail" >&2; exit 1; \
 	fi
 	@echo "OK: an empty digest fails as expected: $$(grep -o 'image.server.digest.*' $(OUT)/template/fail.err)"
+	@gc() { helm template abfs $(CHART) -n abfs -f $(CI)/seed-values.yaml --set server.gc.enabled=true \
+	  --set gcCollector.enabled=true "$$@"; } ; \
+	c=$$(gc --show-only templates/gc-collector-cronjob.yaml); \
+	grep -qxF -- '                - --dry-run' <<<"$$c" || { echo "FAIL: the default collector does not run --dry-run" >&2; exit 1; }; \
+	if grep -qE -- '--(min-replicas|delete-types)' <<<"$$c"; then echo "FAIL: the dry run passes --min-replicas or --delete-types" >&2; exit 1; fi; \
+	c=$$(gc --show-only templates/gc-collector-cronjob.yaml --set gcCollector.mode=condemn); \
+	grep -qxF -- '                - --min-replicas=2' <<<"$$c" || { echo "FAIL: condemn mode lacks --min-replicas=2" >&2; exit 1; }; \
+	if grep -qF -- '--delete-types' <<<"$$c"; then echo "FAIL: condemn mode passes --delete-types" >&2; exit 1; fi; \
+	c=$$(gc --show-only templates/gc-collector-cronjob.yaml --set otel.enabled=false --set alerts.enabled=false); \
+	if grep -qE -- 'metrics-provider|OTEL_' <<<"$$c"; then echo "FAIL: the collector exports telemetry with otel.enabled=false" >&2; exit 1; fi; \
+	if gc --set alerts.enabled=false | grep -qF 'alert: AbfsGc'; then echo "FAIL: alerts.enabled=false renders the GC rules" >&2; exit 1; fi; \
+	echo "OK: the collector runs --dry-run by default, condemn adds only --min-replicas, otel.enabled=false drops telemetry, and no GC rules without alerts"
 
 # The smoke test values render on the example values, replace its pool, and give the
 # clients the server and project of the manifest host; the host file builds, and its
@@ -206,7 +222,8 @@ examples:
 
 # Each overlay, then the components the example overlay leaves out, then the
 # rules that the two backend modes exclude each other, that backend-new holds
-# no garbage collector resource, and that gc builds only with backend-new.
+# no garbage collector resource, that gc builds only with backend-new, and that
+# both backend modes grant the server the bucket reader role.
 kustomize:
 	@mkdir -p $(OUT)/kustomize
 	@for k in $(OVERLAYS); do \
@@ -229,31 +246,39 @@ kustomize:
 	echo "OK: backend-new + backend-existing fails as expected"; \
 	kz backend-new settings >"$$t/kustomization.yaml"; \
 	kubectl kustomize "$$t" >$(OUT)/kustomize/new.yaml; \
-	if grep -qE 'name: abfs-(gc|table-gc|gc-policy-(gc|objects-g))$$|family: g$$|Gc[A-Z][a-z]+ \(' $(OUT)/kustomize/new.yaml; then \
+	if grep -qE 'name: abfs-(gc|table-abfsgc|gc-policy-(abfsgc-[et]|objects-abfsgc))$$|family: abfsgc$$|Gc[A-Z][a-z]+ \(' $(OUT)/kustomize/new.yaml; then \
 	  echo "FAIL: backend-new without gc holds a garbage collector resource" >&2; exit 1; \
 	fi; \
 	echo "OK: backend-new without gc holds no garbage collector resource ($$(grep -c '^kind:' $(OUT)/kustomize/new.yaml) objects)"; \
 	kz backend-new gc settings >"$$t/kustomization.yaml"; \
 	kubectl kustomize "$$t" >$(OUT)/kustomize/new-gc.yaml; \
-	[[ $$(grep -cE '^  name: abfs-(table-gc|gc-policy-(gc-[et]|objects-g))$$|^  - family: g$$' $(OUT)/kustomize/new-gc.yaml) == 5 ]] || \
-	  { echo "FAIL: backend-new + gc lacks the table gc, the family objects:g or their policies" >&2; exit 1; }; \
+	[[ $$(grep -cE '^  name: abfs-(table-abfsgc|gc-policy-(abfsgc-[et]|objects-abfsgc))$$|^  - family: abfsgc$$' $(OUT)/kustomize/new-gc.yaml) == 5 ]] || \
+	  { echo "FAIL: backend-new + gc lacks the table abfsgc, the family objects:abfsgc or their policies" >&2; exit 1; }; \
 	fam() { awk '/^kind: BigtableTable$$/ { t = 1 } /^---$$/ { t = 0 } t && /^  name: abfs-table-objects$$/ { o = 1 } \
 	  o && /^  - family: / { printf "%s ", $$3 } /^---$$/ { o = 0 }' "$$1"; } ; \
 	[[ $$(fam $(OUT)/kustomize/new.yaml) == "meta data " ]] || \
 	  { echo "FAIL: the table objects of backend-new has the families $$(fam $(OUT)/kustomize/new.yaml), not meta data" >&2; exit 1; }; \
-	[[ $$(fam $(OUT)/kustomize/new-gc.yaml) == "meta data g " ]] || \
-	  { echo "FAIL: the table objects of backend-new + gc has the families $$(fam $(OUT)/kustomize/new-gc.yaml), not meta data g" >&2; exit 1; }; \
+	[[ $$(fam $(OUT)/kustomize/new-gc.yaml) == "meta data abfsgc " ]] || \
+	  { echo "FAIL: the table objects of backend-new + gc has the families $$(fam $(OUT)/kustomize/new-gc.yaml), not meta data abfsgc" >&2; exit 1; }; \
 	awk '/^kind: BigtableAppProfile$$/ { p = 1 } /^---$$/ { p = 0 } p' $(OUT)/kustomize/new-gc.yaml >"$$t/profile.yaml"; \
 	for want in '  name: abfs-gc' '  resourceID: abfs-gc' '    name: abfs-objects' \
 	    '    allowTransactionalWrites: true' '    clusterId: abfs-objects-c1' '    priority: PRIORITY_LOW'; do \
 	  grep -qxF -- "$$want" "$$t/profile.yaml" || { echo "FAIL: the app profile abfs-gc of backend-new + gc lacks '$$want'" >&2; exit 1; }; \
 	done; \
-	echo "OK: backend-new + gc ($$(grep -c '^kind:' $(OUT)/kustomize/new-gc.yaml) objects; objects families meta data g; app profile abfs-gc)"; \
+	echo "OK: backend-new + gc ($$(grep -c '^kind:' $(OUT)/kustomize/new-gc.yaml) objects; objects families meta data abfsgc; app profile abfs-gc)"; \
 	kz backend-existing gc settings >"$$t/kustomization.yaml"; \
 	if kubectl kustomize "$$t" >/dev/null 2>&1; then \
 	  echo "FAIL: backend-existing and gc together built, but must fail" >&2; exit 1; \
 	fi; \
 	echo "OK: backend-existing + gc fails as expected"
+	@br() { awk 'BEGIN { RS = "\n---\n" } /\nkind: IAMPolicyMember\n/ && /\n  name: abfs-server-storage-legacy-bucket-reader\n/' "$$1"; } ; \
+	for f in new:'    name: abfs-blobs' existing-proxy-subnet:'    external: example-project-abfs-blobs'; do \
+	  m=$$(br $(OUT)/kustomize/$${f%%:*}.yaml); \
+	  for want in '  role: roles/storage.legacyBucketReader' '    kind: StorageBucket' "$${f#*:}"; do \
+	    grep -qxF -- "$$want" <<<"$$m" || { echo "FAIL: the bucket reader member of $${f%%:*}.yaml lacks '$$want'" >&2; exit 1; }; \
+	  done; \
+	done; \
+	echo "OK: both backend modes grant the server roles/storage.legacyBucketReader on the bucket"
 
 # The schema source of ddl and ddl-check: an ABFS source tree, or a commit of
 # DDL_REPO that has the GCP server, for example

@@ -76,7 +76,7 @@ The chart never creates the release namespace: the KCC base creates `abfs` (leve
 | `server.healthProbeInterval` | `10s` | `--health-probe-interval` of the backend probe |
 | `server.shutdownTimeout` | `25s` | `--shutdown-timeout` |
 | `server.logSampleRate` | `0.01` | `--log-sample-rate` |
-| `server.gc.enabled` | `false` | `--gc`; needs the garbage collector resources, which neither backend mode creates by default: `components/gc` with `backend-new`, then `init --gc` ([runbook](runbook.md#garbage-collection)). Adds up to about 1 GiB of server memory, which the memory check counts. |
+| `server.gc.enabled` | `false` | `--gc`; needs the garbage collector resources, which neither backend mode creates by default: `components/gc` with `backend-new`, then `init --gc` ([runbook](runbook.md#garbage-collection)). Adds up to about 1 GiB of server memory, which the memory check counts. The collector is [`gcCollector`](#gccollector). |
 | `server.extraArgs` | `[]` | More server flags |
 | `server.preStopSleepSeconds` | `120` | Time the pod keeps serving after its endpoint is removed, at least `gateway.drainingTimeoutSec` plus about 60 s |
 | `server.terminationGracePeriodSeconds` | `240` | preStop (120 s) + the longest stop after SIGTERM (105 s: `server.drainDelay`, `server.shutdownTimeout`, with `server.gc.enabled` up to 20 s of GC touches and 30 s of heartbeat delete, 15 s of telemetry flush) + 15 s margin. Raise it with any of these. |
@@ -86,6 +86,23 @@ The chart never creates the release namespace: the KCC base creates `abfs` (leve
 | `server.probes.liveness` | period 10, timeout 2, failures 6 | TCP on 50051; gRPC health does not drive liveness |
 
 The server listens on 50051 (gRPC, plaintext h2c) and serves HTTP debug endpoints on 127.0.0.1:8051 only. The replicas spread over nodes (`topologySpreadConstraints` on `kubernetes.io/hostname`, `maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`). The pod mounts no service account token (`automountServiceAccountToken: false`); Workload Identity does not need one.
+
+## gcCollector
+
+| Value | Default | Meaning |
+| --- | --- | --- |
+| `gcCollector.enabled` | `false` | CronJob `abfs-gc-collector`, `abfs server gcp gc run` as the KSA `abfs-server`. Needs `server.gc.enabled` ([runbook](runbook.md#garbage-collection)). |
+| `gcCollector.mode` | `dry-run` | `dry-run`, `condemn` or `delete`. Condemn and delete pass `--min-replicas` = `server.replicas.min` - 1 and need `server.replicas.min` >= 2 and `pdb.enabled`. |
+| `gcCollector.schedule` | `"0 2 * * *"` | UTC (`timeZone: Etc/UTC`), at a low-write hour. The alerts assume one cycle a day. |
+| `gcCollector.suspend` | `false` | `true` for `gc undo` and `gc backfill`; then wait for or delete the active Job |
+| `gcCollector.bigtableAppProfile` | `abfs-gc` | `--bt-app-profile`; must equal the profile of `components/gc`. Required. |
+| `gcCollector.deleteTypes` | `[]` | `--delete-types`, delete mode only, where it is required. Widen from the top of the graph down. |
+| `gcCollector.memoryLimit` | `24Gi` | Memory request and limit; `GOMEMLIMIT` is 90 % of it. At least 1.4 x (`keys_bytes` + `edges_bytes` + `map_rows_bytes`) of the report; 24Gi covers about 10^8 objects. |
+| `gcCollector.cpuRequest` | `4` | No CPU limit; `GOMAXPROCS` follows it |
+| `gcCollector.deadlineSeconds` | `14400` | `activeDeadlineSeconds` of each Job, at least 3600 |
+| `gcCollector.computeClass`, `.nodeSelector`, `.tolerations` | `abfs-server`, `{}`, `[]` | Placement, as for `bootstrap.computeClass` |
+| alerts | | With `alerts.enabled` (needs `otel.enabled`), a `Rules` object `abfs-gc-collector`: `AbfsGcCycleNotClean` (a cycle that was not clean ended after the last clean one) and `AbfsGcNoCleanCycle` (no clean cycle within a day plus the starting deadline of 2 hours, `deadlineSeconds` rounded up to hours and an hour: 31 hours with the defaults), both on `abfs_gc_cycle_end_timestamp_seconds{mode,result}`. |
+| fixed | | `concurrencyPolicy: Forbid`, `startingDeadlineSeconds: 7200`, `backoffLimit: 0`, 7 successful and 7 failed Jobs kept, `terminationGracePeriodSeconds: 90`, `safe-to-evict: "false"` |
 
 ## gateway
 
@@ -219,7 +236,7 @@ Every class sets `whenUnsatisfiable: DoNotScaleUp`, Hyperdisk Balanced boot disk
 | `networkPolicy.enabled` | `true` | Server ingress only from the proxy-only subnet, the health check ranges, the bootstrap Job and the test pod. Inert without Dataplane V2. |
 | `networkPolicy.proxyOnlySubnetCidr` | `""` (required when enabled) | |
 | `networkPolicy.healthCheckCidrs` | `[35.191.0.0/16]` | |
-| `alerts.enabled` | `false` | Managed Service for Prometheus rules: a `Rules` object for the pusher pool, and a `GlobalRules` object `<release>-gke-metrics` with `AbfsNodeDiskHigh` (a boot disk over 85 % for 5 minutes, any node of the cluster) and `AbfsPusherRestarted` (a pusher container, `git-pusher` or `git-pusher-seed`, restarted in the last 15 minutes). `kubectl get node <node> -L cloud.google.com/compute-class` shows the class of a node that fires. |
+| `alerts.enabled` | `false` | Managed Service for Prometheus rules: a `Rules` object for the pusher pool, a `Rules` object `abfs-gc-collector` with `gcCollector.enabled` ([gcCollector](#gccollector)), and a `GlobalRules` object `<release>-gke-metrics` with `AbfsNodeDiskHigh` (a boot disk over 85 % for 5 minutes, any node of the cluster) and `AbfsPusherRestarted` (a pusher container, `git-pusher` or `git-pusher-seed`, restarted in the last 15 minutes). `kubectl get node <node> -L cloud.google.com/compute-class` shows the class of a node that fires. |
 | `alerts.for` | `30m` | Duration of the pusher pool rules |
 | `alerts.clusterName` | `""` (required with `enabled`) | Name of this GKE cluster; the `GlobalRules` rules filter on it, since they read every cluster in the metrics scope |
 | `tests.enabled` | `true` | `helm test` pods |

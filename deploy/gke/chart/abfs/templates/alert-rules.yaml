@@ -51,6 +51,45 @@ spec:
           annotations:
             summary: No pusher reports metrics.
 {{- end }}
+{{- if and .Values.alerts.enabled .Values.gcCollector.enabled }}
+{{- /* The collector's end-of-cycle gauge, labels mode and result; the one place of its name. */}}
+{{- $end := "abfs_gc_cycle_end_timestamp_seconds" }}
+{{- $window := printf "%dh" (add 24 (div (include "abfs.gcCollector.startingDeadlineSeconds" .) 3600) (div (add .Values.gcCollector.deadlineSeconds 3599) 3600) 1) }}
+---
+# The garbage collector's cycles. A collector series lives minutes a day and each run is a
+# new series, so both rules read one window and take the maximum. The window is a day,
+# plus the starting deadline and the Job deadline (gcCollector.deadlineSeconds, in whole
+# hours), by which a cycle can end later than the one before, plus an hour: 31 hours with
+# the defaults. The first fires when a cycle that was not clean ended after the last clean
+# one, and resolves at the next clean cycle; the second covers runs that export nothing
+# (an OOM kill, a pod that never started, a missed or suspended schedule).
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: abfs-gc-collector
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+    {{- include "abfs.selectorLabels" "gc-collector" | nindent 4 }}
+spec:
+  groups:
+    - name: abfs-gc-collector
+      interval: 60s
+      rules:
+        - alert: AbfsGcCycleNotClean
+          expr: >-
+            max by (mode, result) (max_over_time({{ $end }}{result!="ok"}[{{ $window }}]))
+            > scalar(max(max_over_time({{ $end }}{result="ok"}[{{ $window }}])) or vector(0))
+          labels:
+            severity: warning
+          annotations:
+            summary: The last GC cycle was refused, stopped or failed; the result label names the cause.
+        - alert: AbfsGcNoCleanCycle
+          expr: absent_over_time({{ $end }}{result="ok"}[{{ $window }}])
+          labels:
+            severity: warning
+          annotations:
+            summary: No GC cycle ended clean in the last {{ $window }}.
+{{- end }}
 {{- if and .Values.alerts.enabled (or .Values.ci.enabled .Values.pusher.enabled) }}
 {{- if not .Values.alerts.clusterName }}
 {{- fail "alerts.clusterName is required with alerts.enabled: the GlobalRules object would otherwise match the nodes and containers of every cluster in the project's metrics scope" }}

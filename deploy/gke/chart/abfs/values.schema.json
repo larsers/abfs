@@ -112,6 +112,24 @@
         "minReadySeconds": {"type": "integer", "minimum": 0}
       }
     },
+    "gcCollector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "mode": {"enum": ["dry-run", "condemn", "delete"]},
+        "schedule": {"type": "string", "minLength": 1},
+        "suspend": {"type": "boolean"},
+        "bigtableAppProfile": {"type": "string", "pattern": "^$|^[_a-zA-Z0-9][-_.a-zA-Z0-9]*$"},
+        "deleteTypes": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "memoryLimit": {"$ref": "#/definitions/quantity"},
+        "cpuRequest": {"type": ["integer", "string"]},
+        "deadlineSeconds": {"type": "integer", "minimum": 3600},
+        "computeClass": {"type": "string"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"}
+      }
+    },
     "gateway": {
       "type": "object",
       "properties": {
