@@ -268,7 +268,8 @@ gcloud container clusters create $CLUSTER \
   --maintenance-window-recurrence 'FREQ=WEEKLY;BYDAY=SA,SU' \
   --machine-type n4-standard-4 --disk-type hyperdisk-balanced --num-nodes 1 \
   --service-account abfs-system-nodes@$P.iam.gserviceaccount.com \
-  --image-type COS_CONTAINERD --workload-metadata GKE_METADATA
+  --image-type COS_CONTAINERD --workload-metadata GKE_METADATA \
+  --shielded-secure-boot --shielded-integrity-monitoring
 gcloud container clusters get-credentials $CLUSTER --project $P --region $REGION \
   --dns-endpoint
 ```
@@ -289,7 +290,8 @@ gcloud container clusters describe $CLUSTER --project $P --region $REGION \
     networkConfig.datapathProvider, verticalPodAutoscaling, autoscaling,
     addonsConfig.httpLoadBalancing, addonsConfig.horizontalPodAutoscaling,
     addonsConfig.gcePersistentDiskCsiDriverConfig, monitoringConfig.managedPrometheusConfig,
-    maintenancePolicy.window, controlPlaneEndpointsConfig, privateClusterConfig)'
+    maintenancePolicy.window, controlPlaneEndpointsConfig, privateClusterConfig,
+    nodePools[].config.shieldedInstanceConfig)'
 kubectl get nodes -o wide
 kubectl get crd computeclasses.cloud.google.com gateways.gateway.networking.k8s.io \
   verticalpodautoscalers.autoscaling.k8s.io
@@ -307,6 +309,7 @@ Expected:
 - `autoscalingProfile: OPTIMIZE_UTILIZATION`, no `enableNodeAutoprovisioning: true` ([Cluster-level node auto-provisioning](prerequisites.md#cluster-level-node-auto-provisioning)).
 - `dnsEndpointConfig`: `allowExternalTraffic: true` and an endpoint under `gke.goog`; `ipEndpointsConfig`: `enabled: false`.
 - `privateClusterConfig`: `enablePrivateNodes: true`, no `peeringName` ([Control plane to node traffic](prerequisites.md#control-plane-to-node-traffic)). A `publicEndpoint` address may show; it accepts no connections.
+- `shieldedInstanceConfig`: the system pool shows `enableSecureBoot: true`, `enableIntegrityMonitoring: true`.
 - Every node shows `<none>` under `EXTERNAL-IP`. The three CRDs exist; `gke-l7-rilb` appears within 10 minutes.
 
 If it fails: [kubectl cannot reach the control plane](troubleshooting.md#kubectl-cannot-reach-the-control-plane), [Gateway waits for its controller](troubleshooting.md#gateway-waits-for-its-controller).

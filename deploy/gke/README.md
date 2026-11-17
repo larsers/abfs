@@ -34,7 +34,7 @@ This folder deploys the open-source ABFS GCP server, the git-pushers and the CI 
 Details in [prerequisites.md](docs/prerequisites.md); the install order in [install.md](docs/install.md).
 
 - GKE Standard with a regional control plane. Autopilot does not allow the privileged CI pods.
-- A GKE version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in GKE 1.37.2-gke.1325000 on the Rapid channel ([prerequisites](docs/prerequisites.md#gke-version-for-the-ci-nodes)). `ci.casfs.provider: daemonset` instead runs Ubuntu CI nodes that build casfs on each node; it does not build on kernel series 6.14 and 6.19.
+- A GKE version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in GKE 1.37.2-gke.1325000 on the Rapid channel ([prerequisites](docs/prerequisites.md#gke-version-for-the-ci-nodes)). `ci.casfs.provider: daemonset` instead runs Ubuntu CI nodes that build casfs on each node; it does not build on kernel series 6.14 and 6.19, and cannot run under `constraints/compute.requireShieldedVm` ([prerequisites](docs/prerequisites.md#secure-boot-on-the-ci-nodes)).
 - Config Connector installed by hand from its operator bundle, 1.130.1 or later, not the GKE add-on.
 - A VPC with a proxy-only subnet. With private nodes: a Private Service Connect endpoint for Google APIs with its DNS zones, Private Google Access and Cloud NAT.
 - Control plane access through the DNS-based endpoint only.

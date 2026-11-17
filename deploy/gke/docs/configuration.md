@@ -168,7 +168,7 @@ With `pusher.enabled: false` (the pushers run in another release), set `pusher.p
 | `ci.cacheman.fsyncObjects` | `true` | |
 | `ci.cacheman.toolDir` | `/opt/abfs/bin` | Tool set in the `abfs-client` image |
 | `ci.cacheman.resources` | 2 CPU, 4Gi request, 8Gi limit | No CPU limit and no `GOMAXPROCS`. The VerticalPodAutoscaler `abfs-cacheman` recommends a memory request ([Right-sizing](#right-sizing)). |
-| `ci.casfs.provider` | `image` | `image`: COS CI nodes, secure boot on, casfs from the node image (COS 133 build 44-193 or later). `daemonset`: Ubuntu CI nodes, secure boot off, the loader builds casfs on each node. |
+| `ci.casfs.provider` | `image` | `image`: COS CI nodes, secure boot on, casfs from the node image (COS 133 build 44-193 or later). `daemonset`: Ubuntu CI nodes, secure boot off, the loader builds casfs on each node; not possible under `constraints/compute.requireShieldedVm`. |
 | `ci.casfs.maxMounts` | `4` | `casfs_max_mounts`: build pods per node plus 2. Read-only after load. |
 | `ci.casfs.mountGbPerWorkspace` | `6` | Kernel memory per active workspace, for the slab budget ([sizing](ci-job.md#sizing)) |
 | `ci.casfs.maxRamShare` | `0.4` | Upper bound: the loader lowers `maxMounts` until `maxMounts` x `mountGbPerWorkspace` fits this share of `MemTotal` |
@@ -206,7 +206,7 @@ With `pusher.enabled: false` (the pushers run in another release), set `pusher.p
 | `computeClasses.pusherSeed.families`, `.minCores`, `.minMemoryGb` | `[n4, n4d, c4d, c4]`, `32`, `240` | Highmem shapes for the seed |
 | `computeClasses.pusherSteady.families` | `[n4, n4d, c4d, c4]` | No size floor |
 
-Every class sets `whenUnsatisfiable: DoNotScaleUp`, Hyperdisk Balanced boot disks and `nodePoolConfig.imageStreaming` from `computeClasses.imageStreaming`. The CI class sets `maintenanceExclusion: UNTIL_END_OF_SUPPORT` and uses `cos_containerd` with secure boot on (`ci.casfs.provider: image`), or `ubuntu_containerd` with secure boot off (`daemonset`; `nodePoolAutoCreation.shieldedInstanceConfig.enableSecureBoot`, GKE 1.36.3-gke.1244000 or later). A change applies to new CI node pools only ([Secure boot on the CI nodes](prerequisites.md#secure-boot-on-the-ci-nodes)). The other classes use `cos_containerd`. Servers and pushers never run on Spot.
+Every class sets `whenUnsatisfiable: DoNotScaleUp`, Hyperdisk Balanced boot disks, `nodePoolConfig.imageStreaming` from `computeClasses.imageStreaming`, and secure boot and integrity monitoring on (`nodePoolAutoCreation.shieldedInstanceConfig`, GKE 1.36.3-gke.1244000 or later). The CI class sets `maintenanceExclusion: UNTIL_END_OF_SUPPORT` and uses `cos_containerd` (`ci.casfs.provider: image`), or `ubuntu_containerd` with secure boot off (`daemonset`). A change applies to new node pools only ([Secure boot on the CI nodes](prerequisites.md#secure-boot-on-the-ci-nodes)). The other classes use `cos_containerd`. Servers and pushers never run on Spot.
 
 ## otel, pdb, networkPolicy, alerts, tests
 
