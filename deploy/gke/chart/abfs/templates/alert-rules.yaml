@@ -97,10 +97,10 @@ spec:
         - alert: AbfsPusherRestarted
           expr: >-
             increase(kubernetes_io:container_restart_count{monitored_resource="k8s_container",
-            namespace_name="{{ .Release.Namespace }}", container_name="git-pusher"{{ $cluster }}}[15m]) > 0
+            namespace_name="{{ .Release.Namespace }}", container_name=~"git-pusher(-seed)?"{{ $cluster }}}[15m]) > 0
           labels:
             severity: warning
           annotations:
-            summary: A git-pusher container restarted; check its last state for OOMKilled.
+            summary: A pusher container restarted; check its last state for OOMKilled.
     {{- end }}
 {{- end }}

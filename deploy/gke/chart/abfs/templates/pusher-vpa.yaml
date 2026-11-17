@@ -17,10 +17,13 @@
 {{- if not (has $v.mode (list "Initial" "Recreate" "InPlaceOrRecreate")) }}
 {{- fail "pusher.vpa.mode must be Initial, Recreate or InPlaceOrRecreate" }}
 {{- end }}
-# Steady phase only, so the history never holds the seed peak. Memory only: the CPU request
-# sets GOMAXPROCS. The pusher sets no GOMEMLIMIT, so an in-place memory change needs no
-# restart. Initial applies the recommendation only to a new pod, never to a container that
-# restarts after an OOM kill.
+# Steady phase only. GKE builds the recommendation from the usage history of the target,
+# including the time before this object existed, and on a switch to seed Helm updates the
+# StatefulSet before it deletes this object. So only the steady container git-pusher is
+# controlled; every other container, such as the seed container git-pusher-seed, is Off.
+# Memory only: the CPU request sets GOMAXPROCS. The pusher sets no GOMEMLIMIT, so an
+# in-place memory change needs no restart. Initial applies the recommendation only to a new
+# pod, never to a container that restarts after an OOM kill.
 apiVersion: autoscaling.k8s.io/v1
 kind: VerticalPodAutoscaler
 metadata:
@@ -43,4 +46,6 @@ spec:
           memory: {{ $v.minMemory | quote }}
         maxAllowed:
           memory: {{ $v.maxMemory | quote }}
+      - containerName: "*"
+        mode: "Off"
 {{- end }}

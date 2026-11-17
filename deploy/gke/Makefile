@@ -110,6 +110,15 @@ template:
 	want "$$p" '              path: /info' "the pusher StatefulSet"; \
 	if grep -qE '^          (liveness|startup)Probe:' <<<"$$p"; then echo "FAIL: the pusher has a liveness or startup probe" >&2; exit 1; fi; \
 	echo "OK: the pusher is ready on /info and has no liveness probe"; \
+	want "$$p" '        - name: git-pusher-seed' "the seed pusher StatefulSet"; \
+	want "$$(show pusher-statefulset.yaml --set pusher.phase=steady)" '        - name: git-pusher' "the steady pusher StatefulSet"; \
+	pv=$$(show pusher-vpa.yaml --set pusher.phase=steady); \
+	want "$$pv" '      - containerName: git-pusher' "the pusher VerticalPodAutoscaler"; \
+	[[ $$(grep -A1 -xF '      - containerName: "*"' <<<"$$pv" | tail -n 1) == '        mode: "Off"' ]] || \
+	  { echo "FAIL: the pusher VerticalPodAutoscaler has no '*' container policy in mode Off" >&2; exit 1; }; \
+	show alert-rules.yaml --set alerts.enabled=true --set alerts.clusterName=x | grep -qF 'container_name=~"git-pusher(-seed)?"' || \
+	  { echo "FAIL: AbfsPusherRestarted does not match both pusher container names" >&2; exit 1; }; \
+	echo "OK: the pusher container is git-pusher-seed in seed and git-pusher in steady, the VPA controls only git-pusher, and the restart alert matches both"; \
 	v=$$(show cacheman-vpa.yaml); \
 	for w in '    kind: DaemonSet' '    updateMode: "Off"' '        controlledResources: ["memory"]'; do \
 	  want "$$v" "$$w" "the cacheman VerticalPodAutoscaler"; \

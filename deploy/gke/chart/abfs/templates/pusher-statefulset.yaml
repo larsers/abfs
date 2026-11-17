@@ -21,7 +21,9 @@
 # git-pushers. Pod names <namePrefix>-<ordinal> are the pool entry names. A phase change
 # changes the node selector, so the rolling update recreates each pusher on a node of the
 # other class, in its PVC's zone. Runs as root under PSA baseline, as on VMs, so a new
-# volume needs no fsGroup.
+# volume needs no fsGroup. The container is git-pusher-seed in the seed phase and git-pusher
+# in the steady phase, so the steady memory VPA neither learns from nor resizes a seed
+# container (templates/pusher-vpa.yaml).
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -84,7 +86,7 @@ spec:
             - name: tmp
               mountPath: /tmp
       containers:
-        - name: git-pusher
+        - name: {{ ternary "git-pusher-seed" "git-pusher" (eq $p.phase "seed") }}
           image: {{ include "abfs.image" (dict "root" . "image" "pusher") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
