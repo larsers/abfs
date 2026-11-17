@@ -132,6 +132,34 @@ server:
       timeoutSeconds: 2
       failureThreshold: 6
 
+# The garbage collector's cycle, `abfs server gcp gc run`, as the CronJob abfs-gc-collector
+# under the server's service account (docs/runbook.md, "Garbage collection"). Needs
+# server.gc.enabled.
+gcCollector:
+  enabled: false
+  # dry-run, condemn or delete. Run each mode clean before the next.
+  mode: dry-run
+  # UTC, at a low-write hour. The alerts assume one cycle a day.
+  schedule: "0 2 * * *"
+  # true for `gc undo` and `gc backfill`; then wait for or delete the active Job.
+  suspend: false
+  # The collector's app profile; must equal the one of components/gc.
+  bigtableAppProfile: abfs-gc
+  # Delete mode only, as --delete-types; required there. Widen from the top of the graph
+  # down: commit, project-status and build types, then trees and deep trees, then blobs.
+  deleteTypes: []
+  # Memory request and limit. GOMEMLIMIT is 90 % of it. At least 1.4 x the report's
+  # keys_bytes + edges_bytes + map_rows_bytes; 24Gi covers about 10^8 objects.
+  memoryLimit: 24Gi
+  # CPU request; no CPU limit. GOMAXPROCS follows it.
+  cpuRequest: 4
+  # activeDeadlineSeconds of each Job. The window of the GC alerts grows with it.
+  deadlineSeconds: 14400
+  # Placement, as for bootstrap.computeClass. The server class runs in the Bigtable zone.
+  computeClass: abfs-server
+  nodeSelector: {}
+  tolerations: []
+
 gateway:
   className: gke-l7-rilb
   # Name of the KCC ComputeAddress (purpose SHARED_LOADBALANCER_VIP).
@@ -383,7 +411,8 @@ networkPolicy:
   healthCheckCidrs:
     - 35.191.0.0/16
 
-# Managed Service for Prometheus rules. Off by default: the pusher pool rules read the OTLP
+# Managed Service for Prometheus rules. Off by default: the pusher pool rules and the GC
+# collector rules (Rules object abfs-gc-collector, with gcCollector.enabled) read the OTLP
 # metrics the managed collector stores, which is not checked on a cluster yet. The node
 # disk and pusher restart rules read GKE system metrics through a GlobalRules object.
 alerts:

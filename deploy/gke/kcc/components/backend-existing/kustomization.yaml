@@ -50,3 +50,5 @@ replacements:
     targets:
       - select: {kind: IAMPolicyMember, name: abfs-server-storage-object-user}
         fieldPaths: [spec.resourceRef.external]
+      - select: {kind: IAMPolicyMember, name: abfs-server-storage-legacy-bucket-reader}
+        fieldPaths: [spec.resourceRef.external]

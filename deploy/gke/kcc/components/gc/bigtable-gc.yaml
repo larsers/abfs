@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # The Bigtable parts of the garbage collector, as `abfs server gcp init --gc`
-# creates them: the table gc and the family g of the table objects, each
-# family keeping one version. The Spanner tables of the garbage collector are
+# creates them: the table abfsgc and the family abfsgc of the table objects,
+# each family keeping one version. The Spanner tables of the garbage collector are
 # not here; `init --gc` adds them (docs/runbook.md, Garbage collection).
 # Also the app profile abfs-gc of the collector, which `init` does not create:
 # the `gc` commands take it with --bt-app-profile abfs-gc.
@@ -22,12 +22,12 @@
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableTable
 metadata:
-  name: abfs-table-gc
+  name: abfs-table-abfsgc
   namespace: abfs
   annotations:
     cnrm.cloud.google.com/deletion-policy: abandon
 spec:
-  resourceID: gc
+  resourceID: abfsgc
   instanceRef:
     name: abfs-objects
   columnFamily:
@@ -37,7 +37,7 @@ spec:
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableGCPolicy
 metadata:
-  name: abfs-gc-policy-objects-g
+  name: abfs-gc-policy-objects-abfsgc
   namespace: abfs
   annotations:
     cnrm.cloud.google.com/deletion-policy: abandon
@@ -46,7 +46,7 @@ spec:
     name: abfs-objects
   tableRef:
     name: abfs-table-objects
-  columnFamily: g
+  columnFamily: abfsgc
   maxVersion:
     - number: 1
   deletionPolicy: ABANDON
@@ -54,7 +54,7 @@ spec:
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableGCPolicy
 metadata:
-  name: abfs-gc-policy-gc-e
+  name: abfs-gc-policy-abfsgc-e
   namespace: abfs
   annotations:
     cnrm.cloud.google.com/deletion-policy: abandon
@@ -62,7 +62,7 @@ spec:
   instanceRef:
     name: abfs-objects
   tableRef:
-    name: abfs-table-gc
+    name: abfs-table-abfsgc
   columnFamily: e
   maxVersion:
     - number: 1
@@ -71,7 +71,7 @@ spec:
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableGCPolicy
 metadata:
-  name: abfs-gc-policy-gc-t
+  name: abfs-gc-policy-abfsgc-t
   namespace: abfs
   annotations:
     cnrm.cloud.google.com/deletion-policy: abandon
@@ -79,7 +79,7 @@ spec:
   instanceRef:
     name: abfs-objects
   tableRef:
-    name: abfs-table-gc
+    name: abfs-table-abfsgc
   columnFamily: t
   maxVersion:
     - number: 1

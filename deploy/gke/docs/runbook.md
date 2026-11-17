@@ -18,7 +18,7 @@ The release namespace must be `abfs`: the KCC base binds Workload Identity to `a
 
 The overlay lists one of:
 
-- `backend-new`: Config Connector creates the Spanner instance and database with the schema, the Bigtable instance with one cluster, the tables `objects`, `maps` and `chunks` with their Bigtable garbage collection policies, the bucket, and the server's three roles. Use it only for resources that do not exist yet. It creates no resource of the ABFS garbage collector ([Garbage collection](#garbage-collection)).
+- `backend-new`: Config Connector creates the Spanner instance and database with the schema, the Bigtable instance with one cluster, the tables `objects`, `maps` and `chunks` with their Bigtable garbage collection policies, the bucket, and the server's roles. Use it only for resources that do not exist yet. It creates no resource of the ABFS garbage collector ([Garbage collection](#garbage-collection)).
 - `backend-existing`: Config Connector creates no object for the backend and only grants the server's roles on the named resources. Never put an existing backend into `backend-new`: adopting a live Bigtable instance or table can delete clusters and column families.
 
 ### What an existing backend must have
@@ -57,7 +57,7 @@ abfs_admin() {
 }
 GC=                 # GC=--gc when garbage collection is on
 gcloud spanner databases ddl describe $DB --instance $SPANNER --project $P >ddl-before.sql
-for t in objects maps chunks ${GC:+gc}; do
+for t in objects maps chunks ${GC:+abfsgc}; do
   gcloud bigtable instances tables describe $t --instance $BT --project $P \
     --format 'yaml(columnFamilies)'
 done >families-before.yaml
@@ -66,7 +66,7 @@ abfs_admin server gcp init $GC --project $P --instance $SPANNER --db $DB \
   --bt-instance $BT --bucket $BUCKET
 
 gcloud spanner databases ddl describe $DB --instance $SPANNER --project $P >ddl-after.sql
-for t in objects maps chunks ${GC:+gc}; do
+for t in objects maps chunks ${GC:+abfsgc}; do
   gcloud bigtable instances tables describe $t --instance $BT --project $P \
     --format 'yaml(columnFamilies)'
 done >families-after.yaml
@@ -90,24 +90,32 @@ abfs_admin() {
 
 ## Garbage collection
 
-Garbage collection is off by default: neither backend mode creates its resources, and the server runs without `--gc` (`server.gc.enabled: false`). It needs these resources:
+Off by default (`server.gc.enabled`, `gcCollector.enabled`). Neither backend mode creates its resources:
 
 | Resource | Created by |
 | --- | --- |
-| Bigtable table `gc` (families `e`, `t`) and the family `g` of `objects` | `components/gc` with `backend-new`, `init --gc` with `backend-existing` |
-| Bigtable app profile `abfs-gc` of the collector: single-cluster routing, single-row transactions, priority low | `components/gc` with `backend-new`, `gcloud` with `backend-existing` (below) |
-| the Spanner tables of `casdb/gcschema.sql` of the deployed commit (`GcState`, `GcReplicas`, and more in later releases) | `init --gc`, in both modes |
-| objects under `gc/` in the bucket: condemned lists, in later releases also records of deletes and removed refs | `abfs server gcp gc run` |
+| Bigtable table `abfsgc` (families `e`, `t`) and the family `abfsgc` of `objects` | `components/gc` with `backend-new`, `init --gc` with `backend-existing` |
+| Bigtable app profile `abfs-gc`: single-cluster routing, single-row transactions, priority low | `components/gc` with `backend-new`, `gcloud` with `backend-existing` (below) |
+| Spanner tables `AbfsGcState`, `AbfsGcLists`, `AbfsGcServers` | `init --gc`, in both modes |
+| objects under `abfsgc/` in the bucket | the collector |
+| `roles/storage.legacyBucketReader` of the server on the bucket | both backend components |
 
-Never add the garbage collector's Spanner tables to the Config Connector `ddl` list.
+Never add these Spanner tables to the Config Connector `ddl` list.
 
-To turn it on, follow "Enable or disable garbage collection" in `doc/sysadmin/GCP_GC.md` of the deployed commit (in `source/` of the bundle). Here its steps 1 and 2 become:
+### Turn it on
 
-1. With `backend-new`, list `components/gc` after `backend-new` in the overlay, apply it, and wait until every object is Ready. Do this before `init --gc`, or Config Connector deletes the family `g` that `init` creates.
-2. Run `init --gc` as in [Conformance check](#conformance-check), with `GC=--gc`. On this run the files differ, and with `backend-existing` the describe of table `gc` before `init` fails. Then run the check again with `GC=--gc`; it must print `conformant`.
-3. `helm upgrade` with `server.gc.enabled=true`. A server with `--gc` stops at startup and names a missing garbage collector resource, or prints the `gcloud` command when the Bigtable app profile refuses single-row transactions. It needs up to about 1 GiB more memory; the render fails when the cache bounds plus 7 GiB exceed `server.memoryLimit`.
+Steps of `doc/sysadmin/GCP_GC.md`, "Enable or disable garbage collection":
 
-With `backend-existing`, create the collector's app profile once. `<bt-instance>` is `backend.bigtableInstance`, `<project>` is `backend.project`, and `<cluster>` its cluster in the servers' zone (`backend.zone`); list the clusters first:
+1. With `backend-new`, list `components/gc` after `backend-new`, apply, and wait until every object is Ready before `init --gc`; otherwise Config Connector deletes the family `abfsgc` that `init` creates.
+2. Run `init --gc` as in [Conformance check](#conformance-check), with `GC=--gc`; its files differ (with `backend-existing` the first describe of `abfsgc` fails). Rerun it; it must print `conformant`.
+3. `helm upgrade` with `server.gc.enabled=true`. A server with `--gc` stops at startup and names a missing resource.
+4. `abfs_admin server gcp gc backfill` with the backend flags of `init` and `--bt-app-profile abfs-gc`; then `gc-keepalive` on for the clients (`GCP_GC.md` steps 3 and 4).
+5. `helm upgrade` with `gcCollector.enabled=true` (mode `dry-run`).
+6. When the dry run reports are clean, `gcCollector.mode=condemn`, for at least 7 daily cycles under real use.
+7. Check the last condemn reports as `GCP_GC.md` step 8 lists.
+8. `gcCollector.mode=delete` with `gcCollector.deleteTypes`, widened from the top of the graph down (`GCP_GC.md`, "Operator rules").
+
+With `backend-existing`, create the app profile once; `<cluster>` is the cluster in `backend.zone`:
 
 ```sh
 gcloud bigtable clusters list --instances <bt-instance> --project <project>
@@ -116,14 +124,43 @@ gcloud bigtable app-profiles create abfs-gc --instance <bt-instance> --project <
   --description "ABFS GC collector"
 ```
 
-Then continue with the backfill, the client option `gc-keepalive` and the dry runs of the server documentation:
+### The collector
 
-- Run every `abfs server gcp gc` command with `--bt-app-profile abfs-gc`. The servers keep their own profile (`backend.bigtableAppProfile`).
-- For `gc run --condemn` and `gc run --delete`, pass `--min-replicas` (not `--expected-replicas`): `server.replicas.min` - 1 (2 with the defaults). Leave `--max-replicas` unset.
-- A server pod that was killed (an OOM kill, a node failure) leaves a crash record that makes the cycles refuse deletes for a while.
-- On every upgrade, run `init --gc` of the new release before the servers, in both modes. With `backend-new`, apply a release's Bigtable change in `components/gc` or `backend-new` before `init --gc`; a table or family that `init` created alone is deleted at the next reconcile.
+The CronJob `abfs-gc-collector` runs `abfs server gcp gc run --<gcCollector.mode>` daily at 02:00 UTC as the server's service account; condemn and delete pass `--min-replicas` = `server.replicas.min` - 1 ([values](configuration.md#gccollector)). Run a cycle now (never during a scheduled one: it fails and alerts until a clean cycle) and read its exit code:
 
-To turn it off, `helm upgrade` with `server.gc.enabled=false` and turn `gc-keepalive` off on the clients. The resources can stay. Keep `components/gc` in the overlay while they exist: without it, Config Connector deletes the family `objects:g` with the condemn markers, and the component's five objects stay in the cluster and fail on every reconcile. Removing the garbage collector resources is not part of this runbook.
+```sh
+kubectl -n abfs create job --from=cronjob/abfs-gc-collector gc-manual-1
+kubectl -n abfs get pods -l job-name=gc-manual-1 \
+  -o jsonpath='{.items[0].status.containerStatuses[0].state.terminated.exitCode}'
+```
+
+| Code | Cause | Check |
+| --- | --- | --- |
+| 0 | Clean | |
+| 1 | Cycle failed: flags, app profile, backend, lease, `condemn.not_completed` | the error line |
+| 3 | `condemn.refused` | backfill, servers, pins |
+| 4 | `delete.refused`; the cycle condemned | server fleet, keep-alive, app profile |
+| 5 | `delete.step.error`: a worker error stopped the delete step | `error`; the next cycle retries |
+| 6 | `delete.chunks.skipped` with a due record, or `unflagged` | bucket reader grant, versioning, retention, `error_sample` |
+| 128+n | Signal n | `gcCollector.deadlineSeconds`, eviction |
+
+Several causes give the lowest of 3 to 6. Each report is one log line (over 16 KiB it may split: then `kubectl -n abfs logs job/<job>`):
+
+```sh
+gcloud logging read 'resource.type="k8s_container" AND resource.labels.namespace_name="abfs" AND
+  resource.labels.container_name="gc-collector" AND jsonPayload.phase:*' --project=<project> \
+  --freshness=8d --format=json
+```
+
+With `alerts.enabled`, the `Rules` object `abfs-gc-collector` has `AbfsGcCycleNotClean` (the last cycle was not clean; label `result` names the cause) and `AbfsGcNoCleanCycle` (no clean cycle in 31 hours; also after the first enable). Check both in Metrics Explorer once.
+
+For `gc undo` and `gc backfill`, `helm upgrade` with `gcCollector.suspend=true`, then wait for or delete the active Job. Undo reads the delete records (7 days), not backups.
+
+### Upgrade and turn off
+
+- On every upgrade, run `init --gc` of the new release before the servers. With `backend-new`, apply a Bigtable change in `components/gc` or `backend-new` first; Config Connector deletes a table or family that `init` created alone.
+- Turn off: `gcCollector.enabled=false`, then `server.gc.enabled=false`, then `gc-keepalive` off. Keep `components/gc` while its resources exist, or Config Connector deletes the family `objects:abfsgc` and the five objects fail on every reconcile.
+- Turning it on again needs all garbage collector state removed first. A removal procedure exists for operators and is published after it is proven.
 
 ## Seed and steady phase
 
@@ -282,8 +319,6 @@ The file's `# ddl-base:` line holds the sha256 and count of the first release's 
 
 The check guards only the base; in review, a new migration may only add lines at the end. `scripts/gen-ddl.sh` writes the list once from `casdb/schema.sql`, for the release that first creates the database; never run it over the file again. With `backend-existing`, schema changes come from `abfs server gcp init` of the new release. With garbage collection on, `init --gc` of the new release adds the garbage collector's changes in both modes ([Garbage collection](#garbage-collection)).
 
-A `backend-new` database created from an earlier tree whose `spanner-database-ddl.yaml` has 7 entries (the base and `GcState`, `GcReplicas`) keeps that list; Config Connector refuses a shorter one. Copy the earlier file over `kcc/components/backend-new/spanner-database-ddl.yaml` of the new release before applying, and list `components/gc` too, or Config Connector deletes the family `g` of `objects`.
-
 ## Config Connector upgrade and rollback
 
 Upgrade with the operator file of the newer bundle. Keep each bundle; uninstalling a version needs its files.
@@ -397,7 +432,7 @@ The OSS server has no authentication and no TLS by default: any host reaching th
 - The NetworkPolicy lets only the proxy-only subnet, the health check range, the bootstrap Job and the Helm test pod reach the server pods. It needs Dataplane V2.
 - Keep the VPC's firewall rules and routes so only the CI nodes and admin hosts reach the address.
 
-- Only the server's Google service account holds Google roles: `roles/spanner.databaseUser`, `roles/bigtable.user` and `roles/storage.objectUser` on the three resources. `init` runs with the admin's own credentials.
+- Only the server's Google service account holds Google roles: `roles/spanner.databaseUser`, `roles/bigtable.user`, and `roles/storage.objectUser` and `roles/storage.legacyBucketReader` on the bucket. `init` runs with the admin's own credentials.
 - The Gerrit credentials live in one Secret, mounted only into the pushers.
 - In `abfs-ci`, the casfs loader (host root, and the host network with `ci.casfs.provider: daemonset` only) and the build pods run privileged; cacheman runs unprivileged, with a root init container for its directories. The server, the pushers and the bootstrap Job run without privileges in `abfs`; the pushers run as root, which the `baseline` level allows.
 - All builds on a CI node read the same cache, and the kernel trusts cached content by name. Give each tenant its own CI class and node pools.
