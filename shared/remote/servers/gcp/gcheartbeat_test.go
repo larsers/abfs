@@ -33,21 +33,17 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// statsToucher returns the stats it is set to, after calling onStats.
+// statsToucher returns the stats it is set to.
 type statsToucher struct {
 	fakeToucher
-	mu      sync.Mutex
-	stats   gc.TouchStats
-	onStats func()
-	late    atomic.Bool
+	mu    sync.Mutex
+	stats gc.TouchStats
+	late  atomic.Bool
 }
 
 func (f *statsToucher) Late() bool { return f.late.Load() }
 
 func (f *statsToucher) Stats() gc.TouchStats {
-	if f.onStats != nil {
-		f.onStats()
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.stats
@@ -80,17 +76,6 @@ func readServer(t *testing.T, s *GCPServer) gc.Server {
 	return servers[0]
 }
 
-// spannerTime returns the read time of a strong Spanner read.
-func spannerTime(t *testing.T, s *GCPServer) time.Time {
-	t.Helper()
-	ro := s.casdb.SpannerClient().Single()
-	defer ro.Close()
-	require.NoError(t, ro.Query(context.Background(), spanner.Statement{SQL: "SELECT 1"}).Do(func(*spanner.Row) error { return nil }))
-	ts, err := ro.Timestamp()
-	require.NoError(t, err)
-	return ts
-}
-
 // The first heartbeat is written before enableGCHooks returns, with the
 // server's settings, so a server has its row before its first call.
 func TestGCHooks_Heartbeat(t *testing.T) {
@@ -99,31 +84,16 @@ func TestGCHooks_Heartbeat(t *testing.T) {
 	r := readServer(t, s)
 	require.Equal(s.gcHooks.server.ID, r.ID)
 	require.Equal(int64(gc.ExtractorVersion), r.Version)
+	require.Equal(int64(3), r.Version, "the version of the GC rules that bound present answers")
 	require.True(r.GC)
 	require.True(r.LinkValidation)
 	require.Equal(36*time.Hour, r.TouchInterval)
 	require.Equal(6*time.Hour, r.CacheTTL)
 	require.Equal(time.Hour, r.HeartbeatInterval)
 	require.WithinDuration(time.Now(), r.LastSeen, time.Minute)
-	require.False(r.StatsTime.After(r.LastSeen))
 	require.Zero(r.TouchLossTime)
 	require.Zero(r.StoppedAt)
 	require.Zero(s.gcHooks.heartbeatFailures.Load())
-}
-
-// StatsTime is a Spanner read time taken before the touch stats are read, so
-// that a collector can rely on a row with StatsTime after its snapshot to
-// hold every loss counted before the snapshot, whatever the server's clock.
-func TestGCHooks_HeartbeatStatsTimeBeforeStatsRead(t *testing.T) {
-	require := require.New(t)
-	s, st := newHeartbeatServer(t, time.Hour)
-	before := spannerTime(t, s)
-	var statsRead time.Time
-	st.onStats = func() { statsRead = spannerTime(t, s) }
-	require.NoError(s.heartbeat(context.Background()))
-	r := readServer(t, s)
-	require.False(r.StatsTime.Before(before), "StatsTime %s before %s", r.StatsTime, before)
-	require.False(r.StatsTime.After(statsRead), "StatsTime %s after the stats read at %s", r.StatsTime, statsRead)
 }
 
 // A heartbeat after a lost touch records the loss with its commit time; one
@@ -225,7 +195,7 @@ func TestGCHooks_HeartbeatRecordsAGap(t *testing.T) {
 	// until a heartbeat is written.
 	orig := writeServer
 	t.Cleanup(func() { writeServer = orig })
-	writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool, bool) error {
+	writeServer = func(context.Context, *spanner.Client, *gc.Server, bool, bool) error {
 		return status.Error(codes.Unavailable, "injected")
 	}
 	now += bound + 1
@@ -270,7 +240,7 @@ func TestGCHooks_FirstHeartbeatFailureStopsStart(t *testing.T) {
 	s := newEmulatorCASDBServer(t)
 	orig, origTimeout := writeServer, firstHeartbeatTimeout
 	t.Cleanup(func() { writeServer, firstHeartbeatTimeout = orig, origTimeout })
-	writeServer = func(context.Context, *spanner.Client, *gc.Server, time.Time, bool, bool) error {
+	writeServer = func(context.Context, *spanner.Client, *gc.Server, bool, bool) error {
 		return status.Error(codes.PermissionDenied, "injected")
 	}
 	firstHeartbeatTimeout = 200 * time.Millisecond
@@ -296,11 +266,11 @@ func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
 	var failing atomic.Bool
 	orig := writeServer
 	t.Cleanup(func() { writeServer = orig })
-	writeServer = func(ctx context.Context, c *spanner.Client, sv *gc.Server, statsTime time.Time, lost, mapRowsLost bool) error {
+	writeServer = func(ctx context.Context, c *spanner.Client, sv *gc.Server, lost, mapRowsLost bool) error {
 		if failing.Load() {
 			return status.Error(codes.PermissionDenied, "injected")
 		}
-		return orig(ctx, c, sv, statsTime, lost, mapRowsLost)
+		return orig(ctx, c, sv, lost, mapRowsLost)
 	}
 	// Every call that reads or writes the store, each with the code it got.
 	// The calls run in this order: PutRefs creates the server and project

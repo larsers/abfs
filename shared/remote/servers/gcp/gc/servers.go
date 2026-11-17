@@ -25,19 +25,22 @@ import (
 const (
 	serversTable = "GcServers"
 	// MaxHeartbeatInterval is the longest heartbeat interval of a server with
-	// GC. The collector waits up to this long for a heartbeat that read the
-	// touch stats after its snapshot.
+	// GC.
 	MaxHeartbeatInterval = 10 * time.Minute
 	// ValidationWriteBound bounds the time from the start of a server's link
 	// validation to the end of the last write that records the reference it
-	// validated: a new object, ref or map result.
+	// validated: a new object, ref or map result. It also bounds the time
+	// from the start of a call to an answer that objects are present.
 	ValidationWriteBound = 2 * time.Minute
+	// HeartbeatTimeout is the deadline of the write of a heartbeat. A server
+	// stops serving two heartbeat intervals and this long after its last
+	// successful heartbeat.
+	HeartbeatTimeout = 30 * time.Second
 )
 
-// Server is the heartbeat row of a server process in GcServers. Unlike a
-// row of GcReplicas it stays when the process stops, so that the collector
-// can tell for any time window which processes ran and whether one of them
-// lost touches, crashed or ran with settings that break the timing rules.
+// Server is the heartbeat row of a server process in GcServers. It stays
+// when the process stops, so that the collector can tell for any time window
+// which processes ran, with which version of the GC rules and settings.
 type Server struct {
 	// ID is made by NewReplicaID.
 	ID string
@@ -52,48 +55,26 @@ type Server struct {
 	// objects, refs and map results, which rescues the objects they link.
 	LinkValidation bool
 	// The fields below are set by ReadServers. LastSeen is the commit time
-	// of the last heartbeat. StatsTime is a Spanner read time before the
-	// server read the touch stats that its last heartbeat recorded.
-	// TouchLossTime is the commit time of the first heartbeat or stop that
+	// of the last heartbeat. TouchLossTime is the commit time of the first heartbeat or stop that
 	// recorded an object touch the server lost, the newest one when there
 	// were several, and StoppedAt the commit time of a clean stop.
-	// MapRowLossTime is as TouchLossTime for the map row touches, which
-	// servers of older versions count in TouchLossTime. All three are zero
-	// when unset.
+	// MapRowLossTime is as TouchLossTime for the map row touches. The losses
+	// are reported, not checked. All three are zero when unset.
 	LastSeen       time.Time
-	StatsTime      time.Time
 	TouchLossTime  time.Time
 	StoppedAt      time.Time
 	MapRowLossTime time.Time
 }
 
-var serverColumns = []string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "StatsTime", "TouchLossTime", "StoppedAt", "MapRowLossTime"}
+var serverColumns = []string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "TouchLossTime", "StoppedAt", "MapRowLossTime"}
 
-// ReadServerTime returns the read time of a strong read of the row of the
-// server id in GcServers. Spanner chose it, so a read of the touch stats
-// that starts after the call returns comes after it in real time, whatever
-// the local clock says.
-func ReadServerTime(ctx context.Context, client *spanner.Client, id string) (time.Time, error) {
-	ro := client.Single()
-	defer ro.Close()
-	err := ro.Read(ctx, serversTable, spanner.Key{id}, []string{"ServerId"}).Do(func(*spanner.Row) error { return nil })
-	if err == nil {
-		var ts time.Time
-		if ts, err = ro.Timestamp(); err == nil {
-			return ts, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("failed to read the Spanner time for the heartbeat of server %s: %w", id, err)
-}
-
-// WriteServer writes the heartbeat of the server process s, with statsTime
-// from ReadServerTime. lost records that the process lost object touches since
-// its last heartbeat was written, and mapRowsLost that it lost map row
-// touches.
-func WriteServer(ctx context.Context, client *spanner.Client, s *Server, statsTime time.Time, lost, mapRowsLost bool) error {
-	cols := serverColumns[:9:9]
+// WriteServer writes the heartbeat of the server process s. lost records that
+// the process lost object touches since its last heartbeat was written, and
+// mapRowsLost that it lost map row touches.
+func WriteServer(ctx context.Context, client *spanner.Client, s *Server, lost, mapRowsLost bool) error {
+	cols := serverColumns[:8:8]
 	vals := []any{s.ID, s.Version, s.GC, int64(s.TouchInterval / time.Second), int64(s.CacheTTL / time.Second),
-		int64(s.HeartbeatInterval / time.Second), s.LinkValidation, spanner.CommitTimestamp, statsTime}
+		int64(s.HeartbeatInterval / time.Second), s.LinkValidation, spanner.CommitTimestamp}
 	cols, vals = appendLosses(cols, vals, lost, mapRowsLost)
 	if _, err := client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate(serversTable, cols, vals)}); err != nil {
 		return fmt.Errorf("failed to write the heartbeat of server %s: %w", s.ID, err)
@@ -142,7 +123,7 @@ func readServers(ctx context.Context, client *spanner.Client) ([]Server, time.Ti
 		var s Server
 		var touch, ttl, heartbeat int64
 		var loss, stopped, mapRowLoss spanner.NullTime
-		if err := row.Columns(&s.ID, &s.Version, &s.GC, &touch, &ttl, &heartbeat, &s.LinkValidation, &s.LastSeen, &s.StatsTime, &loss, &stopped, &mapRowLoss); err != nil {
+		if err := row.Columns(&s.ID, &s.Version, &s.GC, &touch, &ttl, &heartbeat, &s.LinkValidation, &s.LastSeen, &loss, &stopped, &mapRowLoss); err != nil {
 			return err
 		}
 		s.TouchInterval = time.Duration(touch) * time.Second

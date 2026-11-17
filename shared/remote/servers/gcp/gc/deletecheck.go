@@ -30,15 +30,6 @@ import (
 	"github.com/google/abfs/shared/objects/gitobjects"
 )
 
-// statsWaitMargin is how much longer than its heartbeat interval the
-// collector waits for a server to write a heartbeat whose touch stats were
-// read after the snapshot, and statsPollInterval how often it reads them;
-// tests change them.
-var (
-	statsWaitMargin   = time.Minute
-	statsPollInterval = 10 * time.Second
-)
-
 // tooNewBatch is the number of keys of one point read of the objects written
 // during the consistency scan, and tooNewReadsInFlight the number of batches
 // checked at once. tooNewMaxWait bounds how long the scan waits for the
@@ -65,11 +56,10 @@ type DeleteOpts struct {
 	Types []string
 	// AcceptMountsWithoutKeepAlive deletes objects of the types clients write
 	// while live mounts run without the GC keep-alive, whose caches may hold
-	// the only copy of such an object. The check then only warns, unless a
-	// map row loss counts for the cycle (see serverEvidence.mapRowLoss).
+	// the only copy of such an object. The check then only warns.
 	AcceptMountsWithoutKeepAlive bool
 	// NoBackupCheck deletes without a backup of the tables taken after the
-	// list was complete.
+	// newest list was complete.
 	NoBackupCheck bool
 	// DeleteRate is the maximum number of objects deleted per second; zero
 	// means no limit.
@@ -149,9 +139,9 @@ type DeleteReport struct {
 	// TooNew reports the objects the consistency scan found without a gc row
 	// because they were written during it.
 	TooNew *TooNewReport `json:"too_new,omitempty"`
-	// Plan reports what the cycle would delete from the list before; dry runs
-	// and condemn cycles report only it. PlanError is why a dry run could not
-	// read that list, so it reports no plan.
+	// Plan reports what the cycle would delete; dry runs and condemn cycles
+	// report only it. PlanError is why the cycle could not read the list
+	// records, so it reports no plan.
 	Plan      *DeletePlanReport `json:"plan,omitempty"`
 	PlanError string            `json:"plan_error,omitempty"`
 	// Step reports the delete step, when it ran.
@@ -169,17 +159,12 @@ type DeleteReport struct {
 // deleteEvidence is what deleteBlockers judges, gathered by the cycle before
 // its delete step.
 type deleteEvidence struct {
-	// snapshot is the snapshot of this cycle, and previousCondemnCycle the
-	// cycle of the condemn or delete lease before its own.
-	snapshot             time.Time
-	previousCondemnCycle int64
-	// list is the list GcState names, listHeader its header, nil when it
-	// could not be read, and listErr why.
-	list       ListState
-	listHeader *listHeader
-	listErr    string
-	servers    *serverEvidence
-	instance   instanceEvidence
+	// snapshot is the snapshot of this cycle, and holds the records of the
+	// condemned lists.
+	snapshot time.Time
+	holds    *listHolds
+	servers  *serverEvidence
+	instance instanceEvidence
 	// refRemovalErr is the error of the removal of expired refs.
 	refRemovalErr error
 	// tooNew is the check of the objects written during the consistency
@@ -188,78 +173,36 @@ type deleteEvidence struct {
 	tooNewErr error
 }
 
-// newDeleteEvidence returns the evidence that the lease, the previous list
-// read by c and the dry run res hold. The cycle adds the rest.
-func newDeleteEvidence(lease *Lease, c *condemner, res *Result) *deleteEvidence {
-	ev := &deleteEvidence{
-		snapshot:             lease.Start,
-		previousCondemnCycle: lease.PreviousCondemnCycle,
-		list:                 c.prev.state,
-		listErr:              c.prev.err,
-		servers:              res.servers,
-	}
-	if c.prev.list != nil {
-		ev.listHeader = c.prev.list.header
-	}
-	return ev
+// newDeleteEvidence returns the evidence that the lease and the dry run res
+// hold. The cycle adds the rest.
+func newDeleteEvidence(lease *Lease, res *Result) *deleteEvidence {
+	return &deleteEvidence{snapshot: lease.Start, holds: res.holds, servers: res.servers}
 }
 
 // deleteBlockers returns the reasons in the report r and the evidence ev why
-// the cycle must not delete from the list before it, and the warnings of the
-// checks that o turns into warnings. Each condition closes a case in which a
-// delete could remove an object that is still in use; the server read just
-// before the delete step is waitForServerStats.
+// the cycle must not delete, and the warnings of the checks that o turns into
+// warnings. Each condition closes a case in which a delete could remove an
+// object that is still in use; the server read just before the delete step
+// is recheckServers. Which keys the cycle may delete, the hold of their
+// markers, is the plan's.
 func deleteBlockers(r *Report, ev *deleteEvidence, o *DeleteOpts) (reasons, warnings []string) {
 	add := func(format string, args ...any) {
 		reasons = append(reasons, fmt.Sprintf(format, args...))
 	}
 
-	// The list is the one the last condemn or delete cycle wrote, and all its
-	// markers were written before its completion time.
-	l := ev.list
-	switch {
-	case l.Location == "":
-		add("no condemn cycle published a list to delete from")
-	case ev.listErr != "" || ev.listHeader == nil:
-		add("the list %s could not be read: %s", l.Location, ev.listErr)
-	case !l.Complete:
-		add("the list %s is not complete: the cycle that wrote it stopped before it wrote every marker", l.Location)
-	case !l.CompleteTime.After(l.SnapshotTime):
-		add("the list %s has no completion time after its snapshot: a collector of an older version wrote it", l.Location)
-	case ev.listHeader.cycle != ev.previousCondemnCycle:
-		add("the list %s is of cycle %d, but cycle %d was the last condemn or delete cycle and did not complete its own list", l.Location, ev.listHeader.cycle, ev.previousCondemnCycle)
+	if ev.holds == nil || ev.holds.err != nil {
+		add("the GC list records could not be read, so no marker is known to be complete")
 	}
-
 	if ev.servers == nil {
 		add("the GC servers were not read")
 	} else {
-		start := windowStart(ev.snapshot, o.Grace)
-		// A server may answer from information read before the last marker
-		// landed until the largest cache TTL has passed; the reference or
-		// touch such a use makes lands within the larger of the two write
-		// bounds, and the mark of this cycle must see it.
-		ttl := ev.servers.longestCacheTTL(start)
-		bound := ttl + max(ValidationWriteBound, TouchDrainBound) + clockSkewMargin
-		if !l.CompleteTime.IsZero() && ev.snapshot.Before(l.CompleteTime.Add(bound)) {
-			add("the snapshot %s is earlier than the completion of the list at %s plus the largest server cache TTL %s, the write bound %s and the clock skew margin %s: a server may still use information read before the markers; run the cycle at %s or later",
-				formatTime(ev.snapshot), formatTime(l.CompleteTime), ttl, max(ValidationWriteBound, TouchDrainBound), clockSkewMargin, formatTime(l.CompleteTime.Add(bound)))
-		}
 		reasons = append(reasons, windowBlockers(ev.servers, ev.snapshot, &o.DryRunOpts)...)
 	}
-	// An object first written or used after the snapshot of the list must
-	// still be recent in this mark.
-	if ev.listHeader != nil {
-		prev := l.SnapshotTime
-		if ev.listHeader.snapshot.Before(prev) {
-			prev = ev.listHeader.snapshot
-		}
-		if limit := prev.Add(o.Grace - clockSkewMargin - ValidationWriteBound); !ev.snapshot.Before(limit) {
-			add("the snapshot %s is not earlier than the snapshot of the list at %s plus the grace %s less the clock skew margin and the write bound: objects used after that list was taken may no longer be recent; this cycle condemns again",
-				formatTime(ev.snapshot), formatTime(prev), o.Grace)
-		}
+	var newest time.Time
+	if ev.holds != nil {
+		newest = ev.holds.newest()
 	}
-
-	reasons = append(reasons, instanceBlockers(&ev.instance, l.CompleteTime)...)
+	reasons = append(reasons, instanceBlockers(&ev.instance, newest)...)
 	if ev.refRemovalErr != nil {
 		add("the removal of expired refs failed: %v", ev.refRemovalErr)
 	}
@@ -269,32 +212,18 @@ func deleteBlockers(r *Report, ev *deleteEvidence, o *DeleteOpts) (reasons, warn
 	if o.allowsClientWrittenTypes() {
 		m := &r.LiveMounts
 		if m.WithoutKeepAlive > 0 {
-			samples := mountSamples(m, "without_keepalive")
-			msg := fmt.Sprintf("%d live mounts run without the GC keep-alive, so their caches may hold the only copy of a blob, tree or eval object they wrote%s", m.WithoutKeepAlive, samples)
-			// The flag accepts the content such a mount wrote, not the
-			// outputs of a map result whose map row touch a server lost.
-			var mapRowLoss string
-			if ev.servers != nil {
-				mapRowLoss = ev.servers.withoutKeepAliveMapRowLoss(ev.snapshot, o.Grace, m.WithoutKeepAlive, samples)
-			}
-			switch {
-			case !o.AcceptMountsWithoutKeepAlive:
-				add("%s; set gc-keepalive in their config, or pass --accept-mounts-without-keepalive", msg)
-			case mapRowLoss != "":
-				reasons = append(reasons, mapRowLoss)
-			default:
+			msg := fmt.Sprintf("%d live mounts run without the GC keep-alive, so their caches may hold the only copy of a blob, tree or eval object they wrote%s", m.WithoutKeepAlive, mountSamples(m, "without_keepalive"))
+			if o.AcceptMountsWithoutKeepAlive {
 				warnings = append(warnings, msg)
+			} else {
+				add("%s; set gc-keepalive in their config, or pass --accept-mounts-without-keepalive", msg)
 			}
 		}
 		if m.WithoutLocalWriteCheck > 0 {
 			add("%d live mounts with the GC keep-alive run with a cacheman that does not keep locally written content until a server confirms it%s", m.WithoutLocalWriteCheck, mountSamples(m, "without_local_write_check"))
 		}
 		if m.TouchIntervalTooLong > 0 {
-			var note string
-			if ev.servers != nil {
-				note = ev.servers.mapRowLossNote(ev.snapshot, o.Grace)
-			}
-			add("%d live mounts touch their objects less often than the grace allows%s%s", m.TouchIntervalTooLong, note, mountSamples(m, "touch_interval_too_long"))
+			add("%d live mounts touch their objects less often than the grace allows%s", m.TouchIntervalTooLong, mountSamples(m, "touch_interval_too_long"))
 		}
 	}
 
@@ -326,78 +255,33 @@ func mountSamples(m *MountCounts, count string) string {
 	return ", for example " + strings.Join(parts, ", ")
 }
 
-// waitForServerStats reads the GC servers again just before the delete step
-// and returns the reasons why the cycle must not delete. Every live server
-// must have written a heartbeat whose touch stats it read after the snapshot,
-// so that a touch it lost since the first read shows; the collector waits up
-// to the server's heartbeat interval plus statsWaitMargin for one. The
-// evidence of the first read must hold again on this read, and the touch
-// interval of the live mounts in r must still fit the servers that run now
-// when o allows types that clients write. It fails only when ctx ends.
-func waitForServerStats(ctx context.Context, lease *Lease, r *Report, o *DeleteOpts) ([]string, error) {
-	return pollServerStats(ctx, func(ctx context.Context) (*serverEvidence, error) {
-		return readServerEvidence(ctx, lease.client, lease.name)
+// recheckServers reads the GC servers again just before the delete step and
+// returns the reasons why the cycle must not delete: the evidence of the
+// first read must hold again on this read, and the touch interval of the live
+// mounts in r must still fit the servers that run now when o allows types
+// that clients write. It fails only when ctx ends.
+func recheckServers(ctx context.Context, lease *Lease, r *Report, o *DeleteOpts) ([]string, error) {
+	return checkServersAgain(ctx, func(ctx context.Context) (*serverEvidence, error) {
+		return readServerEvidence(ctx, lease.client)
 	}, r, o)
 }
 
-// pollServerStats is waitForServerStats with the reads of read.
-func pollServerStats(ctx context.Context, read func(ctx context.Context) (*serverEvidence, error), r *Report, o *DeleteOpts) ([]string, error) {
-	start := time.Now()
-	for {
-		e, err := read(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, err
-			}
-			return []string{fmt.Sprintf("the second read of the GC servers failed: %v", err)}, nil
+// checkServersAgain is recheckServers with the read of read.
+func checkServersAgain(ctx context.Context, read func(ctx context.Context) (*serverEvidence, error), r *Report, o *DeleteOpts) ([]string, error) {
+	e, err := read(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
 		}
-		reasons := slices.Concat(windowBlockers(e, r.SnapshotTime, &o.DryRunOpts), liveBlockers(e, &o.CondemnOpts))
-		if o.allowsClientWrittenTypes() && r.LiveMounts.longestTouch > 0 {
-			if !keepAliveTouchFits(r.LiveMounts.longestTouch, e.keepAliveTouchLimit(r.SnapshotTime, o.Grace)) {
-				reasons = append(reasons, fmt.Sprintf("live mounts touch their objects every %s, too seldom for the grace %s less the longest touch interval and cache TTL of the servers that run now%s", r.LiveMounts.longestTouch, o.Grace, e.mapRowLossNote(r.SnapshotTime, o.Grace)))
-			}
-		}
-		if o.allowsClientWrittenTypes() && o.AcceptMountsWithoutKeepAlive && r.LiveMounts.WithoutKeepAlive > 0 {
-			if reason := e.withoutKeepAliveMapRowLoss(r.SnapshotTime, o.Grace, r.LiveMounts.WithoutKeepAlive, ""); reason != "" {
-				reasons = append(reasons, reason)
-			}
-		}
-		if len(reasons) > 0 {
-			return reasons, nil
-		}
-		var late []string
-		waiting := false
-		for _, s := range e.inWindow(windowStart(r.SnapshotTime, o.Grace)) {
-			if !s.StoppedAt.IsZero() || !s.StatsTime.Before(r.SnapshotTime.Add(clockSkewMargin)) {
-				continue
-			}
-			waiting = true
-			if wait := statsWait(&s); time.Since(start) > wait {
-				late = append(late, fmt.Sprintf("server %s wrote no heartbeat with touch stats read after the snapshot within %s", s.ID, wait))
-			}
-		}
-		if len(late) > 0 || !waiting {
-			return late, nil
-		}
-		select {
-		case <-time.After(statsPollInterval):
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		return []string{fmt.Sprintf("the second read of the GC servers failed: %v", err)}, nil
+	}
+	reasons := slices.Concat(windowBlockers(e, r.SnapshotTime, &o.DryRunOpts), liveBlockers(e, &o.CondemnOpts))
+	if o.allowsClientWrittenTypes() && r.LiveMounts.longestTouch > 0 {
+		if !keepAliveTouchFits(r.LiveMounts.longestTouch, e.keepAliveTouchLimit(r.SnapshotTime, o.Grace)) {
+			reasons = append(reasons, fmt.Sprintf("live mounts touch their objects every %s, too seldom for the grace %s less the longest touch interval and cache TTL of the servers that run now", r.LiveMounts.longestTouch, o.Grace))
 		}
 	}
-}
-
-// statsWait returns how long the collector waits for a heartbeat of s with
-// touch stats read after the snapshot: its heartbeat interval, at most the
-// largest one a server may run with, plus statsWaitMargin. A row written by
-// hand or by another build may hold a longer interval, and the collector
-// holds the lease while it waits.
-func statsWait(s *Server) time.Duration {
-	interval := s.HeartbeatInterval
-	if interval <= 0 || interval > MaxHeartbeatInterval {
-		interval = MaxHeartbeatInterval
-	}
-	return interval + statsWaitMargin
+	return reasons, nil
 }
 
 // TooNewReport reports the objects that the consistency scan found without a

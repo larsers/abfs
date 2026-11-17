@@ -29,6 +29,7 @@ import (
 
 const (
 	stateTable           = "GcState"
+	listsTable           = "GcLists"
 	DefaultStateName     = "default"
 	DefaultLeaseDuration = 5 * time.Minute
 	PhaseDryRun          = "dry-run"
@@ -85,10 +86,6 @@ type Lease struct {
 	// that lease had been released. A holder that stalled may still act until
 	// then.
 	PreviousExpiry time.Time
-	// PreviousCondemnCycle is the cycle of the last condemn or delete lease
-	// before this one, zero when there was none. Leases of the other phases
-	// do not change it.
-	PreviousCondemnCycle int64
 	// MaxGrace is the largest grace of any condemn or delete lease, this one
 	// included.
 	MaxGrace time.Duration
@@ -112,9 +109,9 @@ func DefaultHolder() string {
 // AcquireLease takes the lease of the garbage collector name for duration and
 // starts a new cycle in the given phase: it increments the cycle number and
 // the lease epoch and records the start time, the grace and the expiry of the
-// lease it takes over. A condemn or delete lease also records its cycle as
-// the last condemn cycle and raises the largest grace to its own. It fails
-// with *ErrLeaseHeld while another holder's lease is valid.
+// lease it takes over. A condemn or delete lease also raises the largest
+// grace to its own. It fails with *ErrLeaseHeld while another holder's lease
+// is valid.
 func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, phase string, duration, grace time.Duration) (*Lease, error) {
 	if duration < minLeaseDuration {
 		return nil, fmt.Errorf("lease duration %s is shorter than %s", duration, minLeaseDuration)
@@ -129,15 +126,15 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		leaseExpiry = now.Add(duration)
 		var cycle, epoch int64
 		var prevStart, expiry spanner.NullTime
-		var condemnCycle, maxGrace spanner.NullInt64
-		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime", "CondemnCycle", "MaxGraceSeconds"})
+		var maxGrace spanner.NullInt64
+		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"Cycle", "LeaseHolder", "LeaseEpoch", "LeaseExpiry", "CycleStartTime", "MaxGraceSeconds"})
 		switch {
 		case spanner.ErrCode(err) == codes.NotFound:
 		case err != nil:
 			return err
 		default:
 			var current spanner.NullString
-			if err := row.Columns(&cycle, &current, &epoch, &expiry, &prevStart, &condemnCycle, &maxGrace); err != nil {
+			if err := row.Columns(&cycle, &current, &epoch, &expiry, &prevStart, &maxGrace); err != nil {
 				return err
 			}
 			if current.Valid && current.StringVal != holder && expiry.Valid && expiry.Time.After(now) {
@@ -149,7 +146,6 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		if expiry.Valid {
 			l.PreviousExpiry = expiry.Time
 		}
-		l.PreviousCondemnCycle = condemnCycle.Int64
 		l.MaxGrace = time.Duration(maxGrace.Int64) * time.Second
 		cols := map[string]any{
 			"Name":                   name,
@@ -166,7 +162,6 @@ func AcquireLease(ctx context.Context, client *spanner.Client, name, holder, pha
 		}
 		if phase == PhaseCondemn || phase == PhaseDelete {
 			l.MaxGrace = max(l.MaxGrace, grace.Truncate(time.Second))
-			cols["CondemnCycle"] = l.Cycle
 			cols["MaxGraceSeconds"] = int64(l.MaxGrace / time.Second)
 		}
 		return txn.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(stateTable, cols)})
@@ -193,7 +188,7 @@ func (l *Lease) RecordSnapshot(ctx context.Context, snapshot time.Time) error {
 	return nil
 }
 
-// ListState is the condemned list that GcState records.
+// ListState is the condemned list that GcState records, for reports.
 type ListState struct {
 	// Location is the name of the list object in the server bucket, empty
 	// when no condemn cycle published one.
@@ -201,8 +196,7 @@ type ListState struct {
 	// SnapshotTime is the snapshot time of the cycle that wrote it.
 	SnapshotTime time.Time
 	// Complete tells that every marker of the list was written, and
-	// CompleteTime is the commit time of the write that recorded it; a cycle
-	// that only recorded Complete leaves it zero.
+	// CompleteTime is the commit time of the write that recorded it.
 	Complete     bool
 	CompleteTime time.Time
 }
@@ -222,23 +216,99 @@ func (l *Lease) ReadList(ctx context.Context) (ListState, error) {
 	return ListState{Location: location.StringVal, SnapshotTime: snapshot.Time, Complete: complete.Valid && complete.Bool, CompleteTime: completeTime.Time}, nil
 }
 
-// RecordList records the condemned list of this cycle, not complete yet.
+// ListRecord is the row of GcLists of the list of one condemn or delete
+// cycle. A marker of that cycle counts for a delete only once the record is
+// complete: every marker of the list landed before CompleteTime.
+type ListRecord struct {
+	Cycle        int64
+	SnapshotTime time.Time
+	Location     string
+	// CompleteTime is the commit time of the write that completed the list,
+	// zero while it is not complete. CacheTTL is the largest cache TTL of the
+	// servers that may have run since the window start of the cycle, read
+	// after the last marker batch returned, and Markers the number of
+	// markers written.
+	CompleteTime time.Time
+	CacheTTL     time.Duration
+	Markers      int64
+}
+
+// Complete reports whether every marker of the list was written.
+func (r *ListRecord) Complete() bool {
+	return !r.CompleteTime.IsZero()
+}
+
+var listColumns = []string{"Cycle", "SnapshotTime", "Location", "CompleteTime", "CacheTTLSeconds", "Markers"}
+
+// ReadListRecords returns the rows of GcLists of the garbage collector of
+// the lease, by cycle.
+func (l *Lease) ReadListRecords(ctx context.Context) (map[int64]*ListRecord, error) {
+	records := make(map[int64]*ListRecord)
+	err := l.client.Single().Read(ctx, listsTable, spanner.Key{l.name}.AsPrefix(), listColumns).Do(func(row *spanner.Row) error {
+		var r ListRecord
+		var location spanner.NullString
+		var complete spanner.NullTime
+		var ttl, markers spanner.NullInt64
+		if err := row.Columns(&r.Cycle, &r.SnapshotTime, &location, &complete, &ttl, &markers); err != nil {
+			return err
+		}
+		r.Location, r.CompleteTime, r.Markers = location.StringVal, complete.Time, markers.Int64
+		r.CacheTTL = time.Duration(ttl.Int64) * time.Second
+		records[r.Cycle] = &r
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the GC list records (Spanner table %s, which 'abfs server gcp init --gc' creates): %w", listsTable, err)
+	}
+	return records, nil
+}
+
+// RecordList records the condemned list of this cycle, not complete yet, in
+// GcState and in GcLists.
 func (l *Lease) RecordList(ctx context.Context, location string, snapshot time.Time) error {
-	if err := l.update(ctx, func(time.Time) map[string]any {
+	insert := spanner.Insert(listsTable, []string{"Name", "Cycle", "SnapshotTime", "Location"}, []any{l.name, l.Cycle, snapshot, location})
+	if err := l.updateWith(ctx, func(time.Time) map[string]any {
 		return map[string]any{"ListLocation": location, "ListSnapshotTime": snapshot, "ListComplete": false, "ListCompleteTime": spanner.NullTime{}}
-	}); err != nil {
+	}, insert); err != nil {
 		return fmt.Errorf("failed to record the GC condemned list: %w", err)
 	}
 	return nil
 }
 
 // CompleteList records that every marker of the list of this cycle was
-// written, with the commit time of the write.
-func (l *Lease) CompleteList(ctx context.Context) error {
-	if err := l.update(ctx, func(time.Time) map[string]any {
+// written, with the commit time of the write, the largest cache TTL of the
+// servers ttl and the number of markers.
+func (l *Lease) CompleteList(ctx context.Context, ttl time.Duration, markers int64) error {
+	complete := spanner.Update(listsTable, []string{"Name", "Cycle", "CompleteTime", "CacheTTLSeconds", "Markers"},
+		[]any{l.name, l.Cycle, spanner.CommitTimestamp, int64((ttl + time.Second - 1) / time.Second), markers})
+	if err := l.updateWith(ctx, func(time.Time) map[string]any {
 		return map[string]any{"ListComplete": true, "ListCompleteTime": spanner.CommitTimestamp}
-	}); err != nil {
+	}, complete); err != nil {
 		return fmt.Errorf("failed to record the GC condemned list as complete: %w", err)
+	}
+	return nil
+}
+
+// PruneListRecords deletes the rows of GcLists of cycles.
+func (l *Lease) PruneListRecords(ctx context.Context, cycles []int64) error {
+	if len(cycles) == 0 {
+		return nil
+	}
+	muts := make([]*spanner.Mutation, len(cycles))
+	for i, c := range cycles {
+		muts[i] = spanner.Delete(listsTable, spanner.Key{l.name, c})
+	}
+	if err := l.updateWith(ctx, func(time.Time) map[string]any { return map[string]any{} }, muts...); err != nil {
+		return fmt.Errorf("failed to delete old GC list records: %w", err)
+	}
+	return nil
+}
+
+// ClearListRecords deletes every row of GcLists of the garbage collector of
+// the lease.
+func (l *Lease) ClearListRecords(ctx context.Context) error {
+	if err := l.updateWith(ctx, func(time.Time) map[string]any { return map[string]any{} }, spanner.Delete(listsTable, spanner.Key{l.name}.AsPrefix())); err != nil {
+		return fmt.Errorf("failed to delete the GC list records: %w", err)
 	}
 	return nil
 }
@@ -284,6 +354,11 @@ func (l *Lease) checkWrite(d time.Duration) error {
 // update writes the columns that set returns, given the Spanner time, if the
 // lease is still ours.
 func (l *Lease) update(ctx context.Context, set func(now time.Time) map[string]any) error {
+	return l.updateWith(ctx, set)
+}
+
+// updateWith is update that also applies extra in the same transaction.
+func (l *Lease) updateWith(ctx context.Context, set func(now time.Time) map[string]any, extra ...*spanner.Mutation) error {
 	_, err := l.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{l.name}, []string{"LeaseHolder", "LeaseEpoch"})
 		if spanner.ErrCode(err) == codes.NotFound {
@@ -307,7 +382,7 @@ func (l *Lease) update(ctx context.Context, set func(now time.Time) map[string]a
 		cols := set(now)
 		cols["Name"] = l.name
 		cols["UpdateTime"] = spanner.CommitTimestamp
-		return txn.BufferWrite([]*spanner.Mutation{spanner.UpdateMap(stateTable, cols)})
+		return txn.BufferWrite(append([]*spanner.Mutation{spanner.UpdateMap(stateTable, cols)}, extra...))
 	})
 	if errors.Is(err, ErrLeaseLost) {
 		return ErrLeaseLost

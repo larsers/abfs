@@ -30,11 +30,16 @@ import (
 
 type Hash = entities.Hash
 
-// ExtractorVersion is stored with the edges of every object. Bump it whenever
-// the rules of Edges change, and raise requiredVersion to it for the types
-// whose edges changed, so that a backfill rewrites only the rows of those
-// types.
-const ExtractorVersion = 2
+// ExtractorVersion is the version of the GC rules a server follows. It is
+// stored with the edges of every object and in the heartbeat row of every
+// server, and the collector refuses to delete while a server of an older
+// version may have run. Bump it whenever the rules of Edges change, and raise
+// requiredVersion to it for the types whose edges changed, so that a backfill
+// rewrites only the rows of those types; bump it too when a server change
+// that the delete rule depends on changes, without raising requiredVersion.
+// Version 3 bounds the time from the start of a call to a present answer and
+// checks the write bound before each attempt.
+const ExtractorVersion = 3
 
 // requiredVersion returns the oldest extractor version whose edges of type typ
 // are still correct. Version 1 gave deep trees no edges to their nested deep

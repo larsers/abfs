@@ -33,7 +33,7 @@ func TestCheckReplicas(t *testing.T) {
 		{"default settings", func(r *Replica) {}, ""},
 		{"stale", func(r *Replica) { r.LastSeen = now.Add(-time.Hour); r.TouchInterval = 0 }, ""},
 		{"no GC", func(r *Replica) { r.GC = false }, "runs without the garbage collector hooks"},
-		{"old edge rules", func(r *Replica) { r.Version = ExtractorVersion - 1 }, "older than version"},
+		{"old GC rules", func(r *Replica) { r.Version = ExtractorVersion - 1 }, "older than version"},
 		{"no touches", func(r *Replica) { r.TouchInterval = 0 }, "writes no touches"},
 		{"long touch interval", func(r *Replica) { r.TouchInterval = 37 * time.Hour }, "touch interval 37h0m0s is longer than half the grace (36h0m0s)"},
 		{"no TTL", func(r *Replica) { r.CacheTTL = 0 }, "without a TTL"},
@@ -62,25 +62,32 @@ func TestCheckReplicas(t *testing.T) {
 }
 
 // The rows of GcServers count in the replica checks, except those of
-// processes that stopped without losing touches at the stop. A loss recorded
-// before the stop does not make a restart count twice on its host.
+// processes that recorded a stop, with or without a loss. A row that did not
+// record a stop counts as a live host only within its serve limit.
 func TestServerReplicas(t *testing.T) {
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 	row := func(id string, stopped bool, lost time.Time) Server {
-		s := Server{ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now.Add(-time.Minute), TouchLossTime: lost}
+		s := Server{ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, HeartbeatInterval: 5 * time.Minute, LastSeen: now.Add(-time.Minute), TouchLossTime: lost}
 		if stopped {
 			s.StoppedAt = now.Add(-time.Minute)
 		}
 		return s
 	}
-	atStop, earlier := now.Add(-time.Minute), now.Add(-24*time.Hour)
+	atStop := now.Add(-time.Minute)
+	crashed := row("srv-4-gg", false, time.Time{})
+	crashed.LastSeen = now.Add(-12 * time.Minute)
+	slow := row("srv-5-hh", false, time.Time{})
+	slow.HeartbeatInterval, slow.LastSeen = time.Hour, now.Add(-21*time.Minute)
 	replicas, stopped := serverReplicas([]Server{
 		row("srv-0-aa", false, time.Time{}), row("srv-1-bb", true, time.Time{}), row("srv-1-cc", false, time.Time{}),
-		row("srv-2-dd", true, atStop), row("srv-3-ee", true, earlier), row("srv-3-ff", false, time.Time{}),
+		row("srv-2-dd", true, atStop), row("srv-3-ff", false, time.Time{}), crashed, slow,
 	})
 	require.Equal(t, int64(2), stopped)
 	o := DefaultDryRunOpts()
 	rep := checkReplicas(replicas, now, &o)
+	// The crashed row is past 2 x 5 min + 30 s + 1 min; the row with an
+	// interval above the largest counts with 10 min, so 21 min 30 s.
 	require.Equal(t, int64(4), rep.Live)
-	require.Equal(t, map[string]int64{"srv-0": 1, "srv-1": 1, "srv-2": 1, "srv-3": 1}, rep.RowsPerHost)
+	require.Equal(t, int64(1), rep.Stale)
+	require.Equal(t, map[string]int64{"srv-0": 1, "srv-1": 1, "srv-3": 1, "srv-5": 1}, rep.RowsPerHost)
 }

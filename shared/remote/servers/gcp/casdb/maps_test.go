@@ -16,10 +16,12 @@ package casdb
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/bigtable"
+	"cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/bttest"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/option"
@@ -79,4 +81,42 @@ func TestMapResults_InsertionOrder(t *testing.T) {
 	got, err = c.MapResults(ctx, from)
 	require.NoError(err)
 	require.Equal([]entities.Hash{tos[1], tos[2], tos[3], tos[0]}, got)
+}
+
+// A Bigtable client made with options takes the classic connections for
+// every call, so the interceptors of the options see each write.
+func TestNewBigtableClient_OptionsSeeWrites(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	require.True(bigtableConfig("", false, true).DisableSession)
+	require.False(bigtableConfig("", false, false).DisableSession)
+
+	srv, err := bttest.NewServer("localhost:0")
+	require.NoError(err)
+	t.Cleanup(srv.Close)
+	t.Setenv("BIGTABLE_EMULATOR_HOST", "")
+	conn, err := grpc.NewClient(srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(err)
+	t.Cleanup(func() { _ = conn.Close() })
+	adm, err := bigtable.NewAdminClient(ctx, "test-proj", "test-bt", option.WithGRPCConn(conn))
+	require.NoError(err)
+	require.NoError(adm.CreateTable(ctx, "maps"))
+	require.NoError(adm.CreateColumnFamily(ctx, "maps", "cf"))
+
+	var writes atomic.Int32
+	count := grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if _, ok := req.(*bigtablepb.MutateRowRequest); ok {
+			writes.Add(1)
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
+	bt, err := newBigtableClient(ctx, "test-proj", "test-bt", "", 1, false,
+		option.WithEndpoint(srv.Addr), option.WithoutAuthentication(),
+		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())), option.WithGRPCDialOption(count))
+	require.NoError(err)
+	t.Cleanup(func() { _ = bt.Close() })
+	mut := bigtable.NewMutation()
+	mut.Set("cf", "c", bigtable.Now(), []byte("v"))
+	require.NoError(bt.Open("maps").Apply(ctx, "row", mut))
+	require.Equal(int32(1), writes.Load())
 }

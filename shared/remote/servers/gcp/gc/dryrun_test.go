@@ -59,29 +59,24 @@ func TestGraceProblem(t *testing.T) {
 		return Server{ID: id, GC: true, CacheTTL: ttl, LastSeen: lastSeen}
 	}
 	tests := []struct {
-		name     string
-		servers  []Server
-		replicas []Replica
-		want     string
-		ttl      time.Duration
+		name    string
+		servers []Server
+		want    string
+		ttl     time.Duration
 	}{
-		{"no rows", nil, nil, "no server that may have run within the grace wrote a GC heartbeat", 0},
-		{"only rows before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot.Add(-80*time.Hour))}, nil, "no server that may have run", 6 * time.Hour},
-		{"default TTL", []Server{server("srv-0-aa", 6*time.Hour, snapshot)}, nil, "", 6 * time.Hour},
-		{"TTL that fits exactly", []Server{server("srv-0-aa", 69*time.Hour, snapshot)}, nil, "", 69 * time.Hour},
+		{"no rows", nil, "no server that may have run within the grace wrote a GC heartbeat", 0},
+		{"only rows before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot.Add(-80*time.Hour))}, "no server that may have run", 6 * time.Hour},
+		{"default TTL", []Server{server("srv-0-aa", 6*time.Hour, snapshot)}, "", 6 * time.Hour},
+		{"TTL that fits exactly", []Server{server("srv-0-aa", 69*time.Hour, snapshot)}, "", 69 * time.Hour},
 		{"stopped server with a long TTL", []Server{
 			server("srv-0-aa", 6*time.Hour, snapshot),
 			{ID: "srv-1-bb", CacheTTL: 70 * time.Hour, LastSeen: snapshot.Add(-time.Hour), StoppedAt: snapshot.Add(-time.Hour)},
-		}, nil, "grace 72h0m0s is shorter than the cache TTL 70h0m0s of server srv-1-bb plus the longest push 3h0m0s", 70 * time.Hour},
-		{"server of an older version", []Server{server("srv-0-aa", 6*time.Hour, snapshot)},
-			[]Replica{{ID: "old-0-aa", CacheTTL: 70 * time.Hour, LastSeen: snapshot}}, "cache TTL 70h0m0s of server old-0-aa", 70 * time.Hour},
-		{"server of an older version only", nil, []Replica{{ID: "old-0-aa", CacheTTL: 6 * time.Hour, LastSeen: snapshot}}, "", 6 * time.Hour},
-		{"server of an older version before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot)},
-			[]Replica{{ID: "old-0-aa", CacheTTL: 70 * time.Hour, LastSeen: start.Add(-31 * time.Minute)}}, "", 6 * time.Hour},
+		}, "grace 72h0m0s is shorter than the cache TTL 70h0m0s of server srv-1-bb plus the longest push 3h0m0s", 70 * time.Hour},
+		{"crashed server before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot), server("srv-1-bb", 70*time.Hour, start.Add(-31*time.Minute))}, "", 6 * time.Hour},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			e := &serverEvidence{servers: tt.servers, replicas: tt.replicas, readTime: snapshot}
+			e := &serverEvidence{servers: tt.servers, readTime: snapshot}
 			got := e.graceProblem(start, &o)
 			if tt.want == "" {
 				require.Empty(t, got)

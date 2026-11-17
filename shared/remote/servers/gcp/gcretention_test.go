@@ -205,13 +205,14 @@ func TestDeleteGC_FailedRefRemovalRefusesDeletes(t *testing.T) {
 	require.Contains(r.Delete.Refused[0], "injected")
 	require.Contains(r.Delete.Refs.Error, "injected")
 	require.Nil(r.Delete.Step)
-	require.Equal(int64(2), r.Condemn.Condemned)
+	require.Zero(r.Condemn.Condemned)
+	require.Equal(int64(2), r.Condemn.Kept)
 	location, complete := f.listState()
 	require.Equal(r.Condemn.List, location.StringVal)
 	require.True(complete.Bool)
 	require.Equal([]string{"refs/abfs/build/user/u/b1"}, f.metaRefs("refs/abfs/build/"))
 	for _, k := range []entities.Hash{target, other} {
-		require.Equal([][]byte{marker(byte(r.Cycle))}, f.markerCells(k), k)
+		require.Equal([][]byte{marker(1)}, f.markerCells(k), k)
 	}
 
 	f.age()

@@ -30,6 +30,9 @@ import (
 	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/spanner"
+	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/iterator"
@@ -67,9 +70,25 @@ func newCondemnFixture(t *testing.T) *condemnFixture {
 
 func (f *condemnFixture) heartbeat(id string) {
 	f.t.Helper()
-	require.NoError(f.t, gc.WriteHeartbeat(context.Background(), f.s.casdb.SpannerClient(), &gc.Replica{
-		ID: id, Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour,
-	}))
+	s := &gc.Server{ID: id, Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
+	require.NoError(f.t, gc.WriteServer(context.Background(), f.s.casdb.SpannerClient(), s, false, false))
+}
+
+// listRecord returns the row of GcLists of cycle, nil when there is none.
+func (f *condemnFixture) listRecord(cycle int64) *gc.ListRecord {
+	f.t.Helper()
+	row, err := f.s.casdb.SpannerClient().Single().ReadRow(context.Background(), "GcLists", spanner.Key{gc.DefaultStateName, cycle}, []string{"Cycle", "Location", "CompleteTime", "CacheTTLSeconds", "Markers"})
+	if spanner.ErrCode(err) == codes.NotFound {
+		return nil
+	}
+	require.NoError(f.t, err)
+	r := &gc.ListRecord{}
+	var location spanner.NullString
+	var complete spanner.NullTime
+	var ttl, markers spanner.NullInt64
+	require.NoError(f.t, row.Columns(&r.Cycle, &location, &complete, &ttl, &markers))
+	r.Location, r.CompleteTime, r.CacheTTL, r.Markers = location.StringVal, complete.Time, time.Duration(ttl.Int64)*time.Second, markers.Int64
+	return r
 }
 
 func (f *condemnFixture) opts() *gc.CondemnOpts {
@@ -129,9 +148,10 @@ func (f *condemnFixture) listNames() []string {
 }
 
 // A condemn cycle marks exactly the unreachable objects that have an object
-// row with its number, and never creates an object row for a gc row without
-// one. The next cycle rewrites the markers of keys still unreachable to its
-// own number, leaving one cell, so an old number cannot match later.
+// row with its number, never creates an object row for a gc row without one,
+// and completes its list in GcLists with the largest cache TTL of the
+// servers. The next cycle keeps the markers of keys still unreachable: a
+// recorded marker is never written again.
 func TestCondemnGC_MarksUnreachableObjects(t *testing.T) {
 	require := require.New(t)
 	f := newCondemnFixture(t)
@@ -171,14 +191,24 @@ func TestCondemnGC_MarksUnreachableObjects(t *testing.T) {
 	location, complete := f.listState()
 	require.Equal("gc/condemned/default/1", location.StringVal)
 	require.True(complete.Bool)
+	rec := f.listRecord(1)
+	require.Equal("gc/condemned/default/1", rec.Location)
+	require.True(rec.Complete())
+	require.Equal(6*time.Hour, rec.CacheTTL)
+	require.Equal(int64(3), rec.Markers)
+	require.Equal(6.0, r.Condemn.CacheTTLHours)
 
 	res, err = f.condemn(nil)
 	require.NoError(err)
-	require.Equal(int64(3), res.Report.Condemn.Condemned)
+	require.Zero(res.Report.Condemn.Condemned)
+	require.Equal(int64(3), res.Report.Condemn.Kept)
 	for _, k := range []entities.Hash{gone, goneTree, goneBlob} {
-		require.Equal([][]byte{marker(2)}, f.markerCells(k), k)
+		require.Equal([][]byte{marker(1)}, f.markerCells(k), k)
 	}
-	require.Equal([]string{"gc/condemned/default/1", "gc/condemned/default/2", "gc/condemned/default/2.live"}, f.listNames())
+	require.Equal([]string{"gc/condemned/default/1", "gc/condemned/default/2"}, f.listNames())
+	require.Zero(f.listRecord(2).Markers)
+	require.Equal(int64(3), res.Report.Delete.Plan.Held)
+	require.Zero(res.Report.Delete.Plan.Candidates)
 }
 
 // A refused cycle writes no marker, no list and no list state, and still
@@ -208,6 +238,7 @@ func TestCondemnGC_RefusedRunWritesNothing(t *testing.T) {
 	require.Empty(f.listNames())
 	location, _ := f.listState()
 	require.False(location.Valid)
+	require.Nil(f.listRecord(1))
 }
 
 // The marker a condemn cycle writes is the value the server's rescue
@@ -237,9 +268,8 @@ func TestCondemnGC_ServerRescuesCondemnedObjects(t *testing.T) {
 	require.Equal(int64(1), rescuesOf(f.s, pathGetObject))
 }
 
-// A cycle that cannot publish its list writes no marker, so that every
-// marker is in a list that a later cycle reads. Here the list name is taken
-// by another run.
+// A cycle that cannot publish its list writes no marker and no record. Here
+// the list name is taken by another run.
 func TestCondemnGC_NoMarkerWithoutList(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -255,12 +285,13 @@ func TestCondemnGC_NoMarkerWithoutList(t *testing.T) {
 	require.Empty(f.markerCells(blob))
 	location, _ := f.listState()
 	require.False(location.Valid)
+	require.Nil(f.listRecord(1))
 }
 
-// A cycle clears the markers of the previous list's live keys before its own
-// list replaces the previous one in GcState. A cycle that stops at its list
-// write therefore leaves no marker on a live key, and the previous list stays
-// in GcState for the next cycle, which leaves no marker of cycle 1.
+// A cycle clears the markers of the live keys that its scan read before it
+// writes its list, so a cycle that stops at its list write leaves no marker
+// on a live key. The marker of a key still unreachable, of a complete list,
+// stays through every later cycle.
 func TestCondemnGC_ClearsLiveKeysBeforeItsList(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -283,17 +314,17 @@ func TestCondemnGC_ClearsLiveKeysBeforeItsList(t *testing.T) {
 	location, complete := f.listState()
 	require.Equal("gc/condemned/default/1", location.StringVal)
 	require.True(complete.Bool)
+	require.Nil(f.listRecord(2))
 
 	res, err := f.condemn(nil)
 	require.NoError(err)
 	require.Equal("gc/condemned/default/1", res.Report.PreviousList.Location)
-	f.requireNoMarker(1)
-	require.Equal([][]byte{marker(3)}, f.markerCells(still))
+	require.Zero(res.Report.Condemn.Cleared)
+	require.Equal([][]byte{marker(1)}, f.markerCells(still))
 }
 
-// A previous list that is gone does not stop the next cycle: the report says
-// so, and the cycle condemns and rewrites the markers of what is still
-// unreachable.
+// The list in GcState serves only the report: a cycle runs on when it is gone
+// or cannot be read, and the markers of what is still unreachable stay.
 func TestCondemnGC_MissingPreviousList(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -309,49 +340,71 @@ func TestCondemnGC_MissingPreviousList(t *testing.T) {
 	prev := res.Report.PreviousList
 	require.Equal("gc/condemned/default/1", prev.Location)
 	require.Equal("not found", prev.Error)
-	require.Equal(int64(1), res.Report.Condemn.Condemned)
-	require.Equal([][]byte{marker(2)}, f.markerCells(k))
+	require.Zero(res.Report.Condemn.Condemned)
+	require.Equal([][]byte{marker(1)}, f.markerCells(k))
 	location, _ := f.listState()
 	require.Equal("gc/condemned/default/2", location.StringVal)
+
+	w := f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/2").NewWriter(ctx)
+	_, err = w.Write([]byte("not a list"))
+	require.NoError(err)
+	require.NoError(w.Close())
+	res, err = f.condemn(nil)
+	require.NoError(err)
+	require.NotEmpty(res.Report.PreviousList.Error)
+	require.Equal([][]byte{marker(1)}, f.markerCells(k))
 }
 
-// A dry run reads the list of the last condemn cycle only to count what a
-// delete would remove: one it cannot read leaves out the counts and says why,
-// while a condemn cycle, which needs the list, fails.
-func TestDryRunGC_UnreadablePreviousList(t *testing.T) {
+// A dry run plans from the markers its scan read and the list records: a key
+// of a complete list is held until the hold after the completion has passed,
+// and then a candidate. It writes nothing.
+func TestDryRunGC_PlansFromMarkers(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	f := newCondemnFixture(t)
 	f.heartbeat("srv-0-aa")
-	f.blob("unreachable file", f.old)
+	k := f.blob("unreachable file", f.old)
 	_, err := f.condemn(nil)
 	require.NoError(err)
 	o := gc.DefaultDryRunOpts()
 	o.Shards = 3
 	res, err := f.s.DryRunGC(ctx, f.bucket, &o)
 	require.NoError(err)
-	require.Equal(int64(1), res.Report.Delete.Plan.Candidates)
+	plan := res.Report.Delete.Plan
+	require.Zero(plan.Candidates)
+	require.Equal(int64(1), plan.Held)
+	require.Len(plan.Lists, 1)
+	require.Equal(int64(1), plan.Lists[0].Cycle)
+	require.Equal(88.0, plan.Lists[0].HoldHours)
+	require.False(plan.Lists[0].Eligible)
 
-	w := f.s.storage.Bucket(f.bucket).Object("gc/condemned/default/1").NewWriter(ctx)
-	_, err = w.Write([]byte("not a list"))
-	require.NoError(err)
-	require.NoError(w.Close())
+	ageList(t, f.s, 1, 89*time.Hour)
 	res, err = f.s.DryRunGC(ctx, f.bucket, &o)
 	require.NoError(err)
-	require.Nil(res.Report.Delete.Plan)
-	require.Contains(res.Report.Delete.PlanError, "gc/condemned/default/1")
-	_, err = f.condemn(nil)
-	require.Error(err)
+	require.Equal(int64(1), res.Report.Delete.Plan.Candidates)
+	require.Equal(int64(1), res.Report.Delete.Plan.WouldDelete)
+	require.Equal([][]byte{marker(1)}, f.markerCells(k))
+}
+
+// ageList moves the completion of the list of cycle back by d.
+func ageList(t *testing.T, s *GCPServer, cycle int64, d time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	sp := s.casdb.SpannerClient()
+	row, err := sp.Single().ReadRow(ctx, "GcLists", spanner.Key{gc.DefaultStateName, cycle}, []string{"CompleteTime"})
+	require.NoError(t, err)
+	var complete time.Time
+	require.NoError(t, row.Columns(&complete))
+	_, err = sp.Apply(ctx, []*spanner.Mutation{spanner.Update("GcLists", []string{"Name", "Cycle", "CompleteTime"}, []any{gc.DefaultStateName, cycle, complete.Add(-d)})})
+	require.NoError(t, err)
 }
 
 // liveLine is a line of a live list.
 type liveLine struct {
-	Key       string     `json:"key"`
-	Type      string     `json:"type"`
-	Root      *gc.Root   `json:"root"`
-	TouchTime *time.Time `json:"touch_time"`
-	Marker    *int64     `json:"marker"`
-	Rescued   bool       `json:"rescued"`
+	Key    string   `json:"key"`
+	Type   string   `json:"type"`
+	Root   *gc.Root `json:"root"`
+	Marker int64    `json:"marker"`
 }
 
 func (f *condemnFixture) liveLines(name string) map[string]liveLine {
@@ -383,11 +436,11 @@ func (f *condemnFixture) requireNoMarker(cycle byte) {
 	require.NoError(f.t, err)
 }
 
-// The next condemn cycle clears the markers of the previous list's keys that
-// are live again and lists every such key with the root that keeps it: a
-// key a ref reaches again under source with the ref, a key touched since
-// under recent with its touch time, and a key a server read under recent as
-// rescued.
+// The next condemn cycle clears the markers of the keys that are live again
+// and lists every such key with the root that keeps it: a key a ref reaches
+// again under source with the ref, a key touched since under recent. A key a
+// server read has no marker left, and counts as rescued in the report of the
+// previous list.
 func TestCondemnGC_ListsLiveKeysOfPreviousList(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -402,8 +455,7 @@ func TestCondemnGC_ListsLiveKeysOfPreviousList(t *testing.T) {
 
 	refTime := f.now.Add(-time.Minute)
 	f.ref("platform/b", "refs/heads/again", reRooted, refTime)
-	touchTime := f.now.Add(-2 * time.Minute)
-	f.touch(touched, touchTime)
+	f.touch(touched, f.now.Add(-2*time.Minute))
 	require.NoError(f.s.enableGCHooks(&NewServerOpts{}))
 	t.Cleanup(f.s.stopGCHooks)
 	f.s.forget(rescued)
@@ -416,45 +468,40 @@ func TestCondemnGC_ListsLiveKeysOfPreviousList(t *testing.T) {
 	for _, k := range []entities.Hash{reRooted, touched, rescued} {
 		require.Empty(f.markerCells(k), k)
 	}
-	require.Equal([][]byte{marker(2)}, f.markerCells(still))
+	require.Equal([][]byte{marker(1)}, f.markerCells(still))
 
 	prev := res.Report.PreviousList
 	require.Equal("gc/condemned/default/1", prev.Location)
 	require.Equal(int64(1), prev.Cycle)
 	require.True(prev.Complete)
 	require.Equal(int64(4), prev.Keys)
-	require.Equal(int64(2), prev.Cleared)
-	require.Equal("gc/condemned/default/2.live", prev.LiveList)
+	cr := res.Report.Condemn
+	require.Equal(int64(2), cr.Cleared)
+	require.Equal("gc/condemned/default/2.live", cr.LiveList)
+	require.Equal(int64(2), res.Report.Consistency.MarkedLive)
 	blobs := prev.Types["blob"]
 	require.Equal(int64(1), blobs.StillUnreachable)
 	require.Equal(map[string]int64{"source": 1, "recent": 2}, blobs.Live)
 	require.Equal(int64(1), blobs.Rescued)
 	require.Equal([]string{reRooted.String()}, blobs.Samples["source"])
 
-	lines := f.liveLines(prev.LiveList)
-	require.Len(lines, 3)
+	lines := f.liveLines(cr.LiveList)
+	require.Len(lines, 2)
 	ref := lines[reRooted.String()]
 	require.Equal("source", ref.Root.Class)
 	require.Equal("platform/b", ref.Root.Project)
 	require.Equal("refs/heads/again", ref.Root.Ref)
 	require.WithinDuration(refTime, *ref.Root.UpdateTime, time.Millisecond)
-	require.Equal(int64(1), *ref.Marker)
-	require.False(ref.Rescued)
+	require.Equal(int64(1), ref.Marker)
 	tl := lines[touched.String()]
 	require.Equal("recent", tl.Root.Class)
-	require.WithinDuration(touchTime, *tl.TouchTime, time.Millisecond)
-	require.False(tl.Rescued)
-	rl := lines[rescued.String()]
-	require.Equal("recent", rl.Root.Class)
-	require.Nil(rl.Marker)
-	require.True(rl.Rescued)
-	require.Equal("blob", rl.Type)
+	require.Equal("blob", tl.Type)
 }
 
 // A cycle that stops after half its marker batches leaves markers of its
-// number on part of its list. The next cycle clears those of keys that are
-// live again and rewrites the rest, so no marker of the stopped cycle is
-// left for an exact-number delete to match.
+// number on part of its list and a record that is not complete. The next
+// cycle clears those of keys that are live again and writes the rest again
+// with its own number, so no marker of the stopped cycle is left.
 func TestCondemnGC_CrashMidwayLeavesNoOldMarker(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -488,6 +535,7 @@ func TestCondemnGC_CrashMidwayLeavesNoOldMarker(t *testing.T) {
 	location, complete := f.listState()
 	require.Equal("gc/condemned/default/1", location.StringVal)
 	require.False(complete.Bool)
+	require.False(f.listRecord(1).Complete())
 
 	// One key of each batch is reached again.
 	f.ref("platform/a", "refs/heads/main", f.tree(f.old, keys[0], keys[2]), f.old)
@@ -498,15 +546,22 @@ func TestCondemnGC_CrashMidwayLeavesNoOldMarker(t *testing.T) {
 	require.Empty(f.markerCells(keys[2]))
 	require.Equal([][]byte{marker(2)}, f.markerCells(keys[1]))
 	require.Equal([][]byte{marker(2)}, f.markerCells(keys[3]))
-	prev := res.Report.PreviousList
-	require.False(prev.Complete)
-	require.Equal(int64(1), prev.Cleared)
-	lines := f.liveLines(prev.LiveList)
-	require.Len(lines, 2)
-	// The marker of a key the stopped cycle never reached is missing, which is
-	// no rescue.
-	require.False(lines[keys[2].String()].Rescued)
-	require.Equal(int64(1), *lines[keys[0].String()].Marker)
+	require.Equal(int64(2), res.Report.Condemn.Condemned)
+	require.False(res.Report.PreviousList.Complete)
+	require.Equal(int64(1), res.Report.Condemn.Cleared)
+	lines := f.liveLines(res.Report.Condemn.LiveList)
+	require.Len(lines, 1)
+	require.Equal(int64(1), lines[keys[0].String()].Marker)
+	require.Equal(int64(1), res.Report.Delete.Plan.Unrecorded)
+
+	// The record of the stopped cycle goes once no row holds its marker, in a
+	// cycle after the next one.
+	require.NotNil(f.listRecord(1))
+	res, err = f.condemn(nil)
+	require.NoError(err)
+	require.Nil(f.listRecord(1))
+	require.NotNil(f.listRecord(2))
+	require.Equal(int64(1), res.Report.Condemn.RecordsRemoved)
 }
 
 // newBigtableClientWith returns a client of the emulator whose unary calls
@@ -564,7 +619,143 @@ func TestCondemnGC_ReappliedMarkerAfterRescue(t *testing.T) {
 	res, err := f.condemn(nil)
 	require.NoError(err)
 	require.Empty(f.markerCells(k))
-	line := f.liveLines(res.Report.PreviousList.LiveList)[k.String()]
+	line := f.liveLines(res.Report.Condemn.LiveList)[k.String()]
 	require.Equal("recent", line.Root.Class)
-	require.Equal(int64(1), *line.Marker)
+	require.Equal(int64(1), line.Marker)
+}
+
+// The largest cache TTL that a list records is read after its markers were
+// written: a server row that appears while the cycle writes them counts,
+// although the first read of the cycle did not see it.
+func TestCondemnGC_ListTTLReadAfterMarkers(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	key := f.blob("unreachable file", f.old)
+	var marks atomic.Int32
+	bt := newInterceptedClient(t, grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		cs, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return &mutateLog{ClientStream: cs, add: func(e string) {
+			if e == "mark" && marks.Add(1) == 1 {
+				s := &gc.Server{ID: "srv-0-bb", Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 10 * time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
+				require.NoError(gc.WriteServer(ctx, f.s.casdb.SpannerClient(), s, false, false))
+			}
+		}}, nil
+	}))
+	res, err := gc.Condemn(ctx, f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), f.s, f.opts())
+	require.NoError(err)
+	require.Equal(int32(1), marks.Load())
+	require.Equal(6.0, res.Report.Settings.CacheTTLHours)
+	require.Equal(10.0, res.Report.Condemn.CacheTTLHours)
+	require.Equal(10*time.Hour, f.listRecord(1).CacheTTL)
+	require.Equal([][]byte{marker(1)}, f.markerCells(key))
+}
+
+// failingListRead fails every read of the Spanner table GcLists.
+type failingListRead struct {
+	grpc.ClientStream
+	failed bool
+}
+
+func (r *failingListRead) SendMsg(m any) error {
+	if req, ok := m.(*spannerpb.ReadRequest); ok && req.GetTable() == "GcLists" {
+		r.failed = true
+	}
+	return r.ClientStream.SendMsg(m)
+}
+
+func (r *failingListRead) RecvMsg(m any) error {
+	if r.failed {
+		return status.Error(codes.PermissionDenied, "read refused by the test")
+	}
+	return r.ClientStream.RecvMsg(m)
+}
+
+// A condemn that cannot read the list records counts every marker as
+// recorded: it keeps a marker without a record as it is, marks only keys
+// without one, and removes no record, though the record of a list that no
+// key holds the marker of would be removed after a read.
+func TestCondemnGC_UnreadableListRecords(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newCondemnFixture(t)
+	f.heartbeat("srv-0-aa")
+	dropped := f.blob("deleted after its condemn", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	for _, table := range []string{"objects", gc.TableName} {
+		mut := bigtable.NewMutation()
+		mut.DeleteRow()
+		require.NoError(f.s.casdb.BTClient().Open(table).Apply(ctx, dropped.String(), mut))
+	}
+	recorded := f.blob("recorded marker", f.old)
+	_, err = f.condemn(nil)
+	require.NoError(err)
+	require.Equal([][]byte{marker(2)}, f.markerCells(recorded))
+	unrecorded := f.blob("marker without a record", f.old)
+	mut := bigtable.NewMutation()
+	mut.Set(gc.ObjectsFamily, gc.CondemnedColumn, bigtable.Now(), marker(9))
+	require.NoError(f.s.casdb.BTClient().Open("objects").Apply(ctx, unrecorded.String(), mut))
+	fresh := f.blob("no marker", f.old)
+
+	sp, err := spanner.NewClient(ctx, f.s.casdb.SpannerClient().DatabaseName(), option.WithGRPCDialOption(grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		cs, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return &failingListRead{ClientStream: cs}, nil
+	})))
+	require.NoError(err)
+	t.Cleanup(sp.Close)
+	res, err := gc.Condemn(ctx, sp, f.s.casdb.BTClient(), f.s.storage.Bucket(f.bucket), f.s, f.opts())
+	require.NoError(err)
+	require.Contains(res.Report.Delete.PlanError, "read refused by the test")
+	require.Equal(int64(1), res.Report.Condemn.Condemned)
+	require.Equal(int64(2), res.Report.Condemn.Kept)
+	require.Zero(res.Report.Condemn.RecordsRemoved)
+	require.Equal([][]byte{marker(2)}, f.markerCells(recorded))
+	require.Equal([][]byte{marker(9)}, f.markerCells(unrecorded))
+	require.Equal([][]byte{marker(3)}, f.markerCells(fresh))
+	require.NotNil(f.listRecord(1))
+	require.True(f.listRecord(3).Complete())
+
+	// The same cycle with the records read removes the record of the first
+	// list and writes the marker without a record again.
+	res, err = f.condemn(nil)
+	require.NoError(err)
+	require.Equal(int64(1), res.Report.Condemn.RecordsRemoved)
+	require.Nil(f.listRecord(1))
+	require.Equal([][]byte{marker(4)}, f.markerCells(unrecorded))
+}
+
+// A condemn or delete cycle on a store without GcLists fails before it
+// writes anything, with an error that names the init that creates the
+// table; a dry run reports the error.
+func TestCondemnGC_MissingListTable(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newDeleteFixture(t)
+	f.blob("unreachable file", f.old)
+	dc, err := database.NewDatabaseAdminClient(ctx)
+	require.NoError(err)
+	defer dc.Close()
+	op, err := dc.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{Database: f.s.casdb.SpannerClient().DatabaseName(), Statements: []string{"DROP TABLE GcLists"}})
+	require.NoError(err)
+	require.NoError(op.Wait(ctx))
+
+	o := f.deleteOpts().DryRunOpts
+	res, err := gc.DryRun(ctx, f.s.casdb.SpannerClient(), f.s.casdb.BTClient(), f.s.storage.Bucket(f.bucket), f.s, &o)
+	require.NoError(err)
+	require.Contains(res.Report.Delete.PlanError, "init --gc")
+	_, err = f.condemn(nil)
+	require.ErrorContains(err, "init --gc")
+	_, err = f.deleteWith(f.s.casdb.BTClient(), nil)
+	require.ErrorContains(err, "init --gc")
+	require.Empty(f.listNames())
+	location, _ := f.listState()
+	require.False(location.Valid)
 }

@@ -49,8 +49,8 @@ import (
 )
 
 // deleteFixture is a condemnFixture whose cycles may delete: one server
-// writes a live GcServers heartbeat whose touch stats it read after every
-// snapshot of the test, and fakeChecks answers for the Bigtable instance.
+// writes a live GcServers heartbeat, and fakeChecks answers for the Bigtable
+// instance.
 type deleteFixture struct {
 	*condemnFixture
 	checks *fakeChecks
@@ -67,7 +67,7 @@ func newDeleteFixture(t *testing.T) *deleteFixture {
 func (f *deleteFixture) server(id string, lost bool) {
 	f.t.Helper()
 	s := &gc.Server{ID: id, Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
-	require.NoError(f.t, gc.WriteServer(context.Background(), f.s.casdb.SpannerClient(), s, time.Now().Add(time.Hour), lost, false))
+	require.NoError(f.t, gc.WriteServer(context.Background(), f.s.casdb.SpannerClient(), s, lost, false))
 }
 
 // fakeChecks answers the checks of the Bigtable instance. hook runs once, at
@@ -131,16 +131,27 @@ func (f *deleteFixture) deletes(o *gc.DeleteOpts) *gc.Result {
 	return res
 }
 
-// age moves the times of the list in GcState back, as if it had been taken
-// 8 h ago and completed 7 h ago, and GcReplicas had been empty since long
-// before the window of the next cycle, so that the timing bounds of a delete
-// from it hold now.
+// age moves the completion of every complete list in GcLists back by 100 h,
+// past the hold of 88 h at the default grace, so that a delete may remove
+// their keys now.
 func (f *deleteFixture) age() {
 	f.t.Helper()
-	now := time.Now()
-	_, err := f.s.casdb.SpannerClient().Apply(context.Background(), []*spanner.Mutation{spanner.Update("GcState",
-		[]string{"Name", "ListSnapshotTime", "ListCompleteTime", "LegacyServersGoneTime"},
-		[]any{gc.DefaultStateName, now.Add(-8 * time.Hour), now.Add(-7 * time.Hour), now.Add(-100 * time.Hour)})})
+	ctx := context.Background()
+	sp := f.s.casdb.SpannerClient()
+	var muts []*spanner.Mutation
+	err := sp.Single().Read(ctx, "GcLists", spanner.Key{gc.DefaultStateName}.AsPrefix(), []string{"Cycle", "CompleteTime"}).Do(func(row *spanner.Row) error {
+		var cycle int64
+		var complete spanner.NullTime
+		if err := row.Columns(&cycle, &complete); err != nil {
+			return err
+		}
+		if complete.Valid {
+			muts = append(muts, spanner.Update("GcLists", []string{"Name", "Cycle", "CompleteTime"}, []any{gc.DefaultStateName, cycle, complete.Time.Add(-100 * time.Hour)}))
+		}
+		return nil
+	})
+	require.NoError(f.t, err)
+	_, err = sp.Apply(ctx, muts)
 	require.NoError(f.t, err)
 }
 
@@ -216,12 +227,14 @@ func (f *deleteFixture) setMarker(key entities.Hash, cells ...[]byte) {
 }
 
 // A delete removes an object only while the newest cell of its marker holds
-// exactly the number of the list it deletes from, read in the conditional
-// write itself: a marker changed between the read before the delete and the
-// delete keeps the object. A row deleted in between is counted deleted and
-// gets no row back.
-func TestDeleteGC_MatchesOnlyTheExactMarker(t *testing.T) {
+// the value the scan read for that key, read in the conditional write itself:
+// a marker changed between the read before the delete and the delete keeps
+// the object. One cycle deletes the keys of two lists, each with its own
+// value. A row deleted in between is counted deleted and gets no row back.
+// The cycle writes no marker on a key whose recorded marker it read.
+func TestDeleteGC_MatchesTheMarkerTheScanRead(t *testing.T) {
 	require := require.New(t)
+	ctx := context.Background()
 	f := newDeleteFixture(t)
 	exact := f.blob("exact marker", f.old)
 	older := f.blob("older marker", f.old)
@@ -230,6 +243,13 @@ func TestDeleteGC_MatchesOnlyTheExactMarker(t *testing.T) {
 	twoCells := f.blob("old cell matches, newest does not", f.old)
 	gone := f.blob("row deleted", f.old)
 	f.delete(nil)
+	// A key of another complete list, cycle 7, with a marker of its own.
+	other := f.blob("marker of another list", f.old)
+	f.setMarker(other, marker(7))
+	_, err := f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Insert("GcLists",
+		[]string{"Name", "Cycle", "SnapshotTime", "CompleteTime", "CacheTTLSeconds", "Markers"},
+		[]any{gc.DefaultStateName, int64(7), f.old, time.Now().Add(-200 * time.Hour), int64(3600), int64(1)})})
+	require.NoError(err)
 	f.age()
 
 	changes := map[string]func(){
@@ -257,22 +277,22 @@ func TestDeleteGC_MatchesOnlyTheExactMarker(t *testing.T) {
 	res, err := f.deleteWith(bt, nil)
 	require.NoError(err)
 	require.Empty(res.Report.Delete.Refused)
+	require.Len(res.Report.Delete.Plan.Lists, 2)
 	step := res.Report.Delete.Step
-	require.Equal(int64(2), step.Deleted)
+	require.Equal(int64(3), step.Deleted)
 	require.Equal(int64(4), step.NotMatched)
-	f.requireGone(exact, gone)
+	f.requireGone(exact, gone, other)
 	f.requirePresent(older, newer, none, twoCells)
-	// The cycle condemns the kept keys again and writes nothing to the
-	// deleted ones.
-	for _, k := range []entities.Hash{older, newer, none, twoCells} {
-		require.Equal([][]byte{marker(2)}, f.markerCells(k), k)
-	}
-	require.Equal(int64(4), res.Report.Condemn.Condemned)
+	require.Equal([][]byte{marker(0)}, f.markerCells(older))
+	require.Equal([][]byte{marker(2)}, f.markerCells(newer))
+	require.Empty(f.markerCells(none))
+	require.Zero(res.Report.Condemn.Condemned)
 }
 
 // A key whose row is gone between the consistency scan and the read of the
 // delete step is not condemned again, so that its marker does not write a
-// row that holds only the marker.
+// row that holds only the marker. A key rescued in between stays without a
+// marker until a later cycle condemns it again.
 func TestDeleteGC_GoneRowGetsNoMarker(t *testing.T) {
 	require := require.New(t)
 	f := newDeleteFixture(t)
@@ -293,8 +313,12 @@ func TestDeleteGC_GoneRowGetsNoMarker(t *testing.T) {
 	require.Equal(int64(1), step.NotMatched)
 	require.Zero(step.Deleted)
 	require.Empty(f.row("objects", gone))
-	require.Equal([][]byte{marker(2)}, f.markerCells(kept))
+	require.Empty(f.markerCells(kept))
+	require.Zero(res.Report.Condemn.Condemned)
+
+	res = f.deletes(nil)
 	require.Equal(int64(1), res.Report.Condemn.Condemned)
+	require.Equal([][]byte{marker(3)}, f.markerCells(kept))
 }
 
 // A server that reads a condemned commit between the mark and the delete
@@ -417,7 +441,10 @@ func TestDeleteGC_MapRows(t *testing.T) {
 	f.ref("platform/a", "refs/heads/touched", touchedResp, old)
 	recentReq, recentResp := evalRow("recent", time.Now().Add(-time.Hour))
 	f.ref("platform/a", "refs/heads/recent", recentResp, old)
-	f.delete(nil)
+	// A condemn cycle runs no delete step, so the expired rows stay for the
+	// delete cycle.
+	_, err := f.condemn(nil)
+	require.NoError(err)
 	f.age()
 
 	f.checks.hook = func() {
@@ -476,10 +503,11 @@ func TestDeleteGC_MapRows(t *testing.T) {
 }
 
 // A refused delete never stops the condemn: the cycle publishes and
-// completes its list and marks what is unreachable, and the next cycle
-// deletes from that list. A probe error that is not a refusal code, a
-// second cluster and a backup listing the library cannot parse each refuse
-// with a reason.
+// completes its list, and the markers of complete lists stay for a later
+// delete. A cycle before the hold of the first list has ended deletes
+// nothing and refuses nothing. A probe error that is not a refusal code, a
+// second cluster, a backup listing the library cannot parse and a backup
+// older than the newest complete list each refuse with a reason.
 func TestDeleteGC_RefusedCycleCondemns(t *testing.T) {
 	require := require.New(t)
 	f := newDeleteFixture(t)
@@ -493,41 +521,48 @@ func TestDeleteGC_RefusedCycleCondemns(t *testing.T) {
 			f.checks.backups = append(f.checks.backups, gc.Backup{Name: table + "-b", Table: table, Start: time.Now(), Ready: true})
 		}
 	}
+	ready()
+	res := f.delete(o)
+	require.Empty(res.Report.Delete.Refused)
+	require.Zero(res.Report.Delete.Step.Deleted)
+	require.Equal([][]byte{marker(1)}, f.markerCells(key))
+	ready()
+	res = f.delete(o)
+	require.Equal(int64(1), res.Report.Delete.Plan.Held)
+	require.Zero(res.Report.Delete.Step.Deleted)
+	f.age()
+
 	tests := []struct {
 		name   string
 		change func()
 		want   string
 	}{
-		{"no list", func() {}, "no condemn cycle published a list to delete from"},
 		{"two clusters", func() { f.checks.clusters = []string{"c1", "c2"} }, "the Bigtable instance has 2 clusters"},
 		{"probe fails", func() { f.checks.probeErr = status.Error(codes.Internal, "injected") }, "the conditional write probe failed: rpc error: code = Internal desc = injected"},
 		{"backup being created", func() {
 			f.checks.backupsErr = errors.New("failed to parse backup proto invalid endTime: nil Timestamp")
 		}, "(a backup that is still being created fails the listing until it is ready)"},
-		{"backup older than the list", func() { f.checks.backups[0].Start = time.Now().Add(-8 * time.Hour) }, "no ready backup of Bigtable table objects started after the list was completed"},
+		{"backup older than the newest list", func() { f.checks.backups[0].Start = time.Now().Add(-200 * time.Hour) }, "no ready backup of Bigtable table objects started after the list was completed"},
 	}
-	for i, tt := range tests {
+	for _, tt := range tests {
 		ready()
 		tt.change()
 		res := f.delete(o)
 		r := res.Report
-		// The first cycle also finds GcReplicas empty only now.
-		if i > 0 {
-			require.Len(r.Delete.Refused, 1, tt.name)
-		}
-		require.True(slices.ContainsFunc(r.Delete.Refused, func(s string) bool { return strings.Contains(s, tt.want) }), "%s: %q", tt.name, r.Delete.Refused)
+		require.Len(r.Delete.Refused, 1, tt.name)
+		require.Contains(r.Delete.Refused[0], tt.want, tt.name)
 		require.Nil(r.Delete.Step, tt.name)
 		// The chunk step of older records runs in a refused cycle too.
 		require.NotNil(r.Delete.Chunks, tt.name)
-		require.Equal(int64(1), r.Condemn.Condemned, tt.name)
-		require.Equal([][]byte{marker(byte(i + 1))}, f.markerCells(key), tt.name)
+		require.Zero(r.Condemn.Condemned, tt.name)
+		require.Equal([][]byte{marker(1)}, f.markerCells(key), tt.name)
 		location, complete := f.listState()
 		require.Equal(r.Condemn.List, location.StringVal, tt.name)
 		require.True(complete.Bool, tt.name)
 		f.age()
 	}
 	ready()
-	res := f.delete(o)
+	res = f.delete(o)
 	require.Empty(res.Report.Delete.Refused)
 	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
 	f.requireGone(key)
@@ -567,8 +602,8 @@ func TestDeleteGC_EndedMountWithoutKeepAlive(t *testing.T) {
 // the cycle before any delete check; the checks of the instance run before
 // the markers of live keys are cleared, the delete step after that and
 // before the cycle's own markers; and the second read of the servers runs
-// after the first checks, so that a touch lost in between refuses the
-// deletes.
+// after the first checks, so that a server of an older version that started
+// in between refuses the deletes. A touch lost in between refuses nothing.
 func TestDeleteGC_CycleOrder(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -608,16 +643,32 @@ func TestDeleteGC_CycleOrder(t *testing.T) {
 	f.requireGone(dead)
 	require.Equal([][]byte{marker(2)}, f.markerCells(newer))
 
-	// A touch lost after the first read of the servers refuses at the second.
-	other := f.blob("kept by a lost touch", f.old)
-	f.condemn(nil)
+	// A server of an older version that starts after the first read of the
+	// servers refuses at the second.
+	other := f.blob("kept by an older server", f.old)
+	_, err = f.condemn(nil)
+	require.NoError(err)
 	f.age()
-	f.checks.hook = func() { f.server("srv-0-aa", true) }
-	res = f.delete(nil)
-	require.Len(res.Report.Delete.Refused, 1)
-	require.Contains(res.Report.Delete.Refused[0], "server srv-0-aa lost touches at")
+	f.checks.hook = func() {
+		s := &gc.Server{ID: "srv-0-old", Version: gc.ExtractorVersion - 1, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
+		require.NoError(gc.WriteServer(ctx, f.s.casdb.SpannerClient(), s, false, false))
+	}
+	// It ran in the window of the list too, which the cycle cannot complete.
+	res, err = f.deleteWith(f.s.casdb.BTClient(), nil)
+	require.ErrorContains(err, "does not complete its list")
+	require.Len(res.Report.Delete.Refused, 2)
+	require.Contains(res.Report.Delete.Refused[0], "server srv-0-old: follows the GC rules of version 2")
 	require.Nil(res.Report.Delete.Step)
 	f.requirePresent(other, newer)
+
+	// A touch lost after the first read refuses nothing.
+	_, err = f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Delete("GcServers", spanner.Key{"srv-0-old"})})
+	require.NoError(err)
+	f.age()
+	f.checks.hook = func() { f.server("srv-0-aa", true) }
+	res = f.deletes(nil)
+	require.Equal(int64(2), res.Report.Delete.Step.Deleted)
+	f.requireGone(other, newer)
 
 	// With no server heartbeat the condemn checks refuse, and no delete
 	// check runs.
@@ -653,10 +704,10 @@ func (m *mutateLog) SendMsg(msg any) error {
 }
 
 // A delete whose outcome is unknown after its retries is read again at the
-// end of the step: a key whose row stays is condemned again with its child,
+// end of the step: a key whose row stays keeps its marker, as does its child,
 // which it blocked; a key whose row is gone counts as deleted and gets no
-// marker. A read that fails stops the cycle before its list, so that the
-// next cycle does not delete from the list of the cycle before.
+// marker. A read that fails stops the cycle before its list; the next cycle
+// plans from the markers and deletes.
 func TestDeleteGC_UnknownOutcome(t *testing.T) {
 	require := require.New(t)
 	f := newDeleteFixture(t)
@@ -691,9 +742,9 @@ func TestDeleteGC_UnknownOutcome(t *testing.T) {
 	f.requireGone(parent)
 	f.requirePresent(keptParent, kept, child)
 	for _, k := range []entities.Hash{keptParent, kept, child} {
-		require.Equal([][]byte{marker(2)}, f.markerCells(k), k)
+		require.Equal([][]byte{marker(1)}, f.markerCells(k), k)
 	}
-	require.Equal(int64(3), res.Report.Condemn.Condemned)
+	require.Zero(res.Report.Condemn.Condemned)
 
 	// The next cycle cannot read the kept parent again.
 	f.age()
@@ -719,9 +770,9 @@ func TestDeleteGC_UnknownOutcome(t *testing.T) {
 	f.requirePresent(keptParent, kept)
 
 	f.age()
-	res = f.delete(nil)
-	require.Len(res.Report.Delete.Refused, 1)
-	require.Contains(res.Report.Delete.Refused[0], "but cycle 3 was the last condemn or delete cycle and did not complete its own list")
+	res = f.deletes(nil)
+	require.Equal(int64(2), res.Report.Delete.Step.Deleted)
+	f.requireGone(keptParent, kept, child)
 }
 
 // failingRead fails a read of the objects table that names key once fail is
@@ -751,13 +802,13 @@ func (r *failingRead) RecvMsg(m any) error {
 	return r.ClientStream.RecvMsg(m)
 }
 
-// Two condemn cycles and a delete cycle over objects of every retention
-// class delete exactly the objects that were unreachable in both marks,
-// with the map rows that name them, and leave every object a root reaches
-// readable. The delete cycle writes no marker to a deleted key and deletes
-// what the plan of the condemn cycle before it counted. A key of the list
-// whose objects row was removed before the scan is no candidate and keeps
-// none of its children.
+// A condemn cycle and the delete cycles after it over objects of every
+// retention class delete, once the hold of the list has ended and not before,
+// exactly the objects that are still unreachable with its marker, with the
+// map rows that name them, and leave every object a root reaches readable.
+// The delete cycle writes no marker to a deleted key and deletes what its
+// plan counted. A key of the list whose objects row was removed before the
+// scan is no candidate and keeps none of its children.
 func TestDeleteGC_EndToEnd(t *testing.T) {
 	require := require.New(t)
 	f := newDeleteFixture(t)
@@ -864,18 +915,20 @@ func TestDeleteGC_EndToEnd(t *testing.T) {
 	del := bigtable.NewMutation()
 	del.DeleteRow()
 	require.NoError(f.s.casdb.BTClient().Open("objects").Apply(context.Background(), rowless.String(), del))
-	res, err := f.condemn(nil)
-	require.NoError(err)
-	plan := res.Report.Delete.Plan
-	require.Equal(int64(len(dead)), plan.WouldDelete)
-	require.Equal(int64(len(dead)), plan.Candidates)
-	require.Zero(plan.BlockedByNoncandidateParent)
-	f.age()
-
 	o := f.deleteOpts()
 	o.AcceptMountsWithoutKeepAlive = true
+	res := f.deletes(o)
+	plan := res.Report.Delete.Plan
+	require.Zero(plan.Candidates)
+	require.Equal(int64(len(dead)), plan.Held)
+	require.Zero(res.Report.Delete.Step.Deleted)
+	require.Zero(res.Report.Condemn.Condemned)
+	f.age()
+
 	res = f.deletes(o)
 	r := res.Report
+	require.Equal(int64(len(dead)), r.Delete.Plan.Candidates)
+	require.Zero(r.Delete.Plan.BlockedByNoncandidateParent)
 	require.Len(r.Delete.Warnings, 1)
 	require.Contains(r.Delete.Warnings[0], "1 live mounts run without the GC keep-alive")
 	step := r.Delete.Step
@@ -980,7 +1033,7 @@ func TestDeleteGC_ChecksObjectsWrittenDuringTheScan(t *testing.T) {
 	res, err := gc.Condemn(ctx, f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), f.s, &f.deleteOpts().CondemnOpts)
 	require.NoError(err)
 	require.Equal(int64(n), res.Report.Consistency.TooNew)
-	require.Nil(res.Report.Delete)
+	require.Nil(res.Report.Delete.TooNew)
 	require.Empty(readsOf())
 
 	o := f.deleteOpts().DryRunOpts
@@ -1011,4 +1064,150 @@ func TestDeleteGC_ChecksObjectsWrittenDuringTheScan(t *testing.T) {
 	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
 	require.Equal(map[string]int{gc.TableName: n}, readsOf())
 	f.requireGone(dead)
+}
+
+// A server that crashed after the condemn, its row left without a stop,
+// refuses nothing: the cycles before the hold has ended delete nothing, and
+// the first one after it deletes.
+func TestDeleteGC_HoldAfterServerCrash(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	key := f.blob("unreachable file", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	f.serverRow("srv-0-crashed", 36*time.Hour, time.Now().Add(-2*time.Hour), time.Time{}, time.Time{})
+
+	for range 2 {
+		res := f.deletes(nil)
+		require.Zero(res.Report.Delete.Step.Deleted)
+		require.Equal(int64(1), res.Report.Delete.Plan.Held)
+		require.Equal([][]byte{marker(1)}, f.markerCells(key))
+	}
+	ageList(t, f.s, 1, 87*time.Hour)
+	res := f.deletes(nil)
+	require.Zero(res.Report.Delete.Step.Deleted, "an hour of the hold is left")
+	ageList(t, f.s, 1, 2*time.Hour)
+	res = f.deletes(nil)
+	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
+	f.requireGone(key)
+}
+
+// A key that a server reads during the hold is rescued: its marker goes and
+// its touch keeps it live at the next mark, so the delete after the hold
+// keeps it, and a later condemn marks it again with a hold of its own.
+func TestDeleteGC_RescuedDuringHoldSurvives(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newDeleteFixture(t)
+	rescued := f.blob("read during the hold", f.old)
+	dead := f.blob("not read", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+
+	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCTouchInterval: time.Hour}))
+	t.Cleanup(f.s.stopGCHooks)
+	f.s.forget(rescued)
+	_, err = f.s.Headers(ctx, []entities.Hash{rescued})
+	require.NoError(err)
+	require.Empty(f.markerCells(rescued))
+	f.age()
+
+	res := f.deletes(nil)
+	require.Equal(int64(1), res.Report.Delete.Step.Deleted)
+	f.requireGone(dead)
+	f.requirePresent(rescued)
+	requireReachable(t, res, true, rescued)
+	require.Empty(f.markerCells(rescued))
+}
+
+// A parent written after the list of its child, which nothing reaches, gets
+// its own marker one cycle later and holds the child until its own hold has
+// ended; then both go in one step, the parent first.
+func TestDeleteGC_ParentAfterListHoldsChild(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	child := f.blob("child", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	parent := f.tree(f.old, child)
+	_, err = f.condemn(nil)
+	require.NoError(err)
+	require.Equal([][]byte{marker(1)}, f.markerCells(child))
+	require.Equal([][]byte{marker(2)}, f.markerCells(parent))
+
+	ageList(t, f.s, 1, 100*time.Hour)
+	res := f.deletes(nil)
+	plan := res.Report.Delete.Plan
+	require.Equal(int64(1), plan.Candidates)
+	require.Equal(int64(1), plan.Held)
+	require.Equal(int64(1), plan.BlockedByNoncandidateParent)
+	require.Equal([]string{parent.String() + ">" + child.String()}, plan.BlockedSamples)
+	require.Zero(res.Report.Delete.Step.Deleted)
+	f.requirePresent(parent, child)
+	require.Equal([][]byte{marker(1)}, f.markerCells(child))
+
+	ageList(t, f.s, 2, 100*time.Hour)
+	res = f.deletes(nil)
+	require.Equal(int64(2), res.Report.Delete.Step.Deleted)
+	f.requireGone(parent, child)
+}
+
+// withoutGCRow stores a blob as a server without --gc does, with no gc row,
+// and moves the time of its objects row back to at.
+func (f *deleteFixture) withoutGCRow(content string, at time.Time) entities.Hash {
+	f.t.Helper()
+	key := objects.HashBlobBytes([]byte(content))
+	require.NoError(f.t, putRaw(f.s, key, fmt.Appendf(nil, "blob %d\x00%s", len(content), content)))
+	mut := bigtable.NewMutation()
+	mut.DeleteCellsInFamily("meta")
+	for _, item := range f.row("objects", key)["meta"] {
+		mut.Set("meta", strings.TrimPrefix(item.Column, "meta:"), bigtable.Time(at), item.Value)
+	}
+	require.NoError(f.t, f.s.casdb.BTClient().Open("objects").Apply(context.Background(), key.String(), mut))
+	return key
+}
+
+// GC turned off for longer than the hold and on again without removing its
+// state: a key read while it was off kept a marker whose hold has ended. The
+// first cycle finds the object a server without --gc wrote, refuses and
+// deletes every list record; after the backfill the key is marked again and
+// deleted only once that new marker has held.
+func TestDeleteGC_OffAndOnAgainHoldsAnew(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	used := f.blob("used while GC was off", f.old)
+	_, err := f.condemn(nil)
+	require.NoError(err)
+	require.Equal([][]byte{marker(1)}, f.markerCells(used))
+
+	ageList(t, f.s, 1, 100*time.Hour)
+	f.s.forget(used)
+	require.NoError(readObject(f.s, used))
+	require.Equal([][]byte{marker(1)}, f.markerCells(used), "a server without --gc does not rescue")
+	added := f.withoutGCRow("added while GC was off", f.old)
+
+	res, err := f.deleteWith(f.s.casdb.BTClient(), nil)
+	var refused *gc.ErrCondemnRefused
+	require.ErrorAs(err, &refused)
+	require.Equal(int64(1), res.Report.Consistency.MissingGCRows)
+	require.True(res.Report.Condemn.RecordsCleared)
+	require.Nil(f.listRecord(1))
+	f.requirePresent(used)
+	require.Equal([][]byte{marker(1)}, f.markerCells(used))
+
+	f.gcRow(added, "blob", nil, f.old)
+	res = f.deletes(nil)
+	require.False(res.Report.Condemn.RecordsCleared)
+	require.Zero(res.Report.Delete.Step.Deleted)
+	cycle := res.Report.Cycle
+	require.Equal([][]byte{marker(byte(cycle))}, f.markerCells(used))
+
+	ageList(t, f.s, cycle, 87*time.Hour)
+	res = f.deletes(nil)
+	require.Zero(res.Report.Delete.Step.Deleted, "an hour of the new hold is left")
+	f.requirePresent(used)
+	ageList(t, f.s, cycle, 2*time.Hour)
+	res = f.deletes(nil)
+	require.Equal(int64(2), res.Report.Delete.Step.Deleted)
+	f.requireGone(used, added)
 }

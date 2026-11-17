@@ -46,7 +46,7 @@ const (
 	DefaultCacheTTL            = 6 * time.Hour
 	DefaultGCTouchInterval     = 36 * time.Hour
 	DefaultGCHeartbeatInterval = 5 * time.Minute
-	heartbeatTimeout           = 30 * time.Second
+	heartbeatTimeout           = gc.HeartbeatTimeout
 	firstHeartbeatRetry        = 5 * time.Second
 	rescueWorkers              = 32
 	metricsScope               = "github.com/google/abfs/shared/remote/servers/gcp"
@@ -131,6 +131,11 @@ type gcHooks struct {
 	metrics     metric.Registration
 	rescueLog   *rescueLog
 	stopped     bool
+	// answerBound bounds the time from the start of a call to a present
+	// answer, and answerSeconds records that time per call. A read-only
+	// server answers no client and bounds nothing.
+	answerBound   bool
+	answerSeconds metric.Float64Histogram
 
 	// rescues counts per path and index into rescueTypes.
 	rescues           [numRescuePaths][]atomic.Int64
@@ -174,8 +179,8 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 // gcHookOpts checks the GC options of opts and returns them with the default
 // heartbeat interval when it is zero. A server that rescues and touches needs
 // a cache TTL, a touch interval and a heartbeat: without them the collector
-// refuses every condemn and delete, and it sees the touches a server lost
-// only through its heartbeat.
+// refuses every condemn and delete, and it sees a server only through its
+// heartbeat.
 func gcHookOpts(opts *NewServerOpts) (NewServerOpts, error) {
 	o := *opts
 	if o.CacheTTL < 0 || o.GCTouchInterval < 0 || o.GCHeartbeatInterval < 0 {
@@ -213,6 +218,7 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 	g.rescueLog = newRescueLog()
 	if !opts.GCReadOnly {
 		g.rescue = gc.NewRescuer(s.casdb.BTClient()).Rescue
+		g.answerBound = true
 	}
 	if opts.GCTouchInterval > 0 && !opts.GCReadOnly {
 		g.touchInterval = seconds(opts.GCTouchInterval)
@@ -231,6 +237,12 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 		return fmt.Errorf("failed to register the GC metrics: %w", err)
 	}
 	g.metrics = reg
+	if g.answerSeconds, err = otel.Meter(metricsScope).Float64Histogram("abfs.gcp.gc.answer_seconds",
+		metric.WithDescription("Time from the start of a call that can answer that objects are present to its answer, by call; a call that takes 2 minutes or more fails"),
+		metric.WithUnit("s")); err != nil {
+		s.stopGCHooks()
+		return fmt.Errorf("failed to register the GC metrics: %w", err)
+	}
 	if opts.GCHeartbeatInterval > 0 && !opts.GCReadOnly {
 		g.server = gc.Server{
 			ID:                gc.NewReplicaID(),
@@ -251,10 +263,9 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 
 // stopGCHooks stops the heartbeat, writes the buffered touches and records in
 // the heartbeat row of this server that it stopped, and whether it lost
-// touches or was paused since its last heartbeat. The row stays: a row
-// without the stop, also after a failed write of the stop, tells the
-// collector that the process crashed and its object and map row touches may
-// be lost.
+// touches or was paused since its last heartbeat. The row stays, so that the
+// collector sees the process in the window of every cycle it may have served
+// in; the losses are reported, not checked.
 func (s *GCPServer) stopGCHooks() {
 	g := &s.gcHooks
 	if g.stopped {
@@ -317,10 +328,7 @@ func (g *gcHooks) losses() int64 {
 
 // mapRowLosses counts the map row touches this process lost so far. They are
 // recorded apart from the object touches: a lost one only shortens the
-// retention of an eval map row, and the collector then requires mounts to
-// touch their objects often enough that the touch of the result, an object
-// touch of MapResults, keeps the outputs until a mount's keep-alive names
-// them.
+// retention of an eval map row.
 func (g *gcHooks) mapRowLosses() int64 {
 	if g.toucher == nil {
 		return 0
@@ -337,9 +345,9 @@ func (g *gcHooks) touchesLate() bool {
 
 // checkHeartbeat fails with Unavailable once the last successful heartbeat
 // of this server is older than two heartbeat intervals plus the write
-// timeout, until the next one succeeds. While its heartbeats fail, the
-// collector cannot learn of touches the server loses, so it must not serve
-// the uses they record.
+// timeout, until the next one succeeds. The collector counts a process for
+// the window of a cycle only while its last heartbeat is recent enough, so a
+// server must not serve without one.
 func (g *gcHooks) checkHeartbeat() error {
 	if g.heartbeatStale == 0 {
 		return nil
@@ -375,8 +383,10 @@ func (s *GCPServer) lookupHeader(key entities.Hash) (CachedHeader, bool) {
 // loaded on the cacheNow clock, so that the entry ages from the start of the
 // read. With GC it replaces an expired entry and keeps the touch mark of the
 // entry it replaces when that touch is of the current period; without GC it
-// keeps an existing entry.
-func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32) CachedHeader {
+// keeps an existing entry. touched tells that the object got a touch of its
+// own after loaded, the edges of a new object or the touch of a rescue, so
+// that a hit in the period of loaded queues none.
+func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32, touched bool) CachedHeader {
 	h := newCachedHeader(hdr)
 	h.Loaded = loaded
 	shard := s.headers[hdr.Id[0]]
@@ -384,8 +394,12 @@ func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32) CachedHeader {
 		shard.PeekOrAdd(hdr.Id, h)
 		return h
 	}
-	if old, ok := shard.Peek(hdr.Id); ok && s.gcHooks.touchInterval > 0 && s.gcHooks.touchedThisPeriod(hdr.Id, old, h.Loaded) {
-		h.Touched = old.Touched
+	if g := &s.gcHooks; g.touchInterval > 0 {
+		if touched {
+			h.Touched = touchMark(g.touchPeriod(hdr.Id, loaded))
+		} else if old, ok := shard.Peek(hdr.Id); ok && g.touchedThisPeriod(hdr.Id, old, h.Loaded) {
+			h.Touched = old.Touched
+		}
 	}
 	shard.Add(hdr.Id, h)
 	return h
@@ -437,9 +451,10 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	// A read of the whole row sees the condemn marker with the content.
 	start := cacheNow()
 	header, content, err := s.casdb.GetObjectData(ctx, key)
+	rescued := false
 	if err == nil && header != nil {
 		if err = s.gcHooks.checkReadAge(start); err == nil {
-			err = s.rescueCondemned(ctx, pathGetObject, header)
+			rescued, err = s.rescueCondemned(ctx, pathGetObject, header)
 		}
 	}
 	if errors.Is(err, casdb.ErrNotFound) || (err == nil && header == nil) {
@@ -449,17 +464,18 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	if err != nil {
 		return CachedHeader{}, nil, err
 	}
-	cachedHdr = s.storeHeader(header, start)
+	cachedHdr = s.storeHeader(header, start, rescued)
 	s.storeContent(key, content, start)
 	s.touchHit(pathGetObject, key, cachedHdr)
 	return cachedHdr, content, nil
 }
 
-// rescueCondemned rescues hdr if the collector condemned it. It returns
-// casdb.ErrNotFound when the collector deleted the object first.
-func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *ObjectHeader) error {
+// rescueCondemned rescues hdr if the collector condemned it and reports
+// whether it did. It returns casdb.ErrNotFound when the collector deleted the
+// object first.
+func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *ObjectHeader) (bool, error) {
 	if hdr.Condemned == nil || s.gcHooks.rescue == nil {
-		return nil
+		return false, nil
 	}
 	req := newRequestID(ctx)
 	err := s.rescueOne(ctx, path, req, hdr)
@@ -468,7 +484,7 @@ func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *O
 	} else if !errors.Is(err, casdb.ErrNotFound) {
 		s.gcHooks.rescueLog.call(ctx, path, req, 1, 0, 1)
 	}
-	return err
+	return err == nil, err
 }
 
 // rescueOne rescues hdr, which the collector condemned, and counts the result.
@@ -493,16 +509,18 @@ func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, req string, 
 }
 
 // rescueHeaders rescues the condemned objects of hdrs and returns hdrs without
-// the ones the collector deleted first. A batch can hold many condemned
-// objects, for example a keep-alive touch right after a cycle condemned what
-// the mount holds, so the rescues run in parallel. A failed rescue does not
-// stop the others: the call fails with the first error once all have run, so
-// a retry finds only the objects whose rescue failed still condemned.
-func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*ObjectHeader) ([]*ObjectHeader, error) {
+// the ones the collector deleted first, and the keys it rescued. A batch can
+// hold many condemned objects, for example a keep-alive touch right after a
+// cycle condemned what the mount holds, so the rescues run in parallel. A
+// failed rescue does not stop the others: the call fails with the first error
+// once all have run, so a retry finds only the objects whose rescue failed
+// still condemned.
+func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*ObjectHeader) ([]*ObjectHeader, map[entities.Hash]bool, error) {
 	if s.gcHooks.rescue == nil {
-		return hdrs, nil
+		return hdrs, nil, nil
 	}
 	gone := make([]bool, len(hdrs))
+	done := make([]bool, len(hdrs))
 	var rescued, failed atomic.Int64
 	var g errgroup.Group
 	g.SetLimit(rescueWorkers)
@@ -519,6 +537,7 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 			switch {
 			case err == nil:
 				rescued.Add(1)
+				done[i] = true
 			case errors.Is(err, casdb.ErrNotFound):
 				gone[i] = true
 				return nil
@@ -531,15 +550,22 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 	err := g.Wait()
 	s.gcHooks.rescueLog.call(ctx, path, req, len(hdrs), int(rescued.Load()), int(failed.Load()))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var keys map[entities.Hash]bool
 	live := hdrs[:0]
 	for i, h := range hdrs {
+		if done[i] {
+			if keys == nil {
+				keys = make(map[entities.Hash]bool)
+			}
+			keys[h.Id] = true
+		}
 		if !gone[i] {
 			live = append(live, h)
 		}
 	}
-	return live, nil
+	return live, keys, nil
 }
 
 // touchMark returns the CachedHeader.Touched value of a touch period. The
@@ -732,9 +758,7 @@ func (s *GCPServer) startHeartbeat(interval time.Duration) error {
 	return nil
 }
 
-// heartbeat writes one heartbeat of this server. The touch stats are read
-// after the Spanner read that gives StatsTime, so every loss counted before
-// that time is in the row.
+// heartbeat writes one heartbeat of this server.
 func (s *GCPServer) heartbeat(ctx context.Context) error {
 	g := &s.gcHooks
 	start := cacheNow()
@@ -744,24 +768,21 @@ func (s *GCPServer) heartbeat(ctx context.Context) error {
 	}
 	hctx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
 	defer cancel()
-	sp := s.casdb.SpannerClient()
-	statsTime, err := gc.ReadServerTime(hctx, sp, g.server.ID)
+	if g.pausedSince() {
+		log.Printf("Warning: the wall clock advanced more than the monotonic clock by over %s since the last GC heartbeat; recording the pause as a touch loss", maxPause)
+		g.pausePending = true
+	}
+	// A late touch leaves the toucher's slots only after its loss is
+	// counted, so the slots are read first.
+	late := g.touchesLate()
+	losses, mapRowLosses := g.losses(), g.mapRowLosses()
+	err := writeServer(hctx, s.casdb.SpannerClient(), &g.server, g.pausePending || late || losses > g.reportedLosses, mapRowLosses > g.reportedMapRowLosses)
 	if err == nil {
-		if g.pausedSince() {
-			log.Printf("Warning: the wall clock advanced more than the monotonic clock by over %s since the last GC heartbeat; recording the pause as a touch loss", maxPause)
-			g.pausePending = true
-		}
-		// A late touch leaves the toucher's slots only after its loss is
-		// counted, so the slots are read first.
-		late := g.touchesLate()
-		losses, mapRowLosses := g.losses(), g.mapRowLosses()
-		if err = writeServer(hctx, sp, &g.server, statsTime, g.pausePending || late || losses > g.reportedLosses, mapRowLosses > g.reportedMapRowLosses); err == nil {
-			g.reportedLosses, g.reportedMapRowLosses = losses, mapRowLosses
-			g.pausePending = false
-			g.hasRow = true
-			g.lastHeartbeat.Store(start)
-			return nil
-		}
+		g.reportedLosses, g.reportedMapRowLosses = losses, mapRowLosses
+		g.pausePending = false
+		g.hasRow = true
+		g.lastHeartbeat.Store(start)
+		return nil
 	}
 	if ctx.Err() == nil {
 		g.heartbeatFailures.Add(1)

@@ -171,31 +171,36 @@ retention rules and the grace keep. The cycle also scans the meta family of the 
 table to check that every object has a gc row.
 
 --dry-run reports what a collection would remove and writes nothing but the garbage
-collector state in Spanner. --condemn also marks the unreachable objects with the cycle
-number, after it wrote their list to the bucket; it deletes nothing, and servers with --gc
-clear the marker of any marked object they read. It refuses, and writes nothing, unless
-every check of the cycle passed: --expected-replicas distinct server hosts, or at least
---min-replicas and at most --max-replicas, write a GC heartbeat, one live row each, with
-settings that fit the timing rules; --grace covers the largest cache TTL of the servers
-plus --longest-push; no object lacks a gc row; and no pin or root could not be read.
---explain adds, per key, the root that keeps it.
+collector state in Spanner. --condemn also clears the markers of live objects and marks the
+unreachable objects that hold no marker of a complete list with the cycle number, after it
+wrote their list to the bucket and its row to the Spanner table GcLists; once every marker
+is written it completes that row. A marker of a complete list is never written again. It
+deletes nothing, and servers with --gc clear the marker of any marked object they read. It
+refuses, and writes no marker and no list, unless every check of the cycle passed:
+--expected-replicas distinct server hosts, or at least --min-replicas and at most
+--max-replicas, write a GC heartbeat, with settings that fit the timing rules; --grace
+covers the largest cache TTL of the servers plus --longest-push; no object lacks a gc row;
+and no pin or root could not be read. An object without a gc row shows that servers ran
+without --gc, so the cycle first deletes every row of GcLists, and later cycles write each
+marker again with a hold of its own. --explain adds, per key, the root that keeps it.
 
---delete runs a condemn cycle that first deletes the objects of the list of the condemn or
-delete cycle before that are still unreachable and still hold its marker: the map rows that
-name them first, then each object after every parent of it, each batch recorded in the
-bucket under gc/deleted/ before its deletes, each delete conditional on the marker. It
-deletes only when every delete check passed, and else only condemns and lists the reasons
-in the report: the list is complete and the cycle runs in the window its timings allow; no
-server that may have run within the grace crashed, lost touches or ran without link
-validation; the Bigtable instance has one cluster and the app profile accepts conditional
-writes; ready backups of the tables exist (unless --no-backup-check); and no live mount can
-hold the only copy of content it wrote. A dry run and a condemn cycle report what a delete
-would remove. The chunks of deleted objects are removed one cycle later, at least 15
-minutes after the record of their batch, unless the row of the object is back; that
-step deletes nothing while the bucket keeps deleted objects for less than 7 days (unless
---allow-no-soft-delete), has Object Versioning on or a retention policy, and it keeps a
-record until a ready backup of the chunks table started after its list (unless
---no-backup-check).
+--delete runs a condemn cycle that first deletes the unreachable objects whose marker is of
+a complete list whose hold has ended: the grace plus 16h after the list was completed, or
+longer when the cache TTL recorded with the list and the keep-alive interval of the live
+mounts need it. It deletes the map rows that name them first, then each object after every
+parent of it, each batch recorded in the bucket under gc/deleted/ before its deletes, each
+delete conditional on the marker the cycle read. It deletes only when every delete check
+passed, and else only condemns and lists the reasons in the report: the list records are
+readable; no server that may have run within the grace ran without link validation or with
+an older version of the GC rules; the Bigtable instance has one cluster and the app profile
+accepts conditional writes; ready backups of the tables exist (unless --no-backup-check);
+and no live mount can hold the only copy of content it wrote. A dry run and a condemn cycle
+report what a delete would remove. The chunks of deleted objects are removed one cycle
+later, at least 15 minutes after the record of their batch, unless the row of the object is
+back; that step deletes nothing while the bucket keeps deleted objects for less than 7 days
+(unless --allow-no-soft-delete), has Object Versioning on or a retention policy, and it
+keeps a record until a ready backup of the chunks table started after the newest complete
+list (unless --no-backup-check).
 Needs the resources of 'abfs server gcp init --gc'.`,
 	}
 }
@@ -211,13 +216,13 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing")
 	fl.BoolVar(&c.condemn, "condemn", false, "Mark the unreachable objects as condemned and delete nothing")
-	fl.BoolVar(&c.delete, "delete", false, "Delete the objects condemned by the cycle before that are still unreachable, then condemn as --condemn does")
+	fl.BoolVar(&c.delete, "delete", false, "Delete the unreachable objects whose condemn marker has held long enough, then condemn as --condemn does")
 	fl.IntVar(&c.opts.ExpectedReplicas, "expected-replicas", 0, "With --condemn or --delete, the number of distinct server hosts that must run with --gc, for a fleet of fixed size (this or --min-replicas is required)")
 	fl.IntVar(&c.opts.MinReplicas, "min-replicas", 0, "With --condemn or --delete, the smallest number of distinct server hosts that must run with --gc, for a fleet whose size changes: the autoscaler minimum less the servers a disruption budget lets stop at once")
 	fl.IntVar(&c.opts.MaxReplicas, "max-replicas", 0, "With --min-replicas, the largest number of distinct server hosts with --gc (0 means no limit)")
 	fl.StringSliceVar(&c.opts.Types, "delete-types", nil, "In delete mode, the object types, separated by commas, that the cycle may delete (default: every type)")
-	fl.BoolVar(&c.opts.AcceptMountsWithoutKeepAlive, "accept-mounts-without-keepalive", false, "In delete mode, delete blobs, trees and eval objects while live mounts run without gc-keepalive, whose caches may hold the only copy of content they wrote; the check then only warns, except after a server lost map row touches: then such mounts still refuse the deletes")
-	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the list was complete")
+	fl.BoolVar(&c.opts.AcceptMountsWithoutKeepAlive, "accept-mounts-without-keepalive", false, "In delete mode, delete blobs, trees and eval objects while live mounts run without gc-keepalive, whose caches may hold the only copy of content they wrote; the check then only warns")
+	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the newest list was complete")
 	fl.BoolVar(&c.opts.AllowNoSoftDelete, "allow-no-soft-delete", false, "In delete mode, delete the bucket chunks of deleted objects although the bucket keeps deleted objects for less than 7 days, so that they cannot be restored")
 	fl.DurationVar(&c.opts.StartDelay, "delete-start-delay", 0, "In delete mode, a pause before the delete step, for tests")
 	if err := fl.MarkHidden("delete-start-delay"); err != nil {

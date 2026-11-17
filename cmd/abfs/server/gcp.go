@@ -155,7 +155,7 @@ func (c *gcpInitCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.opts.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
 	fl.StringVar(&c.opts.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
 	fl.StringVar(&c.opts.BucketName, "bucket", "", "The GCS Bucket Name (required)")
-	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table gc, the column family g of the table objects and the Spanner tables GcState, GcReplicas and GcServers")
+	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table gc, the column family g of the table objects and the Spanner tables GcState, GcServers and GcLists")
 }
 
 func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {

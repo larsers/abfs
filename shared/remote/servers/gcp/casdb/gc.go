@@ -66,13 +66,13 @@ func (c *CASDB) headerFamilies() string {
 	return headerFamily
 }
 
-// CheckGCSchema checks that the garbage collector tables are readable, with
-// the columns added after they were first created.
+// CheckGCSchema checks that the garbage collector tables a server uses are
+// readable, with the columns added after they were first created. GcLists is
+// the collector's alone.
 func (c *CASDB) CheckGCSchema(ctx context.Context) error {
 	for _, q := range []struct{ table, columns string }{
-		{"GcState", "ListLocation, ListSnapshotTime, ListComplete, ListCompleteTime, CondemnCycle, LegacyServersGoneTime, MaxGraceSeconds"},
-		{"GcReplicas", "1"},
-		{"GcServers", "HeartbeatIntervalSeconds, LinkValidation, StatsTime, TouchLossTime, StoppedAt, MapRowLossTime"},
+		{"GcState", "ListLocation, ListSnapshotTime, ListComplete, ListCompleteTime, MaxGraceSeconds"},
+		{"GcServers", "HeartbeatIntervalSeconds, LinkValidation, TouchLossTime, StoppedAt, MapRowLossTime"},
 	} {
 		err := c.dbClient.Single().Query(ctx, spanner.Statement{SQL: "SELECT " + q.columns + " FROM " + q.table + " LIMIT 1"}).Do(func(*spanner.Row) error { return nil })
 		if err != nil {

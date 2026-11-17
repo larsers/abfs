@@ -15,21 +15,15 @@
 package gc
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"os"
 	"time"
-
-	"cloud.google.com/go/spanner"
 )
-
-const replicasTable = "GcReplicas"
 
 // NewReplicaID returns an ID for the heartbeat of this server process: the
 // host name and a random suffix, so that a restarted process gets a new row
-// and the row of a process that stopped without deleting its own stays.
+// and the row of a process that stopped without recording its stop stays.
 func NewReplicaID() string {
 	host, err := os.Hostname()
 	if err != nil {
@@ -40,84 +34,21 @@ func NewReplicaID() string {
 	return host + "-" + hex.EncodeToString(b)
 }
 
-// Replica is the heartbeat row of a server replica in GcReplicas.
+// Replica is what checkReplicas checks of the heartbeat row of a server
+// process in GcServers.
 type Replica struct {
 	ID string
-	// Version is the GC edge extractor version the replica writes into the
-	// table gc, 0 when it writes none.
+	// Version is the version of the GC rules the process follows, which it
+	// also writes into the table gc, 0 when it writes none.
 	Version int64
-	// GC reports whether the replica runs the garbage collector hooks.
+	// GC reports whether the process runs the garbage collector hooks.
 	GC bool
-	// TouchInterval and CacheTTL are the replica's touch period and cache TTL;
-	// zero means it writes no touches or keeps cache entries without a TTL.
-	TouchInterval time.Duration
-	CacheTTL      time.Duration
-	// LastSeen is the commit time of its last heartbeat; WriteHeartbeat
-	// ignores it.
+	// TouchInterval and CacheTTL are the process's touch period and cache
+	// TTL; zero means it writes no touches or keeps cache entries without a
+	// TTL. HeartbeatInterval is the time between two of its heartbeats.
+	TouchInterval     time.Duration
+	CacheTTL          time.Duration
+	HeartbeatInterval time.Duration
+	// LastSeen is the commit time of its last heartbeat.
 	LastSeen time.Time
-}
-
-var replicaColumns = []string{"ReplicaId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "LastSeen"}
-
-// WriteHeartbeat records in the Spanner table GcReplicas that the server
-// replica r is running, with its settings.
-func WriteHeartbeat(ctx context.Context, client *spanner.Client, r *Replica) error {
-	m := spanner.InsertOrUpdate(replicasTable, replicaColumns,
-		[]any{r.ID, r.Version, r.GC, int64(r.TouchInterval / time.Second), int64(r.CacheTTL / time.Second), spanner.CommitTimestamp})
-	if _, err := client.Apply(ctx, []*spanner.Mutation{m}); err != nil {
-		return fmt.Errorf("failed to write the heartbeat of replica %s: %w", r.ID, err)
-	}
-	return nil
-}
-
-// DeleteReplica deletes the row of the replica id from GcReplicas. A server
-// does so when it stops after writing its buffered touches, so that a row
-// left behind marks a process that stopped without them.
-func DeleteReplica(ctx context.Context, client *spanner.Client, id string) error {
-	if _, err := client.Apply(ctx, []*spanner.Mutation{spanner.Delete(replicasTable, spanner.Key{id})}); err != nil {
-		return fmt.Errorf("failed to delete the heartbeat of replica %s: %w", id, err)
-	}
-	return nil
-}
-
-// ReadReplicas returns the rows of GcReplicas.
-func ReadReplicas(ctx context.Context, client *spanner.Client) ([]Replica, error) {
-	return scanReplicas(client.Single().Read(ctx, replicasTable, spanner.AllKeys(), replicaColumns))
-}
-
-func scanReplicas(it *spanner.RowIterator) ([]Replica, error) {
-	var replicas []Replica
-	err := it.Do(func(row *spanner.Row) error {
-		var r Replica
-		var touch, ttl int64
-		if err := row.Columns(&r.ID, &r.Version, &r.GC, &touch, &ttl, &r.LastSeen); err != nil {
-			return err
-		}
-		r.TouchInterval = time.Duration(touch) * time.Second
-		r.CacheTTL = time.Duration(ttl) * time.Second
-		replicas = append(replicas, r)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to read the GC replicas: %w", err)
-	}
-	return replicas, nil
-}
-
-// DeleteStaleReplicas deletes the rows of GcReplicas last seen before before,
-// one per stopped server process, and returns how many it deleted.
-func DeleteStaleReplicas(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {
-	var n int64
-	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		var err error
-		n, err = txn.Update(ctx, spanner.Statement{
-			SQL:    "DELETE FROM " + replicasTable + " WHERE LastSeen < @before",
-			Params: map[string]any{"before": before},
-		})
-		return err
-	})
-	if err != nil {
-		return 0, fmt.Errorf("failed to delete the stale GC replicas: %w", err)
-	}
-	return n, nil
 }

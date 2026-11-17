@@ -16,6 +16,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -98,7 +99,8 @@ func (f *stepFixture) bounds() []string {
 }
 
 // mark scans the tables as a cycle does, with no root, and plans a delete
-// from a list of every key written, for the types allows accepts.
+// of every key that holds the marker of the list, complete long ago, for the
+// types allows accepts.
 func (f *stepFixture) mark(allows func(string) bool) *Result {
 	f.t.Helper()
 	ctx := context.Background()
@@ -114,16 +116,22 @@ func (f *stepFixture) mark(allows func(string) bool) *Result {
 	require.NoError(f.t, err)
 	res := &Result{
 		Report: &Report{Cycle: stepCycle, SnapshotTime: f.now},
-		graph:  g, live: live, seen: scan.seen, unreachable: scan.unreachable, bounds: bounds, maps: maps,
+		graph:  g, live: live, seen: scan.seen, unreachable: scan.unreachable, markers: scan.markers, bounds: bounds, maps: maps,
 	}
-	keys := slices.Clone(f.keys)
-	slices.SortFunc(keys, compareHash)
-	l := &condemnedList{header: &listHeader{cycle: stepListCycle}, keys: keys}
 	if allows == nil {
 		allows = func(string) bool { return true }
 	}
-	res.plan = planDeletes(res, l, f.now.Add(-DefaultMapRetention).UnixMicro(), allows)
+	eligible, lists := f.eligible(res)
+	res.plan = planDeletes(res, eligible, lists, f.now.Add(-DefaultMapRetention).UnixMicro(), allows)
 	return res
+}
+
+// eligible returns the eligible marker values of res when the list of
+// stepListCycle was completed long ago.
+func (f *stepFixture) eligible(res *Result) ([]bool, []ListHoldReport) {
+	o := DefaultDryRunOpts()
+	holds := &listHolds{records: map[int64]*ListRecord{stepListCycle: {Cycle: stepListCycle, CompleteTime: f.now.Add(-200 * time.Hour)}}}
+	return holds.eligible(res.markers, res.unreachable, f.now, 0, &o)
 }
 
 // deleter returns a deleter of cycle 5 whose writes check lease.
@@ -153,9 +161,9 @@ func (f *stepFixture) rowExists(table string, key string) bool {
 
 // The plan puts each candidate below its deepest candidate parent, blocks a
 // candidate with an unreachable parent that has an objects row and is not
-// a candidate, keeps a candidate on a cycle of edges, and fails every key
-// below one the cycle may not delete. A parent without an objects row
-// blocks nothing: nothing can read it.
+// a candidate, such as one without an eligible marker, keeps a candidate on
+// a cycle of edges, and fails every key below one the cycle may not delete.
+// A parent without an objects row blocks nothing: nothing can read it.
 func TestPlanDeletes(t *testing.T) {
 	require := require.New(t)
 	f := newStepFixture(t, 4)
@@ -174,7 +182,6 @@ func TestPlanDeletes(t *testing.T) {
 	f.object(child, "blob", nil)
 	f.objectWith(outside, "tree", []Hash{child}, nil, true)
 	f.objectWith(outside2, "tree", []Hash{child}, nil, true)
-	f.keys = slices.DeleteFunc(f.keys, func(k Hash) bool { return k == outside || k == outside2 })
 	// A parent in the list without an objects row is no candidate and blocks
 	// nothing.
 	ghost, ghostChild := h[8], h[9]
@@ -211,6 +218,8 @@ func TestPlanDeletes(t *testing.T) {
 	require.Equal(outcomeUnplaced, outcome(h[11]))
 	rep := p.report
 	require.Equal(int64(10), rep.Candidates)
+	require.Zero(rep.Unrecorded)
+	require.Equal([]ListHoldReport{{Cycle: stepListCycle, CompleteTime: f.now.Add(-200 * time.Hour), HoldHours: 88, EligibleTime: f.now.Add(-112 * time.Hour), Eligible: true, Unreachable: 10}}, rep.Lists)
 	require.Equal(int64(1), rep.BlockedByNoncandidateParent)
 	require.ElementsMatch([]string{outside.String() + ">" + child.String(), outside2.String() + ">" + child.String()}, rep.BlockedSamples)
 	require.Equal(int64(2), rep.Unplaced)
@@ -247,7 +256,6 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	outReq, outResp := h[2], h[3]
 	f.objectWith(outReq, "eval-request", nil, nil, true)
 	f.object(outResp, "eval-response", nil)
-	f.keys = slices.DeleteFunc(f.keys, func(k Hash) bool { return k == outReq })
 	f.mapRow(outReq, outResp, old)
 	// Both ends live.
 	liveReq, liveResp := h[4], h[5]
@@ -263,11 +271,9 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	for _, k := range []Hash{liveReq, liveResp} {
 		res.live.set(res.graph.find(k))
 	}
-	keys := slices.Clone(f.keys)
-	slices.SortFunc(keys, compareHash)
-	l := &condemnedList{header: &listHeader{cycle: stepListCycle}, keys: keys}
+	eligible, lists := f.eligible(res)
 	plan := func(allows func(string) bool) *deletePlan {
-		return planDeletes(res, l, f.now.Add(-DefaultMapRetention).UnixMicro(), allows)
+		return planDeletes(res, eligible, lists, f.now.Add(-DefaultMapRetention).UnixMicro(), allows)
 	}
 	rows := func(p *deletePlan) []string {
 		var keys []string
@@ -295,6 +301,53 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	require.Equal(outcomeTypeNotAllowed, outcome(resp))
 	require.Equal(outcomeTypeNotAllowed, outcome(outResp))
 	require.Equal(int64(1), p.report.WouldDelete)
+}
+
+// The candidates are the unreachable keys whose marker is of a complete
+// list whose hold has ended, each with its own marker value: a cycle can
+// delete keys of two lists, and holds the keys of a list that is complete
+// but still held, of a list that is not complete and of a cycle without a
+// record.
+func TestPlanDeletes_ByMarker(t *testing.T) {
+	require := require.New(t)
+	f := newStepFixture(t, 2)
+	h := testHashes(6)
+	for i, cycle := range []int64{1, 2, 3, 4, 6} {
+		f.objectWith(h[i], "blob", nil, markerValue(cycle), true)
+	}
+	f.objectWith(h[5], "blob", nil, nil, true)
+	res := f.mark(nil)
+	o := DefaultDryRunOpts()
+	hold := DefaultGrace + condemnHoldMargin
+	holds := &listHolds{records: map[int64]*ListRecord{
+		1: {Cycle: 1, CompleteTime: f.now.Add(-hold - time.Hour)},
+		2: {Cycle: 2, CompleteTime: f.now.Add(-hold)},
+		3: {Cycle: 3, CompleteTime: f.now.Add(-hold + time.Second)},
+		4: {Cycle: 4},
+	}}
+	eligible, lists := holds.eligible(res.markers, res.unreachable, f.now, 0, &o)
+	p := planDeletes(res, eligible, lists, f.now.Add(-DefaultMapRetention).UnixMicro(), func(string) bool { return true })
+	require.Equal(int64(2), p.report.Candidates)
+	require.Equal(int64(1), p.report.Held)
+	require.Equal(int64(2), p.report.Unrecorded)
+	for i, cycle := range []int64{1, 2} {
+		j := p.index(res.graph.find(h[i]))
+		require.GreaterOrEqual(j, 0)
+		require.Equal(markerValue(cycle), p.values[p.markers[j]-1])
+	}
+	for _, k := range h[2:] {
+		require.Equal(-1, p.index(res.graph.find(k)))
+	}
+	require.Len(p.report.Lists, 3)
+	require.Equal([]bool{true, true, false}, []bool{p.report.Lists[0].Eligible, p.report.Lists[1].Eligible, p.report.Lists[2].Eligible})
+
+	// An unread record makes no marker eligible and none recorded.
+	unread := &listHolds{err: errors.New("unavailable")}
+	eligible, lists = unread.eligible(res.markers, res.unreachable, f.now, 0, &o)
+	require.Empty(lists)
+	p = planDeletes(res, eligible, lists, f.now.Add(-DefaultMapRetention).UnixMicro(), func(string) bool { return true })
+	require.Zero(p.report.Candidates)
+	require.True(unread.recorded(markerValue(6)))
 }
 
 // A delete record reads back as written, and keeps the content descriptor

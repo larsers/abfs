@@ -56,10 +56,12 @@ func TestCondemnBlockers(t *testing.T) {
 		{"one GC host short", replicas("srv-0-aa", "srv-1-bb"), []string{"2 server hosts write a GC heartbeat, but 3 are expected"}},
 		// One host more than expected can stand in for a host without GC.
 		{"one GC host more than expected", replicas("srv-0-aa", "srv-1-bb", "srv-2-cc", "srv-3-dd"), []string{"4 server hosts write a GC heartbeat, but 3 are expected"}},
-		{"two live rows from one host", replicas("srv-0-aa", "srv-0-dd", "srv-1-bb", "srv-2-cc"), []string{"host srv-0 has 2 live GC heartbeat rows"}},
+		// Two live rows of one host, as after a restart without a recorded
+		// stop, count once and refuse nothing.
+		{"two live rows from one host", replicas("srv-0-aa", "srv-0-dd", "srv-1-bb", "srv-2-cc"), nil},
 		// A restarted host's old row must not stand in for a host without GC.
 		{"one GC host short with a restarted host's old row live", replicas("srv-0-aa", "srv-0-dd", "srv-1-bb"), []string{
-			"2 server hosts write a GC heartbeat, but 3 are expected", "host srv-0 has 2 live GC heartbeat rows",
+			"2 server hosts write a GC heartbeat, but 3 are expected",
 		}},
 		{"no consistency check", func(r *Report) { r.Consistency.Ran = false }, []string{"the consistency check did not run"}},
 		{"missing gc rows", func(r *Report) { r.Consistency.MissingGCRows = 2 }, []string{"2 objects have no gc row"}},

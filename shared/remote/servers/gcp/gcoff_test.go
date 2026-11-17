@@ -333,7 +333,7 @@ func TestGCOff_NoGCTraffic(t *testing.T) {
 	for _, c := range late {
 		require.True(strings.HasPrefix(c, "ReadRows maps "), c)
 	}
-	require.Zero(spannerRows(t, dbID, "GcReplicas"))
+	require.Zero(spannerRows(t, dbID, "GcLists"))
 	require.Zero(spannerRows(t, dbID, "GcServers"))
 	require.Zero(spannerRows(t, dbID, "GcState"))
 }
@@ -357,7 +357,7 @@ func TestGCOff_GCOnHasGCTraffic(t *testing.T) {
 	require.Contains(traffic, "MutateRows gc ")
 	require.NotEmpty(gcTraffic(late), "the TTL expired, so the reads went to Bigtable again")
 	// Both servers wrote heartbeats and kept their rows when they closed.
-	require.Zero(spannerRows(t, dbID, "GcReplicas"))
+	require.Zero(spannerRows(t, dbID, "GcLists"))
 	require.Equal(2, spannerRows(t, dbID, "GcServers WHERE StoppedAt IS NOT NULL"))
 }
 

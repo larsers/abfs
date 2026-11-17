@@ -305,7 +305,11 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if btConnPool <= 0 {
 		btConnPool = DefaultBtConnPool
 	}
-	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool, opts.ClientMetrics)
+	var clientOpts []option.ClientOption
+	if opts.GC && !opts.GCReadOnly {
+		clientOpts = writeBoundOptions()
+	}
+	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool, opts.ClientMetrics, clientOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -406,6 +410,7 @@ func (s *GCPServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 
 // Headers implements remote.RemoteProvider.
 func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities.ObjectHeader, error) {
+	answer := s.gcHooks.startAnswer()
 	if err := s.gcHooks.checkHeartbeat(); err != nil {
 		return nil, err
 	}
@@ -420,6 +425,9 @@ func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities
 			result[i].Size = obj.Size
 			result[i].Type = entities.ObjectType(obj.TypeString())
 		}
+	}
+	if err := s.gcHooks.checkAnswer(ctx, pathHeaders, answer); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
@@ -501,6 +509,7 @@ func (s *GCPServer) getObjectData(ctx context.Context, key remote.Hash) (CachedH
 
 // GetObject implements remote.RemoteProvider.
 func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.ContentReadCloser, error) {
+	answer := s.gcHooks.startAnswer()
 	if err := s.gcHooks.checkHeartbeat(); err != nil {
 		return nil, err
 	}
@@ -518,6 +527,9 @@ func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.Cont
 			}
 			linksJSON, err := json.Marshal(linksContent)
 			if err == nil {
+				if err := s.gcHooks.checkAnswer(ctx, pathGetObject, answer); err != nil {
+					return nil, err
+				}
 				return remote.NewContentReader(io.NopCloser(bytes.NewReader(linksJSON)), remote.EncodingLinks), nil
 			}
 		}
@@ -525,6 +537,10 @@ func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.Cont
 
 	r, err := s.depot.Load(ctx, content.Content)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.gcHooks.checkAnswer(ctx, pathGetObject, answer); err != nil {
+		_ = r.Close()
 		return nil, err
 	}
 	if s.gcHooks.on {
@@ -537,13 +553,17 @@ func (s *GCPServer) GetObject(ctx context.Context, key remote.Hash) (remote.Cont
 // PutObject implements remote.RemoteProvider.
 func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remote.ContentReadCloser) (retErr error) {
 	defer entities.CloseErrCheck(reader, &retErr)
+	answer := s.gcHooks.startAnswer()
 	if err := s.gcHooks.checkHeartbeat(); err != nil {
 		return err
 	}
 
 	existingHdr, err := s.getHeader(ctx, key)
-	if err != nil || existingHdr.Valid {
+	if err != nil {
 		return err
+	}
+	if existingHdr.Valid {
+		return s.gcHooks.checkAnswer(ctx, pathPutObject, answer)
 	}
 
 	validateOpt := remote.ExtractLinksOpt(true)
@@ -584,7 +604,10 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	if err := s.validateObjectLinks(ctx, links); err != nil {
 		return err
 	}
-	// The edges go first, so that no object row exists without them.
+	// The edges go first, so that no object row exists without them. Their
+	// e:links cell is the touch of the object, made after written, so the
+	// cached header names the touch period of written.
+	written := cacheNow()
 	if s.gcEdges != nil {
 		if err := guard.do(ctx, func(ctx context.Context) error {
 			return s.gcEdges.Put(ctx, key, validator.Type(), validator.Object())
@@ -603,13 +626,12 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 		Content:  content,
 	}
 
-	written := cacheNow()
 	err = guard.do(ctx, func(ctx context.Context) error {
 		addAttempted = true
 		return s.addObject(ctx, header, objContent)
 	})
 	if err == nil {
-		s.storeHeader(header, written)
+		s.storeHeader(header, written, true)
 		s.storeContent(key, objContent, written)
 	}
 
@@ -631,6 +653,7 @@ func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
 
 // MapResults implements remote.RemoteProvider.
 func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.Hash, error) {
+	answer := s.gcHooks.startAnswer()
 	if err := s.gcHooks.checkHeartbeat(); err != nil {
 		return nil, err
 	}
@@ -638,7 +661,13 @@ func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.
 	if err != nil || !s.gcHooks.on {
 		return results, err
 	}
-	return s.liveMapResults(ctx, from, results)
+	if results, err = s.liveMapResults(ctx, from, results); err != nil {
+		return nil, err
+	}
+	if err := s.gcHooks.checkAnswer(ctx, pathMapResults, answer); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // AddMapResult implements remote.RemoteProvider.
@@ -919,9 +948,10 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 	}
 	start := cacheNow()
 	obj, err := s.casdb.GetHeader(ctx, hash)
+	rescued := false
 	if err == nil && obj != nil {
 		if err = s.gcHooks.checkReadAge(start); err == nil {
-			err = s.rescueCondemned(ctx, pathPutObject, obj)
+			rescued, err = s.rescueCondemned(ctx, pathPutObject, obj)
 		}
 	}
 	if err == casdb.ErrNotFound {
@@ -931,7 +961,7 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 	if err != nil || obj == nil {
 		return CachedHeader{}, err
 	}
-	cached := s.storeHeader(obj, start)
+	cached := s.storeHeader(obj, start, rescued)
 	s.touchHit(pathPutObject, hash, cached)
 	return cached, nil
 }
@@ -965,9 +995,10 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 
 	start := cacheNow()
 	objs, err := s.casdb.GetHeaders(ctx, misses)
+	var rescued map[entities.Hash]bool
 	if err == nil && s.gcHooks.on {
 		if err = s.gcHooks.checkReadAge(start); err == nil {
-			objs, err = s.rescueHeaders(ctx, path, objs)
+			objs, rescued, err = s.rescueHeaders(ctx, path, objs)
 		}
 	}
 	if err != nil {
@@ -977,7 +1008,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 
 	foundCount := 0
 	for _, o := range objs {
-		cached := s.storeHeader(o, start)
+		cached := s.storeHeader(o, start, rescued[o.Id])
 		s.touchHit(path, o.Id, cached)
 		for _, i := range missesIdx[o.Id] {
 			foundCount++
