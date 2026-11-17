@@ -35,7 +35,7 @@ import (
 )
 
 // newHooksTestBigtable starts an in-process Bigtable with the tables objects,
-// maps and gc and returns a client for it that dials with opts.
+// maps and abfsgc and returns a client for it that dials with opts.
 func newHooksTestBigtable(t *testing.T, opts ...grpc.DialOption) *bigtable.Client {
 	t.Helper()
 	ctx := context.Background()

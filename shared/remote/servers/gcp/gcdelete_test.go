@@ -49,7 +49,7 @@ import (
 )
 
 // deleteFixture is a condemnFixture whose cycles may delete: one server
-// writes a live GcServers heartbeat, and fakeChecks answers for the Bigtable
+// writes a live AbfsGcServers heartbeat, and fakeChecks answers for the Bigtable
 // instance.
 type deleteFixture struct {
 	*condemnFixture
@@ -127,7 +127,7 @@ func (f *deleteFixture) deletes(o *gc.DeleteOpts) *gc.Result {
 	return res
 }
 
-// age moves the completion of every complete list in GcLists back by 100 h,
+// age moves the completion of every complete list in AbfsGcLists back by 100 h,
 // past the hold of 88 h at the default grace, so that a delete may remove
 // their keys now.
 func (f *deleteFixture) age() {
@@ -135,14 +135,14 @@ func (f *deleteFixture) age() {
 	ctx := context.Background()
 	sp := f.s.casdb.SpannerClient()
 	var muts []*spanner.Mutation
-	err := sp.Single().Read(ctx, "GcLists", spanner.Key{gc.DefaultStateName}.AsPrefix(), []string{"Cycle", "CompleteTime"}).Do(func(row *spanner.Row) error {
+	err := sp.Single().Read(ctx, "AbfsGcLists", spanner.Key{gc.DefaultStateName}.AsPrefix(), []string{"Cycle", "CompleteTime"}).Do(func(row *spanner.Row) error {
 		var cycle int64
 		var complete spanner.NullTime
 		if err := row.Columns(&cycle, &complete); err != nil {
 			return err
 		}
 		if complete.Valid {
-			muts = append(muts, spanner.Update("GcLists", []string{"Name", "Cycle", "CompleteTime"}, []any{gc.DefaultStateName, cycle, complete.Time.Add(-100 * time.Hour)}))
+			muts = append(muts, spanner.Update("AbfsGcLists", []string{"Name", "Cycle", "CompleteTime"}, []any{gc.DefaultStateName, cycle, complete.Time.Add(-100 * time.Hour)}))
 		}
 		return nil
 	})
@@ -242,7 +242,7 @@ func TestDeleteGC_MatchesTheMarkerTheScanRead(t *testing.T) {
 	// A key of another complete list, cycle 7, with a marker of its own.
 	other := f.blob("marker of another list", f.old)
 	f.setMarker(other, marker(7))
-	_, err := f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Insert("GcLists",
+	_, err := f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Insert("AbfsGcLists",
 		[]string{"Name", "Cycle", "SnapshotTime", "CompleteTime", "CacheTTLSeconds", "Markers"},
 		[]any{gc.DefaultStateName, int64(7), f.old, time.Now().Add(-200 * time.Hour), int64(3600), int64(1)})})
 	require.NoError(err)
@@ -648,7 +648,7 @@ func TestDeleteGC_CycleOrder(t *testing.T) {
 	f.requirePresent(other, newer)
 
 	// A touch lost after the first read refuses nothing.
-	_, err = f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Delete("GcServers", spanner.Key{"srv-0-old"})})
+	_, err = f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Delete("AbfsGcServers", spanner.Key{"srv-0-old"})})
 	require.NoError(err)
 	f.age()
 	f.checks.hook = func() { f.server("srv-0-aa", true) }
@@ -658,7 +658,7 @@ func TestDeleteGC_CycleOrder(t *testing.T) {
 
 	// With no server heartbeat the condemn checks refuse, and no delete
 	// check runs.
-	_, err = f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Delete("GcServers", spanner.AllKeys())})
+	_, err = f.s.casdb.SpannerClient().Apply(ctx, []*spanner.Mutation{spanner.Delete("AbfsGcServers", spanner.AllKeys())})
 	require.NoError(err)
 	probes := f.checks.probes
 	_, err = f.deleteWith(f.s.casdb.BTClient(), nil)
@@ -752,7 +752,7 @@ func TestDeleteGC_UnknownOutcome(t *testing.T) {
 	_, err = f.deleteWith(bt, nil)
 	require.ErrorContains(err, "whose delete had an unknown outcome")
 	location, _ := f.listState()
-	require.Equal("gc/condemned/default/2", location.StringVal)
+	require.Equal("abfsgc/condemned/default/2", location.StringVal)
 	f.requirePresent(keptParent, kept)
 
 	f.age()
@@ -1029,7 +1029,7 @@ func TestDeleteGC_ChecksObjectsWrittenDuringTheScan(t *testing.T) {
 	require.Nil(res.Report.Delete.TooNew)
 	require.Empty(readsOf())
 
-	// The gc rows land once the scan of the table gc is done, as those of
+	// The gc rows land once the scan of the table abfsgc is done, as those of
 	// uploads during the cycle do; the scan of the objects waits for them.
 	f.age()
 	var once sync.Once

@@ -28,8 +28,8 @@ import (
 )
 
 const (
-	stateTable           = "GcState"
-	listsTable           = "GcLists"
+	stateTable           = "AbfsGcState"
+	listsTable           = "AbfsGcLists"
 	DefaultStateName     = "default"
 	DefaultLeaseDuration = 5 * time.Minute
 	PhaseDryRun          = "dry-run"
@@ -67,7 +67,7 @@ func (e *ErrLeaseHeld) Error() string {
 	return fmt.Sprintf("another garbage collector (%s) holds the lease until %s", e.Holder, e.Expiry.UTC().Format(time.RFC3339))
 }
 
-// Lease is the right to run a GC cycle, held in the GcState row of one
+// Lease is the right to run a GC cycle, held in the AbfsGcState row of one
 // garbage collector. Each new lease increments LeaseEpoch, and every write
 // checks the holder and the epoch, so a process that lost its lease cannot
 // write the state.
@@ -188,7 +188,7 @@ func (l *Lease) RecordSnapshot(ctx context.Context, snapshot time.Time) error {
 	return nil
 }
 
-// ListState is the condemned list that GcState records, for reports.
+// ListState is the condemned list that AbfsGcState records, for reports.
 type ListState struct {
 	// Location is the name of the list object in the server bucket, empty
 	// when no condemn cycle published one.
@@ -216,7 +216,7 @@ func (l *Lease) ReadList(ctx context.Context) (ListState, error) {
 	return ListState{Location: location.StringVal, SnapshotTime: snapshot.Time, Complete: complete.Valid && complete.Bool, CompleteTime: completeTime.Time}, nil
 }
 
-// ListRecord is the row of GcLists of the list of one condemn or delete
+// ListRecord is the row of AbfsGcLists of the list of one condemn or delete
 // cycle. A marker of that cycle counts for a delete only once the record is
 // complete: every marker of the list landed before CompleteTime.
 type ListRecord struct {
@@ -240,7 +240,7 @@ func (r *ListRecord) Complete() bool {
 
 var listColumns = []string{"Cycle", "SnapshotTime", "Location", "CompleteTime", "CacheTTLSeconds", "Markers"}
 
-// ReadListRecords returns the rows of GcLists of the garbage collector of
+// ReadListRecords returns the rows of AbfsGcLists of the garbage collector of
 // the lease, by cycle.
 func (l *Lease) ReadListRecords(ctx context.Context) (map[int64]*ListRecord, error) {
 	records := make(map[int64]*ListRecord)
@@ -264,7 +264,7 @@ func (l *Lease) ReadListRecords(ctx context.Context) (map[int64]*ListRecord, err
 }
 
 // RecordList records the condemned list of this cycle, not complete yet, in
-// GcState and in GcLists.
+// AbfsGcState and in AbfsGcLists.
 func (l *Lease) RecordList(ctx context.Context, location string, snapshot time.Time) error {
 	insert := spanner.Insert(listsTable, []string{"Name", "Cycle", "SnapshotTime", "Location"}, []any{l.name, l.Cycle, snapshot, location})
 	if err := l.updateWith(ctx, func(time.Time) map[string]any {
@@ -289,7 +289,7 @@ func (l *Lease) CompleteList(ctx context.Context, ttl time.Duration, markers int
 	return nil
 }
 
-// PruneListRecords deletes the rows of GcLists of cycles.
+// PruneListRecords deletes the rows of AbfsGcLists of cycles.
 func (l *Lease) PruneListRecords(ctx context.Context, cycles []int64) error {
 	if len(cycles) == 0 {
 		return nil
@@ -304,7 +304,7 @@ func (l *Lease) PruneListRecords(ctx context.Context, cycles []int64) error {
 	return nil
 }
 
-// ClearListRecords deletes every row of GcLists of the garbage collector of
+// ClearListRecords deletes every row of AbfsGcLists of the garbage collector of
 // the lease.
 func (l *Lease) ClearListRecords(ctx context.Context) error {
 	if err := l.updateWith(ctx, func(time.Time) map[string]any { return map[string]any{} }, spanner.Delete(listsTable, spanner.Key{l.name}.AsPrefix())); err != nil {

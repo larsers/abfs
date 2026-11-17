@@ -31,7 +31,7 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// A delete record is the object gc/deleted/<state>/<cycle>/<level>-<range>-<batch>
+// A delete record is the object abfsgc/deleted/<state>/<cycle>/<level>-<range>-<batch>
 // in the server bucket, written by the delete step before it deletes the rows
 // of one batch, so that the chunks of every deleted object can be found after
 // its row is gone, and an undo can write the rows back. It holds a header,
@@ -43,7 +43,7 @@ import (
 // Readers that need only the keys stop after the key section. Integers are
 // big-endian.
 const (
-	recordPrefix        = "gc/deleted/"
+	recordPrefix        = "abfsgc/deleted/"
 	recordMagic         = "ABFSGCD\n"
 	recordFormatVersion = 2
 	recordObject        = 1

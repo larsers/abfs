@@ -116,13 +116,13 @@ type CondemnReport struct {
 	CacheTTLHours float64  `json:"cache_ttl_hours"`
 	NotCompleted  []string `json:"not_completed,omitempty"`
 	// ListsRemoved counts the list objects of older cycles deleted, and
-	// RecordsRemoved the rows of GcLists of lists no object holds the marker
+	// RecordsRemoved the rows of AbfsGcLists of lists no object holds the marker
 	// of.
 	ListsRemoved   int64 `json:"lists_removed"`
 	RecordsRemoved int64 `json:"records_removed"`
 	// RecordsCleared reports that the cycle found objects without a gc row,
 	// which only servers without --gc write, and deleted every row of
-	// GcLists before any other step, so that every marker is written again
+	// AbfsGcLists before any other step, so that every marker is written again
 	// and held anew.
 	RecordsCleared bool `json:"records_cleared,omitempty"`
 }
@@ -143,7 +143,7 @@ func (e *ErrCondemnRefused) Error() string {
 // run, then, unless condemnBlockers finds a reason to refuse, it clears the
 // markers of the live objects, publishes the list of the unreachable objects
 // that hold no marker of a complete list in bucket, sets their marker
-// g:condemned to the cycle number and completes the list in GcLists. A
+// abfsgc:condemned to the cycle number and completes the list in AbfsGcLists. A
 // marker of a complete list is never written again. It deletes nothing. A
 // refused cycle returns its result with an *ErrCondemnRefused.
 func Condemn(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, opts *CondemnOpts) (*Result, error) {

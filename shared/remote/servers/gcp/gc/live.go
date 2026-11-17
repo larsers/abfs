@@ -71,7 +71,7 @@ type liveKey struct {
 	Marker int64 `json:"marker"`
 }
 
-// previousList is the condemned list that GcState names at the start of a
+// previousList is the condemned list that AbfsGcState names at the start of a
 // cycle, for the report: its state, its keys, nil when it could not be read,
 // and why.
 type previousList struct {
@@ -105,7 +105,7 @@ func readPreviousList(ctx context.Context, lease *Lease, bucket *storage.BucketH
 	return prev, nil
 }
 
-// readPrevious reads the condemned list that GcState names, so that the mark
+// readPrevious reads the condemned list that AbfsGcState names, so that the mark
 // tracks the first roots of its keys. The list serves only the report.
 func (c *condemner) readPrevious(ctx context.Context, lease *Lease, d *dryRun) error {
 	var err error

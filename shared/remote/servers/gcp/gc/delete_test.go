@@ -376,7 +376,7 @@ func TestDeleteRecord_WriteRead(t *testing.T) {
 	}
 	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000)}
 	name := recordObjectName("default", 5, 1, 3, 0)
-	require.Equal("gc/deleted/default/5/1-3-0", name)
+	require.Equal("abfsgc/deleted/default/5/1-3-0", name)
 	size, err := writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, hdr, entries)
 	require.NoError(err)
 	attrs, err := bucket.Object(name).Attrs(ctx)

@@ -87,7 +87,7 @@ type DryRunOpts struct {
 	WriteDeadline time.Duration
 	// Holder names this process in the lease; empty uses DefaultHolder.
 	Holder string
-	// StateName is the GcState row; empty uses DefaultStateName.
+	// StateName is the AbfsGcState row; empty uses DefaultStateName.
 	StateName string
 	// Explain lists keys whose state and first root the report explains.
 	Explain []Hash
@@ -219,7 +219,7 @@ const (
 	RootPermanent = "permanent"
 )
 
-// ObjectCounts counts the objects of the table gc.
+// ObjectCounts counts the objects of the table abfsgc.
 type ObjectCounts struct {
 	// Rows counts the gc rows, one per object.
 	Rows        int64 `json:"rows"`
@@ -321,9 +321,9 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 }
 
 // DryRun runs one garbage collection cycle that only reports: it takes the
-// lease, reads the roots at one snapshot, marks the objects of the table gc
+// lease, reads the roots at one snapshot, marks the objects of the table abfsgc
 // and counts what a collection would remove. It writes nothing but the
-// GcState row and deletes old GcServers rows. objs reads the workspace
+// AbfsGcState row and deletes old AbfsGcServers rows. objs reads the workspace
 // snapshots, mount details and pinned manifests of live mounts and
 // workspaces. With the consistency check the report also counts what a
 // delete cycle would remove now, from the markers it read and the records of
@@ -466,7 +466,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	for _, w := range r.Replicas.Warnings {
 		log.Printf("Warning: %s", w)
 	}
-	// A row of GcServers is evidence for every delete whose window holds it,
+	// A row of AbfsGcServers is evidence for every delete whose window holds it,
 	// so it stays for the largest grace of any condemn or delete cycle, and
 	// for the time before the window in which a map row loss is reported.
 	keep := max(staleReplicaAge, max(d.lease.MaxGrace, o.Grace)+time.Hour+clientMapReuse+keepAlivePassAllowance)

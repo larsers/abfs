@@ -19,7 +19,7 @@
 -- (LeaseHolder until LeaseExpiry, fenced by LeaseEpoch) runs the cycles, and
 -- Phase is the mode of its cycle. PreviousLeaseExpiry is the expiry of the
 -- lease that the current holder took over, NULL when it had been released.
-CREATE TABLE IF NOT EXISTS GcState (
+CREATE TABLE IF NOT EXISTS AbfsGcState (
     Name STRING(64) NOT NULL,
     Cycle INT64 NOT NULL,
     Phase STRING(64),
@@ -38,21 +38,21 @@ CREATE TABLE IF NOT EXISTS GcState (
 -- The condemned list of the last condemn cycle: ListLocation is its object in
 -- the server bucket, ListSnapshotTime the snapshot time of that cycle, and
 -- ListComplete tells that every marker of the list was written. Added after
--- the table, so that init --gc adds them to a GcState created without them.
-ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListSnapshotTime TIMESTAMP;
-ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListComplete BOOL;
+-- the table, so that init --gc adds them to an AbfsGcState created without them.
+ALTER TABLE AbfsGcState ADD COLUMN IF NOT EXISTS ListSnapshotTime TIMESTAMP;
+ALTER TABLE AbfsGcState ADD COLUMN IF NOT EXISTS ListComplete BOOL;
 
 -- ListCompleteTime is the commit time of the write that completed the list,
 -- and MaxGraceSeconds the largest grace of a condemn or delete lease.
-ALTER TABLE GcState ADD COLUMN IF NOT EXISTS ListCompleteTime TIMESTAMP OPTIONS (allow_commit_timestamp=true);
-ALTER TABLE GcState ADD COLUMN IF NOT EXISTS MaxGraceSeconds INT64;
+ALTER TABLE AbfsGcState ADD COLUMN IF NOT EXISTS ListCompleteTime TIMESTAMP OPTIONS (allow_commit_timestamp=true);
+ALTER TABLE AbfsGcState ADD COLUMN IF NOT EXISTS MaxGraceSeconds INT64;
 
 -- One row per condemned list of a garbage collector. A condemn cycle inserts
 -- it before its first marker and sets CompleteTime, the largest cache TTL of
 -- the servers and the number of markers after the last marker was written. A
 -- marker of a cycle without a complete row is written again by a later
 -- condemn; one with a complete row is deleted a hold after CompleteTime.
-CREATE TABLE IF NOT EXISTS GcLists (
+CREATE TABLE IF NOT EXISTS AbfsGcLists (
     Name STRING(MAX) NOT NULL,
     Cycle INT64 NOT NULL,
     SnapshotTime TIMESTAMP NOT NULL,
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS GcLists (
 -- is set when a heartbeat or the stop records lost object touches, StoppedAt
 -- by a clean stop. A process that has neither a recent heartbeat nor
 -- StoppedAt crashed.
-CREATE TABLE IF NOT EXISTS GcServers (
+CREATE TABLE IF NOT EXISTS AbfsGcServers (
     ServerId STRING(MAX) NOT NULL,
     Version INT64 NOT NULL,
     GcEnabled BOOL NOT NULL,
@@ -84,4 +84,4 @@ CREATE TABLE IF NOT EXISTS GcServers (
 
 -- MapRowLossTime is set as TouchLossTime is, when a heartbeat or the stop
 -- records lost map row touches. Both are reported, not checked.
-ALTER TABLE GcServers ADD COLUMN IF NOT EXISTS MapRowLossTime TIMESTAMP OPTIONS (allow_commit_timestamp=true);
+ALTER TABLE AbfsGcServers ADD COLUMN IF NOT EXISTS MapRowLossTime TIMESTAMP OPTIONS (allow_commit_timestamp=true);

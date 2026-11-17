@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	serversTable = "GcServers"
+	serversTable = "AbfsGcServers"
 	// MaxHeartbeatInterval is the longest heartbeat interval of a server with
 	// GC.
 	MaxHeartbeatInterval = 10 * time.Minute
@@ -38,7 +38,7 @@ const (
 	HeartbeatTimeout = 30 * time.Second
 )
 
-// Server is the heartbeat row of a server process in GcServers. It stays
+// Server is the heartbeat row of a server process in AbfsGcServers. It stays
 // when the process stops, so that the collector can tell for any time window
 // which processes ran, with which version of the GC rules and settings.
 type Server struct {
@@ -107,13 +107,13 @@ func appendLosses(cols []string, vals []any, lost, mapRowsLost bool) ([]string, 
 	return cols, vals
 }
 
-// ReadServers returns the rows of GcServers.
+// ReadServers returns the rows of AbfsGcServers.
 func ReadServers(ctx context.Context, client *spanner.Client) ([]Server, error) {
 	servers, _, err := readServers(ctx, client)
 	return servers, err
 }
 
-// readServers returns the rows of GcServers and the time of the read, a
+// readServers returns the rows of AbfsGcServers and the time of the read, a
 // Spanner time like the times in the rows.
 func readServers(ctx context.Context, client *spanner.Client) ([]Server, time.Time, error) {
 	var servers []Server
@@ -143,7 +143,7 @@ func readServers(ctx context.Context, client *spanner.Client) ([]Server, time.Ti
 	return servers, read, nil
 }
 
-// PruneServers deletes the rows of GcServers whose process neither wrote a
+// PruneServers deletes the rows of AbfsGcServers whose process neither wrote a
 // heartbeat nor stopped since before, crashed ones included, and returns how
 // many it deleted.
 func PruneServers(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {

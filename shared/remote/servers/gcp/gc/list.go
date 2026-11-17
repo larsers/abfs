@@ -37,12 +37,12 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// A condemned list is the object gc/condemned/<state>/<cycle> in the server
+// A condemned list is the object abfsgc/condemned/<state>/<cycle> in the server
 // bucket: a header, then one record per condemned object in key order, of
 // the 20-byte key, the type as an index into the header's type names, and
 // the size, big-endian. Format version 1 has no chunk descriptors.
 const (
-	listPrefix        = "gc/condemned/"
+	listPrefix        = "abfsgc/condemned/"
 	liveSuffix        = ".live"
 	listMagic         = "ABFSGCL\n"
 	listFormatVersion = 1

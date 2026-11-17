@@ -26,11 +26,11 @@ const (
 	// and HeartbeatTimeout after its last successful heartbeat, at most
 	// 20.5 minutes. A process counts for the window of a cycle until then.
 	liveReplicaAge = 30 * time.Minute
-	// staleReplicaAge is the shortest time a row of GcServers is kept.
+	// staleReplicaAge is the shortest time a row of AbfsGcServers is kept.
 	staleReplicaAge = 24 * time.Hour
 )
 
-// ReplicaReport reports the server processes seen in GcServers.
+// ReplicaReport reports the server processes seen in AbfsGcServers.
 type ReplicaReport struct {
 	// Live counts the rows of processes that did not record a stop and may
 	// still serve: their last heartbeat is within their serve limit (see
@@ -50,7 +50,7 @@ type ReplicaReport struct {
 	// Warnings lists the live rows whose settings break the timing rules of
 	// the collector. A condemn mode would refuse to run with any of them.
 	Warnings []string `json:"warnings,omitempty"`
-	// ServersRemoved counts the rows of GcServers that the run deleted, those
+	// ServersRemoved counts the rows of AbfsGcServers that the run deleted, those
 	// older than any grace a delete could still need them for.
 	ServersRemoved int64 `json:"servers_removed"`
 	// MapRowLossTime is the latest time a server recorded lost map row
@@ -73,7 +73,7 @@ func (s *Server) replica() Replica {
 	return Replica{ID: s.ID, Version: s.Version, GC: s.GC, TouchInterval: s.TouchInterval, CacheTTL: s.CacheTTL, HeartbeatInterval: s.HeartbeatInterval, LastSeen: s.LastSeen}
 }
 
-// serverReplicas returns the rows of GcServers that checkReplicas checks,
+// serverReplicas returns the rows of AbfsGcServers that checkReplicas checks,
 // all but those of processes that recorded a stop, and how many it left out.
 func serverReplicas(servers []Server) ([]Replica, int64) {
 	var replicas []Replica

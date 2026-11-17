@@ -30,14 +30,14 @@ import (
 	"github.com/google/abfs/shared/objects"
 )
 
-// The table gc has one row per object, keyed like the objects table. The
-// family e holds the edges, the family t the last touch. The family g of the
+// The table abfsgc has one row per object, keyed like the objects table. The
+// family e holds the edges, the family t the last touch. The family abfsgc of the
 // objects table holds the condemn marker.
 const (
-	TableName      = "gc"
+	TableName      = "abfsgc"
 	EdgesFamily    = "e"
 	TouchFamily    = "t"
-	ObjectsFamily  = "g"
+	ObjectsFamily  = "abfsgc"
 	LinksColumn    = "links"
 	TypeColumn     = "type"
 	VersionColumn  = "ver"
@@ -53,7 +53,7 @@ type EdgeWriter struct {
 	budget    writeBudget
 }
 
-// NewEdgeWriter returns an EdgeWriter for the table gc of client's instance.
+// NewEdgeWriter returns an EdgeWriter for the table abfsgc of client's instance.
 // Its writes run under the caller's context; a server bounds them from the
 // link validation of the call.
 func NewEdgeWriter(client *bigtable.Client) *EdgeWriter {
@@ -157,7 +157,7 @@ func versionBytes(v int64) []byte {
 	return binary.BigEndian.AppendUint64(nil, uint64(v))
 }
 
-// Row is a row of the table gc.
+// Row is a row of the table abfsgc.
 type Row struct {
 	Key     Hash
 	Type    string
@@ -168,7 +168,7 @@ type Row struct {
 	Written time.Time
 }
 
-// ParseRow parses a row of the table gc read with the newest cell of each
+// ParseRow parses a row of the table abfsgc read with the newest cell of each
 // column. A column that is missing keeps its zero value.
 func ParseRow(row bigtable.Row) (*Row, error) {
 	if !entities.IsHash(row.Key()) {

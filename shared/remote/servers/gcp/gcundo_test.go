@@ -34,12 +34,12 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// staleLease records in GcState a lease of another holder that expired ten
+// staleLease records in AbfsGcState a lease of another holder that expired ten
 // minutes ago, as a collector that crashed leaves it, so that the fence of
 // the next lease has passed.
 func (f *deleteFixture) staleLease() {
 	f.t.Helper()
-	_, err := f.s.casdb.SpannerClient().Apply(context.Background(), []*spanner.Mutation{spanner.Update("GcState",
+	_, err := f.s.casdb.SpannerClient().Apply(context.Background(), []*spanner.Mutation{spanner.Update("AbfsGcState",
 		[]string{"Name", "LeaseHolder", "LeaseExpiry"}, []any{gc.DefaultStateName, "crashed-collector", time.Now().Add(-10 * time.Minute)})})
 	require.NoError(f.t, err)
 }

@@ -266,7 +266,7 @@ type NewServerOpts struct {
 	// and not GCReadOnly it must be above zero.
 	GCTouchInterval time.Duration
 	// GCHeartbeatInterval is the time between two heartbeats of this server in
-	// the table GcServers; zero uses DefaultGCHeartbeatInterval, and tests set
+	// the table AbfsGcServers; zero uses DefaultGCHeartbeatInterval, and tests set
 	// shorter ones. It is at most gc.MaxHeartbeatInterval, and the server
 	// stops serving while its last successful heartbeat is older than two
 	// intervals and 30 s.

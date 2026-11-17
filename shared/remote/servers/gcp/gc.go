@@ -23,7 +23,7 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// BackfillGC writes the missing and outdated rows of the table gc; see
+// BackfillGC writes the missing and outdated rows of the table abfsgc; see
 // gc.Backfill.
 func (s *GCPServer) BackfillGC(ctx context.Context, opts *gc.BackfillOpts) (*gc.BackfillStats, error) {
 	return gc.Backfill(ctx, s.casdb.BTClient(), s, opts)

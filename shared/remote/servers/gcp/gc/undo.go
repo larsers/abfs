@@ -78,7 +78,7 @@ type UndoOpts struct {
 	WriteDeadline time.Duration
 	// Holder names this process in the lease; empty uses DefaultHolder.
 	Holder string
-	// StateName is the GcState row; empty uses DefaultStateName.
+	// StateName is the AbfsGcState row; empty uses DefaultStateName.
 	StateName string
 }
 

@@ -137,7 +137,7 @@ type walker struct {
 // the commit and the trees of every pinned revision from object content, as
 // a client's checkout of the mount sees them. It reports, for each key,
 // whether the walk reached it and the first path that did. It does not read
-// the gc table, so a gap in the edges the collector extracted does not hide
+// the abfsgc table, so a gap in the edges the collector extracted does not hide
 // a key from it, and it reads trees only to list their entries, so a blob
 // need not exist to be found. objs must neither rescue nor touch what it
 // reads.

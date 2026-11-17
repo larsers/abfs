@@ -61,7 +61,7 @@ func TestCheckReplicas(t *testing.T) {
 	require.Equal(t, ReplicaReport{Live: 1, Stale: 1, Hosts: 1, RowsPerHost: map[string]int64{"srv-0": 1}}, rep)
 }
 
-// The rows of GcServers count in the replica checks, except those of
+// The rows of AbfsGcServers count in the replica checks, except those of
 // processes that recorded a stop, with or without a loss. A row that did not
 // record a stop counts as a live host only within its serve limit.
 func TestServerReplicas(t *testing.T) {

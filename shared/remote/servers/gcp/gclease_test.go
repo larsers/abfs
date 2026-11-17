@@ -55,7 +55,7 @@ func TestAcquireLease_RefusesValidLeaseOfAnotherHolder(t *testing.T) {
 	require.Equal(int64(2), second.Epoch)
 	require.ErrorIs(first.RecordSnapshot(ctx, time.Now()), gc.ErrLeaseLost)
 
-	row, err := sp.Single().ReadRow(ctx, "GcState", spanner.Key{gc.DefaultStateName}, []string{"Phase", "GraceSeconds", "CycleStartTime", "PreviousCycleStartTime"})
+	row, err := sp.Single().ReadRow(ctx, "AbfsGcState", spanner.Key{gc.DefaultStateName}, []string{"Phase", "GraceSeconds", "CycleStartTime", "PreviousCycleStartTime"})
 	require.NoError(err)
 	var phase string
 	var grace int64
@@ -112,7 +112,7 @@ func TestAcquireLease_RecordsPreviousLeaseExpiry(t *testing.T) {
 	ctx := context.Background()
 	sp := newEmulatorCASDBServer(t).casdb.SpannerClient()
 	state := func() (phase spanner.NullString, prev spanner.NullTime) {
-		row, err := sp.Single().ReadRow(ctx, "GcState", spanner.Key{gc.DefaultStateName}, []string{"Phase", "PreviousLeaseExpiry"})
+		row, err := sp.Single().ReadRow(ctx, "AbfsGcState", spanner.Key{gc.DefaultStateName}, []string{"Phase", "PreviousLeaseExpiry"})
 		require.NoError(err)
 		require.NoError(row.Columns(&phase, &prev))
 		return phase, prev
@@ -159,7 +159,7 @@ func TestLease_WatchdogStopsWhenLeaseIsTaken(t *testing.T) {
 
 	// Another process takes the lease over, for example after this one
 	// stalled past its expiry.
-	_, err = sp.Apply(ctx, []*spanner.Mutation{spanner.UpdateMap("GcState", map[string]any{
+	_, err = sp.Apply(ctx, []*spanner.Mutation{spanner.UpdateMap("AbfsGcState", map[string]any{
 		"Name": gc.DefaultStateName, "LeaseHolder": "other", "LeaseEpoch": lease.Epoch + 1, "UpdateTime": spanner.CommitTimestamp,
 	})})
 	require.NoError(err)
@@ -195,7 +195,7 @@ func TestAcquireLease_RecordsLargestGrace(t *testing.T) {
 	ctx := context.Background()
 	sp := newEmulatorCASDBServer(t).casdb.SpannerClient()
 	state := func() (grace spanner.NullInt64) {
-		row, err := sp.Single().ReadRow(ctx, "GcState", spanner.Key{gc.DefaultStateName}, []string{"MaxGraceSeconds"})
+		row, err := sp.Single().ReadRow(ctx, "AbfsGcState", spanner.Key{gc.DefaultStateName}, []string{"MaxGraceSeconds"})
 		require.NoError(err)
 		require.NoError(row.Columns(&grace))
 		return grace
@@ -222,9 +222,9 @@ func TestAcquireLease_RecordsLargestGrace(t *testing.T) {
 	}
 }
 
-// A list gets its row in GcLists with its record in GcState, its completion
+// A list gets its row in AbfsGcLists with its record in AbfsGcState, its completion
 // time from the commit of CompleteList with the cache TTL and the number of
-// markers, and a new list clears the completion in GcState, so that a stale
+// markers, and a new list clears the completion in AbfsGcState, so that a stale
 // time never vouches for a newer list. A holder that lost the lease can
 // neither record nor complete a list, and pruning deletes the rows named.
 func TestLease_ListRecords(t *testing.T) {
@@ -235,7 +235,7 @@ func TestLease_ListRecords(t *testing.T) {
 	l, err := gc.AcquireLease(ctx, sp, gc.DefaultStateName, "holder", gc.PhaseCondemn, time.Minute, testGrace)
 	require.NoError(err)
 	defer l.Release()
-	require.NoError(l.RecordList(ctx, "gc/default/list-1", l.Start))
+	require.NoError(l.RecordList(ctx, "abfsgc/default/list-1", l.Start))
 	st, err := l.ReadList(ctx)
 	require.NoError(err)
 	require.False(st.Complete)
@@ -243,7 +243,7 @@ func TestLease_ListRecords(t *testing.T) {
 	records, err := l.ReadListRecords(ctx)
 	require.NoError(err)
 	require.Len(records, 1)
-	require.Equal("gc/default/list-1", records[1].Location)
+	require.Equal("abfsgc/default/list-1", records[1].Location)
 	require.False(records[1].Complete())
 	require.True(records[1].SnapshotTime.Equal(l.Start))
 
@@ -252,7 +252,7 @@ func TestLease_ListRecords(t *testing.T) {
 	require.NoError(err)
 	require.True(st.Complete)
 	require.True(st.CompleteTime.After(l.Start), "completion %s, lease %s", st.CompleteTime, l.Start)
-	row, err := sp.Single().ReadRow(ctx, "GcState", spanner.Key{gc.DefaultStateName}, []string{"UpdateTime"})
+	row, err := sp.Single().ReadRow(ctx, "AbfsGcState", spanner.Key{gc.DefaultStateName}, []string{"UpdateTime"})
 	require.NoError(err)
 	var updated time.Time
 	require.NoError(row.Columns(&updated))
@@ -268,11 +268,11 @@ func TestLease_ListRecords(t *testing.T) {
 	l2, err := gc.AcquireLease(ctx, sp, gc.DefaultStateName, "other", gc.PhaseCondemn, time.Minute, testGrace)
 	require.NoError(err)
 	defer l2.Release()
-	require.ErrorIs(l.RecordList(ctx, "gc/default/list-x", l.Start), gc.ErrLeaseLost)
+	require.ErrorIs(l.RecordList(ctx, "abfsgc/default/list-x", l.Start), gc.ErrLeaseLost)
 	require.ErrorIs(l.CompleteList(ctx, time.Hour, 1), gc.ErrLeaseLost)
 	require.ErrorIs(l.PruneListRecords(ctx, []int64{1}), gc.ErrLeaseLost)
 
-	require.NoError(l2.RecordList(ctx, "gc/default/list-2", l2.Start))
+	require.NoError(l2.RecordList(ctx, "abfsgc/default/list-2", l2.Start))
 	st, err = l2.ReadList(ctx)
 	require.NoError(err)
 	require.False(st.Complete)

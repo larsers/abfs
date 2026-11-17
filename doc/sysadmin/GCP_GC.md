@@ -17,14 +17,14 @@ Garbage collection is off by default. Three parts take part when it is on:
 * map rows, such as cached build results, within their retention;
 * every object written or used within the grace period (`--grace`, default `72h`).
 
-**Mark.** Each server writes, for every object it stores, a row in the Bigtable table `gc` with the objects it links (its GC edges). The collector reads every ref at one snapshot time, scans the `gc` table and marks in memory everything the roots reach. What stays unmarked is unreachable. It reads no object content.
+**Mark.** Each server writes, for every object it stores, a row in the Bigtable table `abfsgc` with the objects it links (its GC edges). The collector reads every ref at one snapshot time, scans the `abfsgc` table and marks in memory everything the roots reach. What stays unmarked is unreachable. It reads no object content.
 
 **Grace.** A new object is unreachable for a while: an upload stores the children of a commit before the ref that links it, clients reuse hashes they hold, and a server records a use of an object at most once per `--gc-touch-interval`. So an object counts as garbage only when it was neither written nor used within `--grace`; [Root classes](#root-classes) gives the smallest value the command accepts.
 
 **Condemn, rescue, delete.** Nothing is deleted in the cycle that finds it unreachable, nor for a hold after that:
 
 ```
-cycle N     mark; condemn: write list N to the bucket and to GcLists, set marker N
+cycle N     mark; condemn: write list N to the bucket and to AbfsGcLists, set marker N
             on each unreachable object without one, then complete list N
             a server that reads a marked object clears the marker (rescue)
 cycle D     mark again; once the hold of list N has ended (--grace plus 16h after
@@ -38,7 +38,7 @@ A rescue shows that an object was still in use, so the delete, a conditional wri
 
 **Client content.** A mount of a client with `gc-keepalive` rewrites its mount ref every 15 minutes and sends the hashes of what it holds to the server every 18 hours, which keeps them used. Cacheman with `gc-keepalive` keeps content a client wrote out of eviction until a server confirmed it holds the object. `abfs ws snapshot` writes a ref for the snapshot, which keeps it for `--snapshot-retention` after its last `ws snapshot` or `--restore`.
 
-**Servers.** Each server with `--gc` writes a heartbeat row to the Spanner table `GcServers` with the version of the GC rules it follows, its settings, whether it lost a record of a use (a touch) of an object or of a map row, and its stop. The collector refuses to condemn when the number of server hosts does not match, and refuses to delete when any server that ran within the grace followed an older version of the GC rules or ran with settings that break the timing rules. The hold of the markers rests on no touch that a server buffers, so a crash, a lost touch or a pause of a server refuses nothing; lost touches are reported in the heartbeat row and the metrics.
+**Servers.** Each server with `--gc` writes a heartbeat row to the Spanner table `AbfsGcServers` with the version of the GC rules it follows, its settings, whether it lost a record of a use (a touch) of an object or of a map row, and its stop. The collector refuses to condemn when the number of server hosts does not match, and refuses to delete when any server that ran within the grace followed an older version of the GC rules or ran with settings that break the timing rules. The hold of the markers rests on no touch that a server buffers, so a crash, a lost touch or a pause of a server refuses nothing; lost touches are reported in the heartbeat row and the metrics.
 
 **Staged path.** Turn it on in three modes, each after the one before ran clean: `--dry-run` only reports, `--condemn` also marks, and `--delete` also deletes. Each delete record holds the rows it deletes, so `gc undo` can write them back.
 
@@ -47,12 +47,12 @@ A rescue shows that an object was still in use, so the delete, a conditional wri
 | Command | What it does | Writes | When to run it |
 | --- | --- | --- | --- |
 | `abfs server gcp init --gc` | Creates the garbage collector tables and columns | Spanner and Bigtable schema | Once, and with each new version before its servers start |
-| `abfs server gcp --gc` (server flag) | The server side: `gc` rows, touches, rescues, heartbeats | `gc` rows, touches, heartbeat rows; deletes nothing | On every server while garbage collection is on |
-| `gc backfill` | Writes the `gc` rows that objects lack or that have outdated edge rules | `gc` rows | After every server runs with `--gc`, and after an upgrade of the edge rules |
-| `gc run --dry-run` | Runs one cycle that only reports | `GcState`, removal of old heartbeat rows | Before condemn mode, and any time to look |
-| `gc run --condemn` | A dry run that also lists and marks the unreachable objects | Lists in the bucket, `GcLists` rows, markers | On the job's schedule, after clean dry runs |
+| `abfs server gcp --gc` (server flag) | The server side: `abfsgc` rows, touches, rescues, heartbeats | `abfsgc` rows, touches, heartbeat rows; deletes nothing | On every server while garbage collection is on |
+| `gc backfill` | Writes the `abfsgc` rows that objects lack or that have outdated edge rules | `abfsgc` rows | After every server runs with `--gc`, and after an upgrade of the edge rules |
+| `gc run --dry-run` | Runs one cycle that only reports | `AbfsGcState`, removal of old heartbeat rows | Before condemn mode, and any time to look |
+| `gc run --condemn` | A dry run that also lists and marks the unreachable objects | Lists in the bucket, `AbfsGcLists` rows, markers | On the job's schedule, after clean dry runs |
 | `gc run --delete` | A condemn cycle that first deletes the objects whose marker has held long enough, deletes chunks and removes expired refs | Deletes rows, chunks and refs; writes records | On the job's schedule, after clean condemn cycles |
-| `gc undo` | Writes back what delete cycles deleted, from their delete records | `objects`, `gc` and `maps` rows, a cell of `chunks` rows, bucket metadata | After a wrong delete, with the delete job stopped |
+| `gc undo` | Writes back what delete cycles deleted, from their delete records | `objects`, `abfsgc` and `maps` rows, a cell of `chunks` rows, bucket metadata | After a wrong delete, with the delete job stopped |
 | `gc walk` | Tells whether keys are in the checkouts of mounts, from object content | Nothing | To explain a key that a client used after it was condemned |
 
 All `gc` commands are subcommands of `abfs server gcp gc` and take `--project`, `--instance`, `--bucket`, `--db`, `--bt-instance` and `--bt-app-profile` as the server does.
@@ -62,14 +62,14 @@ All `gc` commands are subcommands of `abfs server gcp gc` and take `--project`, 
 Garbage collection is off unless it is turned on, on the servers and on the clients. Turn it on in this order:
 
 1. Run `abfs server gcp init --gc` to add the garbage collector resources. A server with `--gc` refuses to start without them.
-2. Restart every server with `--gc`. From then on each new object gets its `gc` row.
+2. Restart every server with `--gc`. From then on each new object gets its `abfsgc` row.
 3. Run `abfs server gcp gc backfill` for the objects added before. Start it after the last server was restarted with `--gc`, so that no object is added without a row after the scan passed its key.
 4. Turn on the client option `gc-keepalive`, for all clients at once in the central client configuration (`abfs edit config:clients/configs`, see the [System Admin doc](README.md)) with `gc-keepalive: true` under `config:`, or per client with `abfs config`. Set it in the configuration cacheman starts from as well as in the one the mounts start from. Mounts started after the change rewrite their mount ref every 15 minutes, a fixed interval that their mount details record (a configuration that still sets `gc-keepalive-ref-interval` loads, and the key is ignored), and send the hashes of what they hold to the server every `gc-keepalive-touch-interval` (default `18h`), at most 10,000 hashes per second. A send that fails is tried again after 5 minutes, then after twice the previous wait, up to half the touch interval, until one works. The touch interval applies only with `gc-keepalive`; `0` turns the sends off.
 5. Run `abfs server gcp gc run --dry-run` on the job's schedule while seeding and builds run, and check each report: no `replicas.warnings`, no `consistency.missing_gc_rows`, no `objects.outdated_rows`, and the dangling edges and roots.
 6. When the dry runs are clean, run `abfs server gcp gc run --condemn` on the same schedule instead (see [Condemn mode](#condemn-mode)).
 7. Prepare delete mode: a Bigtable instance with one cluster (see [Delete checks](#delete-checks)), an [app profile](#app-profile-of-the-collector) and the [permissions](#permissions-of-the-collector) of the collector, and a bucket with versioning off and no retention policy.
 8. When the condemn cycles have run clean for a week or more under real use, run `abfs server gcp gc run --delete` on the same schedule instead (see [Delete mode](#delete-mode)). Before the first one, check the last condemn reports:
-   * `delete.refused` names no reason you cannot explain;
+   * `app_profile.problems` is empty; the other [delete checks](#delete-checks), such as the cluster count, the conditional write probe and the link validation and versions of the servers, run only in delete mode, so a failed one shows first in the first delete cycle, which then lists it in `delete.refused`, only condemns and exits 4;
    * the `delete.plan` counts per type and their samples are explained;
    * `live_mounts.without_keepalive` and `live_mounts.without_local_write_check` are 0;
    * `condemn.cleared` and `previous_list` show no rescued or live key without an explanation (see [The .live object](#the-live-object)).
@@ -78,7 +78,7 @@ Garbage collection is off unless it is turned on, on the servers and on the clie
 
    Snapshots taken before `gc-keepalive` was on have no ref, so the first delete cycles delete each one that no named workspace holds, with the work tree content only it holds. Before the first delete cycle, have users restore every such snapshot they want to keep into a spare workspace, such as a new `--tmp-ws` mount, with `abfs ws snapshot --restore <hash> <path>`, which writes its ref, or keep the work in a named workspace. A restore replaces the work tree at `<path>`, so never restore into a workspace with work in it. Widen `--delete-types` step by step, as the [operator rules](#operator-rules) say.
 
-A store on which an earlier version of the collector ran is not upgraded in place: remove its garbage collector state first, so that no earlier marker survives. Delete the Spanner tables `GcState`, `GcServers`, `GcLists` and any `GcReplicas`, the Bigtable table `gc` and the column family `g` of `objects`, and the bucket objects under `gc/`, then follow the steps above from step 1.
+A store on which an earlier version of the collector ran is not upgraded in place: remove its garbage collector state first, so that no earlier marker survives. Delete the Spanner tables `AbfsGcState`, `AbfsGcServers` and `AbfsGcLists`, the Bigtable table `abfsgc` and the column family `abfsgc` of `objects`, and the bucket objects under `abfsgc/`, then follow the steps above from step 1. A store of a version before these names holds instead the Spanner tables `GcState`, `GcServers`, `GcLists` and, if present, `GcReplicas`, the Bigtable table `gc` and the column family `g` of `objects`, and the bucket objects under `gc/`.
 
 Off means the state before step 1. A server without `--gc` reads and writes only what a server without garbage collection does and starts on a deployment that plain `init` created; a client without `gc-keepalive` sends nothing extra. The garbage collector resources can stay in place.
 
@@ -89,27 +89,26 @@ These changes that come with garbage collection apply even when it is off. Each 
 * The git-pusher forgets the LFS objects it pushed for a project after a push of that project fails, so the next push checks them against the server again. It also forgets a cached deep tree that the server reports missing, and computes it again.
 * Cacheman serves a `/remote-headers` request, used only by the client keep-alive.
 
-To turn garbage collection off, stop the collector job, restart the servers without `--gc` and turn `gc-keepalive` off. Objects added while it is off get no `gc` row, so turning it on again needs steps 2, 3 and 4 again; until the backfill ran, the consistency pass of the dry run reports the objects without a row, and the condemn and delete modes refuse to run while any are missing. Markers that a condemn cycle wrote stay on their rows while garbage collection is off, and servers without `--gc` do not rescue them, so a marked object used while it was off keeps a marker whose hold may have ended. Before turning it on again, remove the garbage collector state as for a store on which an earlier version of the collector ran (above). If the state stays, the collector covers the case in which objects were added while it was off: a condemn or delete cycle that finds an object without a `gc` row, or one written during its scan by a server without `--gc`, deletes every row of `GcLists` of its state before it writes any marker (`condemn.records_cleared`), so no old marker counts for a delete and each is written again with a full hold. For that, run one condemn cycle after step 2 and before the backfill; it refuses because of the missing rows. It cannot tell an off period in which no object was added.
+To turn garbage collection off, stop the collector job, restart the servers without `--gc` and turn `gc-keepalive` off. Objects added while it is off get no `abfsgc` row, so turning it on again needs steps 2, 3 and 4 again; until the backfill ran, the consistency pass of the dry run reports the objects without a row, and the condemn and delete modes refuse to run while any are missing. Markers that a condemn cycle wrote stay on their rows while garbage collection is off, and servers without `--gc` do not rescue them, so a marked object used while it was off keeps a marker whose hold may have ended. Before turning it on again, remove the garbage collector state as for a store on which an earlier version of the collector ran (above). If the state stays, the collector covers the case in which objects were added while it was off: a condemn or delete cycle that finds an object without an `abfsgc` row, or one written during its scan by a server without `--gc`, deletes every row of `AbfsGcLists` of its state before it writes any marker (`condemn.records_cleared`), so no old marker counts for a delete and each is written again with a full hold. For that, run one condemn cycle after step 2 and before the backfill; it refuses because of the missing rows. It cannot tell an off period in which no object was added.
 
 ### Upgrades
 
 * Each server writes the version of the GC rules it follows into its heartbeat row (version 3 in this release). A collector refuses to delete while a row of a lower version may have run within its grace, and does not complete its list while a row of a lower version may have run within the grace before its snapshot; the markers of such a list are written again by a later cycle. So after an upgrade of the servers, deletes start once no server of an older version ran within the grace and a list completed after that has held.
 * A server change that the delete rule depends on raises the version, so the rule above covers later upgrades too.
-* Use the same or a newer version for the collector than for the servers: a `gc` row with an object type the collector does not know, or of newer edge rules, stops the condemn.
-* This version writes delete records of format version 2 and does not read version 1. A version 1 record fails the chunk step on that record in every cycle and is never removed, and it fails `gc undo`. Delete the objects under `gc/deleted/` that an earlier version wrote before the first delete cycle of this version.
+* Use the same or a newer version for the collector than for the servers: an `abfsgc` row with an object type the collector does not know, or of newer edge rules, stops the condemn.
 
 ## Where the data goes
 
 | Data | Service |
 | --- | --- |
-| The GC edges of each object, the objects it references, and its last touch | Bigtable table `gc` |
-| The condemn marker of an object | Bigtable family `objects:g` |
-| The lease and cycle state of the collector | Spanner table `GcState` |
-| The record of each condemned list: its completion time, the largest cache TTL of the servers and the number of markers | Spanner table `GcLists` |
-| Server heartbeats | Spanner table `GcServers` |
-| Condemned lists and their `.live` objects | bucket, `gc/condemned/<state>/` |
-| Delete records | bucket, `gc/deleted/<state>/` |
-| Ref records | bucket, `gc/refs/<state>/` |
+| The GC edges of each object, the objects it references, and its last touch | Bigtable table `abfsgc` |
+| The condemn marker of an object | Bigtable family `objects:abfsgc` |
+| The lease and cycle state of the collector | Spanner table `AbfsGcState` |
+| The record of each condemned list: its completion time, the largest cache TTL of the servers and the number of markers | Spanner table `AbfsGcLists` |
+| Server heartbeats | Spanner table `AbfsGcServers` |
+| Condemned lists and their `.live` objects | bucket, `abfsgc/condemned/<state>/` |
+| Delete records | bucket, `abfsgc/deleted/<state>/` |
+| Ref records | bucket, `abfsgc/refs/<state>/` |
 
 The state is `default`.
 
@@ -117,13 +116,13 @@ The state is `default`.
 
 ### Create the resources
 
-With `--gc`, `abfs server gcp init` also creates the garbage collector resources: the Bigtable table `gc`, the column family `g` of `objects` and the Spanner tables `GcState`, `GcServers` and `GcLists`. Without it, init creates only the server's own resources. Running it again with `--gc` adds the garbage collector resources to an existing deployment.
+With `--gc`, `abfs server gcp init` also creates the garbage collector resources: the Bigtable table `abfsgc`, the column family `abfsgc` of `objects` and the Spanner tables `AbfsGcState`, `AbfsGcServers` and `AbfsGcLists`. Without it, init creates only the server's own resources. Running it again with `--gc` adds the garbage collector resources to an existing deployment.
 
-Run it with the new version before you start servers of that version: a server with `--gc` checks `GcState` and `GcServers` at start and refuses to start without them. Servers do not use `GcLists`; the collector reads it in every cycle. When it is missing, the condemn and delete modes fail with an error that names `init --gc`, and a dry run reports that error in `delete.plan_error`. The statements are in `shared/remote/servers/gcp/casdb/gcschema.sql`, and each can be applied again without effect.
+Run it with the new version before you start servers of that version: a server with `--gc` checks `AbfsGcState` and `AbfsGcServers` at start and refuses to start without them. Servers do not use `AbfsGcLists`; the collector reads it in every cycle. When it is missing, the condemn and delete modes fail with an error that names `init --gc`, and a dry run reports that error in `delete.plan_error`. The statements are in `shared/remote/servers/gcp/casdb/gcschema.sql`, and each can be applied again without effect.
 
 `init` creates missing tables and does not change existing ones.
 
-At start, a server with `--gc` checks the garbage collector resources, then applies one conditional write: a delete of the cell `g:condemned` of the absent row `abfs-setup-check`. It retries it on a transient error and stops when Bigtable refuses it or it still fails. A server rescues condemned objects with conditional writes (see [Rescue](#rescue)), so its app profile must use single-cluster routing and allow single-row transactions. The default app profile of an instance created with one cluster allows them; for another profile run `gcloud bigtable app-profiles update <profile> --instance=<bt-instance> --route-to=<cluster> --transactional-writes`. Multi-cluster routing cannot allow them.
+At start, a server with `--gc` checks the garbage collector resources, then applies one conditional write: a delete of the cell `abfsgc:condemned` of the absent row `abfs-setup-check`. It retries it on a transient error and stops when Bigtable refuses it or it still fails. A server rescues condemned objects with conditional writes (see [Rescue](#rescue)), so its app profile must use single-cluster routing and allow single-row transactions. The default app profile of an instance created with one cluster allows them; for another profile run `gcloud bigtable app-profiles update <profile> --instance=<bt-instance> --route-to=<cluster> --transactional-writes`. Multi-cluster routing cannot allow them.
 
 The `gc` commands need the garbage collector resources and refuse to run without them. Their own reads of objects leave the garbage collector state as it is: they rescue and touch nothing, so what the collector reads is not kept because it read it.
 
@@ -143,7 +142,7 @@ The service account that runs the `gc` commands needs:
 
 | Permission | Granted by | Needed for |
 | --- | --- | --- |
-| Read and write of `GcState`, `GcServers`, `GcLists` and `Refs`, read of `Projects`, DML deletes | `roles/spanner.databaseUser` on the database | the lease, the heartbeats, the list records, ref removal |
+| Read and write of `AbfsGcState`, `AbfsGcServers`, `AbfsGcLists` and `Refs`, read of `Projects`, DML deletes | `roles/spanner.databaseUser` on the database | the lease, the heartbeats, the list records, ref removal |
 | `bigtable.tables.readRows`, `bigtable.tables.mutateRows` | `roles/bigtable.user` | scans, markers, conditional deletes and the conditional write probe |
 | `bigtable.appProfiles.get` | `roles/bigtable.user` | the app profile check at start; delete mode fails without it |
 | `bigtable.clusters.list` | `roles/bigtable.user` | the cluster count |
@@ -153,11 +152,9 @@ The service account that runs the `gc` commands needs:
 
 Role contents: [Bigtable roles](https://docs.cloud.google.com/iam/docs/roles-permissions/bigtable) and [Cloud Storage roles](https://docs.cloud.google.com/iam/docs/roles-permissions/storage). A missing permission on a delete check refuses the deletes of the cycle and names the permission. Without `storage.buckets.get` the chunk step deletes no chunks.
 
-Optional [backups](#backups) need more: creating Bigtable backups needs `bigtable.backups.create`, and restoring them `bigtable.backups.restore` and `bigtable.tables.create` (for example `roles/bigtable.admin`), which `roles/bigtable.user` does not have ([backups](https://docs.cloud.google.com/bigtable/docs/backups)).
+## Fill the abfsgc table
 
-## Fill the gc table
-
-With `--gc` on, the server writes the `gc` row of each object it adds. Objects added before that, or while it was off, have none. `abfs server gcp gc backfill` scans the `objects` table and writes the missing rows, and the rows whose edge rules are outdated for their object type; it reads every such object that is not a blob:
+With `--gc` on, the server writes the `abfsgc` row of each object it adds. Objects added before that, or while it was off, have none. `abfs server gcp gc backfill` scans the `objects` table and writes the missing rows, and the rows whose edge rules are outdated for their object type; it reads every such object that is not a blob:
 
 ```sh
 abfs server gcp gc backfill --project <project> --instance <spanner-instance> --bucket <bucket> [--dry-run] [--rate 2000] [--shards 16]
@@ -167,7 +164,7 @@ abfs server gcp gc backfill --project <project> --instance <spanner-instance> --
 * `--dry-run` only counts the rows to write.
 * `--rate` limits the object rows scanned per second (0 means no limit).
 * The scan can stop at any time; it prints a key to continue from with `--start`. Running it again skips the rows that are already current.
-* Do not run it while delete cycles run: stop the collector job, or run it without `--delete`, until the backfill has finished. A delete cycle checks that each object written during its consistency scan has a `gc` row, which only a server with `--gc` writes; a backfill that writes the row of such an object in between hides the server without `--gc` that wrote it.
+* Do not run it while delete cycles run: stop the collector job, or run it without `--delete`, until the backfill has finished. A delete cycle checks that each object written during its consistency scan has an `abfsgc` row, which only a server with `--gc` writes; a backfill that writes the row of such an object in between hides the server without `--gc` that wrote it.
 
 A row is current when its version of the edge rules is at least the one its object type requires; only the rows of types whose rules changed are rewritten. Version 2 gives each deep tree an edge to every deep tree nested in it: a directory with 1,000 or more entries below it is stored as a deep tree of its own, which only deep trees link. Version 1 gave deep trees no edges, so the dry run counted those nested deep trees as unreachable although mounts read them.
 
@@ -175,7 +172,7 @@ After upgrading from version 1, run the backfill again; it rewrites only the `de
 
 ## Dry run
 
-`abfs server gcp gc run --dry-run` runs one garbage collection cycle that only reports. It deletes and marks no data; its only writes are to the `GcState` row and the removal of old heartbeat rows of `GcServers`, both in Spanner. `gc run` takes exactly one of `--dry-run`, `--condemn` (see [Condemn mode](#condemn-mode)) and `--delete` (see [Delete mode](#delete-mode)).
+`abfs server gcp gc run --dry-run` runs one garbage collection cycle that only reports. It deletes and marks no data; its only writes are to the `AbfsGcState` row and the removal of old heartbeat rows of `AbfsGcServers`, both in Spanner. `gc run` takes exactly one of `--dry-run`, `--condemn` (see [Condemn mode](#condemn-mode)) and `--delete` (see [Delete mode](#delete-mode)).
 
 ```sh
 abfs server gcp gc run --dry-run --project <project> --instance <spanner-instance> --bucket <bucket> [--report gc-report.json] [--explain <key>[,<key>]]
@@ -183,21 +180,21 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 
 ### A cycle
 
-1. Takes the lease in `GcState`, increments the cycle number and records the start and snapshot times. While another process holds a valid lease the command fails. The lease (5 minutes) is renewed while the cycle runs, and the cycle stops itself if the lease is lost or cannot be renewed in time.
-2. Reads the list records in `GcLists` and the server heartbeats (see [Heartbeat](#heartbeat)) in `GcServers`. It warns about each live server whose settings break the timing rules:
+1. Takes the lease in `AbfsGcState`, increments the cycle number and records the start and snapshot times. While another process holds a valid lease the command fails. The lease (5 minutes) is renewed while the cycle runs, and the cycle stops itself if the lease is lost or cannot be renewed in time.
+2. Reads the list records in `AbfsGcLists` and the server heartbeats (see [Heartbeat](#heartbeat)) in `AbfsGcServers`. It warns about each live server whose settings break the timing rules:
    * a `--gc-touch-interval` of 0 or longer than half of `--grace`;
    * a `--cache-ttl` of 0;
    * GC rules older than the command's.
 
    A live server is one that did not record a stop and whose last heartbeat is within its serve limit: two heartbeat intervals, 30 seconds and a minute of clock skew, 11 minutes 30 seconds at the default interval. A server stops serving 10 minutes 30 seconds after its last successful heartbeat, so a crashed server stops counting as live soon after. It also warns when `--grace` is shorter than the largest `--cache-ttl` of the servers that may have run within the grace plus `--longest-push`, and when no such server wrote a heartbeat; `settings.cache_ttl_hours` reports that largest TTL. A server may have run within the grace while it did not record a stop and its last heartbeat is less than 30 minutes before the start of the grace, or it stopped after that start. The warnings are in the report and the log; the condemn and delete modes refuse to run with any of them. The report counts the distinct host names among the live servers (`replicas.hosts`, the part of each ID before its last `-`) and their live rows per host (`replicas.rows_per_host`). A server that stops cleanly records the stop in its row, which then no longer counts as live (`replicas.stopped`).
 
-   The command deletes the `GcServers` rows whose last heartbeat and stop are older than the longest of a day, the largest `--grace` of any condemn or delete cycle plus 10 hours, and its own `--grace` plus 10 hours (`replicas.servers_removed`); the 10 hours are an hour and the 9 hours before the window in which a lost map row touch is still reported (`replicas.map_row_loss_time`). Lost touches are reported, not checked.
+   The command deletes the `AbfsGcServers` rows whose last heartbeat and stop are older than the longest of a day, the largest `--grace` of any condemn or delete cycle plus 10 hours, and its own `--grace` plus 10 hours (`replicas.servers_removed`); the 10 hours are an hour and the 9 hours before the window in which a lost map row touch is still reported (`replicas.map_row_loss_time`). Lost touches are reported, not checked.
 3. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
 4. For each live mount (see [Mounts and unmounts](#mounts-and-unmounts)), reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
-5. Scans the `gc` table twice in 16 key ranges: first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
-6. Marks in memory everything the roots reach. It walks the roots one at a time in a fixed order: the refs of the classes source, workspaces, snapshots, mounts and unmount records, then the pinned revisions, builds, other `abfs-meta` refs, empty objects, recent objects and map rows, so that the report can name the root that reached an object first. Edges to objects without a `gc` row are skipped and counted. A `gc` row with an object type the binary does not know stops the run.
-7. Scans the `meta` family and the newest condemn marker of the `objects` table to check that every object has a `gc` row, to sum the sizes (`meta:size`) of reachable and unreachable objects and to read the marker of each. This reads every object row once. `consistency.marked` counts the objects with a marker and `consistency.marked_live` those the mark found live. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
-8. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
+5. Scans the `abfsgc` table twice in 16 key ranges: first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
+6. Marks in memory everything the roots reach. It walks the roots one at a time in a fixed order: the refs of the classes source, workspaces, snapshots, mounts and unmount records, then the pinned revisions, builds, other `abfs-meta` refs, empty objects, recent objects and map rows, so that the report can name the root that reached an object first. Edges to objects without an `abfsgc` row are skipped and counted. An `abfsgc` row with an object type the binary does not know stops the run.
+7. Scans the `meta` family and the newest condemn marker of the `objects` table to check that every object has an `abfsgc` row, to sum the sizes (`meta:size`) of reachable and unreachable objects and to read the marker of each. This reads every object row once. `consistency.marked` counts the objects with a marker and `consistency.marked_live` those the mark found live. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
+8. Writes the JSON report as one line to stdout or to `--report`, and logs a one-line summary.
 
 ### Root classes
 
@@ -212,7 +209,7 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 | Eval map rows | the request and the result | `--map-retention` (default `720h`) since the row was written or used |
 | Deep tree and digest map rows | the request and the result | while the tree of the request is reachable |
 | LFS map rows | the request and the result | always |
-| Recent objects | objects whose `gc` row was written or touched within `--grace` (default `72h`) before the snapshot | `--grace` |
+| Recent objects | objects whose `abfsgc` row was written or touched within `--grace` (default `72h`) before the snapshot | `--grace` |
 | Empty objects | the empty file and the empty directory, which every server writes at start | always |
 
 Map rows with request types not listed are kept. A ref past its retention is no root; delete mode removes it (see [Ref removal](#ref-removal)). `--grace` must be longer than `--longest-push` (default `3h`, the longest git-pusher push or build upload), or the command refuses to run. It must also cover the largest `--cache-ttl` of the servers that may have run within it plus `--longest-push`, or condemn and delete cycles refuse (step 2 of [A cycle](#a-cycle)). Each server records its cache TTL in its heartbeat row, and the collector reads it there, as the [hold](#the-hold) of delete mode does. `--mount-idle` must be at least 1 hour, four times the interval at which clients rewrite their mount ref.
@@ -230,10 +227,10 @@ A mount writes the ref `refs/abfs/mount/<prefix>/<start>` when it starts, where 
 The report counts:
 
 * per class, the refs, tombstones, roots and refs past their retention (`refs_to_tombstone` in total), and for mounts the roots that belong to ended mounts (`ended`);
-* roots whose object has no `gc` row (dangling roots);
+* roots whose object has no `abfsgc` row (dangling roots);
 * objects and edges per type, reachable and unreachable, with up to 20 unreachable keys per type (`unreachable_sample`), and dangling edges with a few examples;
 * map rows live and expired per class;
-* the consistency result with the first objects missing a `gc` row. Objects without a `gc` row that were written after the scan of the `gc` table started, less a minute, are counted apart (`too_new`): an upload during the scans lands there when its `gc` row was written after the scan of the `gc` table passed its key, so the count grows with the upload rate and is not an error. `gc` rows without an object row (uploads in flight) are counted too;
+* the consistency result with the first objects missing an `abfsgc` row. Objects without an `abfsgc` row that were written after the scan of the `abfsgc` table started, less a minute, are counted apart (`too_new`): an upload during the scans lands there when its `abfsgc` row was written after the scan of the `abfsgc` table passed its key, so the count grows with the upload rate and is not an error. `abfsgc` rows without an object row (uploads in flight) are counted too;
 * the time of each step and the peak heap;
 * `delete.plan`: what a delete cycle would remove now, from the markers the scan read and the list records. `lists` gives per list whose marker an unreachable object holds its completion time, the cache TTL recorded with it, its hold, when the hold ends (`eligible_time`) and whether it has ended; `held` counts the unreachable objects whose list is still held, `unrecorded` those whose marker has no complete record, which the next condemn writes again; then the candidates and `would_delete` per type with their bytes, the levels and the map rows (see [Delete mode](#delete-mode)). `delete.plan_error` says why the list records could not be read.
 
@@ -247,23 +244,38 @@ The sections `live_mounts`, `workspaces` and `snapshots` report the pins:
 | `without_local_write_check` | mount details with `gc-keepalive` whose cacheman does not keep locally written content until a server confirms it |
 | `touch_interval_too_long` | mount details whose keep-alive touch interval plus a tenth is not shorter than `--grace` less the longest touch interval and cache TTL of the servers and a minute |
 | `pinned_manifests`, `revisions`, `ignored_revisions` | the pinned manifests parsed, the revisions kept, and the revisions that are not hashes |
-| `dangling_revisions` | kept revisions without a `gc` row |
+| `dangling_revisions` | kept revisions without an `abfsgc` row |
 | `not_found` | snapshots, mount details or manifests that do not exist; they pin nothing |
 | `errors` | those that could not be read; a read error may hide a pin, so only read errors stop a condemn |
 
 `samples` names up to 20 mount details per count, with the workspace snapshot, host and user, so that the clients behind them can be found.
 
+### Exit status
+
+`gc run` writes the report, then exits with the status of the first cause in this table. A dry run exits 0 or 1.
+
+| Status | Cause | Modes |
+| --- | --- | --- |
+| 0 | Nothing refused, stopped or skipped | all |
+| 1 | The cycle failed: flags, app profile, backend, lease, a list not completed (`condemn.not_completed`), or the report could not be written | all |
+| 3 | The cycle refused to condemn (`condemn.refused`) | condemn, delete |
+| 4 | The cycle refused to delete and only condemned (`delete.refused`) | delete |
+| 5 | A worker error stopped the delete step (`delete.step.error`); the next cycle deletes the keys it did not reach | delete |
+| 6 | The chunk step deleted no chunks of a delete record past the undo window (`delete.chunks.skipped`, `records_skipped`), could not list the records (`list_failed`), or left a record without its flag a day past the undo window (`unflagged`; the cause is in `errors`, `error_sample`, `record_errors`, `delete_refused` or `unknown_depot`) | delete |
+
+A chunk step that skips while every record is younger than the undo window, as in the first 7 days of delete mode, exits 0.
+
 ### Explain
 
-`--explain <key>[,<key>]` adds an `explain` section with, per key: whether it has a `gc` row and its type, whether it is reachable, the root that reached it first, the write and touch times of its `gc` row, whether it has an `objects` row and the cycle number of its condemn marker. The first root (`first_root`) gives its class and object, and the project, ref and update time of a ref root, the mount details, host and user of a pinned revision, or the result of a map row. It reads two rows per key.
+`--explain <key>[,<key>]` adds an `explain` section with, per key: whether it has an `abfsgc` row and its type, whether it is reachable, the root that reached it first, the write and touch times of its `abfsgc` row, whether it has an `objects` row and the cycle number of its condemn marker. The first root (`first_root`) gives its class and object, and the project, ref and update time of a ref root, the mount details, host and user of a pinned revision, or the result of a map row. It reads two rows per key.
 
 ### Memory and load
 
-Memory grows with the `gc` table. The data of the mark takes about 35 bytes per object (key, type, edge index and bitmaps, with room the key arrays keep while they fill), 4 bytes per edge and 16 bytes per map row; the report shows it as `keys_bytes`, `edges_bytes` and `map_rows_bytes`.
+Memory grows with the `abfsgc` table. The data of the mark takes about 35 bytes per object (key, type, edge index and bitmaps, with room the key arrays keep while they fill), 4 bytes per edge and 16 bytes per map row; the report shows it as `keys_bytes`, `edges_bytes` and `map_rows_bytes`.
 
 The scans read rows faster than Go's garbage collector frees them, so with the default settings the heap grows to about twice the data: 1.5 million objects and 30 million edges take about 170 MB of data and 360 MB of heap. Set `GOMEMLIMIT` for the command to about 1.2 times the data and the heap stays near it (about 190 MB for the same table). A table of 10^8 objects, 2x10^9 edges and 10^7 map rows needs about 12 GB of data: give the job 16 GB with `GOMEMLIMIT=14GiB`, or about 24 GB without it.
 
-The scans read the whole `gc` table, the `maps` keys and the `meta` family of `objects`. Run the command with the [app profile of the collector](#app-profile-of-the-collector).
+The scans read the whole `abfsgc` table, the `maps` keys and the `meta` family of `objects`. Run the command with the [app profile of the collector](#app-profile-of-the-collector).
 
 ## Walk the checkouts of mounts
 
@@ -276,7 +288,7 @@ abfs server gcp gc walk --mount-details <hash>[,<hash>] --key <key>[,<key>] --pr
 * It reads each mount details object, such as the targets of a client's mount refs, and its pinned manifest, and walks the commit and the trees of every pinned revision from object content.
 * A chroot mount pins the tree of its parent workspace for a project in the annotation `abfs.dir.hash.tag` and mounts that tree. The walk follows it as well and reports what it found there with the type prefixed `dir-hash-`. That tree holds the parent workspace's files, so pass the details of the parent mount too.
 * A manifest can pin a project at an annotated tag, as release manifests do. The walk follows the tag, and a tag of a tag, up to 10 deep, to the commit, and reports a key it found as a tag with the type `tag`. A pinned revision that cannot be read or is neither a commit nor a tag is reported with the type `revision`, and such a target of a tag with the type `tag-target`.
-* It does not read the `gc` table, so it finds a key under a `gc` row that lacks an edge, which an `--explain` of the same cycle cannot.
+* It does not read the `abfsgc` table, so it finds a key under an `abfsgc` row that lacks an edge, which an `--explain` of the same cycle cannot.
 * It reads trees only to list their entries, so a blob need not exist to be found.
 * It prints, per key, `inside` with its type, the first path that reached it (project path, then the path in the project, in manifest order), the pinned revision in the column `COMMIT` (a tag when the manifest pins one) and the mount details, or `outside`.
 * Its reads rescue and touch nothing; it takes no lease and writes nothing.
@@ -285,7 +297,7 @@ abfs server gcp gc walk --mount-details <hash>[,<hash>] --key <key>[,<key>] --pr
 
 ## Condemn mode
 
-`abfs server gcp gc run --condemn` runs the cycle of a dry run and then marks every object the mark found unreachable that holds no marker of a complete list: it sets the cell `g:condemned` of its `objects` row to the cycle number, 8 bytes big-endian. It deletes nothing. A server with `--gc` that reads a marked object clears the marker and answers as for any other object (see [Rescue](#rescue)), so a marked object that a client reads again shows that the mark called something garbage that was still in use.
+`abfs server gcp gc run --condemn` runs the cycle of a dry run and then marks every object the mark found unreachable that holds no marker of a complete list: it sets the cell `abfsgc:condemned` of its `objects` row to the cycle number, 8 bytes big-endian. It deletes nothing. A server with `--gc` that reads a marked object clears the marker and answers as for any other object (see [Rescue](#rescue)), so a marked object that a client reads again shows that the mark called something garbage that was still in use.
 
 ```sh
 abfs server gcp gc run --condemn --expected-replicas <hosts> --project <project> --instance <spanner-instance> --bucket <bucket> [--report gc-report.json] [--explain <key>[,<key>]]
@@ -293,12 +305,12 @@ abfs server gcp gc run --condemn --expected-replicas <hosts> --project <project>
 
 ### Condemn refusals
 
-The cycle condemns only when its own report is clean. It refuses, writes no marker and no list, writes the report with the reasons in `condemn.refused` and exits with an error, when any of these holds:
+The cycle condemns only when its own report is clean. It refuses, writes no marker and no list, writes the report with the reasons in `condemn.refused` and exits with status 3 (see [Exit status](#exit-status)), when any of these holds:
 
 * a warning in `replicas.warnings`;
 * the number of distinct host names among the live servers (`replicas.hosts`) differs from `--expected-replicas`, or is outside `--min-replicas` and `--max-replicas`. The count notices servers that write no heartbeat row; two live rows of one host, as after a crash and a restart under the same name, count once and refuse nothing;
-* the consistency check did not run, or found objects without a `gc` row. Such objects show that servers ran without `--gc`, so the cycle first deletes every row of `GcLists` of its state (`condemn.records_cleared`; see [Enable or disable garbage collection](#enable-or-disable-garbage-collection));
-* `gc` rows with outdated or newer edge rules (`objects.outdated_rows`, `objects.newer_rows`);
+* the consistency check did not run, or found objects without an `abfsgc` row. Such objects show that servers ran without `--gc`, so the cycle first deletes every row of `AbfsGcLists` of its state (`condemn.records_cleared`; see [Enable or disable garbage collection](#enable-or-disable-garbage-collection));
+* `abfsgc` rows with outdated or newer edge rules (`objects.outdated_rows`, `objects.newer_rows`);
 * `live_mounts.errors`, `workspaces.errors` or `snapshots.errors`: a pin that could not be read may hide commits a mount, workspace or snapshot needs;
 * a dangling root in the classes `source`, `project-status`, `pushed-packs`, `workspace`, `snapshot`, `mount` or `permanent`. Dangling `pinned-revisions` roots, for example of projects a mount skipped with `--ignore-missing-projects`, do not refuse; check them in `dangling_revisions` and its samples.
 
@@ -312,15 +324,15 @@ Give each server enough time to stop: the time the platform allows before it kil
 
 ### A cycle that condemns
 
-1. Reads the list that `GcState.ListLocation` names, the list of the last condemn cycle, for the report only, and has the mark record the root that first reaches each of its keys. A list that is gone or cannot be read is reported in `previous_list.error`.
-2. Deletes the markers of the objects that the consistency scan read with a marker and the mark found live, and writes every such key to `gc/condemned/<state>/<cycle>.live` in the server bucket (see [The .live object](#the-live-object)). So an object that a root reaches again, or that was used, gets a full hold when it is condemned again. `condemn.cleared` counts them and `condemn.live_list` names the object.
-3. Deletes the rows of `GcLists` older than the cycle before whose marker no object holds (`condemn.records_removed`).
-4. Writes the list of the objects it condemns to `gc/condemned/<state>/<cycle>` (the state is `default`): the unreachable objects without a marker, and those whose marker is of a cycle without a complete record, such as a cycle that stopped midway. An object whose marker has a complete record keeps it (`condemn.kept`): that value is what a later delete of the object matches. It records the list in `GcState` (`ListLocation`, `ListSnapshotTime`, `ListComplete` false) and inserts its row in `GcLists` without a completion time. The list is a binary object: a header with the cycle, the snapshot time, the run and the type names, then per object its 20-byte key, its type and its size, in key order, 29 bytes per object.
+1. Reads the list that `AbfsGcState.ListLocation` names, the list of the last condemn cycle, for the report only, and has the mark record the root that first reaches each of its keys. A list that is gone or cannot be read is reported in `previous_list.error`.
+2. Deletes the markers of the objects that the consistency scan read with a marker and the mark found live, and writes every such key to `abfsgc/condemned/<state>/<cycle>.live` in the server bucket (see [The .live object](#the-live-object)). So an object that a root reaches again, or that was used, gets a full hold when it is condemned again. `condemn.cleared` counts them and `condemn.live_list` names the object.
+3. Deletes the rows of `AbfsGcLists` older than the cycle before whose marker no object holds (`condemn.records_removed`).
+4. Writes the list of the objects it condemns to `abfsgc/condemned/<state>/<cycle>` (the state is `default`): the unreachable objects without a marker, and those whose marker is of a cycle without a complete record, such as a cycle that stopped midway. An object whose marker has a complete record keeps it (`condemn.kept`): that value is what a later delete of the object matches. It records the list in `AbfsGcState` (`ListLocation`, `ListSnapshotTime`, `ListComplete` false) and inserts its row in `AbfsGcLists` without a completion time. The list is a binary object: a header with the cycle, the snapshot time, the run and the type names, then per object its 20-byte key, its type and its size, in key order, 29 bytes per object.
 5. Writes the markers of the objects of the list, in key order, in batches of 2,000, at most 5,000 per second. It marks only objects whose `objects` row the consistency scan read, so it never creates a row.
-6. Reads `GcServers` again after the last marker batch returned and takes the largest `--cache-ttl` of the servers that may have run within the grace before its snapshot. When one of them runs without the garbage collector hooks, has a `--cache-ttl` of 0 or follows an older version of the GC rules, or none wrote a row, the cycle does not complete its list: it lists the reasons in `condemn.not_completed` and fails, and a later cycle writes those markers again. Otherwise it sets `ListComplete` and the completion time in `GcState`, and the completion time (a commit time), the TTL and the number of markers in `GcLists`; `condemn.cache_ttl_hours` reports the TTL.
+6. Reads `AbfsGcServers` again after the last marker batch returned and takes the largest `--cache-ttl` of the servers that may have run within the grace before its snapshot. When one of them runs without the garbage collector hooks, has a `--cache-ttl` of 0 or follows an older version of the GC rules, or none wrote a row, the cycle does not complete its list: it lists the reasons in `condemn.not_completed` and fails, and a later cycle writes those markers again. Otherwise it sets `ListComplete` and the completion time in `AbfsGcState`, and the completion time (a commit time), the TTL and the number of markers in `AbfsGcLists`; `condemn.cache_ttl_hours` reports the TTL.
 7. Removes the list and `.live` objects of all but the newest 7 cycles.
 
-The list and its row in `GcLists` are written before any marker, and only a complete row makes a marker count for a delete. So a cycle that stops midway leaves markers without a complete record, which the next cycle writes again with its own number. The report section `condemn` counts the objects marked, per type, and their bytes.
+The list and its row in `AbfsGcLists` are written before any marker, and only a complete row makes a marker count for a delete. So a cycle that stops midway leaves markers without a complete record, which the next cycle writes again with its own number. The report section `condemn` counts the objects marked, per type, and their bytes.
 
 A cycle reads the previous list once and writes one list and one `.live` object; at 29 bytes per object, a list of 10 million objects is about 290 MB. Besides the memory of the dry run, the collector holds the keys of the previous list and one map entry for each, and the marker of each unreachable object, which fits the room of the existing entry.
 
@@ -339,7 +351,7 @@ A key that a server read since its condemn has no marker left and is not in the 
 `abfs server gcp gc run --delete` runs a condemn cycle that first deletes what earlier cycles condemned, held long enough and is still garbage. Cycle D deletes an object only when all of these hold:
 
 * the consistency scan of cycle D read its `objects` row with the marker of a cycle N, as the newest cell;
-* the list of cycle N has a complete record in `GcLists`, and the snapshot of cycle D is at least the [hold](#the-hold) of that list after its completion;
+* the list of cycle N has a complete record in `AbfsGcLists`, and the snapshot of cycle D is at least the [hold](#the-hold) of that list after its completion;
 * the mark of cycle D finds it unreachable and not recent;
 * every map row that names it was deleted first (see [Map rows](#map-rows));
 * every parent of it in the mark's graph whose `objects` row the scan read was deleted earlier in the same step. A parent that is not live and not deleted, such as one written or used after the marker of the object, keeps it until the parent's own marker has held;
@@ -357,7 +369,7 @@ A delete cycle:
 3. Runs the delete checks. When one fails, the cycle lists the reason in `delete.refused`, logs `GC cycle <n> does not delete and only condemns: <reason>` and goes on as a condemn cycle: it skips step 6 and still condemns and completes its list.
 4. Clears the markers of the live objects, as a condemn cycle does.
 5. Runs the [chunk step](#chunk-step) for the delete records of earlier cycles, also in a cycle whose deletes were refused.
-6. Reads the heartbeats again; the checks of the servers must hold again on this read. Then it deletes: the map rows first, then the objects level by level, each object after its parents. Before the deletes of each batch of up to 2,000 keys it writes a [delete record](#delete-records) to the bucket. The `gc` row of each deleted object goes too, unless the object was written again since the start of the grace. A key whose delete had no clear outcome is read again at the end of the step; one still present keeps its marker. A read that fails stops the cycle before its list; the next cycle plans from the markers and deletes.
+6. Reads the heartbeats again; the checks of the servers must hold again on this read. Then it deletes: the map rows first, then the objects level by level, each object after its parents. Before the deletes of each batch of up to 2,000 keys it writes a [delete record](#delete-records) to the bucket. The `abfsgc` row of each deleted object goes too, unless the object was written again since the start of the grace. A key whose delete had no clear outcome is read again at the end of the step; one still present keeps its marker. A read that fails stops the cycle before its list; the next cycle plans from the markers and deletes.
 7. Condemns what is still unreachable, was not deleted and holds no marker of a complete list, as a condemn cycle does, and completes its list.
 8. Removes the lists, delete records and ref records of old cycles.
 
@@ -378,7 +390,7 @@ Only `--delete` takes `--delete-types` and `--accept-mounts-without-keepalive`; 
 | `--snapshot-retention` | `720h` | Keep what a snapshot ref reaches, with the commits its mount was pinned to, for this time after the ref was written; delete mode removes older snapshot refs. All modes read it |
 | `--gcp-client-metrics` | off | Export the client library metrics to Cloud Monitoring |
 
-These are fixed: the delete step deletes at most 2,000 objects per second, with 32 conditional deletes in flight over the 16 key ranges; the chunk step deletes at most 500 chunks per second, and only those of records at least 7 days old, far longer than the 10 minute lifetime of signed chunk URLs, and repeats the `gc` row deletes of a record from 15 minutes after it; one attempt of a Bigtable write has a deadline of 30 seconds, a list object that plus its size at 8 MiB/s.
+These are fixed: the delete step deletes at most 2,000 objects per second, with 32 conditional deletes in flight over the 16 key ranges; the chunk step deletes at most 500 chunks per second, and only those of records at least 7 days old, far longer than the 10 minute lifetime of signed chunk URLs, and repeats the `abfsgc` row deletes of a record from 15 minutes after it; one attempt of a Bigtable write has a deadline of 30 seconds, a list object that plus its size at 8 MiB/s.
 
 ### The hold
 
@@ -403,7 +415,7 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 
 | Reason | What to do |
 | --- | --- |
-| The list records in `GcLists` cannot be read | Check the collector's access to Spanner, and that `init --gc` created `GcLists` |
+| The list records in `AbfsGcLists` cannot be read | Check the collector's access to Spanner, and that `init --gc` created `AbfsGcLists` |
 | A server of an older version of the GC rules may have run within the grace | Stop it; deletes wait until it stopped `--grace` plus a minute ago |
 | A server runs without link validation | Restart it without `--no-link-validation` |
 | A server's settings break the timing rules | Fix the setting; deletes wait until the server with the old setting stopped `--grace` plus a minute ago |
@@ -413,8 +425,8 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 | The app profile refused a conditional write, or the probe failed | Use a profile with single-cluster routing and single-row transactions; check the [permissions](#permissions-of-the-collector) |
 | The removal of expired refs failed | The next cycle tries again |
 | Live mounts run without `gc-keepalive`; mounts with it run with a cacheman that does not check local writes; mounts touch their objects less often than the grace allows | See [Client caches](#client-caches) |
-| Objects written during the consistency scan have no `gc` row; the reason names up to 10 of them | A server without `--gc` writes to the store; find and stop it |
-| The `gc` rows of the objects written during the consistency scan cannot be read | Check the collector's access to Bigtable and the load of its app profile; the next cycle checks again |
+| Objects written during the consistency scan have no `abfsgc` row; the reason names up to 10 of them | A server without `--gc` writes to the store; find and stop it |
+| The `abfsgc` rows of the objects written during the consistency scan cannot be read | Check the collector's access to Bigtable and the load of its app profile; the next cycle checks again |
 | Only some of the objects written during the consistency scan were checked: the checks fell behind the writes, and the scan stopped waiting for them | Nothing; deletes resume in a later cycle with fewer writes during its scan (see [Planning figures](#planning-figures)) |
 
 A crash, an out-of-memory kill, a preemption, a pause of a VM or a lost touch of a server refuses no deletes. A server records lost touches in its heartbeat row and counts them in `abfs.gcp.gc.touches`; alert on them, since a lost touch can make a condemn mark an object that is still used, which a read then rescues.
@@ -438,28 +450,28 @@ Cacheman reports its checks in `remote_checks` of its stats. `skipped` counts th
 Before the objects, the step deletes the map rows that name a candidate, and the eval rows past `--map-retention` whose two ends stay live.
 
 * Each delete is conditional: a row written or used since the start of the grace (for an expired eval row, since the start of the map retention) stays, and a row that stays keeps both its candidate ends.
-* A row goes only when both its ends are of types `--delete-types` allows; an end without a `gc` row counts as allowed. Otherwise the row stays and keeps its candidate ends, so a cycle limited to some types drops no cached result of the others.
+* A row goes only when both its ends are of types `--delete-types` allows; an end without an `abfsgc` row counts as allowed. Otherwise the row stays and keeps its candidate ends, so a cycle limited to some types drops no cached result of the others.
 * Readers that miss a deleted eval row compute the result again.
 
 ### Delete records
 
-Each batch of the delete step writes the object `gc/deleted/<state>/<cycle>/<level>-<range>-<batch>` before any of its deletes. It holds a header with the cycle, the run and the start of the grace, then the 20-byte key of each object and the keys of the two ends of each map row, then per object the newest cell of each column of the families `meta` and `data` of its `objects` row, with its time, and the values of the family `e` of its `gc` row. A record holds at most 16 MiB; a larger batch goes into several records, and the report counts their size in `delete.step.record_bytes`. The chunk step and `gc undo` read these records.
+Each batch of the delete step writes the object `abfsgc/deleted/<state>/<cycle>/<level>-<range>-<batch>` before any of its deletes. It holds a header with the cycle, the run and the start of the grace, then the 20-byte key of each object and the keys of the two ends of each map row, then per object the newest cell of each column of the families `meta` and `data` of its `objects` row, with its time, and the values of the family `e` of its `abfsgc` row. A record holds at most 16 MiB; a larger batch goes into several records, and the report counts their size in `delete.step.record_bytes`. The chunk step and `gc undo` read these records.
 
-When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest 7 cycles that have records, and every record flagged within 7 days, so a record lives about 14 days. Before it removes the records of a cycle it writes `gc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts those older than 8 days, past the 7 days every record waits, and gives the age of the oldest.
+When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest 7 cycles that have records, and every record flagged within 7 days, so a record lives about 14 days. Before it removes the records of a cycle it writes `abfsgc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts those older than 8 days, past the 7 days every record waits, and gives the age of the oldest; while it is above 0 the cycle exits 6.
 
 ### Chunk step
 
-In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag. From 15 minutes after a record was created, it repeats the `gc` row deletes of its objects without a row, which a delete step that stopped can leave, and sets `gc-rows-done=<cycle>` on it (`records_gc_rows_done`). From 7 days after, the undo window, it deletes the chunks, and repeats the `gc` row deletes of a record without `gc-rows-done`. Younger records count in `records_waiting`. For each object of a record:
+In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag. From 15 minutes after a record was created, it repeats the `abfsgc` row deletes of its objects without a row, which a delete step that stopped can leave, and sets `gc-rows-done=<cycle>` on it (`records_gc_rows_done`). From 7 days after, the undo window, it deletes the chunks, and repeats the `abfsgc` row deletes of a record without `gc-rows-done`. Younger records count in `records_waiting`. For each object of a record:
 
 | Object row | Outcome | Count |
 | --- | --- | --- |
 | present with the recorded descriptor | the delete did not happen; the chunks stay | `kept_row_present` |
 | present with another descriptor | a client wrote the object again after the delete; the recorded chunks go | `reput_after_delete` |
-| absent | the recorded chunks go, and the `gc` row, unless the object was written again since | `row_absent` |
+| absent | the recorded chunks go, and the `abfsgc` row, unless the object was written again since | `row_absent` |
 
 A chunk row goes only when it has no cell newer than the record, such as the cell `gc undo` writes. A bucket object goes only under the generation and metageneration read just before the delete, so an object written again or stamped by `gc undo` stays (`restored_after_record`). A delete the bucket refuses (`delete_refused`) or an error leaves the record without the flag, for the next cycle.
 
-The step deletes no chunks, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of the settings below. The `gc` row deletes run either way.
+The step deletes no chunks, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of the settings below. The `abfsgc` row deletes run either way. `records_skipped` counts the records past the undo window whose chunks it skipped. When the records cannot be listed, the step does nothing and reports `list_failed`. Either makes the cycle exit with status 6, as does a record that `unflagged` counts.
 
 * Object Versioning on: a delete would keep a noncurrent version;
 * a retention policy, a default event-based hold or object retention: each can refuse a delete.
@@ -476,7 +488,7 @@ Each delete cycle that passes the condemn checks removes the refs that were past
 | build, build-start and unmount refs | `--build-retention` |
 | snapshot refs | `--snapshot-retention` |
 
-* It first writes them to `gc/refs/<state>/<cycle>` in the bucket, as JSON with the project ID, host, project, ref, update time and target of each.
+* It first writes them to `abfsgc/refs/<state>/<cycle>` in the bucket, as JSON with the project ID, host, project, ref, update time and target of each.
 * Then it removes them in Spanner transactions of up to 500 refs, each ref only while its update time and target are still the ones of the snapshot; a ref written since stays a root.
 * The report counts per class in `delete.refs.classes` the refs recorded, `removed`, `changed` (written since) and `gone`.
 * A failed removal refuses the deletes of the cycle, and the next cycle tries again.
@@ -495,10 +507,10 @@ Only clients with `gc-keepalive` write a snapshot ref: `refs/abfs/snapshot/user/
 Cacheman writes the ref only after the snapshot and the content it links are on the server. The command waits for this at most 30 seconds. When the write fails or is not confirmed in that time, the command logs a warning and still succeeds: the snapshot is stored, and a write still queued in cacheman usually lands later.
 
 * The ref keeps the snapshot, its mount details, their pinned manifest and the pinned commits for `--snapshot-retention` (default `720h`) after its last write.
-* Delete mode then removes the ref, records it in `gc/refs/<state>/<cycle>`, and a hold later deletes what only the ref reached.
+* Delete mode then removes the ref, records it in `abfsgc/refs/<state>/<cycle>`, and a hold later deletes what only the ref reached.
 * A snapshot taken without `gc-keepalive`, or by an older client, has no ref and is deleted once it is garbage. A `--restore` of it before the delete creates its ref.
 * The report has a section `snapshots` with the fields of `live_mounts`, counts the refs in `refs.snapshot`, and records `settings.snapshot_retention_hours`.
-* A read error on a snapshot's pins, or a snapshot ref whose target has no `gc` row, stops a condemn.
+* A read error on a snapshot's pins, or a snapshot ref whose target has no `abfsgc` row, stops a condemn.
 * A collector of an older version counts these refs as `other-meta` and keeps the snapshots for good, but not the commits their mounts were pinned to; run a collector of this version.
 
 ### Report of a delete cycle
@@ -508,9 +520,9 @@ The section `delete` holds:
 | Field | Content |
 | --- | --- |
 | `refused`, `warnings` | why the cycle did not delete, and the checks that options turned into warnings |
-| `too_new` | the check of the objects the consistency scan found without a `gc` row because they were written during it: `keys` checked, which equals `consistency.too_new` unless the scan stopped waiting for the checks; `not_hashes`; `gone`, deleted again before the check; `without_gc_row`, with up to 10 `samples`, which are a sample and not the lowest keys. When the check failed, it counts the objects checked before, and the reason is in `refused` |
+| `too_new` | the check of the objects the consistency scan found without an `abfsgc` row because they were written during it: `keys` checked, which equals `consistency.too_new` unless the scan stopped waiting for the checks; `not_hashes`; `gone`, deleted again before the check; `without_gc_row`, with up to 10 `samples`, which are a sample and not the lowest keys. When the check failed, it counts the objects checked before, and the reason is in `refused` |
 | `plan` | what the cycle planned to delete |
-| `step` | the record prefix; the objects deleted per type and their bytes; `not_matched` with samples, each of which should have a rescue log line of a server; `gone`; `blocked` (below a key that was not deleted); `type_not_allowed`; keys of unknown outcome; `gc` rows and map rows deleted and kept; the time of the first 100 levels per key range |
+| `step` | the record prefix; the objects deleted per type and their bytes; `not_matched` with samples, each of which should have a rescue log line of a server; `gone`; `blocked` (below a key that was not deleted); `type_not_allowed`; keys of unknown outcome; `abfsgc` rows and map rows deleted and kept; the time of the first 100 levels per key range |
 | `chunks` | the chunk step |
 | `refs` | the ref removal |
 | `records_removed` | the delete records removed |
@@ -520,7 +532,7 @@ The section `delete` holds:
 * A delete step removes about 24,000 objects in about 19 seconds on one Bigtable node, about 0.8 ms per object. Its rate of at most 2,000 objects per second also bounds it: 10^6 candidates take at least about 8 minutes.
 * A condemn or delete cycle over about 71 million objects takes about 7 to 14 minutes on one node with autoscaling to 3.
 * Writing the markers of about 27,000 objects takes about 6 seconds at the rate of at most 5,000 per second.
-* A delete cycle checks each object written during its consistency scan while the scan runs: it reads the object's `gc` row, and its `objects` row only when the `gc` row is missing, in batches of 100 keys with 8 batches in flight, and keeps only counts and the batches in flight in memory. That is one row read per object. Bigtable rates one SSD node at up to 17,000 row reads per second ([performance](https://docs.cloud.google.com/bigtable/docs/performance)), so on a node with no other load than the collector 1 million objects written during a scan take about 1 minute of reads and 10 million about 10 minutes, less with more nodes. The collector reads at low priority, so a node busy with a seed checks slower.
+* A delete cycle checks each object written during its consistency scan while the scan runs: it reads the object's `abfsgc` row, and its `objects` row only when the `abfsgc` row is missing, in batches of 100 keys with 8 batches in flight, and keeps only counts and the batches in flight in memory. That is one row read per object. Bigtable rates one SSD node at up to 17,000 row reads per second ([performance](https://docs.cloud.google.com/bigtable/docs/performance)), so on a node with no other load than the collector 1 million objects written during a scan take about 1 minute of reads and 10 million about 10 minutes, less with more nodes. The collector reads at low priority, so a node busy with a seed checks slower.
 * When the checks fall behind, the scan waits for them, at most 15 minutes summed over its key ranges. The wait makes a delete cycle up to about 15 minutes longer than a condemn cycle, about the length of one more cycle at 71 million objects, and about 1 minute longer when all 16 key ranges wait at once. The checks share the node with the scan, so they also slow it. Past that wait the scan stops checking and cancels the reads in flight, finishes at full speed, and the cycle refuses its deletes. A cycle during a seed or a large catch-up of a git-pusher can refuse this way; deletes resume in a later cycle with fewer writes during its scan.
 * The step runs one level per link in a chain of unreachable objects: for a dropped branch of 10,000 commits, expect about 10,000 levels and an estimated 13 to 20 minutes of delete step and tens of thousands of delete records, which the next chunk step reads.
 * Deleted chunks are billed for the 7 days of the undo window. The delete records hold the deleted rows, about 3 KB per object on average plus 20 bytes per edge, for about 14 days: at 5 million deleted objects a day, about 15 GB a day and 210 GB in all. `delete.step.record_bytes` gives the size per cycle.
@@ -552,18 +564,18 @@ A batch writes its record before its deletes, so a record can name a key that it
 
 What the undo does:
 
-* It fails when a cycle in the range has pruned records, or a record of the range is of format version 1. When a restored object links an absent object, it reads the keys of the records of every cycle, and then any record of format version 1 under `gc/deleted/<state>/` fails it. Delete those records first (see [Upgrades](#upgrades)).
+* It fails when a cycle in the range has pruned records, or a record of the range is of format version 1. When a restored object links an absent object, it reads the keys of the records of every cycle, and then any record of format version 1 under `abfsgc/deleted/<state>/` fails it. Delete those records first (see [Upgrades](#upgrades)).
 * It takes the lease in the phase `undo`, which does not raise the largest grace. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two write attempts of 30 seconds each and a minute.
 * It restores the newest cycle first and in each cycle the deepest level first, so children come back before their parents.
-* For each object whose row is absent: its chunks must exist; its bucket chunks get the custom metadata `abfs-undo=<cycle>` and its chunk rows a cell `data:undo` with a new time, so that a chunk step that read them earlier cannot delete them; its `gc` row is written from the record with a new time and a touch, so it is recent for `--grace`; its `objects` row comes last, with the cells and times of the record, without the marker.
-* An object is not restored, nor anything that links it, when a chunk is gone (`missing_chunks`; the log names the chunk), it had no `gc` row when it was deleted (`without_gc_row`), or it links an absent object that this run did not restore and that a delete record of another cycle names, or, when the records of a cycle were pruned, any absent object (`blocked_by_child`).
+* For each object whose row is absent: its chunks must exist; its bucket chunks get the custom metadata `abfs-undo=<cycle>` and its chunk rows a cell `data:undo` with a new time, so that a chunk step that read them earlier cannot delete them; its `abfsgc` row is written from the record with a new time and a touch, so it is recent for `--grace`; its `objects` row comes last, with the cells and times of the record, without the marker.
+* An object is not restored, nor anything that links it, when a chunk is gone (`missing_chunks`; the log names the chunk), it had no `abfsgc` row when it was deleted (`without_gc_row`), or it links an absent object that this run did not restore and that a delete record of another cycle names, or, when the records of a cycle were pruned, any absent object (`blocked_by_child`).
 * Map rows come back with a new time. What is present stays as it is.
 
 ## Operator rules
 
 * Raise `--grace` only with care. The collector keeps a server row for the largest grace of any earlier condemn or delete cycle plus an hour, and a delete cycle with a larger grace needs rows from further back, which earlier cycles may have removed. After raising `--grace`, run condemn cycles instead of delete cycles until the increase has passed since the last cycle with the old grace. Lowering it needs no wait.
 * A server of an older version of the GC rules refuses the deletes of every cycle whose grace it may have run in, and the completion of every such list (see [Upgrades](#upgrades)). A server that writes no heartbeat row is seen only by the host count.
-* A map row is deleted only when every end that has a `gc` row is of a type `--delete-types` allows.
+* A map row is deleted only when every end that has an `abfsgc` row is of a type `--delete-types` allows.
 * Widen `--delete-types` from the top of the graph down: commits, `project-status` and build objects first, then trees and deep trees, then blobs. Blobs, trees and eval objects need every live mount on `gc-keepalive` with a cacheman that checks local writes.
 * The servers' `--gc-touch-interval` must be at most half of the collector's `--grace`, and their largest `--cache-ttl` plus the collector's `--longest-push` at most `--grace`. A server with `--gc` refuses to start with either at `0`. The collector reads both from the heartbeat rows; the dry run warns when they break the rule.
 * Deletes come a hold after each list, whatever the schedule of the cycles (see [The hold](#the-hold)).
@@ -584,11 +596,11 @@ A server with `--gc` refuses to start with `--cache-ttl 0` or `--gc-touch-interv
 
 ### GC edges
 
-`PutObject` writes the `gc` row of each new object, with the GC edges, before its object row. This adds one Bigtable write to each upload. A failed `gc` row write fails the upload.
+`PutObject` writes the `abfsgc` row of each new object, with the GC edges, before its object row. This adds one Bigtable write to each upload. A failed `abfsgc` row write fails the upload.
 
 ### Rescue
 
-The collector marks an object it plans to delete with the cell `g:condemned` of its `objects` row. The server reads that cell with every object row it reads: in `Headers`, the existence check of `PutObject`, the link checks of `PutObject`, `PutRefs`, `XchgRefs` and `AddMapResult`, `GetObject` and `MapResults`. On a marked row it:
+The collector marks an object it plans to delete with the cell `abfsgc:condemned` of its `objects` row. The server reads that cell with every object row it reads: in `Headers`, the existence check of `PutObject`, the link checks of `PutObject`, `PutRefs`, `XchgRefs` and `AddMapResult`, `GetObject` and `MapResults`. On a marked row it:
 
 1. writes a touch;
 2. clears the marker, but only while the marker still holds the value it read;
@@ -596,9 +608,9 @@ The collector marks an object it plans to delete with the cell `g:condemned` of 
 
 A rescue whose touch fails fails the call and leaves the marker, so that the client's retry rescues it again. A condemn write that is retried or lands late can set the marker again after a clear, and then only the touch keeps the next cycle from finding the object unreachable.
 
-When the collector deleted the row first, the object is missing, and a client that writes it stores it again. The touch stays behind as a `gc` row with only the touch.
+When the collector deleted the row first, the object is missing, and a client that writes it stores it again. The touch stays behind as an `abfsgc` row with only the touch.
 
-The conditional writes need an app profile that allows single-row transactions, which the server checks at start. Rescue has no switch of its own: with `--gc` every header read includes the family `g`. Only condemn and delete cycles write markers; until one runs, this costs only the wider read.
+The conditional writes need an app profile that allows single-row transactions, which the server checks at start. Rescue has no switch of its own: with `--gc` every header read includes the family `abfsgc`. Only condemn and delete cycles write markers; until one runs, this costs only the wider read.
 
 Up to 32 rescues of one call run in parallel. A failed rescue does not stop the others; the call fails with the first error once all have run, so a retry finds only the objects whose rescue failed still marked.
 
@@ -620,16 +632,16 @@ Each call that rescued an object, or failed to, logs lines that name the call an
 
 ### Touches
 
-When a call finds an object (`Headers`, `GetObject`, the existence check of `PutObject`, the link checks, the results of `MapResults`), the server writes the cell `t:touch` of the object's row in the table `gc`, with a Bigtable server timestamp.
+When a call finds an object (`Headers`, `GetObject`, the existence check of `PutObject`, the link checks, the results of `MapResults`), the server writes the cell `t:touch` of the object's row in the table `abfsgc`, with a Bigtable server timestamp.
 
-* Each server writes at most one touch per object in each period of `--gc-touch-interval`, so an object in use has a touch younger than the interval. The `gc` row of an upload and the touch of a rescue, both written before the call answers, count as the touch of their period, so the next hit in that period writes none. The periods count from the server start, shifted for each object by an offset taken from its key, so the periods of different objects end at different times and their next touches spread over the interval.
+* Each server writes at most one touch per object in each period of `--gc-touch-interval`, so an object in use has a touch younger than the interval. The `abfsgc` row of an upload and the touch of a rescue, both written before the call answers, count as the touch of their period, so the next hit in that period writes none. The periods count from the server start, shifted for each object by an offset taken from its key, so the periods of different objects end at different times and their next touches spread over the interval.
 * `MapResults` also writes the cell of each map row it returns again, with the same limit, so the timestamp of a map row is the time it was last used. Map results therefore come back in the order of their last use, oldest first, instead of the order they were added. ninjago tries the newest result first, so builds are not affected.
 * Each server remembers the last touch of up to 4,000,000 map rows, so that it rewrites each at most once per touch interval. A server that returns more distinct rows per touch period touches a row again once it was forgotten, so its map row touches follow the rate of `MapResults` calls rather than the period. The memory grows with the rows returned, about 225 bytes per row and 900 MB when full.
 
 Touches wait in a buffer of 100,000, and four workers write them in batches of up to 1,000, at least once a second:
 
 * When the buffer is full, `Headers` and `MapResults`, the calls of the client keep-alive and of builds, wait up to half a second per object touch for room. A burst, such as the keep-alive of a large mount, is slowed to the rate the workers write instead of losing touches.
-* When a wait times out, touches are dropped and counted, without waiting, until the buffer has room again. So with `--gc` the latency of `Headers` and `MapResults` depends on the table `gc`: while the buffer is full they run at the rate the workers write, and when the writes stall, the first of them waits half a second.
+* When a wait times out, touches are dropped and counted, without waiting, until the buffer has room again. So with `--gc` the latency of `Headers` and `MapResults` depends on the table `abfsgc`: while the buffer is full they run at the rate the workers write, and when the writes stall, the first of them waits half a second.
 * `GetObject`, the existence check of `PutObject` and the link checks never wait for room; they drop the touch and count it. The next use of a dropped object writes its touch.
 * Map row touches never wait either, and are queued only while the buffer is less than half full, so they take at most about half of it and leave the rest to object touches. The next use of a row whose touch was dropped writes its touch.
 * A touch is written or counted as lost within 251 seconds of the use. A touch whose write starts later, because the process was frozen or starved, is written and also counted as failed.
@@ -651,10 +663,10 @@ A call that answers that objects are present, `Headers`, `GetObject` before it r
 
 ### Heartbeat
 
-Each server writes its row in the Spanner table `GcServers` before it serves and then every 5 minutes. The row holds:
+Each server writes its row in the Spanner table `AbfsGcServers` before it serves and then every 5 minutes. The row holds:
 
 * an ID made of the host name and a random suffix, logged at start;
-* the version of the GC rules the server follows, which it also writes into the table `gc`, and `GcEnabled`, always true;
+* the version of the GC rules the server follows, which it also writes into the table `abfsgc`, and `GcEnabled`, always true;
 * its `--gc-touch-interval`, `--cache-ttl` and heartbeat interval;
 * `LinkValidation`, false with `--no-link-validation`;
 * `LastSeen`, the commit time;
@@ -685,6 +697,14 @@ Metrics, as OpenTelemetry counters and one histogram. Their names keep the dots 
 | `abfs.gcp.gc.heartbeat_failures` | | Failed heartbeat writes |
 | `abfs.gcp.gc.answer_seconds` | `call` | Histogram of the seconds from the start of a call that can answer that objects are present to its answer, by call: `headers`, `put_object`, `get_object`, `map_results`; a call of 2 minutes or more fails |
 
+`gc run` sets three gauges once, at the end of its cycle, through the metrics provider of the command (`--kv metrics-provider=<name>`; none by default). Their names have no dots and no unit, so OTLP and a Prometheus endpoint export them under the same name, for example `prometheus.googleapis.com/abfs_gc_cycle_keys/gauge`. Each run is a new series.
+
+| Metric | Labels | Value |
+| --- | --- | --- |
+| `abfs_gc_cycle_end_timestamp_seconds` | `mode`, `result` | The end of the cycle in seconds since the epoch; `result` is `ok`, `condemn_refused`, `delete_refused`, `delete_stopped`, `chunks_skipped` (status 3 to 6) or `error` (status 1, or a signal) |
+| `abfs_gc_cycle_keys` | `mode`, `action` | `condemned`: `condemn.condemned`, in condemn and delete mode; `deleted`: `delete.step.deleted`, in delete mode |
+| `abfs_gc_cycle_chunks_deleted` | `depot` | `bigtable`: `delete.chunks.chunk_rows_deleted`; `bucket`: `delete.chunks.bucket_objects_deleted`; delete mode only |
+
 ## Limits of the garbage collector
 
 Mounts and pins:
@@ -702,7 +722,7 @@ Mounts and pins:
 
 Servers:
 
-* Only servers with `--gc` write a heartbeat. A server started without `--gc` writes no row, so the collector cannot see it: it does not touch or rescue what its clients use, and the dry run gives no warning about it. The condemn and delete modes check the number of server hosts, which is how they see such a server. Delete mode also refuses when an object written during its consistency scan has no `gc` row; objects written before show as missing `gc` rows. A server without `--gc` that only reads, or writes objects that exist, leaves no trace.
+* Only servers with `--gc` write a heartbeat. A server started without `--gc` writes no row, so the collector cannot see it: it does not touch or rescue what its clients use, and the dry run gives no warning about it. The condemn and delete modes check the number of server hosts, which is how they see such a server. Delete mode also refuses when an object written during its consistency scan has no `abfsgc` row; objects written before show as missing `abfsgc` rows. A server without `--gc` that only reads, or writes objects that exist, leaves no trace.
 * A condemned object read from a server's cache is not rescued, and neither are reads that never reach a server: cacheman's local content, signed URL reads within their 10 minutes, and ninjago's input checks from local attributes. Object touches that a server dropped or failed to write, and touches in its buffer when it crashed or was killed, are lost the same way. A lost touch refuses nothing: the next condemn can mark such an object, and a read of it during the hold rescues it.
 * A pause of a server process under 10 seconds is not recorded.
 
@@ -726,6 +746,6 @@ Builds and records:
 
 Leaks, left for a later orphan sweep:
 
-* A collector that lost its lease and deletes late can leave a row with only a condemn marker, or a `gc` row without an object row.
+* A collector that lost its lease and deletes late can leave a row with only a condemn marker, or an `abfsgc` row without an object row.
 * A map touch that a server wrote after the delete of its row writes the row again.
 * An undo that failed after it kept the chunks of an object it did not finish leaves those chunks, unless it is run again.

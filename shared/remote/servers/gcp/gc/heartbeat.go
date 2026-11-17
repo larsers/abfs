@@ -35,11 +35,11 @@ func NewReplicaID() string {
 }
 
 // Replica is what checkReplicas checks of the heartbeat row of a server
-// process in GcServers.
+// process in AbfsGcServers.
 type Replica struct {
 	ID string
 	// Version is the version of the GC rules the process follows, which it
-	// also writes into the table gc, 0 when it writes none.
+	// also writes into the table abfsgc, 0 when it writes none.
 	Version int64
 	// GC reports whether the process runs the garbage collector hooks.
 	GC bool

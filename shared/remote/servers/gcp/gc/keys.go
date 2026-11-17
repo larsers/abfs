@@ -32,7 +32,7 @@ type keyState struct {
 	written   time.Time
 	touched   time.Time
 	objectRow bool
-	// marker is the value of g:condemned, nil when the row has none.
+	// marker is the value of abfsgc:condemned, nil when the row has none.
 	marker []byte
 }
 
@@ -66,7 +66,7 @@ func readKeyStates(ctx context.Context, bt *bigtable.Client, keys []Hash) ([]key
 			return true
 		}, bigtable.RowFilter(gcFilter))
 		if err != nil {
-			return nil, fmt.Errorf("failed to read rows of the table gc: %w", err)
+			return nil, fmt.Errorf("failed to read rows of the table abfsgc: %w", err)
 		}
 		err = objects.ReadRows(ctx, rows, func(row bigtable.Row) bool {
 			st := &states[index[row.Key()]]

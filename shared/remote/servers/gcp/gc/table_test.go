@@ -33,7 +33,7 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// newTestBigtable starts an in-process Bigtable with the tables objects and gc
+// newTestBigtable starts an in-process Bigtable with the tables objects and abfsgc
 // and returns a client for it.
 func newTestBigtable(t *testing.T) *bigtable.Client {
 	t.Helper()

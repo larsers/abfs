@@ -311,7 +311,8 @@ func TestChunkStep_RestoredAfterRecord(t *testing.T) {
 // undo window for the delete of its chunks. The gc row pass runs also while
 // the bucket settings stop the chunk deletes, and flags the record so that
 // it does not run again. Only a record left without the flag a day past the
-// undo window counts as unflagged.
+// undo window counts as unflagged. A record skipped by the bucket settings
+// counts in RecordsSkipped only once it is past the undo window.
 func TestChunkStep_TwoPasses(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -363,10 +364,14 @@ func TestChunkStep_TwoPasses(t *testing.T) {
 	rep = at(f, name, gcRowPassDelay)
 	require.Len(rep.Skipped, 1)
 	require.Equal(int64(1), rep.GCRowsDeleted)
+	require.Equal(int64(1), rep.RecordsWaiting)
+	require.Zero(rep.RecordsSkipped)
 	require.False(f.rowExists(TableName, key.String()))
 	rep = at(f, name, undoWindow+24*time.Hour-time.Second)
 	require.Zero(rep.Records)
 	require.Zero(rep.Unflagged)
+	require.Equal(int64(1), rep.RecordsSkipped)
+	require.False(rep.ListFailed)
 	require.True(f.rowExists(chunksTableName, row))
 	rep = at(f, name, undoWindow+24*time.Hour)
 	require.Equal(int64(1), rep.Unflagged)
@@ -823,16 +828,16 @@ func TestPruneRecords(t *testing.T) {
 		kept       bool
 	}
 	records := []record{
-		{"gc/deleted/default/3/0-0-0", chunksDoneMetadata, true},
-		{"gc/deleted/default/3/1-0-0", "", true},
-		{"gc/deleted/default/4/1-2-0", chunksDoneMetadata, false},
-		{"gc/deleted/default/4/1-3-0", chunksDoneMetadata, false},
-		{"gc/deleted/default/5/1-0-0", chunksDoneMetadata, false},
-		{"gc/deleted/default/6/1-0-0", gcRowsDoneMetadata, true},
-		{"gc/deleted/default/7/1-0-0", chunksDoneMetadata, true},
-		{"gc/deleted/default/8/1-0-0", chunksDoneMetadata, true},
-		{"gc/deleted/default/notes", chunksDoneMetadata, true},
-		{"gc/deleted/other/1/1-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/3/0-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/3/1-0-0", "", true},
+		{"abfsgc/deleted/default/4/1-2-0", chunksDoneMetadata, false},
+		{"abfsgc/deleted/default/4/1-3-0", chunksDoneMetadata, false},
+		{"abfsgc/deleted/default/5/1-0-0", chunksDoneMetadata, false},
+		{"abfsgc/deleted/default/6/1-0-0", gcRowsDoneMetadata, true},
+		{"abfsgc/deleted/default/7/1-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/8/1-0-0", chunksDoneMetadata, true},
+		{"abfsgc/deleted/default/notes", chunksDoneMetadata, true},
+		{"abfsgc/deleted/other/1/1-0-0", chunksDoneMetadata, true},
 	}
 	for _, r := range records {
 		write(r.name, r.flag)
@@ -909,7 +914,7 @@ func TestPruneRecords_RetentionCountsFromTheFlag(t *testing.T) {
 	// The flag write moves the update time of the record.
 	ctx := context.Background()
 	bucket := newTestBucket(t)
-	obj := bucket.Object("gc/deleted/default/3/0-0-0")
+	obj := bucket.Object("abfsgc/deleted/default/3/0-0-0")
 	require.NoError(obj.NewWriter(ctx).Close())
 	time.Sleep(10 * time.Millisecond)
 	attrs, err := obj.Update(ctx, storage.ObjectAttrsToUpdate{Metadata: flagged})

@@ -33,8 +33,8 @@ type tableFamilies = struct {
 }
 
 // gcBigtableTables lists the Bigtable tables and column families that the
-// garbage collector adds to bigtableTables: the family g of objects and the
-// table gc.
+// garbage collector adds to bigtableTables: the family abfsgc of objects and the
+// table abfsgc.
 var gcBigtableTables = []tableFamilies{
 	{"objects", []string{gc.ObjectsFamily}},
 	{gc.TableName, []string{gc.EdgesFamily, gc.TouchFamily}},

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package gc holds the garbage collector of the GCP server: the GC edges of
-// each object and the Bigtable table gc that stores them.
+// each object and the Bigtable table abfsgc that stores them.
 package gc
 
 import (

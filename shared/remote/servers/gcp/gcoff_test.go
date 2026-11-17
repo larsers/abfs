@@ -289,8 +289,8 @@ func writeCallLog(t *testing.T, calls []string) {
 func gcTraffic(calls []string) []string {
 	var found []string
 	for _, c := range calls {
-		if strings.Contains(c, " gc ") || strings.Contains(c, "family(meta|g)") || strings.Contains(c, "set(g:") ||
-			strings.Contains(c, "delete(g") || strings.Contains(c, "server-time") ||
+		if strings.Contains(c, " abfsgc ") || strings.Contains(c, "family(meta|abfsgc)") || strings.Contains(c, "set(abfsgc:") ||
+			strings.Contains(c, "delete(abfsgc") || strings.Contains(c, "server-time") ||
 			strings.HasPrefix(c, "CheckAndMutateRow") || strings.HasPrefix(c, "ReadModifyWriteRow") {
 			found = append(found, c)
 		}
@@ -333,9 +333,9 @@ func TestGCOff_NoGCTraffic(t *testing.T) {
 	for _, c := range late {
 		require.True(strings.HasPrefix(c, "ReadRows maps "), c)
 	}
-	require.Zero(spannerRows(t, dbID, "GcLists"))
-	require.Zero(spannerRows(t, dbID, "GcServers"))
-	require.Zero(spannerRows(t, dbID, "GcState"))
+	require.Zero(spannerRows(t, dbID, "AbfsGcLists"))
+	require.Zero(spannerRows(t, dbID, "AbfsGcServers"))
+	require.Zero(spannerRows(t, dbID, "AbfsGcState"))
 }
 
 // The same scenario with GC on shows what the check above would catch.
@@ -352,13 +352,13 @@ func TestGCOff_GCOnHasGCTraffic(t *testing.T) {
 	calls := rec.snapshot()
 
 	traffic := strings.Join(gcTraffic(calls), "\n")
-	require.Contains(traffic, "MutateRow gc row=")
-	require.Contains(traffic, "family(meta|g)")
-	require.Contains(traffic, "MutateRows gc ")
+	require.Contains(traffic, "MutateRow abfsgc row=")
+	require.Contains(traffic, "family(meta|abfsgc)")
+	require.Contains(traffic, "MutateRows abfsgc ")
 	require.NotEmpty(gcTraffic(late), "the TTL expired, so the reads went to Bigtable again")
 	// Both servers wrote heartbeats and kept their rows when they closed.
-	require.Zero(spannerRows(t, dbID, "GcLists"))
-	require.Equal(2, spannerRows(t, dbID, "GcServers WHERE StoppedAt IS NOT NULL"))
+	require.Zero(spannerRows(t, dbID, "AbfsGcLists"))
+	require.Equal(2, spannerRows(t, dbID, "AbfsGcServers WHERE StoppedAt IS NOT NULL"))
 }
 
 // A server with GC off starts on a deployment that plain init created, without
