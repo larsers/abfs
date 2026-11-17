@@ -69,7 +69,7 @@ Garbage collection is off unless it is turned on, on the servers and on the clie
 6. When the dry runs are clean, run `abfs server gcp gc run --condemn` on the same schedule instead (see [Condemn mode](#condemn-mode)).
 7. Prepare delete mode: a Bigtable instance with one cluster (see [Delete checks](#delete-checks)), an [app profile](#app-profile-of-the-collector) and the [permissions](#permissions-of-the-collector) of the collector, and a bucket with versioning off and no retention policy.
 8. When the condemn cycles have run clean for a week or more under real use, run `abfs server gcp gc run --delete` on the same schedule instead (see [Delete mode](#delete-mode)). Before the first one, check the last condemn reports:
-   * `delete.refused` names no reason you cannot explain;
+   * `app_profile.problems` is empty; the other [delete checks](#delete-checks), such as the cluster count, the conditional write probe and the link validation and versions of the servers, run only in delete mode, so a failed one shows first in the first delete cycle, which then lists it in `delete.refused`, only condemns and exits 4;
    * the `delete.plan` counts per type and their samples are explained;
    * `live_mounts.without_keepalive` and `live_mounts.without_local_write_check` are 0;
    * `condemn.cleared` and `previous_list` show no rescued or live key without an explanation (see [The .live object](#the-live-object)).
@@ -194,7 +194,7 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 5. Scans the `abfsgc` table twice in 16 key ranges: first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
 6. Marks in memory everything the roots reach. It walks the roots one at a time in a fixed order: the refs of the classes source, workspaces, snapshots, mounts and unmount records, then the pinned revisions, builds, other `abfs-meta` refs, empty objects, recent objects and map rows, so that the report can name the root that reached an object first. Edges to objects without an `abfsgc` row are skipped and counted. An `abfsgc` row with an object type the binary does not know stops the run.
 7. Scans the `meta` family and the newest condemn marker of the `objects` table to check that every object has an `abfsgc` row, to sum the sizes (`meta:size`) of reachable and unreachable objects and to read the marker of each. This reads every object row once. `consistency.marked` counts the objects with a marker and `consistency.marked_live` those the mark found live. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
-8. Writes a JSON report to stdout or to `--report`, and logs a one-line summary.
+8. Writes the JSON report as one line to stdout or to `--report`, and logs a one-line summary.
 
 ### Root classes
 
@@ -250,6 +250,21 @@ The sections `live_mounts`, `workspaces` and `snapshots` report the pins:
 
 `samples` names up to 20 mount details per count, with the workspace snapshot, host and user, so that the clients behind them can be found.
 
+### Exit status
+
+`gc run` writes the report, then exits with the status of the first cause in this table. A dry run exits 0 or 1.
+
+| Status | Cause | Modes |
+| --- | --- | --- |
+| 0 | Nothing refused, stopped or skipped | all |
+| 1 | The cycle failed: flags, app profile, backend, lease, a list not completed (`condemn.not_completed`), or the report could not be written | all |
+| 3 | The cycle refused to condemn (`condemn.refused`) | condemn, delete |
+| 4 | The cycle refused to delete and only condemned (`delete.refused`) | delete |
+| 5 | A worker error stopped the delete step (`delete.step.error`); the next cycle deletes the keys it did not reach | delete |
+| 6 | The chunk step deleted no chunks of a delete record past the undo window (`delete.chunks.skipped`, `records_skipped`), could not list the records (`list_failed`), or left a record without its flag a day past the undo window (`unflagged`; the cause is in `errors`, `error_sample`, `record_errors`, `delete_refused` or `unknown_depot`) | delete |
+
+A chunk step that skips while every record is younger than the undo window, as in the first 7 days of delete mode, exits 0.
+
 ### Explain
 
 `--explain <key>[,<key>]` adds an `explain` section with, per key: whether it has an `abfsgc` row and its type, whether it is reachable, the root that reached it first, the write and touch times of its `abfsgc` row, whether it has an `objects` row and the cycle number of its condemn marker. The first root (`first_root`) gives its class and object, and the project, ref and update time of a ref root, the mount details, host and user of a pinned revision, or the result of a map row. It reads two rows per key.
@@ -290,7 +305,7 @@ abfs server gcp gc run --condemn --expected-replicas <hosts> --project <project>
 
 ### Condemn refusals
 
-The cycle condemns only when its own report is clean. It refuses, writes no marker and no list, writes the report with the reasons in `condemn.refused` and exits with an error, when any of these holds:
+The cycle condemns only when its own report is clean. It refuses, writes no marker and no list, writes the report with the reasons in `condemn.refused` and exits with status 3 (see [Exit status](#exit-status)), when any of these holds:
 
 * a warning in `replicas.warnings`;
 * the number of distinct host names among the live servers (`replicas.hosts`) differs from `--expected-replicas`, or is outside `--min-replicas` and `--max-replicas`. The count notices servers that write no heartbeat row; two live rows of one host, as after a crash and a restart under the same name, count once and refuse nothing;
@@ -442,7 +457,7 @@ Before the objects, the step deletes the map rows that name a candidate, and the
 
 Each batch of the delete step writes the object `abfsgc/deleted/<state>/<cycle>/<level>-<range>-<batch>` before any of its deletes. It holds a header with the cycle, the run and the start of the grace, then the 20-byte key of each object and the keys of the two ends of each map row, then per object the newest cell of each column of the families `meta` and `data` of its `objects` row, with its time, and the values of the family `e` of its `abfsgc` row. A record holds at most 16 MiB; a larger batch goes into several records, and the report counts their size in `delete.step.record_bytes`. The chunk step and `gc undo` read these records.
 
-When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest 7 cycles that have records, and every record flagged within 7 days, so a record lives about 14 days. Before it removes the records of a cycle it writes `abfsgc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts those older than 8 days, past the 7 days every record waits, and gives the age of the oldest.
+When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest 7 cycles that have records, and every record flagged within 7 days, so a record lives about 14 days. Before it removes the records of a cycle it writes `abfsgc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts those older than 8 days, past the 7 days every record waits, and gives the age of the oldest; while it is above 0 the cycle exits 6.
 
 ### Chunk step
 
@@ -456,7 +471,7 @@ In each delete cycle, also one whose deletes were refused, the chunk step reads 
 
 A chunk row goes only when it has no cell newer than the record, such as the cell `gc undo` writes. A bucket object goes only under the generation and metageneration read just before the delete, so an object written again or stamped by `gc undo` stays (`restored_after_record`). A delete the bucket refuses (`delete_refused`) or an error leaves the record without the flag, for the next cycle.
 
-The step deletes no chunks, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of the settings below. The `abfsgc` row deletes run either way.
+The step deletes no chunks, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of the settings below. The `abfsgc` row deletes run either way. `records_skipped` counts the records past the undo window whose chunks it skipped. When the records cannot be listed, the step does nothing and reports `list_failed`. Either makes the cycle exit with status 6, as does a record that `unflagged` counts.
 
 * Object Versioning on: a delete would keep a noncurrent version;
 * a retention policy, a default event-based hold or object retention: each can refuse a delete.
@@ -681,6 +696,14 @@ Metrics, as OpenTelemetry counters and one histogram. Their names keep the dots 
 | `abfs.gcp.gc.map_results_dropped` | | Map results left out because their object is missing |
 | `abfs.gcp.gc.heartbeat_failures` | | Failed heartbeat writes |
 | `abfs.gcp.gc.answer_seconds` | `call` | Histogram of the seconds from the start of a call that can answer that objects are present to its answer, by call: `headers`, `put_object`, `get_object`, `map_results`; a call of 2 minutes or more fails |
+
+`gc run` sets three gauges once, at the end of its cycle, through the metrics provider of the command (`--kv metrics-provider=<name>`; none by default). Their names have no dots and no unit, so OTLP and a Prometheus endpoint export them under the same name, for example `prometheus.googleapis.com/abfs_gc_cycle_keys/gauge`. Each run is a new series.
+
+| Metric | Labels | Value |
+| --- | --- | --- |
+| `abfs_gc_cycle_end_timestamp_seconds` | `mode`, `result` | The end of the cycle in seconds since the epoch; `result` is `ok`, `condemn_refused`, `delete_refused`, `delete_stopped`, `chunks_skipped` (status 3 to 6) or `error` (status 1, or a signal) |
+| `abfs_gc_cycle_keys` | `mode`, `action` | `condemned`: `condemn.condemned`, in condemn and delete mode; `deleted`: `delete.step.deleted`, in delete mode |
+| `abfs_gc_cycle_chunks_deleted` | `depot` | `bigtable`: `delete.chunks.chunk_rows_deleted`; `bucket`: `delete.chunks.bucket_objects_deleted`; delete mode only |
 
 ## Limits of the garbage collector
 

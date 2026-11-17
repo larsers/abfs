@@ -63,8 +63,12 @@ const (
 // ChunkStepReport reports the chunk step of a delete cycle, which deletes the
 // chunks of the objects that the delete records of earlier cycles name.
 type ChunkStepReport struct {
-	// Skipped lists the reasons why the step deleted no chunks.
-	Skipped []string `json:"skipped,omitempty"`
+	// Skipped lists the reasons why the step deleted no chunks, and
+	// RecordsSkipped counts the records past the undo window it skipped for
+	// them. ListFailed reports that the step could not list the records.
+	Skipped        []string `json:"skipped,omitempty"`
+	RecordsSkipped int64    `json:"records_skipped"`
+	ListFailed     bool     `json:"list_failed,omitempty"`
 	// Records counts the records the step read for their chunks and
 	// RecordsDone those it flagged. RecordsWaiting counts the records younger
 	// than the undo window, RecordsGCRowsDone those whose gc rows the step
@@ -153,6 +157,7 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 		return ctx.Err()
 	}
 	if listErr != nil {
+		s.rep.ListFailed = true
 		s.rep.Skipped = append(s.rep.Skipped, listErr.Error())
 	} else {
 		s.rep.Skipped = s.preconditions(ctx)
@@ -164,8 +169,11 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 		eg.SetLimit(chunkRecordWorkers)
 		for _, attrs := range unflagged {
 			chunksDue := !attrs.Created.Add(undoWindow).After(now)
-			if !chunksDue {
+			switch {
+			case !chunksDue:
 				s.rep.RecordsWaiting++
+			case len(s.rep.Skipped) > 0:
+				s.rep.RecordsSkipped++
 			}
 			switch {
 			case chunksDue && len(s.rep.Skipped) == 0:

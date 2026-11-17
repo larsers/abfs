@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/pflag"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/remote/servers/gcp"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
@@ -199,7 +201,13 @@ it deletes, so 'gc undo' can write them back. The chunks of deleted objects are 
 days after the record of their batch, unless the row of the object is back; that step
 deletes no chunk while the bucket has Object Versioning on, a retention policy, a default
 event-based hold or object retention.
-Needs the resources of 'abfs server gcp init --gc'.`,
+Needs the resources of 'abfs server gcp init --gc'.
+
+Exit status: 0 when nothing was refused, stopped or skipped; 1 when the cycle failed; 3
+when it refused to condemn; 4 when it refused to delete; 5 when a worker error stopped its
+delete step; 6 when the chunk step deleted no chunks of a delete record past the undo
+window, could not list the records, or left a record without its flag a day past the undo
+window. Of several, the lowest. A dry run exits 0 or 1.`,
 	}
 }
 
@@ -285,11 +293,146 @@ func (c *gcpGCRunCmd) checkOpts(fl *pflag.FlagSet) error {
 
 func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
-	if err := c.checkOpts(fl); err != nil {
+	m := newCycleMetrics(metrics.GetProvider())
+	r, err := c.run(ctx, fl)
+	return m.endCycle(c.mode(), r, err)
+}
+
+// endCycle sets the gauges of a cycle in mode that reported r and returned
+// err, and returns the error that gives the exit code.
+func (m *cycleMetrics) endCycle(mode string, r *gc.Report, err error) error {
+	result, code := cycleExit(r, err)
+	m.record(mode, result, r, time.Now())
+	if code == 0 || code == 1 {
 		return err
 	}
+	return clierr.CLIErrWithExitCode(code, "%s", outcomeMessage(r, err))
+}
+
+// mode returns the mode of the cycle, empty when no mode flag is set.
+func (c *gcpGCRunCmd) mode() string {
+	switch {
+	case c.delete:
+		return gc.PhaseDelete
+	case c.condemn:
+		return gc.PhaseCondemn
+	case c.dryRun:
+		return gc.PhaseDryRun
+	}
+	return ""
+}
+
+// outcomeExitCodes are the exit codes of the outcomes of a cycle; a cycle
+// that failed exits 1. Of several outcomes, Report.Outcome returns the one
+// with the lowest code.
+var outcomeExitCodes = map[string]int{
+	gc.OutcomeOK:             0,
+	gc.OutcomeCondemnRefused: 3,
+	gc.OutcomeDeleteRefused:  4,
+	gc.OutcomeDeleteStopped:  5,
+	gc.OutcomeChunksSkipped:  6,
+}
+
+// cycleExit returns the result label and the exit code of a cycle that
+// reported r and returned err. A cycle without a report failed, whatever its
+// outcome.
+func cycleExit(r *gc.Report, err error) (string, int) {
+	var refused *gc.ErrCondemnRefused
+	switch {
+	case r == nil:
+		return "error", 1
+	case errors.As(err, &refused):
+		return gc.OutcomeCondemnRefused, outcomeExitCodes[gc.OutcomeCondemnRefused]
+	case err != nil:
+		return "error", 1
+	}
+	outcome := r.Outcome()
+	return outcome, outcomeExitCodes[outcome]
+}
+
+// outcomeMessage returns the error line of a cycle that exits with an
+// outcome other than OutcomeOK.
+func outcomeMessage(r *gc.Report, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	outcome := r.Outcome()
+	switch outcome {
+	case gc.OutcomeCondemnRefused:
+		return fmt.Sprintf("the GC cycle %d refused to condemn: %s", r.Cycle, strings.Join(r.Condemn.Refused, "; "))
+	case gc.OutcomeDeleteRefused:
+		return fmt.Sprintf("the GC cycle %d refused to delete and only condemned: %s", r.Cycle, strings.Join(r.Delete.Refused, "; "))
+	case gc.OutcomeDeleteStopped:
+		return fmt.Sprintf("the GC cycle %d stopped its delete step: %s", r.Cycle, r.Delete.Step.Error)
+	case gc.OutcomeChunksSkipped:
+		c := r.Delete.Chunks
+		switch {
+		case c.ListFailed:
+			return fmt.Sprintf("the GC cycle %d could not list the delete records and deleted no chunks: %s", r.Cycle, strings.Join(c.Skipped, "; "))
+		case c.RecordsSkipped > 0:
+			return fmt.Sprintf("the GC cycle %d deleted no chunks of %d delete records past the undo window: %s", r.Cycle, c.RecordsSkipped, strings.Join(c.Skipped, "; "))
+		default:
+			return fmt.Sprintf("the GC cycle %d left %d delete records without the chunks-done flag a day past the undo window: %d unreadable records, %d errors, %d bucket deletes refused, %d chunks of an unknown depot", r.Cycle, c.Unflagged, c.RecordErrors, c.Errors, c.DeleteRefused, c.UnknownDepot)
+		}
+	}
+	return fmt.Sprintf("the GC cycle %d ended with outcome %s", r.Cycle, outcome)
+}
+
+// cycleMetrics are the gauges of a cycle, set once at its end. Each run is a
+// new series, so they are gauges: a counter would have one point, in which a
+// rate sees no increase.
+type cycleMetrics struct {
+	end    metrics.Gauge
+	keys   metrics.Gauge
+	chunks metrics.Gauge
+}
+
+func newCycleMetrics(p metrics.Provider) *cycleMetrics {
+	return &cycleMetrics{
+		end:    p.NewGauge("abfs_gc_cycle_end_timestamp_seconds", "Time at which a GC cycle ended, in seconds since the epoch, by mode and result: ok, the outcome that set the exit code, or error.", []string{"mode", "result"}),
+		keys:   p.NewGauge("abfs_gc_cycle_keys", "Objects that a GC cycle condemned or deleted, by mode and action.", []string{"mode", "action"}),
+		chunks: p.NewGauge("abfs_gc_cycle_chunks_deleted", "Chunks that the chunk step of a GC delete cycle deleted, by depot.", []string{"depot"}),
+	}
+}
+
+// record sets the gauges of a cycle that ended at end with result and
+// reported r, which may be nil. The counts are those of the steps the mode
+// runs, zero for a step that did not run.
+func (m *cycleMetrics) record(mode, result string, r *gc.Report, end time.Time) {
+	m.end.Set(float64(end.Unix()), mode, result)
+	if r == nil || mode == gc.PhaseDryRun {
+		return
+	}
+	var condemned int64
+	if r.Condemn != nil {
+		condemned = r.Condemn.Condemned
+	}
+	m.keys.Set(float64(condemned), mode, "condemned")
+	if mode != gc.PhaseDelete {
+		return
+	}
+	var deleted, rows, objects int64
+	if d := r.Delete; d != nil {
+		if d.Step != nil {
+			deleted = d.Step.Deleted
+		}
+		if d.Chunks != nil {
+			rows, objects = d.Chunks.ChunkRowsDeleted, d.Chunks.BucketObjectsDeleted
+		}
+	}
+	m.keys.Set(float64(deleted), mode, "deleted")
+	m.chunks.Set(float64(rows), "bigtable")
+	m.chunks.Set(float64(objects), "bucket")
+}
+
+// run runs the cycle, writes its report and returns it, nil when the cycle
+// stopped before it had one or the report could not be written.
+func (c *gcpGCRunCmd) run(ctx context.Context, fl *pflag.FlagSet) (*gc.Report, error) {
+	if err := c.checkOpts(fl); err != nil {
+		return nil, err
+	}
 	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
-		return err
+		return nil, err
 	}
 	// The run reads only the workspace snapshots, mount details and pinned
 	// manifests, once each, and must not rescue them.
@@ -299,11 +442,11 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	c.server.MaxCachedContents = 1
 	profile := checkAppProfile(ctx, &c.server)
 	if c.delete && len(profile.Problems) > 0 {
-		return fmt.Errorf("the Bigtable app profile %s does not fit a delete cycle: %s", profile.ID, strings.Join(profile.Problems, "; "))
+		return nil, fmt.Errorf("the Bigtable app profile %s does not fit a delete cycle: %s", profile.ID, strings.Join(profile.Problems, "; "))
 	}
 	server, err := gcp.New(ctx, &c.server)
 	if err != nil {
-		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+		return nil, fmt.Errorf("failed to create the ABFS GCP server: %w", err)
 	}
 	defer func() {
 		if err := server.Close(); err != nil {
@@ -319,13 +462,14 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	default:
 		res, err = server.DryRunGC(ctx, c.server.BucketName, &c.opts.DryRunOpts)
 	}
-	if res != nil {
-		res.Report.AppProfile = profile
-		if werr := writeReport(c.report, res.Report); werr != nil {
-			return errors.Join(err, werr)
-		}
+	if res == nil {
+		return nil, err
 	}
-	return err
+	res.Report.AppProfile = profile
+	if werr := writeReport(c.report, res.Report); werr != nil {
+		return nil, errors.Join(err, werr)
+	}
+	return res.Report, err
 }
 
 type gcpGCUndoCmd struct {
@@ -546,7 +690,8 @@ func checkAppProfile(ctx context.Context, o *gcp.NewServerOpts) *gc.ProfileRepor
 }
 
 func writeReport(file string, report *gc.Report) error {
-	data, err := json.MarshalIndent(report, "", "  ")
+	// One line is one log entry where the logs of a container are collected.
+	data, err := json.Marshal(report)
 	if err != nil {
 		return fmt.Errorf("failed to encode the GC report: %w", err)
 	}
