@@ -21,7 +21,10 @@
 # auto-creation, and nodes that follow the pod requests. Pods select a class with the
 # cloud.google.com/compute-class node selector; GKE taints the class nodes and adds the
 # toleration to those pods. Image streaming follows computeClasses.imageStreaming on the
-# nodes GKE creates; a change applies to new node pools only.
+# nodes GKE creates; a change applies to new node pools only. Every class turns secure boot
+# and integrity monitoring on, except the CI class with ci.casfs.provider daemonset; the
+# org policy constraints/compute.requireShieldedVm requires both and the vTPM of Shielded
+# GKE Nodes.
 {{- if .Values.ci.enabled }}
 ---
 # CI build nodes: COS with secure boot on and the casfs module of the node image, or Ubuntu
@@ -64,6 +67,7 @@ spec:
     enabled: true
     shieldedInstanceConfig:
       enableSecureBoot: {{ ne .Values.ci.casfs.provider "daemonset" }}
+      enableIntegrityMonitoring: true
   autoscalingPolicy:
     consolidationDelayMinutes: {{ $cc.ci.consolidationDelayMinutes }}
     {{- if ne (toString $cc.ci.consolidationThreshold) "" }}
@@ -126,6 +130,9 @@ spec:
       enabled: {{ $cc.imageStreaming }}
   nodePoolAutoCreation:
     enabled: true
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
   activeMigration:
     optimizeRulePriority: {{ $cc.server.activeMigration }}
   whenUnsatisfiable: DoNotScaleUp
@@ -156,6 +163,9 @@ spec:
       enabled: {{ $cc.imageStreaming }}
   nodePoolAutoCreation:
     enabled: true
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
   activeMigration:
     optimizeRulePriority: false
   whenUnsatisfiable: DoNotScaleUp
@@ -182,6 +192,9 @@ spec:
       enabled: {{ $cc.imageStreaming }}
   nodePoolAutoCreation:
     enabled: true
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
   activeMigration:
     optimizeRulePriority: false
   whenUnsatisfiable: DoNotScaleUp

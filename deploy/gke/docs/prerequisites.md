@@ -14,7 +14,7 @@ GKE Standard with a regional control plane. Autopilot does not allow the privile
 
 | Item | Setting |
 | --- | --- |
-| GKE version | a version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in 1.37.2-gke.1325000 on the Rapid channel ([GKE version for the CI nodes](#gke-version-for-the-ci-nodes)). With `ci.casfs.provider: daemonset`, 1.36.4-gke.1082000 or later (the ComputeClass `maintenanceExclusion` field). HPA rightsizing (Preview) needs 1.36.3-gke.1630000 or later. |
+| GKE version | a version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in 1.37.2-gke.1325000 on the Rapid channel ([GKE version for the CI nodes](#gke-version-for-the-ci-nodes)). With `ci.casfs.provider: daemonset`, 1.36.4-gke.1082000 or later (the ComputeClass `maintenanceExclusion` field), and no enforced `constraints/compute.requireShieldedVm` ([Secure boot on the CI nodes](#secure-boot-on-the-ci-nodes)). HPA rightsizing (Preview) needs 1.36.3-gke.1630000 or later. |
 | Gateway API | channel `standard` |
 | Workload Identity | `workloadPool: <project>.svc.id.goog`, GKE metadata server on every node pool |
 | Managed OpenTelemetry | scope `COLLECTION_AND_INSTRUMENTATION_COMPONENTS`, GKE 1.34.1-gke.2178000 or later. The chart sets the OTLP environment itself and uses no Instrumentation resource. |
@@ -69,7 +69,7 @@ gcloud container clusters get-credentials $C --dns-endpoint
 gcloud container clusters update $C --no-enable-ip-access
 ```
 
-`gcloud container clusters update --enable-private-nodes` applies to new node pools only. To move the system pool to private nodes, the N4 machine type and its own node account, create a new pool (`gcloud container node-pools create` with `--enable-private-nodes`, `--machine-type`, `--disk-type`, `--service-account` and `--workload-metadata`), then delete the old one. If the cluster runs the Config Connector add-on, move to the manual install first ([Moving from the Config Connector add-on](#moving-from-the-config-connector-add-on)).
+`gcloud container clusters update --enable-private-nodes` applies to new node pools only. To move the system pool to private nodes, the N4 machine type, its own node account or secure boot, create a new pool (`gcloud container node-pools create` with `--enable-private-nodes`, `--machine-type`, `--disk-type`, `--service-account`, `--workload-metadata` and `--shielded-secure-boot --shielded-integrity-monitoring`), then delete the old one. `node-pools update` cannot change secure boot. If the cluster runs the Config Connector add-on, move to the manual install first ([Moving from the Config Connector add-on](#moving-from-the-config-connector-add-on)).
 
 ### Image streaming
 
@@ -90,7 +90,7 @@ Each GKE version uses one COS image; the GKE release notes name it, for example 
 
 ### Secure boot on the CI nodes
 
-With `ci.casfs.provider: image` the CI class turns secure boot on; COS loads the casfs module of its own image with it on. With `daemonset` the class turns it off, because secure boot refuses the self-built module. The class field `nodePoolAutoCreation.shieldedInstanceConfig` needs GKE 1.36.3-gke.1244000 or later. A change applies only to CI pools GKE creates afterwards. A hand-made pool sets it at creation ([IOPS fallback node pool for CI](#iops-fallback-node-pool-for-ci)). Check a node with `gcloud compute instances describe <node> --zone <zone> --format 'value(shieldedInstanceConfig.enableSecureBoot)'`.
+Every class turns secure boot and integrity monitoring on; COS loads the casfs module of its own image with secure boot on. With `ci.casfs.provider: daemonset` the CI class turns secure boot off, because secure boot refuses the self-built module. The organization policy `constraints/compute.requireShieldedVm` requires secure boot, integrity monitoring and vTPM (Shielded GKE Nodes, on by default) on every new VM, so `daemonset` cannot run where it is enforced. The class field `nodePoolAutoCreation.shieldedInstanceConfig` needs GKE 1.36.3-gke.1244000 or later. A change applies only to pools GKE creates afterwards. A hand-made pool sets it at creation ([IOPS fallback node pool for CI](#iops-fallback-node-pool-for-ci)). Check a node with `gcloud compute instances describe <node> --zone <zone> --format 'value(shieldedInstanceConfig.enableSecureBoot)'`.
 
 ### Move to the Regular channel
 

@@ -130,11 +130,21 @@ template:
 	  echo "FAIL: ci.enabled=false still renders the CI PriorityClass" >&2; exit 1; \
 	fi; \
 	echo "OK: cacheman and the casfs loader run at the PriorityClass abfs-ci-node, which preempts build pods"; \
-	c=$$(show computeclasses.yaml | awk '/^  name: abfs-ci$$/ { c = 1 } /^---$$/ { c = 0 } c'); \
-	for w in '    imageType: cos_containerd' '      enableSecureBoot: true'; do \
-	  want "$$c" "$$w" "the CI ComputeClass with ci.casfs.provider image"; \
+	cc=$$(show computeclasses.yaml); \
+	for k in ci server pusher-seed pusher-steady; do \
+	  c=$$(awk -v n="  name: abfs-$$k" '$$0 == n { c = 1 } /^---$$/ { c = 0 } c' <<<"$$cc"); \
+	  for w in '      enableSecureBoot: true' '      enableIntegrityMonitoring: true'; do \
+	    want "$$c" "$$w" "the ComputeClass abfs-$$k"; \
+	  done; \
 	done; \
-	echo "OK: the CI ComputeClass runs COS with secure boot on for ci.casfs.provider image"; \
+	want "$$(awk '/^  name: abfs-ci$$/ { c = 1 } /^---$$/ { c = 0 } c' <<<"$$cc")" '    imageType: cos_containerd' \
+	  "the CI ComputeClass with ci.casfs.provider image"; \
+	echo "OK: every ComputeClass turns secure boot and integrity monitoring on, and the CI class runs COS, for ci.casfs.provider image"; \
+	c=$$(show computeclasses.yaml --set ci.casfs.provider=daemonset | awk '/^  name: abfs-ci$$/ { c = 1 } /^---$$/ { c = 0 } c'); \
+	for w in '    imageType: ubuntu_containerd' '      enableSecureBoot: false' '      enableIntegrityMonitoring: true'; do \
+	  want "$$c" "$$w" "the CI ComputeClass with ci.casfs.provider daemonset"; \
+	done; \
+	echo "OK: the CI class runs Ubuntu with secure boot off and integrity monitoring on for ci.casfs.provider daemonset"; \
 	j=$$(show ci-example-job.yaml --set ci.exampleJob.enabled=true --set ci.exampleJob.image=example.com/android-build:1); \
 	want "$$j" '              set -euo pipefail' "the example Job"; \
 	[[ $$(grep -A2 -xF '              cd "$$WORK/src"' <<<"$$j" | tail -n 2 | tr '\n' '|') == \
