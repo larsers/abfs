@@ -29,17 +29,18 @@ cycle N     mark; condemn: write list N to the bucket and to GcLists, set marker
             a server that reads a marked object clears the marker (rescue)
 cycle D     mark again; once the hold of list N has ended (--grace plus 16h after
             its completion, 4 daily cycles at the defaults), delete each object
-            that is still unreachable and still holds marker N; record its chunks
-cycle D+1   delete the chunks recorded in cycle D; ...
+            that is still unreachable and still holds marker N; record its rows
+cycle D+8   delete the chunks recorded in cycle D, in the first cycle whose chunk
+            step starts at least 7 days (the undo window) after the record
 ```
 
-A rescue shows that an object was still in use, so the delete, a conditional write on the marker, does not match. A marker of a complete list is never written again, so an object that stays unreachable keeps the number of the cycle that first condemned it. Large objects keep chunks in the table `chunks` and in the bucket; these go one cycle after their object, so that a reader that already started still finds them.
+A rescue shows that an object was still in use, so the delete, a conditional write on the marker, does not match. A marker of a complete list is never written again, so an object that stays unreachable keeps the number of the cycle that first condemned it. Large objects keep chunks in the table `chunks` and in the bucket; these go 7 days or more after the first delete record that names their object, so that a reader that already started still finds them and `gc undo` can bring the object back.
 
 **Client content.** A mount of a client with `gc-keepalive` rewrites its mount ref every 15 minutes and sends the hashes of what it holds to the server every 18 hours, which keeps them used. Cacheman with `gc-keepalive` keeps content a client wrote out of eviction until a server confirmed it holds the object. `abfs ws snapshot` writes a ref for the snapshot, which keeps it for `--snapshot-retention` after its last `ws snapshot` or `--restore`.
 
 **Servers.** Each server with `--gc` writes a heartbeat row to the Spanner table `GcServers` with the version of the GC rules it follows, its settings, whether it lost a record of a use (a touch) of an object or of a map row, and its stop. The collector refuses to condemn when the number of server hosts does not match, and refuses to delete when any server that ran within the grace followed an older version of the GC rules or ran with settings that break the timing rules. The hold of the markers rests on no touch that a server buffers, so a crash, a lost touch or a pause of a server refuses nothing; lost touches are reported in the heartbeat row and the metrics.
 
-**Staged path.** Turn it on in three modes, each after the one before ran clean: `--dry-run` only reports, `--condemn` also marks, and `--delete` also deletes. Delete mode needs backups of the tables between cycles, which `gc undo` restores from.
+**Staged path.** Turn it on in three modes, each after the one before ran clean: `--dry-run` only reports, `--condemn` also marks, and `--delete` also deletes. Each delete record holds the rows it deletes, so `gc undo` can write them back.
 
 ## Commands
 
@@ -50,8 +51,8 @@ A rescue shows that an object was still in use, so the delete, a conditional wri
 | `gc backfill` | Writes the `gc` rows that objects lack or that have outdated edge rules | `gc` rows | After every server runs with `--gc`, and after an upgrade of the edge rules |
 | `gc run --dry-run` | Runs one cycle that only reports | `GcState`, removal of old heartbeat rows | Before condemn mode, and any time to look |
 | `gc run --condemn` | A dry run that also lists and marks the unreachable objects | Lists in the bucket, `GcLists` rows, markers | On the job's schedule, after clean dry runs |
-| `gc run --delete` | A condemn cycle that first deletes the objects whose marker has held long enough, deletes chunks and removes expired refs | Deletes rows, chunks and refs; writes records | On the job's schedule, after clean condemn cycles, with backups between cycles |
-| `gc undo` | Writes back what delete cycles deleted, from tables restored from backups | `objects`, `gc`, `maps` and `chunks` rows, bucket metadata | After a wrong delete, with the delete job stopped |
+| `gc run --delete` | A condemn cycle that first deletes the objects whose marker has held long enough, deletes chunks and removes expired refs | Deletes rows, chunks and refs; writes records | On the job's schedule, after clean condemn cycles |
+| `gc undo` | Writes back what delete cycles deleted, from their delete records | `objects`, `gc` and `maps` rows, a cell of `chunks` rows, bucket metadata | After a wrong delete, with the delete job stopped |
 | `gc walk` | Tells whether keys are in the checkouts of mounts, from object content | Nothing | To explain a key that a client used after it was condemned |
 
 All `gc` commands are subcommands of `abfs server gcp gc` and take `--project`, `--instance`, `--bucket`, `--db`, `--bt-instance` and `--bt-app-profile` as the server does.
@@ -66,7 +67,7 @@ Garbage collection is off unless it is turned on, on the servers and on the clie
 4. Turn on the client option `gc-keepalive`, for all clients at once in the central client configuration (`abfs edit config:clients/configs`, see the [System Admin doc](README.md)) with `gc-keepalive: true` under `config:`, or per client with `abfs config`. Set it in the configuration cacheman starts from as well as in the one the mounts start from. Mounts started after the change rewrite their mount ref every 15 minutes, a fixed interval that their mount details record (a configuration that still sets `gc-keepalive-ref-interval` loads, and the key is ignored), and send the hashes of what they hold to the server every `gc-keepalive-touch-interval` (default `18h`), at most 10,000 hashes per second. A send that fails is tried again after 5 minutes, then after twice the previous wait, up to half the touch interval, until one works. The touch interval applies only with `gc-keepalive`; `0` turns the sends off.
 5. Run `abfs server gcp gc run --dry-run` on the job's schedule while seeding and builds run, and check each report: no `replicas.warnings`, no `consistency.missing_gc_rows`, no `objects.outdated_rows`, and the dangling edges and roots.
 6. When the dry runs are clean, run `abfs server gcp gc run --condemn` on the same schedule instead (see [Condemn mode](#condemn-mode)).
-7. Prepare delete mode: a Bigtable instance with one cluster (see [Delete checks](#delete-checks)), an [app profile](#app-profile-of-the-collector) and the [permissions](#permissions-of-the-collector) of the collector, the bucket's [soft delete](#soft-delete-of-the-bucket), versioning off and no retention policy, and a job that takes [backups](#backups) between cycles.
+7. Prepare delete mode: a Bigtable instance with one cluster (see [Delete checks](#delete-checks)), an [app profile](#app-profile-of-the-collector) and the [permissions](#permissions-of-the-collector) of the collector, and a bucket with versioning off and no retention policy.
 8. When the condemn cycles have run clean for a week or more under real use, run `abfs server gcp gc run --delete` on the same schedule instead (see [Delete mode](#delete-mode)). Before the first one, check the last condemn reports:
    * `delete.refused` names no reason you cannot explain;
    * the `delete.plan` counts per type and their samples are explained;
@@ -95,6 +96,7 @@ To turn garbage collection off, stop the collector job, restart the servers with
 * Each server writes the version of the GC rules it follows into its heartbeat row (version 3 in this release). A collector refuses to delete while a row of a lower version may have run within its grace, and does not complete its list while a row of a lower version may have run within the grace before its snapshot; the markers of such a list are written again by a later cycle. So after an upgrade of the servers, deletes start once no server of an older version ran within the grace and a list completed after that has held.
 * A server change that the delete rule depends on raises the version, so the rule above covers later upgrades too.
 * Use the same or a newer version for the collector than for the servers: a `gc` row with an object type the collector does not know, or of newer edge rules, stops the condemn.
+* This version writes delete records of format version 2 and does not read version 1. A version 1 record fails the chunk step on that record in every cycle and is never removed, and it fails `gc undo`. Delete the objects under `gc/deleted/` that an earlier version wrote before the first delete cycle of this version.
 
 ## Where the data goes
 
@@ -145,15 +147,13 @@ The service account that runs the `gc` commands needs:
 | `bigtable.tables.readRows`, `bigtable.tables.mutateRows` | `roles/bigtable.user` | scans, markers, conditional deletes and the conditional write probe |
 | `bigtable.appProfiles.get` | `roles/bigtable.user` | the app profile check at start; delete mode fails without it |
 | `bigtable.clusters.list` | `roles/bigtable.user` | the cluster count |
-| `bigtable.backups.list` | `roles/bigtable.user` | the backup checks of the delete and chunk steps |
-| `bigtable.tables.get` | `roles/bigtable.user` | the check of the restored tables in `gc undo` |
 | `monitoring.timeSeries.create` | `roles/bigtable.user`, also in `roles/storage.objectUser` | client library metrics (`--gcp-client-metrics`) |
 | `storage.objects.get`, `list`, `create`, `delete`, `update` | `roles/storage.objectUser` on the bucket | lists and records, generation reads and chunk deletes, the `chunks-done` flag and the `abfs-undo` stamp |
-| `storage.buckets.get` | not in `roles/storage.objectUser`; `roles/storage.legacyBucketReader` on the bucket, or a custom role | the soft delete, versioning, retention and hold checks of the chunk step, and the retention of records |
+| `storage.buckets.get` | not in `roles/storage.objectUser`; `roles/storage.legacyBucketReader` on the bucket, or a custom role | the versioning, retention and hold checks of the chunk step |
 
-Role contents: [Bigtable roles](https://docs.cloud.google.com/iam/docs/roles-permissions/bigtable) and [Cloud Storage roles](https://docs.cloud.google.com/iam/docs/roles-permissions/storage). A missing permission on a delete check refuses the deletes of the cycle and names the permission. Without `storage.buckets.get` the chunk step deletes nothing and no record is removed.
+Role contents: [Bigtable roles](https://docs.cloud.google.com/iam/docs/roles-permissions/bigtable) and [Cloud Storage roles](https://docs.cloud.google.com/iam/docs/roles-permissions/storage). A missing permission on a delete check refuses the deletes of the cycle and names the permission. Without `storage.buckets.get` the chunk step deletes no chunks.
 
-Operators need more for the runbooks: creating Bigtable backups needs `bigtable.backups.create`, and restoring them `bigtable.backups.restore` and `bigtable.tables.create` (for example `roles/bigtable.admin`), which `roles/bigtable.user` does not have ([backups](https://docs.cloud.google.com/bigtable/docs/backups)). Restoring soft-deleted chunks needs `storage.objects.list`, `storage.objects.restore` and `storage.objects.create`, all in `roles/storage.objectUser`.
+Optional [backups](#backups) need more: creating Bigtable backups needs `bigtable.backups.create`, and restoring them `bigtable.backups.restore` and `bigtable.tables.create` (for example `roles/bigtable.admin`), which `roles/bigtable.user` does not have ([backups](https://docs.cloud.google.com/bigtable/docs/backups)).
 
 ## Fill the gc table
 
@@ -361,26 +361,24 @@ A delete cycle:
 7. Condemns what is still unreachable, was not deleted and holds no marker of a complete list, as a condemn cycle does, and completes its list.
 8. Removes the lists, delete records and ref records of old cycles.
 
-So an object is deleted at the earliest a hold after the list that condemned it was completed, unreachable and older than `--grace` at the condemn and at the delete; its chunks go one cycle later. A delete step that the collector left, by a crash or a lost lease, needs no special care: the next cycle plans again from the markers, and a late delete of the old run matches only an object that still holds the marker that run read.
+So an object is deleted at the earliest a hold after the list that condemned it was completed, unreachable and older than `--grace` at the condemn and at the delete; its chunks go 7 days or more after the first delete record that names it (see [Undo](#undo)). A delete step that the collector left, by a crash or a lost lease, needs no special care: the next cycle plans again from the markers, and a late delete of the old run matches only an object that still holds the marker that run read.
 
 `--delete` fails at start, before it scans, when its Bigtable app profile does not fit (see [App profile of the collector](#app-profile-of-the-collector)).
 
 ### Flags of delete mode
 
-Only `--delete` takes the flags from `--delete-types` to `--allow-no-soft-delete`; the other modes reject them. The flags of the dry run and the condemn mode apply as well.
+Only `--delete` takes `--delete-types` and `--accept-mounts-without-keepalive`; the other modes reject them. The flags of the dry run and the condemn mode apply as well.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--expected-replicas`, `--min-replicas`, `--max-replicas` | | As in condemn mode; one of the first two is required |
 | `--delete-types` | every type | Object types, separated by commas, that the cycle may delete. Others are kept, with every object they link |
 | `--accept-mounts-without-keepalive` | off | Delete blobs, trees and eval objects while live mounts run without `gc-keepalive`; the check then only warns (see [Client caches](#client-caches)) |
-| `--no-backup-check` | off | Delete without the [backups](#backups) of the four tables |
-| `--allow-no-soft-delete` | off | Delete bucket chunks although the bucket keeps deleted objects for less than 7 days (see [Soft delete](#soft-delete-of-the-bucket)) |
 | `--mount-idle`, `--build-retention` | `336h`, `720h` | As in the dry run; delete mode removes the refs past them |
 | `--snapshot-retention` | `720h` | Keep what a snapshot ref reaches, with the commits its mount was pinned to, for this time after the ref was written; delete mode removes older snapshot refs. All modes read it |
 | `--gcp-client-metrics` | off | Export the client library metrics to Cloud Monitoring |
 
-These are fixed: the delete step deletes at most 2,000 objects per second, with 32 conditional deletes in flight over the 16 key ranges; the chunk step deletes at most 500 chunks per second, and only those of records at least 15 minutes old, at the earliest in the next cycle, which is longer than the 10 minute lifetime of signed chunk URLs plus a minute of clock skew on each side; one attempt of a Bigtable write has a deadline of 30 seconds, a list object that plus its size at 8 MiB/s.
+These are fixed: the delete step deletes at most 2,000 objects per second, with 32 conditional deletes in flight over the 16 key ranges; the chunk step deletes at most 500 chunks per second, and only those of records at least 7 days old, far longer than the 10 minute lifetime of signed chunk URLs, and repeats the `gc` row deletes of a record from 15 minutes after it; one attempt of a Bigtable write has a deadline of 30 seconds, a list object that plus its size at 8 MiB/s.
 
 ### The hold
 
@@ -413,8 +411,6 @@ Each reason in `delete.refused` stops the deletes of that cycle only; the cycle 
 | The number of live server hosts does not match, on the second read of the servers | As for a [condemn refusal](#condemn-refusals); a crashed pod replaced under a new name counts for about 11 minutes |
 | The Bigtable instance has more than one cluster, or its clusters cannot be listed | Delete mode needs an instance with one cluster: conditional writes sent to different clusters can both succeed |
 | The app profile refused a conditional write, or the probe failed | Use a profile with single-cluster routing and single-row transactions; check the [permissions](#permissions-of-the-collector) |
-| The backups cannot be listed | A backup that is still being created fails the listing; let backups finish before the cycle starts |
-| No ready backup of a table started after the newest list was completed | Take the [backups](#backups) between cycles, or pass `--no-backup-check` |
 | The removal of expired refs failed | The next cycle tries again |
 | Live mounts run without `gc-keepalive`; mounts with it run with a cacheman that does not check local writes; mounts touch their objects less often than the grace allows | See [Client caches](#client-caches) |
 | Objects written during the consistency scan have no `gc` row; the reason names up to 10 of them | A server without `--gc` writes to the store; find and stop it |
@@ -447,13 +443,13 @@ Before the objects, the step deletes the map rows that name a candidate, and the
 
 ### Delete records
 
-Each batch of the delete step writes the object `gc/deleted/<state>/<cycle>/<level>-<range>-<batch>` before any of its deletes. It holds a header with the cycle, the run, the start of the grace and the completion time of the newest complete list when the cycle ran, then per object its 20-byte key and its `data:content` descriptor when a chunk is outside the row, and per map row the keys of its two ends. The chunk step and `gc undo` read these records.
+Each batch of the delete step writes the object `gc/deleted/<state>/<cycle>/<level>-<range>-<batch>` before any of its deletes. It holds a header with the cycle, the run and the start of the grace, then the 20-byte key of each object and the keys of the two ends of each map row, then per object the newest cell of each column of the families `meta` and `data` of its `objects` row, with its time, and the values of the family `e` of its `gc` row. A record holds at most 16 MiB; a larger batch goes into several records, and the report counts their size in `delete.step.record_bytes`. The chunk step and `gc undo` read these records.
 
-When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest 7 cycles that have records, and every record flagged within the longer of 7 days and the bucket's soft delete retention. Before it removes the records of a cycle it writes `gc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts them and gives the age of the oldest.
+When every key of a record is done, the chunk step sets the custom metadata `chunks-done=<cycle>` on it. The cycle keeps the records of the newest 7 cycles that have records, and every record flagged within 7 days, so a record lives about 14 days. Before it removes the records of a cycle it writes `gc/deleted/<state>/<cycle>/pruned`, so that a `gc undo` of that cycle fails instead of restoring nothing. A record without the flag is never removed; `delete.chunks.unflagged` counts those older than 8 days, past the 7 days every record waits, and gives the age of the oldest.
 
 ### Chunk step
 
-In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag that were created at least 15 minutes ago. For each object of a record:
+In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag. From 15 minutes after a record was created, it repeats the `gc` row deletes of its objects without a row, which a delete step that stopped can leave, and sets `gc-rows-done=<cycle>` on it (`records_gc_rows_done`). From 7 days after, the undo window, it deletes the chunks, and repeats the `gc` row deletes of a record without `gc-rows-done`. Younger records count in `records_waiting`. For each object of a record:
 
 | Object row | Outcome | Count |
 | --- | --- | --- |
@@ -461,24 +457,14 @@ In each delete cycle, also one whose deletes were refused, the chunk step reads 
 | present with another descriptor | a client wrote the object again after the delete; the recorded chunks go | `reput_after_delete` |
 | absent | the recorded chunks go, and the `gc` row, unless the object was written again since | `row_absent` |
 
-A chunk row goes only when it has no cell newer than the record. A bucket object goes only under the generation and metageneration read just before the delete, so an object restored from soft delete or stamped by `gc undo` stays (`restored_after_record`). A delete the bucket refuses (`delete_refused`) or an error leaves the record without the flag, for the next cycle.
+A chunk row goes only when it has no cell newer than the record, such as the cell `gc undo` writes. A bucket object goes only under the generation and metageneration read just before the delete, so an object written again or stamped by `gc undo` stays (`restored_after_record`). A delete the bucket refuses (`delete_refused`) or an error leaves the record without the flag, for the next cycle.
 
-The step deletes nothing, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of:
+The step deletes no chunks, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of the settings below. The `gc` row deletes run either way.
 
 * Object Versioning on: a delete would keep a noncurrent version;
-* a retention policy, a default event-based hold or object retention: each can refuse a delete;
-* a soft delete retention under 7 days, without `--allow-no-soft-delete`.
+* a retention policy, a default event-based hold or object retention: each can refuse a delete.
 
-Unless `--no-backup-check`, a record also waits (`records_without_backup`) until a ready, unexpired backup of the `chunks` table exists that started after the completion time in its header: chunk rows have no soft delete, so that backup is their only copy.
-
-### Soft delete of the bucket
-
-Cloud Storage soft delete keeps a deleted object restorable for its retention, 7 days by default and at most 90 ([soft delete](https://docs.cloud.google.com/storage/docs/soft-delete)). Check a bucket with `gcloud storage buckets describe gs://<bucket> --format="default(soft_delete_policy)"`. By default the chunk step refuses to delete on a bucket whose retention is under 7 days; `--allow-no-soft-delete` deletes anyway. Both are valid choices:
-
-* With soft delete, `gc undo` can bring deleted bucket chunks back: restore the names it prints with `gcloud storage restore` and run it again. The deleted bytes are billed during the retention, and a bucket deleted while soft delete is on stays restorable, and cannot be removed for good, until its retention ends.
-* Without soft delete, a deleted bucket chunk is gone at once. `gc undo` restores only the objects whose chunks still exist; it prints the `gs://` names of the missing chunks, leaves the objects that need them and every object that links those unrestored, and exits non-zero. Objects of up to 1 MiB have no bucket chunk and come back from the backups.
-
-Delete records are kept for at least the soft delete retention, so that an undo finds them while it can restore what they name.
+Bucket soft delete plays no part: a bucket with it on works as one without it.
 
 ### Ref removal
 
@@ -537,59 +523,40 @@ The section `delete` holds:
 * A delete cycle checks each object written during its consistency scan while the scan runs: it reads the object's `gc` row, and its `objects` row only when the `gc` row is missing, in batches of 100 keys with 8 batches in flight, and keeps only counts and the batches in flight in memory. That is one row read per object. Bigtable rates one SSD node at up to 17,000 row reads per second ([performance](https://docs.cloud.google.com/bigtable/docs/performance)), so on a node with no other load than the collector 1 million objects written during a scan take about 1 minute of reads and 10 million about 10 minutes, less with more nodes. The collector reads at low priority, so a node busy with a seed checks slower.
 * When the checks fall behind, the scan waits for them, at most 15 minutes summed over its key ranges. The wait makes a delete cycle up to about 15 minutes longer than a condemn cycle, about the length of one more cycle at 71 million objects, and about 1 minute longer when all 16 key ranges wait at once. The checks share the node with the scan, so they also slow it. Past that wait the scan stops checking and cancels the reads in flight, finishes at full speed, and the cycle refuses its deletes. A cycle during a seed or a large catch-up of a git-pusher can refuse this way; deletes resume in a later cycle with fewer writes during its scan.
 * The step runs one level per link in a chain of unreachable objects: for a dropped branch of 10,000 commits, expect about 10,000 levels and an estimated 13 to 20 minutes of delete step and tens of thousands of delete records, which the next chunk step reads.
-* Deleted data is billed until it is gone: in backups for their retention, and soft-deleted chunks for the soft delete retention.
+* Deleted chunks are billed for the 7 days of the undo window. The delete records hold the deleted rows, about 3 KB per object on average plus 20 bytes per edge, for about 14 days: at 5 million deleted objects a day, about 15 GB a day and 210 GB in all. `delete.step.record_bytes` gives the size per cycle.
 
 ## Backups and undo
 
 ### Backups
 
-Each delete cycle needs a ready backup of each of the tables `objects`, `gc`, `maps` and `chunks` that started after the newest list in `GcLists` was completed, that is after the previous condemn or delete cycle completed its list. That list is completed no earlier than any list whose objects the cycle deletes. Without them the cycle refuses its deletes, and still condemns and runs its chunk step.
-
-So a scheduled delete job takes a set of four backups between cycles: after each cycle completed its list, and ready before the next cycle starts. A backup that is still being created when the collector lists the backups fails the listing and refuses the deletes of that cycle. Creating a backup usually takes less than a minute and can take up to an hour ([backups](https://docs.cloud.google.com/bigtable/docs/backups)).
-
-```sh
-for t in objects gc maps chunks; do
-  gcloud bigtable backups create gc-<n>-$t --instance=<bt-instance> --cluster=<cluster> --table=$t --retention-period=7d
-done
-gcloud bigtable backups list --instance=<bt-instance> --cluster=<cluster>
-```
-
-The set taken before cycle N is also the source of an undo of cycle N and later cycles, and the chunk step of cycle N+1 needs its `chunks` backup. Keep each set for as long as an undo of the cycles after it may be needed; 7 days (`--retention-period=7d`) is a good default. The delete records are kept at least 7 days after the chunk step flagged them, so they outlive a 7 day set by at least a cycle, and an undo whose backups expired cannot start. Backups are incremental: they share storage with the table.
+The collector needs no backups, and no delete cycle checks for them. Bigtable backups of the tables are disaster recovery, on a schedule of their own; `gc undo` does not read them. Restoring a backup brings back a table as it was at the backup, with every write since lost, and is for the loss of a table, not for a wrong delete.
 
 ### Undo
 
-`abfs server gcp gc undo` writes back what delete cycles deleted, from the delete records and from the four tables restored from the backups taken before the first of those cycles. It restores every object and map row those cycles deleted, not only the wrong ones; what is still garbage is condemned again after `--grace`, and deleted a hold later.
+`abfs server gcp gc undo` writes back what delete cycles deleted, from their delete records, which hold the rows they deleted, and the live tables. It restores every object and map row those cycles deleted, not only the wrong ones; what is still garbage is condemned again after `--grace`, and deleted a hold later.
+
+The undo window is 7 days. For each key it counts from the first delete record that names it. Within the window, the chunks of the deleted object still exist and an undo restores it. After that, the chunk step deletes the chunks: an undo then restores the objects whose content is inline (up to 32 KiB, most trees and commits) and the map rows, while the records exist, about 14 days.
+
+A batch writes its record before its deletes, so a record can name a key that its cycle did not delete: the delete step stopped, the marker of the key changed, or the outcome of the delete stayed unknown. A later cycle deletes that key. An undo of that later cycle can lose up to one cycle of the window for the key, and then reports its chunks as missing (`missing_chunks`).
 
 1. Stop the delete job.
-2. Restore the four backups of the set taken before the first cycle to undo, each once it is an hour old (Bigtable advises to wait that long before a restore of a standard backup), to tables with a suffix:
+2. Run the undo for the first wrong cycle through the last cycle that ran. A later cycle can delete the children of an object an earlier cycle deleted, so an undo of one cycle alone can miss them:
 
    ```sh
-   gcloud bigtable instances tables restore --source=projects/<project>/instances/<bt-instance>/clusters/<cluster>/backups/gc-<n>-<table> --destination=<table>-r --destination-instance=<bt-instance>
+   abfs server gcp gc undo --cycle <n> [--through <m>] --project <project> --instance <spanner-instance> --bucket <bucket> --bt-app-profile abfs-gc
    ```
 
-3. Run the undo for the first wrong cycle through the last cycle that ran. A later cycle can delete the children of an object an earlier cycle deleted, so an undo of one cycle alone can miss them:
-
-   ```sh
-   abfs server gcp gc undo --cycle <n> [--through <m>] --from-suffix -r --project <project> --instance <spanner-instance> --bucket <bucket> --bt-app-profile abfs-gc
-   ```
-
-4. When it prints bucket chunks it waits for, restore them from soft delete and run the same undo again:
-
-   ```sh
-   abfs server gcp gc undo ... | awk '/^  gs:\/\//{print $1}' | gcloud storage restore --read-paths-from-stdin
-   ```
-
-   Without soft delete these chunks are gone, and the objects that need them stay deleted. The command fails while anything was not restored. Run a failed undo again: chunks it kept for an object it did not finish stay in the bucket for good otherwise.
-5. Undo restores no refs. It names the ref records of the cycle before `--cycle` through `--through`; put back the refs that were removed by mistake with `test-client put-ref` (see [Ref removal](#ref-removal)).
-6. Fix the cause of the wrong delete before the delete job runs again, and delete the restored tables.
+3. When it reports objects blocked by a child, follow the reason: undo the cycle it names too, or run the same undo again. The command fails while anything was not restored. Run a failed undo again: chunks it kept for an object it did not finish stay in the store for good otherwise.
+4. Undo restores no refs. It names the ref records of the cycle before `--cycle` through `--through`; put back the refs that were removed by mistake with `test-client put-ref` (see [Ref removal](#ref-removal)).
+5. Fix the cause of the wrong delete before the delete job runs again.
 
 What the undo does:
 
-* It checks that each restored table was restored from a backup of its live table that ended before the first delete record of cycle n was written; `--no-source-check` skips this. It fails when a cycle in the range has pruned records.
+* It fails when a cycle in the range has pruned records, or a record of the range is of format version 1. When a restored object links an absent object, it reads the keys of the records of every cycle, and then any record of format version 1 under `gc/deleted/<state>/` fails it. Delete those records first (see [Upgrades](#upgrades)).
 * It takes the lease in the phase `undo`, which does not raise the largest grace. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two write attempts of 30 seconds each and a minute.
 * It restores the newest cycle first and in each cycle the deepest level first, so children come back before their parents.
-* For each object whose row is absent: its bucket chunks must exist and get the custom metadata `abfs-undo=<cycle>`, so that a chunk step that read them earlier cannot delete them; its chunk rows and its `gc` row are written with a new time and a touch, so it is recent for `--grace`; its `objects` row comes last, without the marker.
-* An object is not restored, nor anything that links it, when a bucket chunk is missing, its restored row holds another descriptor than its record, or it links an object deleted since the backup that this run did not restore.
+* For each object whose row is absent: its chunks must exist; its bucket chunks get the custom metadata `abfs-undo=<cycle>` and its chunk rows a cell `data:undo` with a new time, so that a chunk step that read them earlier cannot delete them; its `gc` row is written from the record with a new time and a touch, so it is recent for `--grace`; its `objects` row comes last, with the cells and times of the record, without the marker.
+* An object is not restored, nor anything that links it, when a chunk is gone (`missing_chunks`; the log names the chunk), it had no `gc` row when it was deleted (`without_gc_row`), or it links an absent object that this run did not restore and that a delete record of another cycle names, or, when the records of a cycle were pruned, any absent object (`blocked_by_child`).
 * Map rows come back with a new time. What is present stays as it is.
 
 ## Operator rules

@@ -94,17 +94,16 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 		{[]string{"--condemn", "--expected-replicas=3", "--max-replicas=4"}, "expected replicas excludes min and max replicas"},
 		{[]string{"--condemn", "--min-replicas=-1"}, "cannot be negative"},
 		// The flags of delete mode have no effect in the other modes.
-		{[]string{"--condemn", "--min-replicas=2", "--no-backup-check"}, "only delete mode takes --no-backup-check"},
+		{[]string{"--condemn", "--min-replicas=2", "--accept-mounts-without-keepalive"}, "only delete mode takes --accept-mounts-without-keepalive"},
 		{[]string{"--dry-run", "--accept-mounts-without-keepalive"}, "only delete mode takes --accept-mounts-without-keepalive"},
 		{[]string{"--dry-run", "--delete-types=commit"}, "only delete mode takes --delete-types"},
 		{[]string{"--condemn", "--min-replicas=2", "--delete-start-delay=5m"}, "only delete mode takes --delete-start-delay"},
-		{[]string{"--condemn", "--min-replicas=2", "--allow-no-soft-delete"}, "only delete mode takes --allow-no-soft-delete"},
 		// Delete mode implies the condemn and takes its checks.
 		{[]string{"--delete"}, "invalid expected replicas 0"},
 		{[]string{"--delete", "--condemn", "--min-replicas=2"}, "pass one of --dry-run, --condemn and --delete"},
 		{[]string{"--delete", "--dry-run", "--min-replicas=2"}, "pass one of --dry-run, --condemn and --delete"},
 		{[]string{"--delete", "--min-replicas=2"}, ""},
-		{[]string{"--delete", "--min-replicas=2", "--delete-types=commit,blob", "--no-backup-check", "--accept-mounts-without-keepalive", "--delete-start-delay=5m"}, ""},
+		{[]string{"--delete", "--min-replicas=2", "--delete-types=commit,blob", "--accept-mounts-without-keepalive", "--delete-start-delay=5m"}, ""},
 		{[]string{"--delete", "--min-replicas=2", "--delete-types=commits"}, `invalid object type "commits"`},
 		{[]string{"--delete", "--min-replicas=2", "--chunk-delay=1h"}, "unknown flag: --chunk-delay"},
 	}
@@ -131,13 +130,11 @@ func TestGCPGCRunFlags_Modes(t *testing.T) {
 	require.Equal(t, gc.DefaultKeepLists, c.opts.KeepLists)
 	require.Equal(t, float64(2000), c.opts.DeleteRate)
 	require.Equal(t, 32, c.opts.DeleteWorkers)
-	require.Equal(t, 15*time.Minute, c.opts.ChunkDelay)
 	require.Equal(t, float64(500), c.opts.ChunkRate)
 	require.Equal(t, 16, c.opts.Shards)
 	require.Equal(t, 5*time.Minute, c.opts.LeaseDuration)
 	require.Equal(t, 30*time.Second, c.opts.WriteDeadline)
 	require.True(t, c.opts.Consistency)
-	require.False(t, c.opts.AllowNoSoftDelete)
 	require.Zero(t, c.opts.StartDelay)
 	// The pause before the delete step is for tests and not in the help.
 	require.True(t, fl.Lookup("delete-start-delay").Hidden)
@@ -170,22 +167,18 @@ func TestGCPGCFlags_ClientMetrics(t *testing.T) {
 	}
 }
 
-// gc undo needs the first cycle and the suffix of the restored tables, and
-// takes a range of cycles in order. Its workers, lease and write deadline are
-// fixed.
+// gc undo needs the first cycle and takes a range of cycles in order. Its
+// workers, lease and write deadline are fixed.
 func TestGCPGCUndoFlags(t *testing.T) {
 	tests := []struct {
 		args    []string
 		wantErr string
 	}{
-		{nil, "pass --cycle and --from-suffix"},
-		{[]string{"--cycle=2"}, "pass --cycle and --from-suffix"},
-		{[]string{"--from-suffix=-r"}, "pass --cycle and --from-suffix"},
-		{[]string{"--cycle=2", "--from-suffix=-r"}, ""},
-		{[]string{"--cycle=2", "--through=4", "--from-suffix=-r"}, ""},
-		{[]string{"--cycle=3", "--through=2", "--from-suffix=-r"}, "the last cycle to undo, 2, is before the first, 3"},
-		{[]string{"--cycle=-1", "--from-suffix=-r"}, "invalid cycle -1"},
-		{[]string{"--cycle=2", "--from-suffix=a/b"}, `invalid suffix "a/b"`},
+		{nil, "pass --cycle"},
+		{[]string{"--cycle=2"}, ""},
+		{[]string{"--cycle=2", "--through=4"}, ""},
+		{[]string{"--cycle=3", "--through=2"}, "the last cycle to undo, 2, is before the first, 3"},
+		{[]string{"--cycle=-1"}, "invalid cycle -1"},
 	}
 	for _, tt := range tests {
 		c := &gcpGCUndoCmd{RootCmd: root.NewRootCommand()}

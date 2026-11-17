@@ -16,8 +16,10 @@ package gc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -350,8 +352,11 @@ func TestPlanDeletes_ByMarker(t *testing.T) {
 	require.True(unread.recorded(markerValue(6)))
 }
 
-// A delete record reads back as written, and keeps the content descriptor
-// only of an object with a chunk outside the inline depot.
+// A delete record reads back as written: the keys of every entry, and of an
+// object the cells of its objects row with their times and the values of
+// its edges, or none when it had no gc row. A read of the keys only stops
+// before the rows. A record with bytes after its entries, or of format
+// version 1, is not read.
 func TestDeleteRecord_WriteRead(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -359,23 +364,68 @@ func TestDeleteRecord_WriteRead(t *testing.T) {
 	h := testHashes(3)
 	entries := []recordEntry{
 		{kind: recordMapRow, key: h[0], mapTo: h[1]},
-		{kind: recordObject, key: h[1], content: []byte(`[{"size":40000,"depot":"bigtable","id":"x-u-0"}]`)},
-		{kind: recordObject, key: h[2]},
+		{kind: recordObject, key: h[1], cells: []recordCell{
+			{family: objectsMetaFamily, column: "type", ts: 1000, value: []byte("blob")},
+			{family: objectsDataFamily, column: objectsContentColumn, ts: 2000, value: []byte(`[{"size":40000,"depot":"bigtable","id":"x-u-0"}]`)},
+		}, edges: []recordCell{
+			{family: EdgesFamily, column: LinksColumn, value: PackEdges([]Hash{h[2]})},
+			{family: EdgesFamily, column: TypeColumn, value: []byte("tree")},
+			{family: EdgesFamily, column: VersionColumn, value: versionBytes(ExtractorVersion)},
+		}},
+		{kind: recordObject, key: h[2], cells: []recordCell{{family: objectsMetaFamily, column: "type", ts: 3000, value: []byte("blob")}}},
 	}
-	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000), listComplete: time.UnixMicro(2000)}
+	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000)}
 	name := recordObjectName("default", 5, 1, 3, 0)
 	require.Equal("gc/deleted/default/5/1-3-0", name)
-	require.NoError(writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, hdr, entries))
+	size, err := writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, hdr, entries)
+	require.NoError(err)
+	attrs, err := bucket.Object(name).Attrs(ctx)
+	require.NoError(err)
+	require.Equal(attrs.Size, size)
 	got, gotEntries, err := readRecord(ctx, bucket, name)
 	require.NoError(err)
 	require.Equal(hdr, got)
 	require.Equal(entries, gotEntries)
-	require.ErrorContains(writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, &recordHeader{runID: "other#1"}, nil), `written by the GC run "collector#3"`)
+	want, err := hdr.write(io.Discard)
+	require.NoError(err)
+	for _, e := range entries {
+		want += e.size()
+	}
+	require.Equal(int64(want), size)
+	typ, ok := gotEntries[1].edge(TypeColumn)
+	require.True(ok)
+	require.Equal([]byte("tree"), typ)
+	require.Equal(entries[1].cells[1].value, gotEntries[1].content())
+	_, keys, err := readRecordKeys(ctx, bucket, name)
+	require.NoError(err)
+	for i, e := range keys {
+		require.Equal(entries[i].kind, e.kind)
+		require.Equal(entries[i].key, e.key)
+		require.Equal(entries[i].mapTo, e.mapTo)
+		require.Empty(e.cells)
+	}
+	_, err = writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, &recordHeader{runID: "other#1"}, nil)
+	require.ErrorContains(err, `written by the GC run "collector#3"`)
 
-	require.Nil(recordedContent([]byte(`[{"size":4,"depot":"inline","id":"abcd"}]`)))
-	two := []byte(`[{"size":1048576,"depot":"bigtable","id":"x-u-0"},{"size":5,"depot":"bucket","id":"x-u-1"}]`)
-	require.Equal(two, recordedContent(two))
-	require.Equal([]byte("not json"), recordedContent([]byte("not json")))
+	r, err := bucket.Object(name).NewReader(ctx)
+	require.NoError(err)
+	b, err := io.ReadAll(r)
+	require.NoError(err)
+	require.NoError(r.Close())
+	longer := recordObjectName("default", 5, 1, 4, 0)
+	w := bucket.Object(longer).NewWriter(ctx)
+	_, err = w.Write(append(b, 0))
+	require.NoError(err)
+	require.NoError(w.Close())
+	_, _, err = readRecord(ctx, bucket, longer)
+	require.ErrorContains(err, "has more than the 3 entries its header counts")
+
+	old := bucket.Object(recordObjectName("default", 4, 1, 0, 0)).NewWriter(ctx)
+	_, err = old.Write(binary.BigEndian.AppendUint64(binary.BigEndian.AppendUint32([]byte(recordMagic), 1), 4))
+	require.NoError(err)
+	require.NoError(old.Close())
+	_, _, err = readRecord(ctx, bucket, recordObjectName("default", 4, 1, 0, 0))
+	require.ErrorContains(err, "unsupported delete record format version 1")
 }
 
 // call is a conditional write the delete step sent.

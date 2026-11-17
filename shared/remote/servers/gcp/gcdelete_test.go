@@ -73,20 +73,16 @@ func (f *deleteFixture) server(id string, lost bool) {
 // fakeChecks answers the checks of the Bigtable instance. hook runs once, at
 // the next probe: after the mark of a cycle and before its delete step.
 type fakeChecks struct {
-	mu         sync.Mutex
-	clusters   []string
-	probeErr   error
-	backups    []gc.Backup
-	backupsErr error
-	hook       func()
-	probes     int
+	mu       sync.Mutex
+	clusters []string
+	probeErr error
+	hook     func()
+	probes   int
 }
 
 var _ gc.InstanceChecks = (*fakeChecks)(nil)
 
 func (c *fakeChecks) Clusters(context.Context) ([]string, error) { return c.clusters, nil }
-
-func (c *fakeChecks) Backups(context.Context) ([]gc.Backup, error) { return c.backups, c.backupsErr }
 
 func (c *fakeChecks) ProbeConditionalWrite(context.Context) error {
 	c.mu.Lock()
@@ -102,7 +98,7 @@ func (c *fakeChecks) ProbeConditionalWrite(context.Context) error {
 
 func (f *deleteFixture) deleteOpts() *gc.DeleteOpts {
 	o := gc.DefaultDeleteOpts()
-	o.Shards, o.ExpectedReplicas, o.Rate, o.BatchSize, o.DeleteRate, o.NoBackupCheck = 3, 1, 0, 2, 0, true
+	o.Shards, o.ExpectedReplicas, o.Rate, o.BatchSize, o.DeleteRate = 3, 1, 0, 2, 0
 	return &o
 }
 
@@ -505,21 +501,15 @@ func TestDeleteGC_MapRows(t *testing.T) {
 // A refused delete never stops the condemn: the cycle publishes and
 // completes its list, and the markers of complete lists stay for a later
 // delete. A cycle before the hold of the first list has ended deletes
-// nothing and refuses nothing. A probe error that is not a refusal code, a
-// second cluster, a backup listing the library cannot parse and a backup
-// older than the newest complete list each refuse with a reason.
+// nothing and refuses nothing. A probe error that is not a refusal code and
+// a second cluster each refuse with a reason.
 func TestDeleteGC_RefusedCycleCondemns(t *testing.T) {
 	require := require.New(t)
 	f := newDeleteFixture(t)
 	key := f.blob("unreachable file", f.old)
 	o := f.deleteOpts()
-	o.NoBackupCheck = false
 	ready := func() {
-		f.checks.clusters, f.checks.probeErr, f.checks.backupsErr = []string{"c1"}, nil, nil
-		f.checks.backups = nil
-		for _, table := range []string{"objects", gc.TableName, "maps", "chunks"} {
-			f.checks.backups = append(f.checks.backups, gc.Backup{Name: table + "-b", Table: table, Start: time.Now(), Ready: true})
-		}
+		f.checks.clusters, f.checks.probeErr = []string{"c1"}, nil
 	}
 	ready()
 	res := f.delete(o)
@@ -539,10 +529,6 @@ func TestDeleteGC_RefusedCycleCondemns(t *testing.T) {
 	}{
 		{"two clusters", func() { f.checks.clusters = []string{"c1", "c2"} }, "the Bigtable instance has 2 clusters"},
 		{"probe fails", func() { f.checks.probeErr = status.Error(codes.Internal, "injected") }, "the conditional write probe failed: rpc error: code = Internal desc = injected"},
-		{"backup being created", func() {
-			f.checks.backupsErr = errors.New("failed to parse backup proto invalid endTime: nil Timestamp")
-		}, "(a backup that is still being created fails the listing until it is ready)"},
-		{"backup older than the newest list", func() { f.checks.backups[0].Start = time.Now().Add(-200 * time.Hour) }, "no ready backup of Bigtable table objects started after the list was completed"},
 	}
 	for _, tt := range tests {
 		ready()

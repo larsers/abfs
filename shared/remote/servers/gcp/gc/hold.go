@@ -86,18 +86,6 @@ func (h *listHolds) recorded(value []byte) bool {
 	return h.err != nil || h.record(value) != nil
 }
 
-// newest returns the newest completion time of the records, zero when none
-// is complete.
-func (h *listHolds) newest() time.Time {
-	var t time.Time
-	for _, r := range h.records {
-		if r.CompleteTime.After(t) {
-			t = r.CompleteTime
-		}
-	}
-	return t
-}
-
 // ListHoldReport reports the hold of the condemned list of one cycle.
 type ListHoldReport struct {
 	Cycle        int64     `json:"cycle"`

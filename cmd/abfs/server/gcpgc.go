@@ -193,14 +193,12 @@ delete conditional on the marker the cycle read. It deletes only when every dele
 passed, and else only condemns and lists the reasons in the report: the list records are
 readable; no server that may have run within the grace ran without link validation or with
 an older version of the GC rules; the Bigtable instance has one cluster and the app profile
-accepts conditional writes; ready backups of the tables exist (unless --no-backup-check);
-and no live mount can hold the only copy of content it wrote. A dry run and a condemn cycle
-report what a delete would remove. The chunks of deleted objects are removed one cycle
-later, at least 15 minutes after the record of their batch, unless the row of the object is
-back; that step deletes nothing while the bucket keeps deleted objects for less than 7 days
-(unless --allow-no-soft-delete), has Object Versioning on or a retention policy, and it
-keeps a record until a ready backup of the chunks table started after the newest complete
-list (unless --no-backup-check).
+accepts conditional writes; and no live mount can hold the only copy of content it wrote. A
+dry run and a condemn cycle report what a delete would remove. Each record holds the rows
+it deletes, so 'gc undo' can write them back. The chunks of deleted objects are removed 7
+days after the record of their batch, unless the row of the object is back; that step
+deletes no chunk while the bucket has Object Versioning on, a retention policy, a default
+event-based hold or object retention.
 Needs the resources of 'abfs server gcp init --gc'.`,
 	}
 }
@@ -222,8 +220,6 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.IntVar(&c.opts.MaxReplicas, "max-replicas", 0, "With --min-replicas, the largest number of distinct server hosts with --gc (0 means no limit)")
 	fl.StringSliceVar(&c.opts.Types, "delete-types", nil, "In delete mode, the object types, separated by commas, that the cycle may delete (default: every type)")
 	fl.BoolVar(&c.opts.AcceptMountsWithoutKeepAlive, "accept-mounts-without-keepalive", false, "In delete mode, delete blobs, trees and eval objects while live mounts run without gc-keepalive, whose caches may hold the only copy of content they wrote; the check then only warns")
-	fl.BoolVar(&c.opts.NoBackupCheck, "no-backup-check", false, "In delete mode, delete without ready backups of the tables objects, gc, maps and chunks taken after the newest list was complete")
-	fl.BoolVar(&c.opts.AllowNoSoftDelete, "allow-no-soft-delete", false, "In delete mode, delete the bucket chunks of deleted objects although the bucket keeps deleted objects for less than 7 days, so that they cannot be restored")
 	fl.DurationVar(&c.opts.StartDelay, "delete-start-delay", 0, "In delete mode, a pause before the delete step, for tests")
 	if err := fl.MarkHidden("delete-start-delay"); err != nil {
 		panic(err)
@@ -240,7 +236,7 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 
 // deleteOnlyFlags are the flags that only delete mode reads.
 var deleteOnlyFlags = []string{
-	"delete-types", "accept-mounts-without-keepalive", "no-backup-check", "allow-no-soft-delete", "delete-start-delay",
+	"delete-types", "accept-mounts-without-keepalive", "delete-start-delay",
 }
 
 // checkOpts checks the mode flags set in fl and fills the keys to explain.
@@ -341,19 +337,18 @@ type gcpGCUndoCmd struct {
 func (c *gcpGCUndoCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:  "undo",
-		Usage: "--cycle <n> [--through <m>] --from-suffix <suffix> --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
+		Usage: "--cycle <n> [--through <m>] --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
 		Desc: `Write back the objects and map rows that the delete cycles n to m deleted, from the
-tables objects, gc, maps and chunks restored as <table><suffix> from backups taken before
-cycle n, and the delete records of those cycles in the bucket. Restores the newest cycle
-first and the children of an object before it. For each object whose row is absent: its
-chunks in the bucket must exist and get the metadata abfs-undo, its chunk rows and its gc
-row are written again with a touch, so that it is recent for the grace, and its objects
-row comes last, without the condemn marker. Map rows come back with a new time. Objects
-and map rows that are present stay as they are. An object whose chunks are gone from the
-bucket is not restored, nor is anything that links it: the command prints the chunk
-names; restore them from soft delete and run the command again. Takes the GC lease, in
-the phase undo, and waits before its first write until a collector that lost the lease
-has stopped writing. Fails when something was not restored.`,
+delete records of those cycles in the bucket, which hold the rows they deleted. Restores
+the newest cycle first and the children of an object before it. For each object whose row
+is absent: its chunks must exist, its bucket chunks get the metadata abfs-undo and its
+chunk rows a new cell, its gc row is written again with a touch, so that it is recent for
+the grace, and its objects row comes last, without the condemn marker. Map rows come back
+with a new time. Objects and map rows that are present stay as they are. The chunk step
+deletes the chunks of a deleted object 7 days after its delete; an object whose chunks are
+gone is not restored, nor is anything that links it, and the command names the chunks.
+Takes the GC lease, in the phase undo, and waits before its first write until a collector
+that lost the lease has stopped writing. Fails when something was not restored.`,
 	}
 }
 
@@ -368,13 +363,11 @@ func (c *gcpGCUndoCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
 	fl.Int64Var(&c.opts.Cycle, "cycle", 0, "The first delete cycle whose deletes are undone (required)")
 	fl.Int64Var(&c.opts.Through, "through", 0, "The last delete cycle whose deletes are undone (default: --cycle)")
-	fl.StringVar(&c.opts.FromSuffix, "from-suffix", "", "The suffix of the names of the restored tables, as -r for objects-r, gc-r, maps-r and chunks-r (required)")
-	fl.BoolVar(&c.opts.NoSourceCheck, "no-source-check", false, "Restore from tables that are not restored from backups of the live tables taken before --cycle")
 }
 
 func (c *gcpGCUndoCmd) checkOpts() error {
-	if c.opts.Cycle == 0 || c.opts.FromSuffix == "" {
-		return errors.New("pass --cycle and --from-suffix")
+	if c.opts.Cycle == 0 {
+		return errors.New("pass --cycle")
 	}
 	return c.opts.Validate()
 }
@@ -399,9 +392,9 @@ func (c *gcpGCUndoCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 			log.Printf("Warning: error closing ABFS server: %v", err)
 		}
 	}()
-	rep, err := server.UndoGC(ctx, c.server.BucketName, server.GCTableSources(c.server.ProjectID, c.server.BtInstance), &c.opts)
+	rep, err := server.UndoGC(ctx, c.server.BucketName, &c.opts)
 	if rep != nil {
-		printUndo(rep, c.server.BucketName)
+		printUndo(rep)
 	}
 	if err != nil {
 		return err
@@ -412,18 +405,12 @@ func (c *gcpGCUndoCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return nil
 }
 
-func printUndo(rep *gc.UndoReport, bucket string) {
-	if len(rep.MissingBucketObjects) > 0 {
-		fmt.Printf("Waiting for %d bucket chunks of %d objects; restore them from soft delete and run gc undo again:\n", len(rep.MissingBucketObjects), rep.WaitingForBucketObjects)
-		for _, name := range rep.MissingBucketObjects {
-			fmt.Printf("  gs://%s/%s\n", bucket, name)
-		}
-	}
+func printUndo(rep *gc.UndoReport) {
 	fmt.Printf("Read %d delete records of cycles %d to %d after a wait of %.0f s.\n", rep.Records, rep.FirstCycle, rep.LastCycle, rep.FenceWaitSeconds)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "\tRESTORED\tPRESENT\tMISSING FROM BACKUP\tWAITING FOR CHUNKS\tINVALID\tBLOCKED")
-	fmt.Fprintf(w, "objects\t%d\t%d\t%d\t%d\t%d\t%d\n", rep.Restored, rep.Present, rep.MissingFromBackup, rep.WaitingForBucketObjects, rep.InvalidContent, rep.BlockedByChild)
-	fmt.Fprintf(w, "map rows\t%d\t%d\t%d\t-\t-\t%d\n", rep.MapRowsRestored, rep.MapRowsPresent, rep.MapRowsMissing, rep.MapRowsBlocked)
+	fmt.Fprintln(w, "\tRESTORED\tPRESENT\tMISSING CHUNKS\tNO GC ROW\tINVALID\tBLOCKED")
+	fmt.Fprintf(w, "objects\t%d\t%d\t%d\t%d\t%d\t%d\n", rep.Restored, rep.Present, rep.MissingChunks, rep.WithoutGCRow, rep.InvalidContent, rep.BlockedByChild)
+	fmt.Fprintf(w, "map rows\t%d\t%d\t-\t-\t-\t%d\n", rep.MapRowsRestored, rep.MapRowsPresent, rep.MapRowsBlocked)
 	_ = w.Flush()
 	for _, s := range rep.NotRestoredSample {
 		fmt.Printf("  not restored: %s\n", s)

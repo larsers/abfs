@@ -21,17 +21,11 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// UndoGC writes back what delete cycles deleted, from restored tables, whose
-// backups sources tells, and the delete records in bucket; see gc.Undo.
-func (s *GCPServer) UndoGC(ctx context.Context, bucket string, sources gc.TableSources, opts *gc.UndoOpts) (*gc.UndoReport, error) {
+// UndoGC writes back what delete cycles deleted, from the delete records in
+// bucket; see gc.Undo.
+func (s *GCPServer) UndoGC(ctx context.Context, bucket string, opts *gc.UndoOpts) (*gc.UndoReport, error) {
 	if s.storage == nil {
 		return nil, errors.New("the server has no Cloud Storage client for the delete records")
 	}
-	return gc.Undo(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s.storage.Bucket(bucket), sources, opts)
-}
-
-// GCTableSources returns the sources of the restored tables of the Bigtable
-// instance of project.
-func (s *GCPServer) GCTableSources(project, instance string) gc.TableSources {
-	return gc.NewTableSources(project, instance)
+	return gc.Undo(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s.storage.Bucket(bucket), opts)
 }

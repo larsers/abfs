@@ -85,7 +85,6 @@ func TestListHolds_Eligible(t *testing.T) {
 	require.Empty(holds.prunable(6, values))
 	require.Equal([]int64{3}, holds.prunable(6, values[1:]))
 	require.Equal([]int64{3, 4}, holds.prunable(6, nil))
-	require.Equal(snapshot.Add(-time.Hour), holds.newest())
 	require.Nil((&listHolds{err: errors.New("unavailable")}).prunable(6, nil))
 }
 

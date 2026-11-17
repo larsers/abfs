@@ -37,8 +37,7 @@ import (
 )
 
 // chunkFixture is a stepFixture whose objects have a chunk row and a bucket
-// chunk each, in a bucket that keeps deleted objects for seven days, with a
-// wall clock that the test moves past the chunk delay.
+// chunk each, with a wall clock that the test moves past the undo window.
 type chunkFixture struct {
 	*stepFixture
 	lease  *Lease
@@ -49,9 +48,7 @@ type chunkFixture struct {
 func newChunkFixture(t *testing.T, opts ...grpc.DialOption) *chunkFixture {
 	t.Helper()
 	f := &chunkFixture{stepFixture: newStepFixture(t, 1, opts...), lease: &Lease{Epoch: 3}, checks: &fakeInstance{}}
-	_, err := f.bucket.Update(context.Background(), storage.BucketAttrsToUpdate{SoftDeletePolicy: &storage.SoftDeletePolicy{RetentionDuration: minSoftDeleteRetention}})
-	require.NoError(t, err)
-	f.lease.expiry.Store(time.Now().Add(100 * time.Hour).UnixNano())
+	f.lease.expiry.Store(time.Now().Add(3 * undoWindow).UnixNano())
 	f.clock.Store(time.Now().UnixNano())
 	orig := wallNow
 	wallNow = func() time.Time { return time.Unix(0, f.clock.Load()) }
@@ -59,10 +56,10 @@ func newChunkFixture(t *testing.T, opts ...grpc.DialOption) *chunkFixture {
 	return f
 }
 
-// later moves the wall clock past the chunk delay of every record written so
+// later moves the wall clock past the undo window of every record written so
 // far.
 func (f *chunkFixture) later() {
-	f.clock.Add(int64(DefaultChunkDelay + time.Minute))
+	f.clock.Add(int64(undoWindow + time.Minute))
 }
 
 // chunked writes the object key with the chunks named by uuid.
@@ -146,25 +143,30 @@ func (f *chunkFixture) links(key Hash) {
 }
 
 // record writes a delete record of cycle 5 for keys with the descriptors in
-// descs, the list it deleted from completed at listComplete, as the delete
-// step writes it before its deletes.
-func (f *chunkFixture) record(batch int, listComplete time.Time, keys []Hash, descs map[Hash][]byte) string {
+// descs, as the delete step writes it before its deletes.
+func (f *chunkFixture) record(batch int, keys []Hash, descs map[Hash][]byte) string {
 	f.t.Helper()
 	entries := make([]recordEntry, len(keys))
 	for i, k := range keys {
-		entries[i] = recordEntry{kind: recordObject, key: k, content: recordedContent(descs[k])}
+		entries[i] = recordEntry{kind: recordObject, key: k, cells: []recordCell{{family: objectsDataFamily, column: objectsContentColumn, value: descs[k]}}}
 	}
-	h := &recordHeader{cycle: stepCycle, runID: runID("collector", 3), gcRowsAfter: f.now.Add(-DefaultGrace), listComplete: listComplete}
+	h := &recordHeader{cycle: stepCycle, runID: runID("collector", 3), gcRowsAfter: f.now.Add(-DefaultGrace)}
 	name := recordObjectName(DefaultStateName, stepCycle, 1, 0, batch)
-	require.NoError(f.t, writeRecord(context.Background(), writeBudget{deadline: DefaultWriteDeadline}, f.bucket, name, h, entries))
+	_, err := writeRecord(context.Background(), writeBudget{deadline: DefaultWriteDeadline}, f.bucket, name, h, entries)
+	require.NoError(f.t, err)
 	return name
 }
 
 func (f *chunkFixture) flagOf(name string) string {
 	f.t.Helper()
+	return f.metadataOf(name, chunksDoneMetadata)
+}
+
+func (f *chunkFixture) metadataOf(name, key string) string {
+	f.t.Helper()
 	attrs, err := f.bucket.Object(name).Attrs(context.Background())
 	require.NoError(f.t, err)
-	return attrs.Metadata[chunksDoneMetadata]
+	return attrs.Metadata[key]
 }
 
 // chunkStep runs the chunk step of cycle 6.
@@ -182,8 +184,6 @@ func (f *chunkFixture) chunkStepOK(change func(o *DeleteOpts)) *ChunkStepReport 
 	require.NoError(f.t, err)
 	return rep
 }
-
-func noBackupCheck(o *DeleteOpts) { o.NoBackupCheck = true }
 
 // The chunks of a recorded object go only when its row is gone or holds
 // other chunks: a row with the recorded descriptor, as after a crash between
@@ -203,7 +203,7 @@ func TestChunkStep_RowCheck(t *testing.T) {
 	}
 	f.object(inline, "blob", nil)
 	descs[inline] = f.descriptor(inline, []byte(`[{"size":3,"depot":"inline","id":"YWJj"}]`))
-	name := f.record(0, time.Time{}, h, descs)
+	name := f.record(0, h, descs)
 
 	f.deleteRow(objectsTable, gone)
 	f.deleteRow(objectsTable, reput)
@@ -217,7 +217,7 @@ func TestChunkStep_RowCheck(t *testing.T) {
 	f.deleteRow(objectsTable, inline)
 	f.later()
 
-	rep := f.chunkStepOK(noBackupCheck)
+	rep := f.chunkStepOK(nil)
 	require.Empty(rep.Skipped)
 	for _, k := range []Hash{present, gone, putting} {
 		row, obj := chunkNames(k, "u")
@@ -252,12 +252,12 @@ func TestChunkStep_RowCheck(t *testing.T) {
 	require.Equal(runID("collector", 3), attrs.Metadata[runIDMetadata])
 
 	// A flagged record is not read again.
-	rep = f.chunkStepOK(noBackupCheck)
+	rep = f.chunkStepOK(nil)
 	require.Zero(rep.Records)
 }
 
 // A chunk written or changed at or after its record stays: a bucket chunk
-// written again, as by a restore from soft delete, or written again between
+// written again, as by a restore by hand, or written again between
 // the read of its generation and the delete, and a chunk row written again,
 // as by an undo. The keys are done and the record is flagged.
 func TestChunkStep_RestoredAfterRecord(t *testing.T) {
@@ -287,14 +287,14 @@ func TestChunkStep_RestoredAfterRecord(t *testing.T) {
 		descs[k] = f.chunked(k, "u")
 		f.deleteRow(objectsTable, k)
 	}
-	f.record(0, time.Time{}, h, descs)
+	f.record(0, h, descs)
 	_, obj := chunkNames(rewritten, "u")
 	f.bucketObject(obj)
 	row, _ := chunkNames(newerRow, "u")
 	f.chunkRow(row, time.Now())
 	f.later()
 
-	d := f.deleter(f.lease, noBackupCheck)
+	d := f.deleter(f.lease, nil)
 	d.bucket = client.Bucket(attrs.Name)
 	require.NoError(d.deleteChunks(ctx, stepCycle+1))
 	rep := d.rep.Chunks
@@ -307,60 +307,93 @@ func TestChunkStep_RestoredAfterRecord(t *testing.T) {
 	require.Equal(int64(1), rep.RecordsDone)
 }
 
-// No record is read before the chunk delay has passed since it was
-// created, so that a signed URL of a chunk handed out before the delete
-// still works.
-func TestChunkStep_WaitsForTheChunkDelay(t *testing.T) {
+// A record waits gcRowPassDelay for the repeat of its gc row deletes and the
+// undo window for the delete of its chunks. The gc row pass runs also while
+// the bucket settings stop the chunk deletes, and flags the record so that
+// it does not run again. Only a record left without the flag a day past the
+// undo window counts as unflagged.
+func TestChunkStep_TwoPasses(t *testing.T) {
 	require := require.New(t)
-	f := newChunkFixture(t)
-	key := testHashes(1)[0]
-	descs := map[Hash][]byte{key: f.chunked(key, "u")}
-	f.deleteRow(objectsTable, key)
-	name := f.record(0, time.Time{}, []Hash{key}, descs)
-	attrs, err := f.bucket.Object(name).Attrs(context.Background())
-	require.NoError(err)
-	row, obj := chunkNames(key, "u")
+	ctx := context.Background()
+	setup := func(versioning bool) (*chunkFixture, Hash, string) {
+		f := newChunkFixture(t)
+		f.bucket = newTestBucket(t)
+		_, err := f.bucket.Update(ctx, storage.BucketAttrsToUpdate{VersioningEnabled: versioning})
+		require.NoError(err)
+		key := testHashes(1)[0]
+		descs := map[Hash][]byte{key: f.chunked(key, "u")}
+		f.deleteRow(objectsTable, key)
+		name := f.record(0, []Hash{key}, descs)
+		attrs, err := f.bucket.Object(name).Attrs(ctx)
+		require.NoError(err)
+		f.clock.Store(attrs.Created.UnixNano())
+		return f, key, name
+	}
+	at := func(f *chunkFixture, name string, d time.Duration) *ChunkStepReport {
+		attrs, err := f.bucket.Object(name).Attrs(ctx)
+		require.NoError(err)
+		f.clock.Store(attrs.Created.Add(d).UnixNano())
+		return f.chunkStepOK(nil)
+	}
 
-	f.clock.Store(attrs.Created.Add(DefaultChunkDelay - time.Second).UnixNano())
-	rep := f.chunkStepOK(noBackupCheck)
+	f, key, name := setup(false)
+	row, obj := chunkNames(key, "u")
+	rep := at(f, name, gcRowPassDelay-time.Second)
 	require.Equal(int64(1), rep.RecordsWaiting)
-	require.Zero(rep.Records)
-	require.Equal(int64(1), rep.Unflagged)
-	require.InDelta((DefaultChunkDelay - time.Second).Seconds(), rep.OldestUnflaggedSeconds, 1)
+	require.True(f.rowExists(TableName, key.String()))
+	rep = at(f, name, gcRowPassDelay)
+	require.Equal(int64(1), rep.GCRowsDeleted)
+	require.Equal(int64(1), rep.RecordsGCRowsDone)
+	require.False(f.rowExists(TableName, key.String()))
+	require.Equal("6", f.metadataOf(name, gcRowsDoneMetadata))
+	rep = at(f, name, undoWindow-time.Second)
+	require.Zero(rep.Records + rep.RecordsGCRowsDone + rep.ChunkRowsDeleted + rep.BucketObjectsDeleted)
+	require.Zero(rep.Unflagged)
 	require.True(f.rowExists(chunksTableName, row))
 	require.True(f.objectExists(obj))
-
-	f.clock.Store(attrs.Created.Add(DefaultChunkDelay).UnixNano())
-	rep = f.chunkStepOK(noBackupCheck)
+	rep = at(f, name, undoWindow)
 	require.Equal(int64(1), rep.RecordsDone)
+	require.Zero(rep.GCRowsDeleted + rep.GCRowsKept)
 	require.False(f.rowExists(chunksTableName, row))
 	require.False(f.objectExists(obj))
+
+	// The emulator cannot turn Object Versioning off again.
+	f, key, name = setup(true)
+	row, _ = chunkNames(key, "u")
+	rep = at(f, name, gcRowPassDelay)
+	require.Len(rep.Skipped, 1)
+	require.Equal(int64(1), rep.GCRowsDeleted)
+	require.False(f.rowExists(TableName, key.String()))
+	rep = at(f, name, undoWindow+24*time.Hour-time.Second)
+	require.Zero(rep.Records)
+	require.Zero(rep.Unflagged)
+	require.True(f.rowExists(chunksTableName, row))
+	rep = at(f, name, undoWindow+24*time.Hour)
+	require.Equal(int64(1), rep.Unflagged)
+	require.Empty(f.flagOf(name))
 }
 
-// The step deletes nothing from a bucket whose settings would make a delete
-// permanent or keep the bytes: soft delete shorter than seven days, unless
-// the operator allows it, Object Versioning or a retention policy.
+// The step deletes no chunk from a bucket whose settings would keep the
+// bytes or refuse the delete: Object Versioning, a retention policy, a
+// default event-based hold or object retention. Soft delete, on or off,
+// changes nothing.
 func TestChunkStep_BucketSettings(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
-	week := &storage.SoftDeletePolicy{RetentionDuration: minSoftDeleteRetention}
 	tests := []struct {
 		name  string
 		attrs storage.BucketAttrs
-		allow bool
 		want  string
 	}{
-		{"seven days of soft delete", storage.BucketAttrs{SoftDeletePolicy: week}, false, ""},
-		{"no soft delete", storage.BucketAttrs{}, false, "keeps deleted objects for 0s in soft delete"},
-		{"six days of soft delete", storage.BucketAttrs{SoftDeletePolicy: &storage.SoftDeletePolicy{RetentionDuration: 6 * 24 * time.Hour}}, false, "keeps deleted objects for 144h0m0s"},
-		{"no soft delete, allowed", storage.BucketAttrs{}, true, ""},
-		{"versioning", storage.BucketAttrs{SoftDeletePolicy: week, VersioningEnabled: true}, true, "Object Versioning on"},
-		{"retention policy", storage.BucketAttrs{SoftDeletePolicy: week, RetentionPolicy: &storage.RetentionPolicy{RetentionPeriod: time.Hour}}, true, "retention policy of 1h0m0s"},
-		{"default event-based hold", storage.BucketAttrs{SoftDeletePolicy: week, DefaultEventBasedHold: true}, true, "event-based hold on each new object"},
-		{"object retention", storage.BucketAttrs{SoftDeletePolicy: week, ObjectRetentionMode: "Enabled"}, true, "object retention Enabled"},
+		{"no soft delete", storage.BucketAttrs{}, ""},
+		{"seven days of soft delete", storage.BucketAttrs{SoftDeletePolicy: &storage.SoftDeletePolicy{RetentionDuration: 7 * 24 * time.Hour}}, ""},
+		{"versioning", storage.BucketAttrs{VersioningEnabled: true}, "Object Versioning on"},
+		{"retention policy", storage.BucketAttrs{RetentionPolicy: &storage.RetentionPolicy{RetentionPeriod: time.Hour}}, "retention policy of 1h0m0s"},
+		{"default event-based hold", storage.BucketAttrs{DefaultEventBasedHold: true}, "event-based hold on each new object"},
+		{"object retention", storage.BucketAttrs{ObjectRetentionMode: "Enabled"}, "object retention Enabled"},
 	}
 	for _, tt := range tests {
-		got := bucketProblems(&tt.attrs, tt.allow)
+		got := bucketProblems(&tt.attrs)
 		if tt.want == "" {
 			require.Empty(got, tt.name)
 			continue
@@ -379,72 +412,22 @@ func TestChunkStep_BucketSettings(t *testing.T) {
 		key := testHashes(1)[0]
 		descs := map[Hash][]byte{key: f.chunked(key, "u")}
 		f.deleteRow(objectsTable, key)
-		name := f.record(0, time.Time{}, []Hash{key}, descs)
+		name := f.record(0, []Hash{key}, descs)
 		f.later()
 		_, obj := chunkNames(key, "u")
 		return f, name, obj
 	}
-	allow := func(o *DeleteOpts) { o.NoBackupCheck, o.AllowNoSoftDelete = true, true }
-	for _, step := range []struct {
-		change     func(o *DeleteOpts)
-		versioning bool
-	}{
-		{noBackupCheck, false},
-		{allow, true},
-	} {
-		f, name, obj := setup(step.versioning)
-		rep := f.chunkStepOK(step.change)
-		require.Len(rep.Skipped, 1)
-		require.Zero(rep.Records)
-		require.Equal(int64(1), rep.Unflagged)
-		require.True(f.objectExists(obj))
-		require.Empty(f.flagOf(name))
-	}
-	f, name, obj := setup(false)
-	rep := f.chunkStepOK(allow)
+	f, name, obj := setup(true)
+	rep := f.chunkStepOK(nil)
+	require.Len(rep.Skipped, 1)
+	require.Zero(rep.Records)
+	require.True(f.objectExists(obj))
+	require.Empty(f.flagOf(name))
+	f, name, obj = setup(false)
+	rep = f.chunkStepOK(nil)
 	require.Empty(rep.Skipped)
 	require.Equal("6", f.flagOf(name))
 	require.False(f.objectExists(obj))
-}
-
-// Chunk rows have no soft delete, so a record is processed only when a ready
-// backup of the chunks table that has not expired started after the list it
-// deleted from was complete; the operator can skip the check.
-func TestChunkStep_BackupCheck(t *testing.T) {
-	require := require.New(t)
-	f := newChunkFixture(t)
-	key := testHashes(1)[0]
-	descs := map[Hash][]byte{key: f.chunked(key, "u")}
-	f.deleteRow(objectsTable, key)
-	listComplete := time.Now().Add(-time.Hour)
-	name := f.record(0, listComplete, []Hash{key}, descs)
-	f.later()
-	row, _ := chunkNames(key, "u")
-	after := listComplete.Add(time.Minute)
-	refused := []struct {
-		name    string
-		backups []Backup
-	}{
-		{"no backup", nil},
-		{"before the list", []Backup{{Table: chunksTableName, Start: listComplete.Add(-time.Minute), Ready: true}}},
-		{"not ready", []Backup{{Table: chunksTableName, Start: after}}},
-		{"expired", []Backup{{Table: chunksTableName, Start: after, Ready: true, Expire: time.Unix(0, f.clock.Load()).Add(-time.Minute)}}},
-		{"another table", []Backup{{Table: objectsTable, Start: after, Ready: true}}},
-	}
-	for _, tt := range refused {
-		f.checks.backups = tt.backups
-		rep := f.chunkStepOK(nil)
-		require.Empty(rep.Skipped, tt.name)
-		require.Equal(int64(1), rep.RecordsWithoutBackup, tt.name)
-		require.Equal(int64(1), rep.Unflagged, tt.name)
-		require.True(f.rowExists(chunksTableName, row), tt.name)
-	}
-	f.checks.backups = []Backup{{Table: chunksTableName, Start: after, Ready: true, Expire: time.Unix(0, f.clock.Load()).Add(time.Hour)}}
-	rep := f.chunkStepOK(nil)
-	require.Equal(int64(1), rep.RecordsDone)
-	require.Equal("6", f.flagOf(name))
-	require.False(f.rowExists(chunksTableName, row))
-	require.True(f.checks.backupsCalled)
 }
 
 // A key the step cannot finish leaves its record without the flag, and the
@@ -473,10 +456,11 @@ func TestChunkStep_KeepsUnfinishedRecords(t *testing.T) {
 	f.object(key, "blob", nil)
 	descs := map[Hash][]byte{key: f.descriptor(key, []byte(`[{"size":3,"depot":"mem","id":"x"}]`))}
 	f.deleteRow(objectsTable, key)
-	name := f.record(0, time.Time{}, []Hash{key}, descs)
+	name := f.record(0, []Hash{key}, descs)
 	f.later()
+	f.clock.Add(int64(24 * time.Hour))
 	for range 2 {
-		rep := f.chunkStepOK(noBackupCheck)
+		rep := f.chunkStepOK(nil)
 		require.Equal(int64(1), rep.Records)
 		require.Equal(int64(1), rep.UnknownDepot)
 		require.Zero(rep.RecordsDone)
@@ -500,10 +484,10 @@ func TestChunkStep_StopsBeforeLeaseExpiry(t *testing.T) {
 				descs[key] = f.descriptor(key, fmt.Appendf(nil, `[{"size":3,"depot":"bucket","id":"%s"}]`, obj))
 			}
 			f.deleteRow(objectsTable, key)
-			name := f.record(0, time.Time{}, []Hash{key}, descs)
+			name := f.record(0, []Hash{key}, descs)
 			f.later()
 			f.lease.expiry.Store(f.clock.Load() + int64(2*DefaultWriteDeadline+clockSkewMargin-time.Second))
-			_, err := f.chunkStep(noBackupCheck)
+			_, err := f.chunkStep(nil)
 			require.ErrorIs(err, errLeaseExpiring)
 			require.True(f.rowExists(chunksTableName, row))
 			require.True(f.objectExists(obj))
@@ -569,10 +553,10 @@ func TestChunkStep_HeldChunks(t *testing.T) {
 				_, err := f.bucket.Object(obj).Update(ctx, storage.ObjectAttrsToUpdate{TemporaryHold: true})
 				require.NoError(err)
 			}
-			record := f.record(0, time.Time{}, []Hash{key}, descs)
+			record := f.record(0, []Hash{key}, descs)
 			f.later()
 			step := func() *ChunkStepReport {
-				d := f.deleter(f.lease, noBackupCheck)
+				d := f.deleter(f.lease, nil)
 				d.bucket = client.Bucket(f.bucket.BucketName())
 				require.NoError(d.deleteChunks(ctx, stepCycle+1))
 				return d.rep.Chunks
@@ -582,7 +566,6 @@ func TestChunkStep_HeldChunks(t *testing.T) {
 			rep := step()
 			require.Equal(int64(1), rep.DeleteRefused)
 			require.Zero(rep.RestoredAfterRecord + rep.BucketObjectsDeleted + rep.RecordsDone)
-			require.Equal(int64(1), rep.Unflagged)
 			require.Empty(f.flagOf(record))
 			require.True(f.objectExists(obj))
 			if name == "temporary hold" {
@@ -637,14 +620,14 @@ func TestChunkStep_MetadataChangesAreNoRestore(t *testing.T) {
 		descs[k] = f.descriptor(k, fmt.Appendf(nil, `[{"size":3,"depot":"bucket","id":"%s"}]`, obj))
 		f.deleteRow(objectsTable, k)
 	}
-	record := f.record(0, time.Time{}, h, descs)
+	record := f.record(0, h, descs)
 	for obj, metadata := range map[string]map[string]string{undoneObj: {undoMetadata: "5"}, labeledObj: {"label": "x"}} {
 		_, err := f.bucket.Object(obj).Update(ctx, storage.ObjectAttrsToUpdate{Metadata: metadata})
 		require.NoError(err)
 	}
 	f.later()
 	step := func() *ChunkStepReport {
-		d := f.deleter(f.lease, noBackupCheck)
+		d := f.deleter(f.lease, nil)
 		d.bucket = client.Bucket(f.bucket.BucketName())
 		require.NoError(d.deleteChunks(ctx, stepCycle+1))
 		return d.rep.Chunks
@@ -728,12 +711,11 @@ func TestChunkStep_RecordsShareTheKeyBound(t *testing.T) {
 		descs[k] = f.descriptor(k, fmt.Appendf(nil, `[{"size":3,"depot":"bucket","id":"%s"}]`, obj))
 		f.deleteRow(objectsTable, k)
 	}
-	f.record(0, time.Time{}, h[:3], descs)
-	f.record(1, time.Time{}, h[3:], descs)
+	f.record(0, h[:3], descs)
+	f.record(1, h[3:], descs)
 	f.later()
 
 	d := f.deleter(f.lease, func(o *DeleteOpts) {
-		noBackupCheck(o)
 		o.DeleteWorkers = workers
 	})
 	d.bucket = client.Bucket(f.bucket.BucketName())
@@ -786,7 +768,7 @@ func TestDeleteStep_ChunksOfDeletedKeysOnly(t *testing.T) {
 	require.Equal(int64(2), step.NotMatched)
 	f.later()
 
-	rep := f.chunkStepOK(noBackupCheck)
+	rep := f.chunkStepOK(nil)
 	require.Equal(step.RecordsWritten, rep.RecordsDone)
 	require.Equal(int64(2), rep.Keys)
 	require.Equal(int64(1), rep.KeptRowPresent)
@@ -819,40 +801,41 @@ func leaseAt() *Lease {
 }
 
 // Pruning deletes the records of the cycles beyond the newest keep ones
-// whose records are all flagged and older than the soft delete retention of
-// the bucket, and at least seven days, so that an undo finds them while it
-// can restore what they name. A record without the flag, whose chunks may
-// still be to delete, keeps every record of its cycle. Before it deletes the
-// records of a cycle, it writes the pruned marker of the cycle, which it
+// whose records were all flagged at least the undo window ago, so that an
+// undo finds them while it can restore what they name. A record without the
+// flag of its chunk pass, whose chunks may still be to delete, keeps every
+// record of its cycle, also when its gc row pass is done. Before it deletes
+// the records of a cycle, it writes the pruned marker of the cycle, which it
 // keeps, and every write is within the write budget.
 func TestPruneRecords(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	bucket := newTestBucket(t)
-	write := func(name string, flagged bool) {
+	write := func(name, flag string) {
 		w := bucket.Object(name).NewWriter(ctx)
-		if flagged {
-			w.Metadata = map[string]string{chunksDoneMetadata: "9"}
+		if flag != "" {
+			w.Metadata = map[string]string{flag: "9"}
 		}
 		require.NoError(w.Close())
 	}
 	type record struct {
-		name          string
-		flagged, kept bool
+		name, flag string
+		kept       bool
 	}
 	records := []record{
-		{"gc/deleted/default/3/0-0-0", true, true},
-		{"gc/deleted/default/3/1-0-0", false, true},
-		{"gc/deleted/default/4/1-2-0", true, false},
-		{"gc/deleted/default/4/1-3-0", true, false},
-		{"gc/deleted/default/5/1-0-0", true, false},
-		{"gc/deleted/default/7/1-0-0", true, true},
-		{"gc/deleted/default/8/1-0-0", true, true},
-		{"gc/deleted/default/notes", true, true},
-		{"gc/deleted/other/1/1-0-0", true, true},
+		{"gc/deleted/default/3/0-0-0", chunksDoneMetadata, true},
+		{"gc/deleted/default/3/1-0-0", "", true},
+		{"gc/deleted/default/4/1-2-0", chunksDoneMetadata, false},
+		{"gc/deleted/default/4/1-3-0", chunksDoneMetadata, false},
+		{"gc/deleted/default/5/1-0-0", chunksDoneMetadata, false},
+		{"gc/deleted/default/6/1-0-0", gcRowsDoneMetadata, true},
+		{"gc/deleted/default/7/1-0-0", chunksDoneMetadata, true},
+		{"gc/deleted/default/8/1-0-0", chunksDoneMetadata, true},
+		{"gc/deleted/default/notes", chunksDoneMetadata, true},
+		{"gc/deleted/other/1/1-0-0", chunksDoneMetadata, true},
 	}
 	for _, r := range records {
-		write(r.name, r.flagged)
+		write(r.name, r.flag)
 	}
 	markers := []string{prunedMarkerName(DefaultStateName, 4), prunedMarkerName(DefaultStateName, 5)}
 	prune := func(lease *Lease) (int64, error) {
@@ -892,15 +875,6 @@ func TestPruneRecords(t *testing.T) {
 	require.Zero(removed)
 	requireRecords(false)
 
-	// Younger than the soft delete retention of the bucket.
-	_, err = bucket.Update(ctx, storage.BucketAttrsToUpdate{SoftDeletePolicy: &storage.SoftDeletePolicy{RetentionDuration: undoWindow + 2*time.Hour}})
-	require.NoError(err)
-	removed, err = prune(leaseAt())
-	require.NoError(err)
-	require.Zero(removed)
-	requireRecords(false)
-
-	laterBy(t, 2*time.Hour)
 	removed, err = prune(leaseAt())
 	require.NoError(err)
 	require.Equal(int64(3), removed)
@@ -912,8 +886,8 @@ func TestPruneRecords(t *testing.T) {
 }
 
 // The retention of a delete record counts from its flag, when its chunks
-// entered soft delete, not from its write: a record whose chunk step ran days
-// late stays while an undo can still restore its chunks.
+// were deleted, not from its write: a record whose chunk step ran days late
+// stays the undo window after it.
 func TestPruneRecords_RetentionCountsFromTheFlag(t *testing.T) {
 	require := require.New(t)
 	now := time.Now()
@@ -941,27 +915,4 @@ func TestPruneRecords_RetentionCountsFromTheFlag(t *testing.T) {
 	attrs, err := obj.Update(ctx, storage.ObjectAttrsToUpdate{Metadata: flagged})
 	require.NoError(err)
 	require.True(attrs.Updated.After(attrs.Created), "updated %s, created %s", attrs.Updated, attrs.Created)
-}
-
-// The chunk delay must exceed the lifetime of a signed URL of a chunk by
-// twice the clock skew margin: the servers date the URLs by their clocks and
-// the step judges the age of a record by its own.
-func TestDeleteOpts_ChunkDelayCoversClockSkew(t *testing.T) {
-	for _, tt := range []struct {
-		delay time.Duration
-		ok    bool
-	}{
-		{signedURLLifetime + time.Second, false},
-		{signedURLLifetime + 2*clockSkewMargin - time.Second, false},
-		{signedURLLifetime + 2*clockSkewMargin, true},
-	} {
-		o := DefaultDeleteOpts()
-		o.MinReplicas, o.ChunkDelay = 2, tt.delay
-		err := o.Validate()
-		if tt.ok {
-			require.NoError(t, err, tt.delay)
-		} else {
-			require.ErrorContains(t, err, "by twice the clock skew margin", tt.delay)
-		}
-	}
 }

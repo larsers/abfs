@@ -50,17 +50,13 @@ func newDeleteCase() *deleteCase {
 	for _, id := range []string{"srv-0-aa", "srv-1-bb", "srv-2-cc"} {
 		servers = append(servers, liveServer(id, snapshot))
 	}
-	var backups []Backup
-	for _, table := range backupTables {
-		backups = append(backups, Backup{Name: table + "-1", Table: table, Start: snapshot.Add(-time.Minute), Ready: true})
-	}
 	return &deleteCase{
 		r: &Report{SnapshotTime: snapshot, Consistency: ConsistencyReport{Ran: true}},
 		ev: &deleteEvidence{
 			snapshot: snapshot,
 			holds:    &listHolds{records: map[int64]*ListRecord{4: {Cycle: 4, SnapshotTime: listSnapshot, CompleteTime: complete, CacheTTL: 6 * time.Hour}}},
 			servers:  &serverEvidence{servers: servers, readTime: snapshot},
-			instance: instanceEvidence{clusters: []string{"c1"}, backups: backups, backupsChecked: true},
+			instance: instanceEvidence{clusters: []string{"c1"}},
 		},
 		o: o,
 	}
@@ -82,14 +78,6 @@ func stoppedServer(id string, stopped time.Time) Server {
 
 func (c *deleteCase) addServer(s Server) {
 	c.ev.servers.servers = append(c.ev.servers.servers, s)
-}
-
-func (c *deleteCase) setBackup(table string, change func(b *Backup)) {
-	for i := range c.ev.instance.backups {
-		if c.ev.instance.backups[i].Table == table {
-			change(&c.ev.instance.backups[i])
-		}
-	}
 }
 
 func liveMounts(count string, n int64) func(c *deleteCase) {
@@ -195,24 +183,6 @@ func TestDeleteBlockers(t *testing.T) {
 		{"probe denied", func(c *deleteCase) {
 			c.ev.instance.probeErr = status.Error(codes.PermissionDenied, "denied")
 		}, []string{"the conditional write probe failed (the collector needs bigtable.tables.readRows and bigtable.tables.mutateRows)"}, nil},
-
-		// Backups.
-		{"no backup of chunks", func(c *deleteCase) { c.ev.instance.backups = c.ev.instance.backups[:3] }, []string{"no ready backup of Bigtable table chunks"}, nil},
-		{"backup of maps not ready", func(c *deleteCase) { c.setBackup("maps", func(b *Backup) { b.Ready = false }) }, []string{"no ready backup of Bigtable table maps"}, nil},
-		{"backup of objects older than the list", func(c *deleteCase) {
-			c.setBackup("objects", func(b *Backup) { b.Start = c.ev.holds.records[4].CompleteTime.Add(-time.Minute) })
-		}, []string{"no ready backup of Bigtable table objects"}, nil},
-		{"backup of objects older than the newest complete list", func(c *deleteCase) {
-			c.ev.holds.records[5] = &ListRecord{Cycle: 5, CompleteTime: c.ev.snapshot.Add(-time.Hour)}
-			c.ev.holds.records[6] = &ListRecord{Cycle: 6}
-			c.setBackup("objects", func(b *Backup) { b.Start = c.ev.snapshot.Add(-2 * time.Hour) })
-		}, []string{"no ready backup of Bigtable table objects started after the list was completed at 2026-11-08T11:00:00Z"}, nil},
-		{"backup listing denied", func(c *deleteCase) {
-			c.ev.instance.backups, c.ev.instance.backupsErr = nil, status.Error(codes.PermissionDenied, "denied")
-		}, []string{"cannot list the backups of the Bigtable instance (the collector needs bigtable.backups.list)"}, nil},
-		{"backup check off", func(c *deleteCase) {
-			c.ev.instance.backups, c.ev.instance.backupsChecked = nil, false
-		}, nil, nil},
 
 		{"ref removal failed", func(c *deleteCase) { c.ev.refRemovalErr = errors.New("aborted") }, []string{"the removal of expired refs failed: aborted"}, nil},
 
@@ -383,8 +353,6 @@ func TestDeleteOpts_Validate(t *testing.T) {
 		{func(o *DeleteOpts) { o.DeleteWorkers = DefaultScanShards - 1 }, "fewer than the 16 key ranges"},
 		{func(o *DeleteOpts) { o.DeleteWorkers = DefaultScanShards }, ""},
 		{func(o *DeleteOpts) { o.DeleteRate = -1 }, "invalid delete rate"},
-		{func(o *DeleteOpts) { o.ChunkDelay = 10 * time.Minute }, "not longer than the 10m0s lifetime"},
-		{func(o *DeleteOpts) { o.ChunkDelay = 12 * time.Minute }, ""},
 		{func(o *DeleteOpts) { o.StartDelay = -time.Second }, "invalid delete start delay"},
 		{func(o *DeleteOpts) { o.MinReplicas = 0 }, "invalid expected replicas 0"},
 	}
@@ -650,55 +618,37 @@ func TestTooNewCheck_ReadFailsAfterWriterFound(t *testing.T) {
 }
 
 type fakeInstance struct {
-	clusters      []string
-	probeErr      error
-	probes        int
-	backups       []Backup
-	backupsCalled bool
+	clusters []string
+	probeErr error
+	probes   int
 }
 
 func (f *fakeInstance) Clusters(context.Context) ([]string, error) { return f.clusters, nil }
-
-func (f *fakeInstance) Backups(context.Context) ([]Backup, error) {
-	f.backupsCalled = true
-	return f.backups, nil
-}
 
 func (f *fakeInstance) ProbeConditionalWrite(context.Context) error {
 	f.probes++
 	return f.probeErr
 }
 
-// The checks of the instance are read for every delete, and the backups only
-// unless the operator skips them.
+// The checks of the instance are read for every delete.
 func TestReadInstanceEvidence(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	f := &fakeInstance{clusters: []string{"c1"}, probeErr: status.Error(codes.FailedPrecondition, "no transactions")}
-	o := &DeleteOpts{}
-	e := readInstanceEvidence(ctx, f, writeBudget{}, o)
-	require.True(f.backupsCalled)
-	require.True(e.backupsChecked)
+	e := readInstanceEvidence(ctx, f, writeBudget{})
 	require.Equal([]string{"c1"}, e.clusters)
 	require.Equal(codes.FailedPrecondition, status.Code(e.probeErr))
-	reasons := instanceBlockers(&e, time.Now())
-	require.Len(reasons, 1+len(backupTables))
-
-	f.backupsCalled = false
-	o.NoBackupCheck = true
-	e = readInstanceEvidence(ctx, f, writeBudget{}, o)
-	require.False(f.backupsCalled)
-	require.Len(instanceBlockers(&e, time.Now()), 1)
+	require.Len(instanceBlockers(&e), 1)
 
 	// The probe is a write of the collector: it is retried on transient
 	// errors and not sent once the lease could expire.
 	f.probes, f.probeErr = 0, status.Error(codes.Unavailable, "busy")
-	e = readInstanceEvidence(ctx, f, writeBudget{deadline: time.Second}, o)
+	e = readInstanceEvidence(ctx, f, writeBudget{deadline: time.Second})
 	require.Equal(writeAttempts, f.probes)
 	f.probes, f.probeErr = 0, nil
 	expiring := &Lease{}
 	expiring.expiry.Store(time.Now().Add(time.Minute).UnixNano())
-	e = readInstanceEvidence(ctx, f, writeBudget{deadline: DefaultWriteDeadline, lease: expiring}, o)
+	e = readInstanceEvidence(ctx, f, writeBudget{deadline: DefaultWriteDeadline, lease: expiring})
 	require.Zero(f.probes)
 	require.ErrorIs(e.probeErr, errLeaseExpiring)
 }
