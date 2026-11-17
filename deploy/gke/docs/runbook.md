@@ -140,7 +140,7 @@ When every pusher has completed its initial push, move to the steady phase:
 helm upgrade abfs chart/abfs -n abfs -f <values.yaml> --set pusher.phase=steady --timeout 30m
 ```
 
-Put `pusher.phase: steady` into the values file too. The StatefulSet recreates each pusher, highest ordinal first, on a node of `abfs-pusher-steady` in its PVC's zone, with `pusher.steadyResources`. The chart creates the pusher VerticalPodAutoscaler in this phase only. The autoscaler deletes the empty seed nodes.
+Put `pusher.phase: steady` into the values file too. The StatefulSet recreates each pusher, highest ordinal first, on a node of `abfs-pusher-steady` in its PVC's zone, with `pusher.steadyResources`. The chart creates the pusher VerticalPodAutoscaler in this phase only. The pusher container is `git-pusher-seed` in the seed phase and `git-pusher` in the steady phase; the VPA controls only `git-pusher`, so seed usage never sets the steady size ([Right-sizing](configuration.md#right-sizing)). The autoscaler deletes the empty seed nodes.
 
 Go back to `phase: seed` before a re-shard, after a lost PVC, or before adding a large new branch.
 
@@ -151,7 +151,7 @@ Go back to `phase: seed` before a re-shard, after a lost PVC, or before adding a
 - Never `kubectl scale` the StatefulSet. With fewer pods than the pool, the missing pushers' projects go unpolled without an error. More pods than the pool fail their config lookup.
 - A change of `pusher.count` is a re-shard: pushers clone the moved projects again from Gerrit (hours), and the PVCs must hold the new share. Do it in the seed phase, with `helm upgrade`, never by hand.
 
-With `alerts.enabled=true` and `alerts.clusterName` set to the cluster's name, Managed Service for Prometheus rules fire when pool projects have no running pusher, fewer pushers report than `pushers-count`, or a `git-pusher` container restarts.
+With `alerts.enabled=true` and `alerts.clusterName` set to the cluster's name, Managed Service for Prometheus rules fire when pool projects have no running pusher, fewer pushers report than `pushers-count`, or a pusher container (`git-pusher` or `git-pusher-seed`) restarts.
 
 ### A pusher OOM kill
 
@@ -159,7 +159,7 @@ An OOM-killed pusher restarts with the same limit. `kubectl -n abfs describe pod
 
 ```sh
 kubectl -n abfs get pods -l app.kubernetes.io/component=pusher
-kubectl -n abfs get vpa abfs-pusher -o jsonpath='{.status.recommendation.containerRecommendations[0].target.memory}{"\n"}'
+kubectl -n abfs get vpa abfs-pusher -o jsonpath='{.status.recommendation.containerRecommendations[?(@.containerName=="git-pusher")].target.memory}{"\n"}'
 kubectl -n abfs delete pod abfs-pusher-<n>
 ```
 
