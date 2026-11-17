@@ -36,80 +36,21 @@ const (
 	keepAlivePassAllowance = time.Hour
 )
 
-// serverEvidence is what the collector knows of the server processes: the
-// heartbeat rows of both tables and the time GcReplicas was last found to
-// hold no row.
+// serverEvidence is what the collector knows of the server processes: their
+// heartbeat rows in GcServers.
 type serverEvidence struct {
 	// servers are the rows of GcServers, read at readTime.
 	servers  []Server
 	readTime time.Time
-	// replicas are the rows of GcReplicas, which servers of an older version
-	// write and delete when they stop.
-	replicas []Replica
-	// legacyGone is LegacyServersGoneTime, zero while GcReplicas holds a row.
-	legacyGone time.Time
 }
 
-// readServerEvidence runs the guard of GcReplicas for the garbage collector
-// name, then reads GcServers.
-func readServerEvidence(ctx context.Context, client *spanner.Client, name string) (*serverEvidence, error) {
-	replicas, gone, err := checkLegacyServers(ctx, client, name)
-	if err != nil {
-		return nil, err
-	}
+// readServerEvidence reads GcServers.
+func readServerEvidence(ctx context.Context, client *spanner.Client) (*serverEvidence, error) {
 	servers, read, err := readServers(ctx, client)
 	if err != nil {
 		return nil, err
 	}
-	return &serverEvidence{servers: servers, readTime: read, replicas: replicas, legacyGone: gone}, nil
-}
-
-// checkLegacyServers reads GcReplicas and records in the GcState row name
-// since when it has been empty. A server of an older version writes its row
-// when it starts, deletes it when it stops and leaves no other trace, so the
-// collector sees only the servers of an older version that run at one of its
-// reads. LegacyServersGoneTime before a window start means that every read
-// since then found GcReplicas empty; it does not show that no such server ran
-// in the window, since one that started and stopped between two reads left no
-// row to find. The transaction sets LegacyServersGoneTime to its commit time
-// when it finds no row and the time is not set, and clears it when it finds a
-// row. It returns the rows and the time, zero when not set. Both writes state
-// a fact of the read, so a collector that lost its lease may make them too.
-func checkLegacyServers(ctx context.Context, client *spanner.Client, name string) ([]Replica, time.Time, error) {
-	var replicas []Replica
-	var gone time.Time
-	var set bool
-	commit, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, stateTable, spanner.Key{name}, []string{"LegacyServersGoneTime"})
-		if err != nil {
-			return err
-		}
-		var stored spanner.NullTime
-		if err := row.Columns(&stored); err != nil {
-			return err
-		}
-		if replicas, err = scanReplicas(txn.Read(ctx, replicasTable, spanner.AllKeys(), replicaColumns)); err != nil {
-			return err
-		}
-		gone, set = stored.Time, false
-		var value any
-		switch {
-		case len(replicas) == 0 && !stored.Valid:
-			value, set = spanner.CommitTimestamp, true
-		case len(replicas) > 0 && stored.Valid:
-			value, gone = spanner.NullTime{}, time.Time{}
-		default:
-			return nil
-		}
-		return txn.BufferWrite([]*spanner.Mutation{spanner.Update(stateTable, []string{"Name", "LegacyServersGoneTime"}, []any{name, value})})
-	})
-	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("failed to check the GC replicas of older servers: %w", err)
-	}
-	if set {
-		gone = commit
-	}
-	return replicas, gone, nil
+	return &serverEvidence{servers: servers, readTime: read}, nil
 }
 
 // windowStart returns the start of the window of a delete cycle whose
@@ -163,22 +104,13 @@ func (e *serverEvidence) longestCacheTTL(start time.Time) time.Duration {
 }
 
 // graceTTL returns the server with the largest cache TTL among those that
-// may have run since start, from their rows in GcServers and GcReplicas, and
-// false when no such row exists.
-func (e *serverEvidence) graceTTL(start time.Time) (Replica, bool) {
-	var longest Replica
+// may have run since start, and false when no such row exists.
+func (e *serverEvidence) graceTTL(start time.Time) (Server, bool) {
+	var longest Server
 	found := false
-	consider := func(r Replica) {
-		if !found || r.CacheTTL > longest.CacheTTL {
-			longest, found = r, true
-		}
-	}
 	for _, s := range e.inWindow(start) {
-		consider(Replica{ID: s.ID, CacheTTL: s.CacheTTL})
-	}
-	for _, r := range e.replicas {
-		if !r.LastSeen.Add(liveReplicaAge).Before(start) {
-			consider(r)
+		if !found || s.CacheTTL > longest.CacheTTL {
+			longest, found = s, true
 		}
 	}
 	return longest, found
@@ -204,113 +136,35 @@ func (e *serverEvidence) graceProblem(start time.Time, o *DryRunOpts) string {
 // snapshot: the grace less the longest touch interval and the longest cache
 // TTL of the processes that may have run in its window, and the clock skew
 // margin. An answer from the header cache rests on a touch made when the
-// entry was looked up, up to the TTL before the answer.
-//
-// When a server lost a map row touch (see mapRowLoss), the limit also leaves
-// out clientMapReuse and keepAlivePassAllowance. Without the touch the eval
-// map row may no longer keep the outputs of a result, and a build can apply
-// the result clientMapReuse after the server returned it: until the next
-// keep-alive pass names the outputs, only the touch of that answer keeps
-// them.
+// entry was looked up, up to the TTL before the answer. A mount that keeps
+// to it needs no rescue of what it holds; the hold of the condemn markers
+// does not rest on it.
 func (e *serverEvidence) keepAliveTouchLimit(snapshot time.Time, grace time.Duration) time.Duration {
 	start := windowStart(snapshot, grace)
-	limit := grace - e.longestTouchInterval(start) - e.longestCacheTTL(start) - clockSkewMargin
-	if _, lost := e.mapRowLoss(snapshot, grace); lost {
-		limit -= clientMapReuse + keepAlivePassAllowance
-	}
-	return limit
+	return grace - e.longestTouchInterval(start) - e.longestCacheTTL(start) - clockSkewMargin
 }
 
-// mapRowLossStart returns the time from which a lost map row touch counts for
-// a cycle whose snapshot is snapshot. The outputs of a result whose map row
-// touch was lost rest on the touch of the server's answer until a keep-alive
-// pass names them, up to clientMapReuse, the keep-alive interval plus a tenth
-// and keepAlivePassAllowance after the answer. For a mount whose interval
-// fits the limit without a loss, the pass after an earlier loss names them
-// early enough before the snapshot that its touch counts.
-func mapRowLossStart(snapshot time.Time, grace time.Duration) time.Time {
-	return windowStart(snapshot, grace).Add(-clientMapReuse - keepAlivePassAllowance)
-}
-
-// mapRowLossEvent is a map row loss that counts for a cycle.
-type mapRowLossEvent struct {
-	// server is the ID of the server that lost map row touches, and at the
-	// time it recorded the loss.
-	server string
-	at     time.Time
-	// crashed is set when the server did not record a stop and its last
-	// heartbeat is older than a live row may be: it may have lost map row
-	// touches it never recorded, up to at, the last time it may have run.
-	crashed bool
-}
-
-// mapRowLoss returns the latest map row loss since mapRowLossStart, and
-// whether there is one. A row of a server of an older version has no
-// MapRowLossTime: such a server records those losses in TouchLossTime. A
-// process that did not record a stop may have lost map row touches after its
-// last heartbeat, as it may have lost object touches, so it counts as a loss
-// at the last time it may have run.
-func (e *serverEvidence) mapRowLoss(snapshot time.Time, grace time.Duration) (mapRowLossEvent, bool) {
-	start := mapRowLossStart(snapshot, grace)
-	var latest mapRowLossEvent
-	found := false
+// mapRowLoss returns the latest time a server that may have run since the
+// window start of a cycle whose snapshot is snapshot recorded lost map row
+// touches, or any time from clientMapReuse and keepAlivePassAllowance before
+// that start, and whether there is one. It is reported, not checked.
+func (e *serverEvidence) mapRowLoss(snapshot time.Time, grace time.Duration) (time.Time, bool) {
+	start := windowStart(snapshot, grace).Add(-clientMapReuse - keepAlivePassAllowance)
+	var latest time.Time
 	for _, s := range e.inWindow(start) {
-		loss := mapRowLossEvent{server: s.ID, at: s.MapRowLossTime}
-		if e.crashed(&s) {
-			loss.at, loss.crashed = s.LastSeen.Add(liveReplicaAge), true
-		}
-		if !loss.at.IsZero() && !loss.at.Before(start) && (!found || loss.at.After(latest.at)) {
-			latest, found = loss, true
+		if !s.MapRowLossTime.Before(start) && s.MapRowLossTime.After(latest) {
+			latest = s.MapRowLossTime
 		}
 	}
-	return latest, found
-}
-
-// describe says why loss counts.
-func (loss *mapRowLossEvent) describe() string {
-	if loss.crashed {
-		return fmt.Sprintf("server %s last wrote its heartbeat at %s and did not record a stop: it crashed and may have lost map row touches", loss.server, formatTime(loss.at.Add(-liveReplicaAge)))
-	}
-	return fmt.Sprintf("server %s lost map row touches at %s", loss.server, formatTime(loss.at))
-}
-
-// mapRowLossNote explains the part of the keep-alive limit that a map row
-// loss adds, or returns "" when there is none.
-func (e *serverEvidence) mapRowLossNote(snapshot time.Time, grace time.Duration) string {
-	loss, lost := e.mapRowLoss(snapshot, grace)
-	if !lost {
-		return ""
-	}
-	return fmt.Sprintf(", and less the %s for which clients reuse map results and the %s a keep-alive pass may take, since %s",
-		clientMapReuse, keepAlivePassAllowance, loss.describe())
-}
-
-// withoutKeepAliveMapRowLoss returns the reason why a cycle whose snapshot is
-// snapshot must not delete the types clients write while n live mounts run
-// without the GC keep-alive, which --accept-mounts-without-keepalive accepts,
-// or "" when no map row loss counts. samples names some of the mounts. Such a
-// mount touches nothing after the server's answer, so after a map row loss
-// the outputs of a map result it applies may not be recent at the mark.
-func (e *serverEvidence) withoutKeepAliveMapRowLoss(snapshot time.Time, grace time.Duration, n int64, samples string) string {
-	loss, lost := e.mapRowLoss(snapshot, grace)
-	if !lost {
-		return ""
-	}
-	return fmt.Sprintf("%d live mounts run without the GC keep-alive%s, and %s: such a mount may apply a map result whose outputs no map row keeps any more, which --accept-mounts-without-keepalive does not accept; set gc-keepalive in their config",
-		n, samples, loss.describe())
-}
-
-// crashed reports whether the process of s did not record a stop and its last
-// heartbeat is older than a live row may be at the read.
-func (e *serverEvidence) crashed(s *Server) bool {
-	return s.StoppedAt.IsZero() && e.readTime.Sub(s.LastSeen) > liveReplicaAge
+	return latest, !latest.IsZero()
 }
 
 // windowBlockers returns the reasons in e why a cycle whose snapshot is
-// snapshot must not delete: a process that may have run in the window and
-// crashed, lost touches, ran without link validation or with settings that
-// break the timing rules, or GcReplicas not found empty at every read since
-// the window start.
+// snapshot must not delete: a process that may have run in the window ran
+// without link validation, with an older version of the GC rules or with
+// settings that break the timing rules, or the grace does not cover the
+// largest cache TTL. A process that crashed or lost touches does not count:
+// the delete rule rests on no touch that a server buffers.
 func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []string {
 	var reasons []string
 	add := func(format string, args ...any) {
@@ -324,37 +178,53 @@ func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []stri
 	slices.SortFunc(in, func(a, b Server) int { return cmp.Compare(a.ID, b.ID) })
 	for i := range in {
 		s := &in[i]
-		if e.crashed(s) {
-			add("server %s last wrote its heartbeat at %s and did not record a stop: it crashed and its buffered touches may be lost; deletes wait until that is before the window start", s.ID, formatTime(s.LastSeen))
-		}
-		if !s.TouchLossTime.IsZero() && !s.TouchLossTime.Before(start) {
-			add("server %s lost touches at %s, after the window start %s", s.ID, formatTime(s.TouchLossTime), formatTime(start))
-		}
 		if s.GC && !s.LinkValidation {
 			add("server %s runs without link validation, so it can accept an object or ref that links a condemned object without reading it", s.ID)
 		}
-		r := Replica{ID: s.ID, Version: s.Version, GC: s.GC, TouchInterval: s.TouchInterval, CacheTTL: s.CacheTTL}
+		r := s.replica()
 		for _, p := range replicaProblems(&r, o) {
 			add("server %s: %s", s.ID, p)
 		}
 	}
-	switch {
-	case len(e.replicas) > 0:
-		add("GcReplicas holds %d rows of servers of an older version, which keep no evidence of the touches they lose", len(e.replicas))
-	case e.legacyGone.IsZero():
-		add("no cycle has recorded that GcReplicas is empty")
-	case e.legacyGone.After(start):
-		add("GcReplicas was first found empty at %s, after the window start %s: a server of an older version may have run in the window", formatTime(e.legacyGone), formatTime(start))
-	}
 	return reasons
 }
 
+// listCacheTTL returns the largest cache TTL of the processes that may have
+// run since the window start of a cycle whose snapshot is snapshot, which a
+// condemn records with its list, and the reasons why it must not complete the
+// list: a server that has no row there may have used information read before
+// the markers, and one without the GC hooks, without a cache TTL or of an
+// older version of the GC rules does not bound its answers.
+func (e *serverEvidence) listCacheTTL(snapshot time.Time, grace time.Duration) (time.Duration, []string) {
+	var reasons []string
+	in := e.inWindow(windowStart(snapshot, grace))
+	if len(in) == 0 {
+		return 0, []string{"no server that may have run within the grace wrote a GC heartbeat, so the largest cache TTL is not known"}
+	}
+	slices.SortFunc(in, func(a, b Server) int { return cmp.Compare(a.ID, b.ID) })
+	var ttl time.Duration
+	for _, s := range in {
+		ttl = max(ttl, s.CacheTTL)
+		if !s.GC {
+			reasons = append(reasons, fmt.Sprintf("server %s runs without the garbage collector hooks", s.ID))
+			continue
+		}
+		if s.CacheTTL <= 0 {
+			reasons = append(reasons, fmt.Sprintf("server %s keeps cache entries without a TTL", s.ID))
+		}
+		if s.Version < ExtractorVersion {
+			reasons = append(reasons, fmt.Sprintf("server %s follows the GC rules of version %d, older than version %d of this collector", s.ID, s.Version, ExtractorVersion))
+		}
+	}
+	return ttl, reasons
+}
+
 // liveBlockers returns the reasons in e why a cycle must not condemn or
-// delete that the live heartbeat rows of both tables show, as condemnBlockers
-// does for the first read.
+// delete that the live heartbeat rows show, as condemnBlockers does for the
+// first read.
 func liveBlockers(e *serverEvidence, o *CondemnOpts) []string {
-	fromServers, _ := serverReplicas(e.servers)
-	rep := checkReplicas(slices.Concat(e.replicas, fromServers), e.readTime, &o.DryRunOpts)
+	replicas, _ := serverReplicas(e.servers)
+	rep := checkReplicas(replicas, e.readTime, &o.DryRunOpts)
 	return append(rep.Warnings, replicaCountProblems(&rep, o)...)
 }
 

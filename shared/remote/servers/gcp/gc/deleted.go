@@ -106,7 +106,8 @@ type recordHeader struct {
 	// e:links cell is newer belongs to an object written again after the
 	// mark, and stays.
 	gcRowsAfter time.Time
-	// listComplete is when the list the cycle deleted from was complete.
+	// listComplete is the newest completion time of a list, at or after the
+	// completion of every list the cycle deleted from.
 	listComplete time.Time
 	count        int64
 }

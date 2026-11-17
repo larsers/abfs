@@ -56,12 +56,13 @@ const (
 
 // Delete runs one garbage collection cycle that deletes. It runs the steps
 // of a condemn cycle and, when every check of deleteBlockers holds, deletes
-// the objects of the list of the cycle before that are still unreachable and
-// still hold its marker: the map rows that name them first, then each object
-// after every parent of it, each batch recorded in bucket before its
-// deletes. It then condemns what is still unreachable and was not deleted. A
-// cycle whose deletes are refused condemns as a condemn cycle does and lists
-// the reasons in Report.Delete.Refused. checks reads the Bigtable instance.
+// the unreachable objects whose marker is of a complete list whose hold has
+// ended, each only while it still holds the marker the scan read: the map
+// rows that name them first, then each object after every parent of it,
+// each batch recorded in bucket before its deletes. It then condemns what is
+// still unreachable, was not deleted and holds no recorded marker. A cycle
+// whose deletes are refused condemns as a condemn cycle does and lists the
+// reasons in Report.Delete.Refused. checks reads the Bigtable instance.
 func Delete(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, checks InstanceChecks, opts *DeleteOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
@@ -85,11 +86,12 @@ type DeleteStepReport struct {
 	Deleted      int64            `json:"deleted"`
 	DeletedBytes int64            `json:"deleted_bytes"`
 	Types        map[string]int64 `json:"types,omitempty"`
-	// NotMatched counts keys whose marker was not the one of the list, as
-	// after a rescue, Gone keys whose row was gone before the step, Blocked
-	// keys with a parent or map row that was not deleted, TypeNotAllowed keys
-	// of types the cycle may not delete, Unplaced keys on a cycle of edges,
-	// and NotSent keys the step did not reach because a worker failed.
+	// NotMatched counts keys whose marker was no longer the one the scan
+	// read, as after a rescue, Gone keys whose row was gone before the step,
+	// Blocked keys with a parent or map row that was not deleted,
+	// TypeNotAllowed keys of types the cycle may not delete, Unplaced keys on
+	// a cycle of edges, and NotSent keys the step did not reach because a
+	// worker failed.
 	NotMatched       int64    `json:"not_matched"`
 	NotMatchedSample []string `json:"not_matched_sample,omitempty"`
 	Gone             int64    `json:"gone"`
@@ -141,7 +143,8 @@ type deleter struct {
 	checks InstanceChecks
 	budget writeBudget
 	rep    *DeleteReport
-	// listComplete is when the list the cycle deletes from was complete.
+	// listComplete is the newest completion time of a list, at or after the
+	// completion of every list the cycle deletes from.
 	listComplete time.Time
 }
 
@@ -153,12 +156,12 @@ func (d *deleter) check(ctx context.Context, lease *Lease, c *condemner, res *Re
 	r := res.Report
 	d.rep = &DeleteReport{}
 	if r.Delete != nil {
-		d.rep.Plan = r.Delete.Plan
+		d.rep.Plan, d.rep.PlanError = r.Delete.Plan, r.Delete.PlanError
 	}
 	r.Delete = d.rep
 	d.budget = c.budget
-	d.listComplete = c.prev.state.CompleteTime
-	ev := newDeleteEvidence(lease, c, res)
+	d.listComplete = res.holds.newest()
+	ev := newDeleteEvidence(lease, res)
 	d.rep.Refs, ev.refRemovalErr = d.removeExpiredRefs(ctx, lease, res)
 	if stops(ctx, ev.refRemovalErr) {
 		return ev.refRemovalErr
@@ -183,11 +186,10 @@ func (d *deleter) logRefused(cycle int64) {
 	}
 }
 
-// run runs the steps of a delete cycle after the markers of the live keys of
-// the previous list were cleared: the chunk step of the records of earlier
-// cycles, the second server read and, unless a check refused, the delete
-// step. It returns the nodes it deleted or found without a row, which the
-// cycle must not condemn.
+// run runs the steps of a delete cycle after the markers of the live keys
+// were cleared: the chunk step of the records of earlier cycles, the second
+// server read and, unless a check refused, the delete step. It returns the
+// nodes it deleted or found without a row, which the cycle must not condemn.
 func (d *deleter) run(ctx context.Context, lease *Lease, res *Result) (bitmap, error) {
 	if err := d.deleteChunks(ctx, res.Report.Cycle); err != nil {
 		return nil, err
@@ -202,7 +204,7 @@ func (d *deleter) run(ctx context.Context, lease *Lease, res *Result) (bitmap, e
 			return nil, ctx.Err()
 		}
 	}
-	reasons, err := waitForServerStats(ctx, lease, res.Report, d.opts)
+	reasons, err := recheckServers(ctx, lease, res.Report, d.opts)
 	if err != nil {
 		return nil, err
 	}
@@ -229,10 +231,11 @@ type step struct {
 	objects *bigtable.Table
 	gcTable *bigtable.Table
 	maps    *bigtable.Table
-	// deleteObject, deleteGCRow, deleteMapRow and deleteExpiredMapRow are
-	// the conditional mutations.
-	deleteObject, deleteGCRow, deleteMapRow, deleteExpiredMapRow *bigtable.Mutation
-	marker                                                       []byte
+	// deleteObjects holds the conditional delete of an objects row per
+	// marker number; deleteGCRow, deleteMapRow and deleteExpiredMapRow are
+	// the other conditional mutations.
+	deleteObjects                                  map[uint32]*bigtable.Mutation
+	deleteGCRow, deleteMapRow, deleteExpiredMapRow *bigtable.Mutation
 	// stop is set by the first worker error; no worker starts a call after
 	// it.
 	stop    atomic.Bool
@@ -263,7 +266,6 @@ func (d *deleter) deleteStep(ctx context.Context, lease *Lease, res *Result) (bi
 		objects: d.bt.Open(objectsTable),
 		gcTable: d.bt.Open(TableName),
 		maps:    d.bt.Open(mapsTableName),
-		marker:  markerValue(p.report.ListCycle),
 		header: recordHeader{
 			cycle:        r.Cycle,
 			runID:        runID(o.Holder, lease.Epoch),
@@ -273,7 +275,12 @@ func (d *deleter) deleteStep(ctx context.Context, lease *Lease, res *Result) (bi
 		rep: &DeleteStepReport{Records: recordPrefixOf(o.StateName) + fmt.Sprint(r.Cycle) + "/", Types: make(map[string]int64)},
 	}
 	d.rep.Step = s.rep
-	s.deleteObject = conditionalDelete(markerPredicate(s.marker), true)
+	s.deleteObjects = make(map[uint32]*bigtable.Mutation)
+	for _, m := range p.markers {
+		if s.deleteObjects[m] == nil {
+			s.deleteObjects[m] = conditionalDelete(markerPredicate(p.values[m-1]), true)
+		}
+	}
 	s.deleteGCRow = conditionalDelete(newerCellPredicate(EdgesFamily, LinksColumn, s.header.gcRowsAfter), false)
 	s.deleteMapRow = conditionalDelete(newerCellPredicate(mapsFamily, "", r.SnapshotTime.Add(-o.Grace)), false)
 	s.deleteExpiredMapRow = conditionalDelete(newerCellPredicate(mapsFamily, "", r.SnapshotTime.Add(-o.MapRetention)), false)
@@ -324,8 +331,8 @@ func (d *deleter) deleteStep(ctx context.Context, lease *Lease, res *Result) (bi
 		}
 	}
 	s.rep.Seconds = time.Since(start).Seconds()
-	log.Printf("GC cycle %d deleted %d objects of %d bytes from the list of cycle %d; %d not matched, %d blocked, %d unknown, %d map rows deleted",
-		r.Cycle, s.rep.Deleted, s.rep.DeletedBytes, p.report.ListCycle, s.rep.NotMatched, s.rep.Blocked, s.rep.Unknown, s.rep.MapRowsDeleted)
+	log.Printf("GC cycle %d deleted %d objects of %d bytes; %d not matched, %d blocked, %d unknown, %d map rows deleted",
+		r.Cycle, s.rep.Deleted, s.rep.DeletedBytes, s.rep.NotMatched, s.rep.Blocked, s.rep.Unknown, s.rep.MapRowsDeleted)
 	return deleted, nil
 }
 
@@ -607,9 +614,9 @@ func readObjectRows(ctx context.Context, objects *bigtable.Table, b writeBudget,
 }
 
 // deleteBatch runs the delete of one batch of candidates of a range: it
-// reads their rows, fails those whose marker is not the one of the list,
-// records the rest with their content descriptors, and then deletes each
-// whose newest marker is still that one, and its gc row.
+// reads their rows, fails those whose marker is no longer the one the scan
+// read, records the rest with their content descriptors, and then deletes
+// each whose newest marker is still that one, and its gc row.
 func (s *step) deleteBatch(ctx context.Context, level, rng, batch int, items []int32) error {
 	p := s.p
 	rows := make([]string, len(items))
@@ -627,7 +634,7 @@ func (s *step) deleteBatch(ctx context.Context, level, rng, batch int, items []i
 		switch {
 		case !st.present:
 			p.outcome[i] = outcomeGone
-		case !slices.Equal(st.marker, s.marker):
+		case !slices.Equal(st.marker, p.values[p.markers[i]-1]):
 			p.outcome[i] = outcomeNotMatched
 		default:
 			left = append(left, i)
@@ -646,14 +653,14 @@ func (s *step) deleteBatch(ctx context.Context, level, rng, batch int, items []i
 }
 
 // deleteKey deletes the objects row of candidate i if its newest marker is
-// the one of the list, and then its gc row unless a write since the grace
+// the one the scan read, and then its gc row unless a write since the grace
 // start made it newer. A key that did not match is read again, because a
 // retry after a lost response finds the row deleted. It returns an error
 // only when the step must stop.
 func (s *step) deleteKey(ctx context.Context, i int) error {
 	p := s.p
 	row := s.g.key(p.cands[i]).String()
-	matched, sent, err := condApply(ctx, s.d.budget, s.objects, row, s.deleteObject)
+	matched, sent, err := condApply(ctx, s.d.budget, s.objects, row, s.deleteObjects[p.markers[i]])
 	if err != nil {
 		if !sent {
 			return err
@@ -708,7 +715,7 @@ func (s *step) writeRecord(ctx context.Context, level, rng, batch int, entries [
 
 // resolveUnknown reads the keys whose delete had an unknown outcome, after
 // every call of the step ended: a key without a row was deleted, a key with
-// one stays in the list of this cycle.
+// one keeps its marker.
 func (s *step) resolveUnknown(ctx context.Context) error {
 	p := s.p
 	var unknown []int
@@ -725,7 +732,7 @@ func (s *step) resolveUnknown(ctx context.Context) error {
 	}
 	states, err := s.readRows(ctx, rows)
 	if err != nil {
-		return fmt.Errorf("failed to read the %d objects whose delete had an unknown outcome; the cycle stops before its list, so the next cycle does not delete: %w", len(unknown), err)
+		return fmt.Errorf("failed to read the %d objects whose delete had an unknown outcome; the cycle stops before its list, and those still present keep their markers: %w", len(unknown), err)
 	}
 	for k, i := range unknown {
 		if states[rows[k]].present {

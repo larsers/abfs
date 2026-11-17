@@ -533,45 +533,30 @@ func TestDryRunGC_LeaseRefusesSecondRun(t *testing.T) {
 	require.Equal("second", res.Report.Holder)
 }
 
-// The dry run warns about live replicas whose settings break the timing
-// rules and about a cache TTL the grace does not cover, ignores replicas that
-// stopped, and deletes the rows of replicas not seen for a day.
+// The dry run warns about live servers whose settings break the timing rules
+// and about a cache TTL the grace does not cover, and ignores servers that
+// stopped serving.
 func TestDryRunGC_ChecksReplicaSettings(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
 	f := newGCFixture(t)
 	sp := f.s.casdb.SpannerClient()
-	good := gc.Replica{ID: "good", Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}
-	require.NoError(gc.WriteHeartbeat(ctx, sp, &good))
+	good := gc.Server{ID: "good", Version: gc.ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, HeartbeatInterval: 5 * time.Minute, LinkValidation: true}
+	require.NoError(gc.WriteServer(ctx, sp, &good, false, false))
 	bad := good
 	bad.ID, bad.TouchInterval, bad.CacheTTL = "bad", 72*time.Hour, 70*time.Hour
-	require.NoError(gc.WriteHeartbeat(ctx, sp, &bad))
-	_, err := sp.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcReplicas",
-		[]string{"ReplicaId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "LastSeen"},
-		[]any{"stopped", int64(0), true, int64(0), int64(0), f.now.Add(-2 * time.Hour)}),
-		spanner.InsertOrUpdate("GcReplicas",
-			[]string{"ReplicaId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "LastSeen"},
-			[]any{"gone", int64(0), true, int64(0), int64(0), f.now.Add(-25 * time.Hour)}),
-	})
-	require.NoError(err)
+	require.NoError(gc.WriteServer(ctx, sp, &bad, false, false))
+	f.serverRow("stopped", 0, f.now.Add(-2*time.Hour), f.now.Add(-2*time.Hour), time.Time{})
+	f.serverRow("crashed", 0, f.now.Add(-2*time.Hour), time.Time{}, time.Time{})
 
 	r := f.run(nil).Report
 	require.Equal(int64(2), r.Replicas.Live)
-	require.Equal(int64(2), r.Replicas.Stale)
-	require.Equal(int64(1), r.Replicas.Removed)
+	require.Equal(int64(1), r.Replicas.Stale)
+	require.Equal(int64(1), r.Replicas.Stopped)
 	require.Len(r.Replicas.Warnings, 2)
 	require.Contains(r.Replicas.Warnings[0], "replica bad: touch interval 72h0m0s")
 	require.Contains(r.Replicas.Warnings[1], "grace 72h0m0s is shorter than the cache TTL 70h0m0s of server bad plus the longest push 3h0m0s")
 	require.Equal(70.0, r.Settings.CacheTTLHours)
-
-	// The row not seen for a day is gone.
-	replicas, err := gc.ReadReplicas(ctx, sp)
-	require.NoError(err)
-	var ids []string
-	for _, rep := range replicas {
-		ids = append(ids, rep.ID)
-	}
-	require.ElementsMatch([]string{"good", "bad", "stopped"}, ids)
 }
 
 // A directory with DeepTreeThreshold or more entries below it is a deep tree

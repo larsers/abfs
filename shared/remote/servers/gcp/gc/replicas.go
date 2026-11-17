@@ -21,46 +21,42 @@ import (
 )
 
 const (
-	// liveReplicaAge is how recent the heartbeat of a live replica is.
+	// liveReplicaAge bounds the time from the last heartbeat of a process to
+	// the end of its service: a server stops serving two heartbeat intervals
+	// and HeartbeatTimeout after its last successful heartbeat, at most
+	// 20.5 minutes. A process counts for the window of a cycle until then.
 	liveReplicaAge = 30 * time.Minute
-	// staleReplicaAge is the age after which the collector deletes a row.
+	// staleReplicaAge is the shortest time a row of GcServers is kept.
 	staleReplicaAge = 24 * time.Hour
 )
 
-// ReplicaReport reports the server replicas seen in GcReplicas and
-// GcServers.
+// ReplicaReport reports the server processes seen in GcServers.
 type ReplicaReport struct {
-	// Live counts the replicas whose heartbeat is younger than liveReplicaAge.
+	// Live counts the rows of processes that did not record a stop and may
+	// still serve: their last heartbeat is within their serve limit (see
+	// serveLimit).
 	Live int64 `json:"live"`
-	// Stale counts the other rows.
+	// Stale counts the other rows that did not record a stop.
 	Stale int64 `json:"stale"`
-	// Removed counts the rows of GcReplicas not seen for a day, which the
-	// run deleted.
-	Removed int64 `json:"removed"`
-	// Stopped counts the rows of GcServers of processes that stopped without
-	// losing touches at the stop. They are not checked here and stay.
+	// Stopped counts the rows of processes that recorded a stop. They are
+	// not checked here and stay.
 	Stopped int64 `json:"stopped"`
-	// Hosts counts the distinct host names among the live replicas, and
+	// Hosts counts the distinct host names among the live rows, and
 	// RowsPerHost the live rows of each host. A host has more than one live
-	// row after a server restarted without removing its row.
+	// row for a short time after a server restarted without recording its
+	// stop.
 	Hosts       int64            `json:"hosts"`
 	RowsPerHost map[string]int64 `json:"rows_per_host,omitempty"`
-	// Warnings lists the live replicas whose settings break the timing rules
-	// of the collector. A condemn mode would refuse to run with any of them.
+	// Warnings lists the live rows whose settings break the timing rules of
+	// the collector. A condemn mode would refuse to run with any of them.
 	Warnings []string `json:"warnings,omitempty"`
 	// ServersRemoved counts the rows of GcServers that the run deleted, those
 	// older than any grace a delete could still need them for.
 	ServersRemoved int64 `json:"servers_removed"`
-	// LegacyServersGoneTime is when a cycle first found GcReplicas empty, and
-	// every read since found it empty too; nil while GcReplicas holds a row.
-	// A server of an older version keeps no row after it stops, so one that
-	// ran only between two reads is not seen.
-	LegacyServersGoneTime *time.Time `json:"legacy_servers_gone_time,omitempty"`
 	// MapRowLossTime is the latest time a server recorded lost map row
-	// touches that the keep-alive limit of the live mounts counts, or, for a
-	// server that crashed, the last time it may have run; nil when none did.
-	// The limit then also leaves out the time clients reuse map results and
-	// the time a keep-alive pass may take.
+	// touches, from the time clients reuse map results and a keep-alive pass
+	// may take before the window start; nil when none did. It is reported,
+	// not checked.
 	MapRowLossTime *time.Time `json:"map_row_loss_time,omitempty"`
 }
 
@@ -72,32 +68,46 @@ func ReplicaHost(id string) string {
 	return id
 }
 
+// replica returns what checkReplicas checks of s.
+func (s *Server) replica() Replica {
+	return Replica{ID: s.ID, Version: s.Version, GC: s.GC, TouchInterval: s.TouchInterval, CacheTTL: s.CacheTTL, HeartbeatInterval: s.HeartbeatInterval, LastSeen: s.LastSeen}
+}
+
 // serverReplicas returns the rows of GcServers that checkReplicas checks,
-// all but those of processes that stopped without losing touches at the
-// stop, and how many it left out. A process whose stop recorded a loss counts
-// until its row is stale, as a row that a server keeps in GcReplicas then. A
-// loss recorded by an earlier heartbeat does not keep a stopped row live:
-// such a row of GcReplicas went away at the stop.
+// all but those of processes that recorded a stop, and how many it left out.
 func serverReplicas(servers []Server) ([]Replica, int64) {
 	var replicas []Replica
 	var stopped int64
-	for _, s := range servers {
-		if !s.StoppedAt.IsZero() && !s.TouchLossTime.Equal(s.StoppedAt) {
+	for i := range servers {
+		if !servers[i].StoppedAt.IsZero() {
 			stopped++
 			continue
 		}
-		replicas = append(replicas, Replica{ID: s.ID, Version: s.Version, GC: s.GC, TouchInterval: s.TouchInterval, CacheTTL: s.CacheTTL, LastSeen: s.LastSeen})
+		replicas = append(replicas, servers[i].replica())
 	}
 	return replicas, stopped
 }
 
-// checkReplicas checks the settings of the replicas seen within
-// liveReplicaAge before now against the timing rules of replicaProblems.
+// serveLimit returns how long after its last heartbeat the process of r may
+// still serve: two heartbeat intervals, HeartbeatTimeout and the clock skew
+// margin. A row with an interval out of range counts with the largest one.
+func serveLimit(r *Replica) time.Duration {
+	interval := r.HeartbeatInterval
+	if interval <= 0 || interval > MaxHeartbeatInterval {
+		interval = MaxHeartbeatInterval
+	}
+	return min(2*interval+HeartbeatTimeout+clockSkewMargin, liveReplicaAge)
+}
+
+// checkReplicas checks the settings of the replicas that may still serve at
+// now, within their serve limit, against the timing rules of replicaProblems,
+// and counts their hosts. A process that stopped serving without recording
+// its stop, such as a crashed one, then no longer counts as a host.
 func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaReport {
 	var rep ReplicaReport
 	for i := range replicas {
 		r := &replicas[i]
-		if now.Sub(r.LastSeen) > liveReplicaAge {
+		if now.Sub(r.LastSeen) > serveLimit(r) {
 			rep.Stale++
 			continue
 		}
@@ -130,7 +140,7 @@ func replicaProblems(r *Replica, o *DryRunOpts) []string {
 		problems = append(problems, fmt.Sprintf(format, args...))
 	}
 	if r.Version < ExtractorVersion {
-		add("writes gc rows of edge rules version %d, older than version %d of this collector", r.Version, ExtractorVersion)
+		add("follows the GC rules of version %d, older than version %d of this collector", r.Version, ExtractorVersion)
 	}
 	switch {
 	case r.TouchInterval <= 0:

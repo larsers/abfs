@@ -162,7 +162,8 @@ func TestUndoGC_RestoresDeletedRows(t *testing.T) {
 	// The blob is recent in the first mark, so that cycle 2 deletes its
 	// parents and cycle 3 the blob.
 	f.touch(blob, time.Now())
-	f.delete(nil)
+	_, err = f.condemn(nil)
+	require.NoError(err)
 	mut := bigtable.NewMutation()
 	mut.DeleteCellsInFamily(gc.TouchFamily)
 	require.NoError(f.s.casdb.BTClient().Open(gc.TableName).Apply(ctx, blob.String(), mut))

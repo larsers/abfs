@@ -26,6 +26,7 @@ import (
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/storage"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
@@ -178,7 +179,7 @@ type Report struct {
 	Condemn      *CondemnReport      `json:"condemn,omitempty"`
 	PreviousList *PreviousListReport `json:"previous_list,omitempty"`
 	// Delete reports the delete step of a delete cycle, and in the other
-	// modes what one would delete from the list of the cycle before.
+	// modes what one would delete.
 	Delete *DeleteReport `json:"delete,omitempty"`
 	// Explain explains the keys of DryRunOpts.Explain.
 	Explain []KeyReport  `json:"explain,omitempty"`
@@ -271,24 +272,29 @@ type Result struct {
 	first map[uint32]rootRef
 	roots *rootTable
 	// unreachable lists, in key order, the unreachable nodes that the
-	// consistency scan found an objects row for: the ones a condemn marks.
-	// tooNew is the check, in a delete cycle, of the objects that scan found
-	// without a gc row because they were written during it, and tooNewErr why
-	// it failed.
+	// consistency scan found an objects row for, with their markers, and
+	// marked the live nodes it found a marker for; markers are the values
+	// they number. tooNew is the check, in a delete cycle, of the objects
+	// that scan found without a gc row because they were written during it,
+	// and tooNewErr why it failed.
 	unreachable []sizedNode
+	marked      []sizedNode
+	markers     [][]byte
 	tooNew      *TooNewReport
 	tooNewErr   error
 	// seen holds the nodes that the consistency scan found an objects row
 	// for.
 	seen bitmap
-	// servers is the server evidence read at the start of the cycle.
+	// servers is the server evidence read at the start of the cycle, and
+	// holds the records of the condemned lists read after the lease was
+	// taken.
 	servers *serverEvidence
+	holds   *listHolds
 	// bounds are the key ranges of the scans, and maps the rows of the table
 	// maps.
 	bounds []string
 	maps   *mapScan
-	// plan is the plan of a delete from the list of the cycle before, nil
-	// when there is none.
+	// plan is the plan of a delete, nil when there is none.
 	plan *deletePlan
 	// expiredRefs are the refs past their retention at the snapshot.
 	expiredRefs []expiredRef
@@ -317,11 +323,12 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 // DryRun runs one garbage collection cycle that only reports: it takes the
 // lease, reads the roots at one snapshot, marks the objects of the table gc
 // and counts what a collection would remove. It writes nothing but the
-// GcState row and deletes the GcReplicas rows not seen for a day. objs reads
-// the workspace snapshots, mount details and pinned manifests of live mounts
-// and workspaces. With bucket, which holds the condemned lists, the report
-// also counts what a delete cycle would remove from the last list, or says
-// in Report.Delete why it could not read it.
+// GcState row and deletes old GcServers rows. objs reads the workspace
+// snapshots, mount details and pinned manifests of live mounts and
+// workspaces. With the consistency check the report also counts what a
+// delete cycle would remove now, from the markers it read and the records of
+// the lists, or says in Report.Delete why it could not read the records.
+// bucket is not read.
 func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
@@ -358,36 +365,32 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, buck
 	runCtx, stop := lease.Keep(ctx)
 	defer stop()
 
-	d := &dryRun{opts: o, lease: lease, sp: sp, bt: bt, objs: objs, start: start, phase: phase, keepUnreachable: c != nil}
+	d := &dryRun{opts: o, lease: lease, sp: sp, bt: bt, objs: objs, start: start, phase: phase}
 	var res *Result
-	var prev previousList
-	var planErr error
-	switch {
-	case c != nil:
+	holds, err := readListHolds(runCtx, lease)
+	if err == nil && c != nil && spanner.ErrCode(holds.err) == codes.NotFound {
+		// The table is missing; its error names the init that creates it.
+		err = holds.err
+	}
+	if err == nil && c != nil {
 		err = c.readPrevious(runCtx, lease, d)
-		prev = c.prev
-	case bucket != nil:
-		// A dry run reads the list only for the counts of what a delete
-		// would remove, so it reports a failed read and runs on.
-		if prev, planErr = readPreviousList(runCtx, lease, bucket); planErr != nil {
-			if runCtx.Err() != nil {
-				err = planErr
-			} else {
-				log.Printf("Warning: the GC dry run does not count what a delete would remove: %v", planErr)
-			}
-		}
-		d.keepUnreachable = prev.list != nil
 	}
 	if err == nil {
+		// Only a plan needs the unreachable nodes of a dry run.
+		d.keepUnreachable = c != nil || holds.err == nil
 		res, err = d.run(runCtx)
 	}
-	if err == nil && prev.list != nil && res.seen != nil {
-		res.plan = planDeletes(res, prev.list, res.Report.SnapshotTime.Add(-o.MapRetention).UnixMicro(), allows)
-		res.plan.report.List = prev.state.Location
-		res.Report.Delete = &DeleteReport{Plan: res.plan.report}
-	}
-	if err == nil && planErr != nil {
-		res.Report.Delete = &DeleteReport{PlanError: planErr.Error()}
+	if err == nil {
+		res.holds = holds
+		switch {
+		case !o.Consistency:
+		case holds.err != nil:
+			res.Report.Delete = &DeleteReport{PlanError: holds.describe()}
+		default:
+			eligible, lists := holds.eligible(res.markers, res.unreachable, res.Report.SnapshotTime, res.Report.LiveMounts.longestTouch, o)
+			res.plan = planDeletes(res, eligible, lists, res.Report.SnapshotTime.Add(-o.MapRetention).UnixMicro(), allows)
+			res.Report.Delete = &DeleteReport{Plan: res.plan.report}
+		}
 	}
 	if err == nil && c != nil {
 		err = c.run(runCtx, lease, res)
@@ -444,12 +447,12 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	if err := d.lease.RecordSnapshot(ctx, snapshot); err != nil {
 		return nil, err
 	}
-	servers, err := readServerEvidence(ctx, d.sp, o.StateName)
+	servers, err := readServerEvidence(ctx, d.sp)
 	if err != nil {
 		return nil, err
 	}
-	fromServers, stopped := serverReplicas(servers.servers)
-	r.Replicas = checkReplicas(slices.Concat(servers.replicas, fromServers), snapshot, o)
+	replicas, stopped := serverReplicas(servers.servers)
+	r.Replicas = checkReplicas(replicas, snapshot, o)
 	r.Replicas.Stopped = stopped
 	start := windowStart(snapshot, o.Grace)
 	longest, _ := servers.graceTTL(start)
@@ -457,21 +460,15 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	if p := servers.graceProblem(start, o); p != "" {
 		r.Replicas.Warnings = append(r.Replicas.Warnings, p)
 	}
-	if !servers.legacyGone.IsZero() {
-		r.Replicas.LegacyServersGoneTime = &servers.legacyGone
-	}
-	if loss, lost := servers.mapRowLoss(snapshot, o.Grace); lost {
-		r.Replicas.MapRowLossTime = &loss.at
+	if at, lost := servers.mapRowLoss(snapshot, o.Grace); lost {
+		r.Replicas.MapRowLossTime = &at
 	}
 	for _, w := range r.Replicas.Warnings {
 		log.Printf("Warning: %s", w)
 	}
-	if r.Replicas.Removed, err = DeleteStaleReplicas(ctx, d.sp, snapshot.Add(-staleReplicaAge)); err != nil {
-		return nil, err
-	}
 	// A row of GcServers is evidence for every delete whose window holds it,
 	// so it stays for the largest grace of any condemn or delete cycle, and
-	// for the time before the window in which a map row loss still counts.
+	// for the time before the window in which a map row loss is reported.
 	keep := max(staleReplicaAge, max(d.lease.MaxGrace, o.Grace)+time.Hour+clientMapReuse+keepAlivePassAllowance)
 	if r.Replicas.ServersRemoved, err = PruneServers(ctx, d.sp, snapshot.Add(-keep)); err != nil {
 		return nil, err
@@ -605,7 +602,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 		r.Consistency = *scan.report
 		r.Objects.ReachableBytes = &scan.sizes.reachable
 		r.Objects.UnreachableBytes = &scan.sizes.unreachable
-		res.unreachable, res.seen = scan.unreachable, scan.seen
+		res.unreachable, res.marked, res.markers, res.seen = scan.unreachable, scan.marked, scan.markers, scan.seen
 		res.tooNew, res.tooNewErr = scan.tooNew, scan.tooNewErr
 		r.Seconds.Consistency = time.Since(step).Seconds()
 	}

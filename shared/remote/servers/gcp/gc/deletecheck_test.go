@@ -42,7 +42,7 @@ type deleteCase struct {
 
 func newDeleteCase() *deleteCase {
 	snapshot := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
-	listSnapshot := snapshot.Add(-24 * time.Hour)
+	listSnapshot := snapshot.Add(-96 * time.Hour)
 	complete := listSnapshot.Add(time.Hour)
 	o := &DeleteOpts{CondemnOpts: DefaultCondemnOpts()}
 	o.MinReplicas = 2
@@ -57,12 +57,10 @@ func newDeleteCase() *deleteCase {
 	return &deleteCase{
 		r: &Report{SnapshotTime: snapshot, Consistency: ConsistencyReport{Ran: true}},
 		ev: &deleteEvidence{
-			snapshot:             snapshot,
-			previousCondemnCycle: 4,
-			list:                 ListState{Location: "gc/default/list-4", SnapshotTime: listSnapshot, Complete: true, CompleteTime: complete},
-			listHeader:           &listHeader{cycle: 4, snapshot: listSnapshot},
-			servers:              &serverEvidence{servers: servers, readTime: snapshot, legacyGone: snapshot.Add(-100 * time.Hour)},
-			instance:             instanceEvidence{clusters: []string{"c1"}, backups: backups, backupsChecked: true},
+			snapshot: snapshot,
+			holds:    &listHolds{records: map[int64]*ListRecord{4: {Cycle: 4, SnapshotTime: listSnapshot, CompleteTime: complete, CacheTTL: 6 * time.Hour}}},
+			servers:  &serverEvidence{servers: servers, readTime: snapshot},
+			instance: instanceEvidence{clusters: []string{"c1"}, backups: backups, backupsChecked: true},
 		},
 		o: o,
 	}
@@ -71,7 +69,7 @@ func newDeleteCase() *deleteCase {
 func liveServer(id string, now time.Time) Server {
 	return Server{
 		ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour,
-		HeartbeatInterval: 5 * time.Minute, LinkValidation: true, LastSeen: now.Add(-time.Minute), StatsTime: now.Add(-time.Minute),
+		HeartbeatInterval: 5 * time.Minute, LinkValidation: true, LastSeen: now.Add(-time.Minute),
 	}
 }
 
@@ -121,62 +119,34 @@ func TestDeleteBlockers(t *testing.T) {
 	}{
 		{"all hold", func(c *deleteCase) {}, nil, nil},
 
-		// The list.
-		{"no list", func(c *deleteCase) { c.ev.list = ListState{}; c.ev.listHeader = nil }, []string{"no condemn cycle published a list"}, nil},
-		{"list gone", func(c *deleteCase) { c.ev.listHeader, c.ev.listErr = nil, "not found" }, []string{"could not be read: not found"}, nil},
-		{"incomplete list", func(c *deleteCase) { c.ev.list.Complete = false }, []string{"is not complete"}, nil},
-		{"list of an older collector", func(c *deleteCase) { c.ev.list.CompleteTime = time.Time{} }, []string{"has no completion time after its snapshot"}, nil},
-		{"stale completion time of an older list", func(c *deleteCase) { c.ev.list.CompleteTime = c.ev.list.SnapshotTime.Add(-time.Hour) }, []string{"has no completion time after its snapshot"}, nil},
-		{"condemn lease between the list and this cycle", func(c *deleteCase) { c.ev.previousCondemnCycle = 5 }, []string{"is of cycle 4, but cycle 5 was the last condemn or delete cycle"}, nil},
+		// The list records; which lists are eligible is the plan's.
+		{"list records not read", func(c *deleteCase) { c.ev.holds = &listHolds{err: errors.New("table not found")} }, []string{"the GC list records could not be read"}, nil},
+		{"no complete list", func(c *deleteCase) { c.ev.holds = &listHolds{records: map[int64]*ListRecord{}} }, nil, nil},
 
-		// The lower bound counts from the completion of the list.
-		{"snapshot within the cache TTL of the completion", func(c *deleteCase) {
-			c.ev.list.CompleteTime = c.ev.snapshot.Add(-6 * time.Hour)
-		}, []string{"is earlier than the completion of the list"}, nil},
-		{"snapshot past the cache TTL and the write bounds", func(c *deleteCase) {
-			c.ev.list.CompleteTime = c.ev.snapshot.Add(-6*time.Hour - TouchDrainBound - clockSkewMargin - time.Second)
-		}, nil, nil},
-		// T is the largest TTL of every server of the window, stopped ones too.
-		{"TTL of a stopped server of the window", func(c *deleteCase) {
-			for i := range c.ev.servers.servers {
-				c.ev.servers.servers[i].CacheTTL = time.Hour
-			}
-			c.ev.list.CompleteTime = c.ev.snapshot.Add(-2 * time.Hour)
-			c.addServer(stoppedServer("srv-9-zz", c.ev.snapshot.Add(-3*time.Hour)))
-		}, []string{"plus the largest server cache TTL 6h0m0s"}, nil},
-
-		// The upper bound counts from the earlier snapshot of the list.
-		{"snapshot past the grace of the list", func(c *deleteCase) {
-			c.ev.list.SnapshotTime = c.ev.snapshot.Add(-72*time.Hour + 2*time.Minute)
-			c.ev.listHeader.snapshot = c.ev.list.SnapshotTime
-		}, []string{"is not earlier than the snapshot of the list"}, nil},
-		{"header snapshot earlier than the state", func(c *deleteCase) {
-			c.ev.listHeader.snapshot = c.ev.snapshot.Add(-72*time.Hour + 2*time.Minute)
-		}, []string{"is not earlier than the snapshot of the list"}, nil},
-		{"snapshot just inside the grace of the list", func(c *deleteCase) {
-			c.ev.list.SnapshotTime = c.ev.snapshot.Add(-72*time.Hour + 3*time.Minute + time.Second)
-			c.ev.listHeader.snapshot = c.ev.list.SnapshotTime
-		}, nil, nil},
-
-		// The processes of the window.
+		// The processes of the window. A crash or a lost touch refuses
+		// nothing: the delete rule rests on no buffered touch.
 		{"crashed predecessor within the grace", func(c *deleteCase) {
 			s := liveServer("srv-0-old", c.ev.snapshot)
 			s.LastSeen = c.ev.snapshot.Add(-10 * time.Hour)
-			c.addServer(s)
-		}, []string{"server srv-0-old last wrote its heartbeat at 2026-11-08T02:00:00Z and did not record a stop"}, nil},
-		{"crash before the window", func(c *deleteCase) {
-			s := liveServer("srv-0-old", c.ev.snapshot)
-			s.LastSeen = c.ev.snapshot.Add(-73 * time.Hour)
 			c.addServer(s)
 		}, nil, nil},
 		{"clean stop with losses 2 h ago", func(c *deleteCase) {
 			s := stoppedServer("srv-0-old", c.ev.snapshot.Add(-2*time.Hour))
 			s.TouchLossTime = s.StoppedAt
 			c.addServer(s)
-		}, []string{"server srv-0-old lost touches"}, nil},
-		{"losses before the window of a server that ran in it", func(c *deleteCase) {
+		}, nil, nil},
+		{"live server that lost touches and map row touches", func(c *deleteCase) {
+			c.ev.servers.servers[1].TouchLossTime = c.ev.snapshot.Add(-time.Hour)
+			c.ev.servers.servers[1].MapRowLossTime = c.ev.snapshot.Add(-time.Hour)
+		}, nil, nil},
+		{"server of an older version within the grace", func(c *deleteCase) {
 			s := stoppedServer("srv-0-old", c.ev.snapshot.Add(-2*time.Hour))
-			s.TouchLossTime = c.ev.snapshot.Add(-80 * time.Hour)
+			s.Version = ExtractorVersion - 1
+			c.addServer(s)
+		}, []string{"server srv-0-old: follows the GC rules of version 2, older than version 3 of this collector"}, nil},
+		{"server of an older version before the window", func(c *deleteCase) {
+			s := stoppedServer("srv-0-old", c.ev.snapshot.Add(-73*time.Hour))
+			s.Version = ExtractorVersion - 1
 			c.addServer(s)
 		}, nil, nil},
 		{"stopped server of the window with touch interval 0", func(c *deleteCase) {
@@ -193,7 +163,7 @@ func TestDeleteBlockers(t *testing.T) {
 			s := stoppedServer("srv-0-old", c.ev.snapshot.Add(-2*time.Hour))
 			s.CacheTTL = 70 * time.Hour
 			c.addServer(s)
-		}, []string{"plus the largest server cache TTL 70h0m0s", "grace 72h0m0s is shorter than the cache TTL 70h0m0s of server srv-0-old plus the longest push 3h0m0s"}, nil},
+		}, []string{"grace 72h0m0s is shorter than the cache TTL 70h0m0s of server srv-0-old plus the longest push 3h0m0s"}, nil},
 		{"stopped server before the window with bad settings", func(c *deleteCase) {
 			s := stoppedServer("srv-0-old", c.ev.snapshot.Add(-73*time.Hour))
 			s.TouchInterval, s.CacheTTL, s.LinkValidation = 0, 0, false
@@ -203,17 +173,6 @@ func TestDeleteBlockers(t *testing.T) {
 			c.ev.servers.servers[1].LinkValidation = false
 		}, []string{"server srv-1-bb runs without link validation"}, nil},
 
-		// Servers of an older version.
-		{"row in GcReplicas", func(c *deleteCase) {
-			c.ev.servers.replicas = []Replica{{ID: "old-0-aa", GC: true, LastSeen: c.ev.snapshot}}
-			c.ev.servers.legacyGone = time.Time{}
-		}, []string{"GcReplicas holds 1 rows"}, nil},
-		{"GcReplicas found empty inside the window", func(c *deleteCase) {
-			c.ev.servers.legacyGone = c.ev.snapshot.Add(-10 * time.Hour)
-		}, []string{"GcReplicas was first found empty at"}, nil},
-		{"GcReplicas never found empty", func(c *deleteCase) {
-			c.ev.servers.legacyGone = time.Time{}
-		}, []string{"no cycle has recorded that GcReplicas is empty"}, nil},
 		{"no server evidence", func(c *deleteCase) { c.ev.servers = nil }, []string{"the GC servers were not read"}, nil},
 
 		// The Bigtable instance.
@@ -241,8 +200,13 @@ func TestDeleteBlockers(t *testing.T) {
 		{"no backup of chunks", func(c *deleteCase) { c.ev.instance.backups = c.ev.instance.backups[:3] }, []string{"no ready backup of Bigtable table chunks"}, nil},
 		{"backup of maps not ready", func(c *deleteCase) { c.setBackup("maps", func(b *Backup) { b.Ready = false }) }, []string{"no ready backup of Bigtable table maps"}, nil},
 		{"backup of objects older than the list", func(c *deleteCase) {
-			c.setBackup("objects", func(b *Backup) { b.Start = c.ev.list.CompleteTime.Add(-time.Minute) })
+			c.setBackup("objects", func(b *Backup) { b.Start = c.ev.holds.records[4].CompleteTime.Add(-time.Minute) })
 		}, []string{"no ready backup of Bigtable table objects"}, nil},
+		{"backup of objects older than the newest complete list", func(c *deleteCase) {
+			c.ev.holds.records[5] = &ListRecord{Cycle: 5, CompleteTime: c.ev.snapshot.Add(-time.Hour)}
+			c.ev.holds.records[6] = &ListRecord{Cycle: 6}
+			c.setBackup("objects", func(b *Backup) { b.Start = c.ev.snapshot.Add(-2 * time.Hour) })
+		}, []string{"no ready backup of Bigtable table objects started after the list was completed at 2026-11-08T11:00:00Z"}, nil},
 		{"backup listing denied", func(c *deleteCase) {
 			c.ev.instance.backups, c.ev.instance.backupsErr = nil, status.Error(codes.PermissionDenied, "denied")
 		}, []string{"cannot list the backups of the Bigtable instance (the collector needs bigtable.backups.list)"}, nil},
@@ -262,18 +226,7 @@ func TestDeleteBlockers(t *testing.T) {
 			liveMounts("without_keepalive", 1)(c)
 			c.o.AcceptMountsWithoutKeepAlive = true
 			c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour)
-		}, []string{"1 live mounts run without the GC keep-alive, for example details d1 of u@host-a, and server srv-2-cc lost map row touches at 2026-11-08T11:00:00Z: such a mount may apply a map result whose outputs no map row keeps any more, which --accept-mounts-without-keepalive does not accept; set gc-keepalive in their config"}, nil},
-		{"live mount without keep-alive, accepted, after a crash before the window", func(c *deleteCase) {
-			liveMounts("without_keepalive", 1)(c)
-			c.o.AcceptMountsWithoutKeepAlive = true
-			c.ev.servers.servers[2].LastSeen = windowStart(c.ev.snapshot, c.o.Grace).Add(-time.Hour)
-		}, []string{"1 live mounts run without the GC keep-alive, for example details d1 of u@host-a, and server srv-2-cc last wrote its heartbeat at 2026-11-05T10:59:00Z and did not record a stop: it crashed and may have lost map row touches"}, nil},
-		{"live mount without keep-alive, accepted, commits only after a map row loss", func(c *deleteCase) {
-			liveMounts("without_keepalive", 1)(c)
-			c.o.AcceptMountsWithoutKeepAlive = true
-			c.o.Types = []string{"commit"}
-			c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour)
-		}, nil, nil},
+		}, nil, []string{"1 live mounts run without the GC keep-alive, so their caches may hold the only copy of a blob, tree or eval object they wrote, for example details d1 of u@host-a"}},
 		{"live mount without keep-alive, commits only", func(c *deleteCase) {
 			liveMounts("without_keepalive", 1)(c)
 			c.o.Types = []string{"commit"}
@@ -289,10 +242,6 @@ func TestDeleteBlockers(t *testing.T) {
 		}, nil, nil},
 		{"keep-alive mount with a 40 h touch interval", liveMounts("touch_interval_too_long", 1), []string{"1 live mounts touch their objects less often than the grace allows, for example details d1 of u@host-a"}, nil},
 		{"server lost map row touches", func(c *deleteCase) { c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour) }, nil, nil},
-		{"keep-alive mount too slow after a map row loss", func(c *deleteCase) {
-			liveMounts("touch_interval_too_long", 1)(c)
-			c.ev.servers.servers[2].MapRowLossTime = c.ev.snapshot.Add(-time.Hour)
-		}, []string{"1 live mounts touch their objects less often than the grace allows, and less the 8h0m0s for which clients reuse map results and the 1h0m0s a keep-alive pass may take, since server srv-2-cc lost map row touches at 2026-11-08T11:00:00Z, for example details d1 of u@host-a"}, nil},
 
 		// Writers without --gc.
 		{"too_new key without a gc row", func(c *deleteCase) {
@@ -380,31 +329,42 @@ func TestReplicaCounts(t *testing.T) {
 	}
 }
 
-// In a rolling upgrade both heartbeat tables hold live rows: their hosts
-// count together, and the settings of the rows of the older servers are
-// checked too.
-func TestLiveBlockers_MixedFleet(t *testing.T) {
+// The live hosts are those whose rows may still serve: a row that did not
+// record a stop counts within two heartbeat intervals, the write timeout and
+// the clock skew margin of its last heartbeat, so a crashed pod replaced
+// under a new name stops counting after about 11 minutes. Its settings are
+// then no longer checked here; the window checks of a delete still read it.
+func TestLiveBlockers_ServeLimit(t *testing.T) {
 	require := require.New(t)
 	now := time.Now()
 	o := DefaultCondemnOpts()
-	o.MinReplicas = 5
+	o.ExpectedReplicas = 3
 	e := &serverEvidence{readTime: now}
-	for _, id := range []string{"new-0-aa", "new-1-bb", "new-2-cc"} {
+	for _, id := range []string{"srv-0-aa", "srv-1-bb", "srv-2-cc"} {
 		e.servers = append(e.servers, liveServer(id, now))
-	}
-	for _, id := range []string{"old-0-aa", "old-1-bb"} {
-		e.replicas = append(e.replicas, Replica{ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now})
 	}
 	require.Empty(liveBlockers(e, &o))
 
-	o.MinReplicas = 6
-	require.Equal([]string{"5 server hosts write a GC heartbeat, but at least 6 are expected"}, liveBlockers(e, &o))
-
-	o.MinReplicas = 5
-	e.replicas[1].CacheTTL = 0
+	crashed := liveServer("srv-3-old", now)
+	crashed.CacheTTL = 0
+	limit := 2*crashed.HeartbeatInterval + HeartbeatTimeout + clockSkewMargin
+	require.Equal(11*time.Minute+30*time.Second, limit)
+	crashed.LastSeen = now.Add(-limit)
+	e.servers = append(e.servers, crashed)
 	got := liveBlockers(e, &o)
-	require.Len(got, 1)
-	require.Contains(got[0], "replica old-1-bb: keeps cache entries without a TTL")
+	require.Len(got, 2)
+	require.Contains(got[0], "replica srv-3-old: keeps cache entries without a TTL")
+	require.Equal("4 server hosts write a GC heartbeat, but 3 are expected", got[1])
+
+	e.servers[3].LastSeen = now.Add(-limit - time.Second)
+	require.Empty(liveBlockers(e, &o))
+
+	// Two live rows of one host count once, and refuse nothing.
+	e.servers[3] = liveServer("srv-1-cafe", now)
+	rep := checkReplicas(func() []Replica { r, _ := serverReplicas(e.servers); return r }(), now, &o.DryRunOpts)
+	require.Equal(int64(3), rep.Hosts)
+	require.Equal(int64(2), rep.RowsPerHost["srv-1"])
+	require.Empty(liveBlockers(e, &o))
 }
 
 // The types to delete must be known, there is at least one delete in
@@ -441,88 +401,46 @@ func TestDeleteOpts_Validate(t *testing.T) {
 	}
 }
 
-// fakeServers serves the reads of pollServerStats from a list, one per read,
-// repeating the last.
-type fakeServers struct {
-	reads []*serverEvidence
-	n     int
-}
-
-func (f *fakeServers) read(context.Context) (*serverEvidence, error) {
-	e := f.reads[min(f.n, len(f.reads)-1)]
-	f.n++
-	return e, nil
-}
-
-// The second server read waits for every live server to read its touch
-// stats after the snapshot, and refuses when one does not within its
-// heartbeat interval and the margin, or when the evidence broke since the
-// first read.
-func TestPollServerStats(t *testing.T) {
-	oldMargin, oldPoll := statsWaitMargin, statsPollInterval
-	statsWaitMargin, statsPollInterval = 0, 10*time.Millisecond
-	t.Cleanup(func() { statsWaitMargin, statsPollInterval = oldMargin, oldPoll })
+// The second server read refuses when the evidence of the first read broke
+// since, and when the live mounts touch too seldom for the servers that run
+// now. It does not wait for heartbeats, and losses refuse nothing.
+func TestCheckServersAgain(t *testing.T) {
 	ctx := context.Background()
-
 	c := newDeleteCase()
 	snapshot := c.r.SnapshotTime
 	evidence := func(change func(e *serverEvidence)) *serverEvidence {
-		e := &serverEvidence{readTime: snapshot.Add(10 * time.Minute), legacyGone: snapshot.Add(-100 * time.Hour)}
+		e := &serverEvidence{readTime: snapshot.Add(10 * time.Minute)}
 		for _, id := range []string{"srv-0-aa", "srv-1-bb", "srv-2-cc"} {
-			s := liveServer(id, snapshot.Add(10*time.Minute))
-			s.HeartbeatInterval = time.Second
-			e.servers = append(e.servers, s)
+			e.servers = append(e.servers, liveServer(id, snapshot.Add(10*time.Minute)))
 		}
 		if change != nil {
 			change(e)
 		}
 		return e
 	}
-	poll := func(reads ...*serverEvidence) ([]string, int) {
+	check := func(e *serverEvidence) []string {
 		t.Helper()
-		f := &fakeServers{reads: reads}
-		reasons, err := pollServerStats(ctx, f.read, c.r, c.o)
+		reasons, err := checkServersAgain(ctx, func(context.Context) (*serverEvidence, error) { return e, nil }, c.r, c.o)
 		require.NoError(t, err)
-		return reasons, f.n
+		return reasons
 	}
 
-	reasons, n := poll(evidence(nil))
-	require.Empty(t, reasons)
-	require.Equal(t, 1, n)
+	require.Empty(t, check(evidence(nil)))
+	// Losses refuse nothing.
+	require.Empty(t, check(evidence(func(e *serverEvidence) {
+		e.servers[2].TouchLossTime = snapshot.Add(5 * time.Minute)
+		e.servers[2].MapRowLossTime = snapshot.Add(5 * time.Minute)
+	})))
+	reasons, err := checkServersAgain(ctx, func(context.Context) (*serverEvidence, error) { return nil, errors.New("unavailable") }, c.r, c.o)
+	require.NoError(t, err)
+	require.Equal(t, []string{"the second read of the GC servers failed: unavailable"}, reasons)
 
-	// A stats read just after the snapshot is within the clock skew margin.
-	late := func(e *serverEvidence) { e.servers[1].StatsTime = snapshot.Add(clockSkewMargin / 2) }
-	reasons, n = poll(evidence(late), evidence(late), evidence(nil))
-	require.Empty(t, reasons)
-	require.Equal(t, 3, n)
-
-	start := time.Now()
-	reasons, _ = poll(evidence(late))
-	require.Equal(t, []string{"server srv-1-bb wrote no heartbeat with touch stats read after the snapshot within 1s"}, reasons)
-	require.GreaterOrEqual(t, time.Since(start), time.Second)
-	require.Less(t, time.Since(start), 1800*time.Millisecond)
-
-	// A stopped server records its losses at the stop and is not waited for.
-	reasons, _ = poll(evidence(func(e *serverEvidence) {
-		late(e)
-		e.servers[1].StoppedAt = snapshot.Add(5 * time.Minute)
-	}))
-	require.Empty(t, reasons)
-
-	// Losses and older servers seen only by the second read refuse at once.
-	reasons, n = poll(evidence(func(e *serverEvidence) { e.servers[2].TouchLossTime = snapshot.Add(5 * time.Minute) }))
-	require.Len(t, reasons, 1)
-	require.Contains(t, reasons[0], "server srv-2-cc lost touches")
-	require.Equal(t, 1, n)
-	reasons, _ = poll(evidence(func(e *serverEvidence) {
-		e.replicas = []Replica{{ID: "old-0-aa", Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: snapshot}}
-		e.legacyGone = time.Time{}
-	}))
-	require.Equal(t, []string{"GcReplicas holds 1 rows of servers of an older version, which keep no evidence of the touches they lose"}, reasons)
+	// A server of an older version seen only by the second read refuses.
+	require.Equal(t, []string{"server srv-2-cc: follows the GC rules of version 2, older than version 3 of this collector", "replica srv-2-cc: follows the GC rules of version 2, older than version 3 of this collector"},
+		check(evidence(func(e *serverEvidence) { e.servers[2].Version = ExtractorVersion - 1 })))
 
 	// The live hosts are counted again.
-	reasons, _ = poll(evidence(func(e *serverEvidence) { e.servers = e.servers[:1] }))
-	require.Equal(t, []string{"1 server hosts write a GC heartbeat, but at least 2 are expected"}, reasons)
+	require.Equal(t, []string{"1 server hosts write a GC heartbeat, but at least 2 are expected"}, check(evidence(func(e *serverEvidence) { e.servers = e.servers[:1] })))
 
 	// The touch interval of the live mounts is checked against the servers
 	// of this read: a server with a longer touch interval leaves a mount less
@@ -537,149 +455,95 @@ func TestPollServerStats(t *testing.T) {
 			e.servers[2].TouchInterval, e.servers[2].CacheTTL = touch, ttl
 		}
 	}
-	reasons, _ = poll(evidence(settings(30*time.Hour, time.Hour)))
-	require.Empty(t, reasons)
+	require.Empty(t, check(evidence(settings(30*time.Hour, time.Hour))))
 	tooSeldom := []string{"live mounts touch their objects every 35h0m0s, too seldom for the grace 72h0m0s less the longest touch interval and cache TTL of the servers that run now"}
-	reasons, _ = poll(evidence(settings(36*time.Hour, time.Hour)))
-	require.Equal(t, tooSeldom, reasons)
-	reasons, _ = poll(evidence(settings(30*time.Hour, 6*time.Hour)))
-	require.Equal(t, tooSeldom, reasons)
-	c.o.Types = []string{"commit"}
-	reasons, _ = poll(evidence(settings(36*time.Hour, time.Hour)))
-	require.Empty(t, reasons)
-	c.o.Types = nil
+	require.Equal(t, tooSeldom, check(evidence(settings(36*time.Hour, time.Hour))))
+	require.Equal(t, tooSeldom, check(evidence(settings(30*time.Hour, 6*time.Hour))))
 
-	// A map row touch lost since the window start, less the 8 h clients
-	// reuse map results and the hour a keep-alive pass may take, leaves out
-	// those 9 h too: 1.1 x 29.5 h fits 72 h less 30 h, 1 h, a minute and
-	// 8 h, but not less the hour as well.
-	c.r.LiveMounts.longestTouch = 29*time.Hour + 30*time.Minute
-	mapRowLoss := func(at time.Time) func(e *serverEvidence) {
-		return func(e *serverEvidence) {
-			settings(30*time.Hour, time.Hour)(e)
-			e.servers[2].MapRowLossTime = at
-		}
-	}
-	windowStart := snapshot.Add(-c.o.Grace - clockSkewMargin)
-	reasons, _ = poll(evidence(mapRowLoss(snapshot.Add(-time.Hour))))
-	require.Equal(t, []string{"live mounts touch their objects every 29h30m0s, too seldom for the grace 72h0m0s less the longest touch interval and cache TTL of the servers that run now, and less the 8h0m0s for which clients reuse map results and the 1h0m0s a keep-alive pass may take, since server srv-2-cc lost map row touches at 2026-11-08T11:00:00Z"}, reasons)
-	reasons, _ = poll(evidence(mapRowLoss(windowStart.Add(-9 * time.Hour))))
-	require.Len(t, reasons, 1)
-	reasons, _ = poll(evidence(mapRowLoss(windowStart.Add(-9*time.Hour - time.Second))))
-	require.Empty(t, reasons)
-	reasons, _ = poll(evidence(settings(30*time.Hour, time.Hour)))
-	require.Empty(t, reasons)
-
-	// Accepted mounts without the keep-alive refuse after a map row loss
-	// that only the second read sees.
-	c.r.LiveMounts = MountCounts{WithoutKeepAlive: 2}
-	c.o.AcceptMountsWithoutKeepAlive = true
-	reasons, _ = poll(evidence(nil))
-	require.Empty(t, reasons)
-	reasons, _ = poll(evidence(mapRowLoss(snapshot.Add(5 * time.Minute))))
-	require.Equal(t, []string{"2 live mounts run without the GC keep-alive, and server srv-2-cc lost map row touches at 2026-11-08T12:05:00Z: such a mount may apply a map result whose outputs no map row keeps any more, which --accept-mounts-without-keepalive does not accept; set gc-keepalive in their config"}, reasons)
+	// A map row loss no longer shortens the limit: a mount at 1.1 x 37 h
+	// fits 72 h less 30 h, 1 h and a minute.
+	c.r.LiveMounts.longestTouch = 37 * time.Hour
+	require.Empty(t, check(evidence(func(e *serverEvidence) {
+		settings(30*time.Hour, time.Hour)(e)
+		e.servers[2].MapRowLossTime = snapshot.Add(-time.Hour)
+	})))
 	c.o.Types = []string{"commit"}
-	reasons, _ = poll(evidence(mapRowLoss(snapshot.Add(5 * time.Minute))))
-	require.Empty(t, reasons)
+	require.Empty(t, check(evidence(settings(36*time.Hour, time.Hour))))
 }
 
 // A map row loss since the window start, less the time clients reuse map
-// results and the time a keep-alive pass may take, shortens the keep-alive
-// limit by both and refuses nothing else. A row of a server of an older
-// version has no map row loss time and records lost map row touches in its
-// touch loss time, which keeps the limit and refuses as any lost touch.
+// results and the time a keep-alive pass may take, is reported and changes
+// no limit and no check.
 func TestServerEvidence_MapRowLoss(t *testing.T) {
 	require := require.New(t)
 	c := newDeleteCase()
 	e, snapshot, grace := c.ev.servers, c.ev.snapshot, c.o.Grace
 	limit := grace - 36*time.Hour - 6*time.Hour - clockSkewMargin
 	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+	_, lost := e.mapRowLoss(snapshot, grace)
+	require.False(lost)
 
 	e.servers[1].MapRowLossTime = snapshot.Add(-time.Hour)
 	e.servers[2].MapRowLossTime = snapshot.Add(-2 * time.Hour)
-	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
-	s, lost := e.mapRowLoss(snapshot, grace)
+	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+	at, lost := e.mapRowLoss(snapshot, grace)
 	require.True(lost)
-	require.False(s.crashed)
-	require.Equal("srv-1-bb", s.server)
+	require.Equal(snapshot.Add(-time.Hour), at)
 	require.Empty(windowBlockers(e, snapshot, &c.o.DryRunOpts))
 
-	// A loss of a process that stopped before map row losses count is not
-	// counted.
-	before := mapRowLossStart(snapshot, grace).Add(-time.Minute)
+	// A loss of a process that stopped before map row losses are reported is
+	// not reported, and a crashed row is not a loss.
+	before := windowStart(snapshot, grace).Add(-clientMapReuse - keepAlivePassAllowance - time.Minute)
 	e.servers[1] = stoppedServer("srv-1-bb", before)
 	e.servers[1].MapRowLossTime = before
-	e.servers[2].MapRowLossTime = time.Time{}
-	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
-
-	e.servers[1] = liveServer("srv-1-bb", snapshot)
-	e.servers[1].TouchLossTime = snapshot.Add(-time.Hour)
-	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
-	require.Equal([]string{"server srv-1-bb lost touches at 2026-11-08T11:00:00Z, after the window start 2026-11-05T11:59:00Z"}, windowBlockers(e, snapshot, &c.o.DryRunOpts))
+	e.servers[2] = liveServer("srv-2-cc", snapshot)
+	e.servers[2].LastSeen = windowStart(snapshot, grace).Add(-time.Hour)
+	_, lost = e.mapRowLoss(snapshot, grace)
+	require.False(lost)
 }
 
-// A server that did not record a stop may have lost map row touches after its
-// last heartbeat that it never recorded, so its row counts as a map row loss
-// at the last time it may have run, its last heartbeat plus the age of a live
-// row, also when the crash is before the window start. A clean stop without a
-// map row loss and a live row do not count.
-func TestServerEvidence_CrashCountsAsMapRowLoss(t *testing.T) {
+// The cache TTL a list records is the largest of every row whose process may
+// have run in the window: rows that stopped in it and crashed rows whose last
+// heartbeat is within the age of a live row before it count, older ones do
+// not. A window without a row, or with a row that does not bound its
+// answers, completes no list.
+func TestServerEvidence_ListCacheTTL(t *testing.T) {
 	require := require.New(t)
-	c := newDeleteCase()
-	e, snapshot, grace := c.ev.servers, c.ev.snapshot, c.o.Grace
-	limit := grace - 36*time.Hour - 6*time.Hour - clockSkewMargin
-	start, lossStart := windowStart(snapshot, grace), mapRowLossStart(snapshot, grace)
-
-	crash := func(lastSeen time.Time) {
-		e.servers[1] = liveServer("srv-1-bb", lastSeen)
-		e.servers[1].LastSeen = lastSeen
+	snapshot := time.Now()
+	grace := DefaultGrace
+	start := windowStart(snapshot, grace)
+	server := func(id string, ttl time.Duration, lastSeen, stopped time.Time) Server {
+		s := liveServer(id, snapshot)
+		s.CacheTTL, s.LastSeen, s.StoppedAt = ttl, lastSeen, stopped
+		return s
 	}
-	crash(start.Add(-liveReplicaAge - time.Hour))
-	require.Empty(windowBlockers(e, snapshot, &c.o.DryRunOpts), "the crash is before the window")
-	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
-	loss, lost := e.mapRowLoss(snapshot, grace)
-	require.True(lost)
-	require.Equal(mapRowLossEvent{server: "srv-1-bb", at: start.Add(-time.Hour), crashed: true}, loss)
-	require.Equal(", and less the 8h0m0s for which clients reuse map results and the 1h0m0s a keep-alive pass may take, since server srv-1-bb last wrote its heartbeat at 2026-11-05T10:29:00Z and did not record a stop: it crashed and may have lost map row touches", e.mapRowLossNote(snapshot, grace))
+	e := &serverEvidence{servers: []Server{
+		server("live-0-aa", 2*time.Hour, snapshot.Add(-time.Minute), time.Time{}),
+		server("stopped-0-aa", 7*time.Hour, start.Add(-time.Hour), start.Add(time.Minute)),
+		server("crashed-0-aa", 9*time.Hour, start.Add(-liveReplicaAge+time.Minute), time.Time{}),
+		server("stopped-1-bb", 20*time.Hour, start.Add(-2*time.Hour), start.Add(-time.Minute)),
+		server("crashed-1-bb", 30*time.Hour, start.Add(-liveReplicaAge-time.Minute), time.Time{}),
+	}}
+	ttl, reasons := e.listCacheTTL(snapshot, grace)
+	require.Empty(reasons)
+	require.Equal(9*time.Hour, ttl)
 
-	crash(lossStart.Add(-liveReplicaAge))
-	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
-	crash(lossStart.Add(-liveReplicaAge - time.Second))
-	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
+	e.servers = e.servers[3:]
+	_, reasons = e.listCacheTTL(snapshot, grace)
+	require.Equal([]string{"no server that may have run within the grace wrote a GC heartbeat, so the largest cache TTL is not known"}, reasons)
 
-	// A failed record of the stop leaves a crashed row; a map row loss the
-	// last heartbeat recorded is earlier than the crash.
-	crash(start.Add(-liveReplicaAge - time.Hour))
-	e.servers[1].MapRowLossTime = e.servers[1].LastSeen
-	loss, _ = e.mapRowLoss(snapshot, grace)
-	require.Equal(start.Add(-time.Hour), loss.at)
-
-	e.servers[1] = stoppedServer("srv-1-bb", start.Add(-time.Hour))
-	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace), "a clean stop")
-	require.Empty(e.mapRowLossNote(snapshot, grace))
-
-	// A live row is not a crash, even when its last heartbeat is long before
-	// the snapshot of the cycle.
-	e.servers[1] = liveServer("srv-1-bb", snapshot)
-	e.readTime = e.servers[1].LastSeen.Add(liveReplicaAge)
-	require.Equal(limit, e.keepAliveTouchLimit(snapshot, grace))
-	e.readTime = e.servers[1].LastSeen.Add(liveReplicaAge + time.Second)
-	require.Equal(limit-9*time.Hour, e.keepAliveTouchLimit(snapshot, grace))
-}
-
-// The collector waits for a server's heartbeat at most the largest heartbeat
-// interval a server may run with, whatever interval its row holds.
-func TestStatsWait(t *testing.T) {
-	for _, tt := range []struct {
-		interval, want time.Duration
-	}{
-		{5 * time.Minute, 5*time.Minute + statsWaitMargin},
-		{MaxHeartbeatInterval, MaxHeartbeatInterval + statsWaitMargin},
-		{time.Hour, MaxHeartbeatInterval + statsWaitMargin},
-		{0, MaxHeartbeatInterval + statsWaitMargin},
-	} {
-		require.Equal(t, tt.want, statsWait(&Server{HeartbeatInterval: tt.interval}), tt.interval)
-	}
+	noTTL := server("nottl-0-aa", 0, snapshot.Add(-time.Minute), time.Time{})
+	noHooks := server("nohooks-0-aa", time.Hour, snapshot.Add(-time.Minute), time.Time{})
+	noHooks.GC = false
+	older := server("older-0-aa", time.Hour, snapshot.Add(-time.Minute), time.Time{})
+	older.Version = ExtractorVersion - 1
+	e.servers = []Server{older, noTTL, noHooks}
+	_, reasons = e.listCacheTTL(snapshot, grace)
+	require.Equal([]string{
+		"server nohooks-0-aa runs without the garbage collector hooks",
+		"server nottl-0-aa keeps cache entries without a TTL",
+		fmt.Sprintf("server older-0-aa follows the GC rules of version %d, older than version %d of this collector", ExtractorVersion-1, ExtractorVersion),
+	}, reasons)
 }
 
 // The objects written during the consistency scan are read again: one that
@@ -944,21 +808,15 @@ func TestCheckConsistency_ChecksTooNewKeys(t *testing.T) {
 	require.NoError(scan.tooNewErr)
 }
 
-// The evidence of a delete names the list the cycle read and the condemn
-// cycle the lease replaced, and carries the servers the dry run read.
+// The evidence of a delete carries the snapshot, the list records and the
+// servers the cycle read.
 func TestNewDeleteEvidence(t *testing.T) {
-	require := require.New(t)
 	start := time.Now()
-	lease := &Lease{Cycle: 7, Start: start, PreviousCondemnCycle: 5}
-	state := ListState{Location: "gc/default/list-5", SnapshotTime: start.Add(-time.Hour), Complete: true, CompleteTime: start.Add(-50 * time.Minute)}
-	header := &listHeader{cycle: 5, snapshot: state.SnapshotTime}
+	lease := &Lease{Cycle: 7, Start: start}
 	servers := &serverEvidence{readTime: start}
-	ev := newDeleteEvidence(lease, &condemner{prev: previousList{state: state, list: &condemnedList{header: header}}}, &Result{servers: servers})
-	require.Equal(&deleteEvidence{snapshot: start, previousCondemnCycle: 5, list: state, listHeader: header, servers: servers}, ev)
-
-	ev = newDeleteEvidence(lease, &condemner{prev: previousList{state: state, err: "not found"}}, &Result{servers: servers})
-	require.Nil(ev.listHeader)
-	require.Equal("not found", ev.listErr)
+	holds := &listHolds{records: map[int64]*ListRecord{}}
+	ev := newDeleteEvidence(lease, &Result{servers: servers, holds: holds})
+	require.Equal(t, &deleteEvidence{snapshot: start, holds: holds, servers: servers}, ev)
 }
 
 // readHook returns a dial option that runs hook before each ReadRows request

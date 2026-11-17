@@ -561,6 +561,46 @@ func TestGCHooks_TouchThrottle(t *testing.T) {
 	require.Equal(int64(1), written(), "no touch in the next period")
 }
 
+// An upload writes the gc row of the object at server time and a rescue
+// touches the object before it answers, so a hit in the same touch period
+// queues no touch of its own, from the cache or after the read; the next
+// period does.
+func TestGCHooks_NoTouchAfterPutOrRescue(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	now := uint32(1)
+	setCacheNow(t, &now)
+	s := newGCHooksServer(t, &NewServerOpts{CacheTTL: 2 * time.Hour, GCTouchInterval: time.Hour})
+	g := &s.gcHooks
+	g.toucher.Close()
+	fake := &fakeToucher{}
+	g.toucher = fake
+	put := putBlob(t, s, "uploaded")
+	rescued := putBlob(t, s, "rescued")
+	now = max(periodEnd(g, put, now), periodEnd(g, rescued, now))
+	_, err := s.Headers(ctx, []entities.Hash{put, rescued})
+	require.NoError(err)
+	require.ElementsMatch([]entities.Hash{put, rescued}, fake.waited)
+
+	fake.waited = nil
+	fresh := putBlob(t, s, "uploaded now")
+	condemnObject(t, s, rescued, 3)
+	for range 2 {
+		_, err = s.Headers(ctx, []entities.Hash{fresh, rescued})
+		require.NoError(err)
+		require.NoError(readObject(s, rescued))
+	}
+	require.Empty(fake.waited)
+	require.Empty(fake.tried)
+	require.False(isCondemned(t, s, rescued))
+	require.True(objectTouched(t, s, rescued), "the rescue touched")
+
+	now = max(periodEnd(g, fresh, now), periodEnd(g, rescued, now))
+	_, err = s.Headers(ctx, []entities.Hash{fresh, rescued})
+	require.NoError(err)
+	require.ElementsMatch([]entities.Hash{fresh, rescued}, fake.waited)
+}
+
 // The keep-alive of a large mount sends batches of 50,000 cached keys back to
 // back. Every hit gets its touch.
 func TestGCHooks_HeadersBurstDropsNoTouches(t *testing.T) {
@@ -592,7 +632,7 @@ func TestGCHooks_GetObjectTouches(t *testing.T) {
 	require := require.New(t)
 	now := uint32(1)
 	setCacheNow(t, &now)
-	s := newGCHooksServer(t, &NewServerOpts{CacheTTL: 10 * time.Minute, GCTouchInterval: time.Hour})
+	s := newGCHooksServer(t, &NewServerOpts{CacheTTL: 2 * time.Hour, GCTouchInterval: time.Hour})
 	cached := putBlob(t, s, "cached")
 	uncached := putBlob(t, s, "uncached")
 	s.forget(uncached)
@@ -600,6 +640,10 @@ func TestGCHooks_GetObjectTouches(t *testing.T) {
 	_, contentOk := s.content[cached[0]].Peek(cached)
 	require.True(hdrOk && contentOk)
 
+	// The upload counts as the touch of its period, so the reads touch in
+	// the next one.
+	require.NoError(readObject(s, cached))
+	now += 3600
 	for range 2 {
 		require.NoError(readObject(s, cached))
 		require.NoError(readObject(s, uncached))
@@ -685,10 +729,11 @@ func TestGCHooks_MapResults(t *testing.T) {
 	used, ok := touched(t, s, casdb.MapRowKey(from, kept), "maps", "cf", "")
 	require.True(ok)
 	require.Greater(used, added, "the map row was not touched")
-	// The validation of AddMapResult touched the three objects, MapResults the
+	// The uploads count as the touches of the three objects in this period,
+	// so the validation of AddMapResult touched none; MapResults touched the
 	// map row of the result it returned.
 	st := s.gcHooks.toucher.Stats()
-	require.Equal(int64(3), st.Written)
+	require.Zero(st.Written)
 	require.Equal(int64(1), st.MapRowsWritten)
 }
 
@@ -762,7 +807,7 @@ func TestGCHooks_ChunkMissingDuringRead(t *testing.T) {
 	// The collector deleted the row during the read.
 	require.NoError(readObject(s, putBlob(t, s, "other")))
 	deleteObjectRow(t, s, key)
-	s.storeHeader(&ObjectHeader{Id: key, Type: "blob", Size: 5}, cacheNow())
+	s.storeHeader(&ObjectHeader{Id: key, Type: "blob", Size: 5}, cacheNow(), false)
 	s.storeContent(key, content, cacheNow())
 	err = readObject(s, key)
 	require.ErrorIs(err, entities.ErrNotExist)
@@ -899,9 +944,10 @@ func TestGCHooks_TouchPeriodsEndPerObject(t *testing.T) {
 	g.toucher.Close()
 	fake := &fakeToucher{}
 	g.toucher = fake
+	// The uploads count as the touches of their period.
 	_, err := s.Headers(ctx, []entities.Hash{a, b})
 	require.NoError(err)
-	require.ElementsMatch([]entities.Hash{a, b}, fake.waited)
+	require.Empty(fake.waited)
 
 	first, second := a, b
 	if periodEnd(g, b, now) < periodEnd(g, a, now) {
@@ -911,11 +957,11 @@ func TestGCHooks_TouchPeriodsEndPerObject(t *testing.T) {
 	now = periodEnd(g, first, now)
 	_, err = s.Headers(ctx, []entities.Hash{a, b})
 	require.NoError(err)
-	require.ElementsMatch([]entities.Hash{a, b, first}, fake.waited)
+	require.ElementsMatch([]entities.Hash{first}, fake.waited)
 	now = periodEnd(g, second, now)
 	_, err = s.Headers(ctx, []entities.Hash{a, b})
 	require.NoError(err)
-	require.ElementsMatch([]entities.Hash{a, b, first, second}, fake.waited)
+	require.ElementsMatch([]entities.Hash{first, second}, fake.waited)
 }
 
 func TestGCHooks_ChunkMissingInBucket(t *testing.T) {
@@ -985,6 +1031,13 @@ func TestGCHooks_Metrics(t *testing.T) {
 			continue
 		}
 		for _, m := range sm.Metrics {
+			if h, ok := m.Data.(metricdata.Histogram[float64]); ok {
+				for _, dp := range h.DataPoints {
+					call, _ := dp.Attributes.Value("call")
+					got[m.Name+"/"+call.AsString()] += int64(dp.Count)
+				}
+				continue
+			}
 			sum, ok := m.Data.(metricdata.Sum[int64])
 			require.True(ok, m.Name)
 			for _, dp := range sum.DataPoints {
@@ -1014,6 +1067,7 @@ func TestGCHooks_Metrics(t *testing.T) {
 	require.Contains(got, "abfs.gcp.cache.ttl_expiries/content")
 	require.Contains(got, "abfs.gcp.gc.map_results_dropped")
 	require.Contains(got, "abfs.gcp.gc.heartbeat_failures")
+	require.Equal(int64(1), got["abfs.gcp.gc.answer_seconds/headers"])
 
 	condemnObject(t, s, key, 4)
 	logged.Reset()

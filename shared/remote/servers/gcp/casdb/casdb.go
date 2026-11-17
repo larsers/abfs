@@ -60,8 +60,8 @@ type CASDB struct {
 
 // New connects to the Spanner database and the Bigtable instance. The client
 // libraries export their built-in metrics to Cloud Monitoring only when
-// clientMetrics is set.
-func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile string, btConnPoolSize int, clientMetrics bool) (*CASDB, error) {
+// clientMetrics is set. opts apply to both clients.
+func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile string, btConnPoolSize int, clientMetrics bool, opts ...option.ClientOption) (*CASDB, error) {
 	sessionPoolConfig := spanner.SessionPoolConfig{
 		MinOpened:     400,
 		MaxOpened:     5000,
@@ -72,19 +72,15 @@ func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile str
 	client, err := spanner.NewClientWithConfig(ctx, spannerDB, spanner.ClientConfig{
 		SessionPoolConfig:    sessionPoolConfig,
 		DisableNativeMetrics: !clientMetrics,
-	}, numChannels)
+	}, append([]option.ClientOption{numChannels}, opts...)...)
 	if err != nil {
 		return nil, err
 	}
 
-	btConfig := bigtable.ClientConfig{AppProfile: btAppProfile}
-	if !clientMetrics {
-		btConfig.MetricsProvider = bigtable.NoopMetricsProvider{}
-	}
-	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, btConfig, bigtableClientOptions(btConnPoolSize)...)
+	btClient, err := newBigtableClient(ctx, projectID, btInstance, btAppProfile, btConnPoolSize, clientMetrics, opts...)
 	if err != nil {
 		client.Close()
-		return nil, fmt.Errorf("failed to create bigtable client: %w", err)
+		return nil, err
 	}
 	mapsTable := btClient.Open("maps")
 	objectsTable := btClient.Open("objects")
@@ -102,6 +98,27 @@ func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile str
 		headersSem:   make(chan struct{}, semSize),
 	}
 	return cas, nil
+}
+
+// newBigtableClient creates the Bigtable client of New.
+func newBigtableClient(ctx context.Context, projectID, btInstance, btAppProfile string, btConnPoolSize int, clientMetrics bool, opts ...option.ClientOption) (*bigtable.Client, error) {
+	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, bigtableConfig(btAppProfile, clientMetrics, len(opts) > 0), append(bigtableClientOptions(btConnPoolSize), opts...)...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create bigtable client: %w", err)
+	}
+	return btClient, nil
+}
+
+// bigtableConfig returns the config of the Bigtable client. The session
+// transport of the library sends calls as messages on streams opened without
+// the context of the call, so the interceptors of options never see them;
+// a client with options keeps to the classic connections, which carry them.
+func bigtableConfig(btAppProfile string, clientMetrics, withOptions bool) bigtable.ClientConfig {
+	config := bigtable.ClientConfig{AppProfile: btAppProfile, DisableSession: withOptions}
+	if !clientMetrics {
+		config.MetricsProvider = bigtable.NoopMetricsProvider{}
+	}
+	return config
 }
 
 // bigtableClientOptions sets the Bigtable client's gRPC connection pool size.

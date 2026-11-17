@@ -154,7 +154,7 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	client, err := spanner.NewClient(ctx, fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID))
 	require.NoError(err)
 	defer client.Close()
-	for _, table := range []string{"GcState", "GcReplicas", "GcServers"} {
+	for _, table := range []string{"GcState", "GcServers", "GcLists"} {
 		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
 		require.Error(err, table)
 	}
@@ -176,7 +176,7 @@ func TestSetup_AddsGCResourcesToExistingDeployment(t *testing.T) {
 	row, err := btClient.Open("objects").ReadRow(ctx, "kept")
 	require.NoError(err)
 	require.NotEmpty(row)
-	for _, table := range []string{"GcState", "GcReplicas", "GcServers"} {
+	for _, table := range []string{"GcState", "GcServers", "GcLists"} {
 		err := client.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table}).Do(func(*spanner.Row) error { return nil })
 		require.NoError(err, table)
 	}
@@ -250,8 +250,8 @@ func TestSetup_AddsGCServersMapRowLossColumn(t *testing.T) {
 	require.NoError(err)
 	defer client.Close()
 	_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("GcServers",
-		[]string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "StatsTime", "TouchLossTime"},
-		[]any{"old-0-aa", int64(1), true, int64(3600), int64(3600), int64(300), true, spanner.CommitTimestamp, time.Now(), spanner.CommitTimestamp})})
+		[]string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "TouchLossTime"},
+		[]any{"old-0-aa", int64(1), true, int64(3600), int64(3600), int64(300), true, spanner.CommitTimestamp, spanner.CommitTimestamp})})
 	require.NoError(err)
 	serverOpts := &NewServerOpts{
 		ProjectID: opts.ProjectID, InstanceID: opts.InstanceID, DatabaseID: opts.DatabaseID,

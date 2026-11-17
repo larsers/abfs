@@ -773,10 +773,11 @@ func TestDeleteStep_ChunksOfDeletedKeysOnly(t *testing.T) {
 	for _, k := range h {
 		f.chunked(k, "u")
 	}
+	res := f.mark(nil)
+	// The marker changes after the scan read it.
 	marker := bigtable.NewMutation()
 	marker.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), markerValue(stepListCycle+1))
 	require.NoError(f.client.Open(objectsTable).Apply(ctx, changed.String(), marker))
-	res := f.mark(nil)
 	d := f.deleter(f.lease, nil)
 	_, err := d.deleteStep(ctx, f.lease, res)
 	require.NoError(err)

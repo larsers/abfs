@@ -26,8 +26,8 @@ const (
 	// outcomePending is a candidate the step tries.
 	outcomePending keyOutcome = iota
 	outcomeDeleted
-	// outcomeNotMatched is a key whose marker was not the one of the list:
-	// a server rescued it.
+	// outcomeNotMatched is a key whose marker was no longer the one the
+	// scan read: a server rescued it.
 	outcomeNotMatched
 	// outcomeGone is a key whose row was gone before its delete.
 	outcomeGone
@@ -46,22 +46,26 @@ const (
 )
 
 // deletePlan is the plan of the delete step of a cycle. Its candidates are
-// the keys of the previous list that the mark found unreachable, with a node
-// and an objects row. A candidate is deleted only after every parent of it
-// in the graph that has an objects row was deleted earlier in the step, so
-// that no object that is still read links a deleted one. Every such parent
-// of a candidate is itself a candidate: it was unreachable at the previous
-// mark too, or it would be recent now. The levels order the candidates so
-// that each comes after all its candidate parents, and the map rows that
-// name a candidate come before all of them, since a map lookup returns the
-// result without reading the request.
+// the nodes that the mark found unreachable and whose objects row the
+// consistency scan read with a marker of a list whose hold has ended. A
+// candidate is deleted only after every parent of it in the graph that has
+// an objects row was deleted earlier in the step, so that no object that is
+// still read links a deleted one. A parent that is not live and not a
+// candidate, such as one written or rescued after the marker of its child,
+// blocks the child until its own marker is eligible. The levels order the
+// candidates so that each comes after all its candidate parents, and the map
+// rows that name a candidate come before all of them, since a map lookup
+// returns the result without reading the request.
 type deletePlan struct {
 	g *graph
 	// cands are the candidate nodes in key order, with the sizes of their
-	// objects; isCand holds them by node.
-	cands  []uint32
-	sizes  []int64
-	isCand bitmap
+	// objects and the numbers of their markers in values; isCand holds them
+	// by node.
+	cands   []uint32
+	sizes   []int64
+	markers []uint32
+	values  [][]byte
+	isCand  bitmap
 	// levels[l] lists the candidates of level l, in key order; level 0 is
 	// the map rows, so levels[0] is empty.
 	levels [][]int32
@@ -81,15 +85,19 @@ type plannedMapRow struct {
 	expired  bool
 }
 
-// DeletePlanReport reports what a delete cycle would remove from the list of
-// the cycle before, if every map row delete and every conditional object
-// delete matched.
+// DeletePlanReport reports what a delete cycle would remove, if every map
+// row delete and every conditional object delete matched.
 type DeletePlanReport struct {
-	List      string `json:"list"`
-	ListCycle int64  `json:"list_cycle"`
-	// Candidates counts the keys of the list that this mark found unreachable
-	// with an objects row; WouldDelete those the step would try, with their
-	// size.
+	// Lists reports the hold of each list whose marker an unreachable object
+	// holds.
+	Lists []ListHoldReport `json:"lists,omitempty"`
+	// Held counts the unreachable objects whose marker has a complete record
+	// whose hold has not ended, and Unrecorded those whose marker has none,
+	// which a condemn writes again.
+	Held       int64 `json:"held"`
+	Unrecorded int64 `json:"unrecorded"`
+	// Candidates counts the unreachable objects whose marker is eligible;
+	// WouldDelete those the step would try, with their size.
 	Candidates       int64                     `json:"candidates"`
 	WouldDelete      int64                     `json:"would_delete"`
 	WouldDeleteBytes int64                     `json:"would_delete_bytes"`
@@ -106,9 +114,9 @@ type DeletePlanReport struct {
 	// TypeNotAllowed counts candidates of types the cycle may not delete.
 	TypeNotAllowed int64 `json:"type_not_allowed,omitempty"`
 	// BlockedByNoncandidateParent counts candidates with a parent that is
-	// unreachable, has an objects row and is not a candidate, each once. It
-	// is zero unless an object was written without the gc row first;
-	// BlockedSamples lists such edges as "parent>child".
+	// unreachable, has an objects row and is not a candidate, each once: a
+	// parent marked after the child, which holds it until its own marker is
+	// eligible. BlockedSamples lists such edges as "parent>child".
 	BlockedByNoncandidateParent int64    `json:"blocked_by_noncandidate_parent"`
 	BlockedSamples              []string `json:"blocked_samples,omitempty"`
 	// Blocked counts candidates below a key the step would not try.
@@ -124,30 +132,37 @@ type PlanTypeCount struct {
 	WouldDeleteBytes int64 `json:"would_delete_bytes"`
 }
 
-// planDeletes plans the delete step from the list l in the mark of res, for
-// the types allows accepts. Eval map rows whose newest cell is older than
-// evalAfter, in microseconds, are past the map retention.
-func planDeletes(res *Result, l *condemnedList, evalAfter int64, allows func(string) bool) *deletePlan {
+// planDeletes plans the delete step in the mark of res, for the types allows
+// accepts: its candidates are the unreachable nodes whose marker eligible
+// holds by its number, and holds reports the lists. Eval map rows whose
+// newest cell is older than evalAfter, in microseconds, are past the map
+// retention.
+func planDeletes(res *Result, eligible []bool, holds []ListHoldReport, evalAfter int64, allows func(string) bool) *deletePlan {
 	g := res.graph
-	p := &deletePlan{g: g, isCand: newBitmap(g.size()), report: &DeletePlanReport{ListCycle: l.header.cycle, Types: make(map[string]*PlanTypeCount)}}
-	for _, k := range l.keys {
-		id := g.find(k)
-		if id == noNode || !res.seen.has(id) || res.live.has(id) || g.recent.has(id) {
-			continue
-		}
-		if p.isCand.set(id) {
-			p.cands = append(p.cands, id)
+	p := &deletePlan{g: g, isCand: newBitmap(g.size()), values: res.markers, report: &DeletePlanReport{Lists: holds, Types: make(map[string]*PlanTypeCount)}}
+	rep := p.report
+	recorded := make([]bool, len(res.markers)+1)
+	for _, h := range holds {
+		for i, v := range res.markers {
+			if markerCycle(v) == h.Cycle {
+				recorded[i+1] = true
+			}
 		}
 	}
-	slices.Sort(p.cands)
-	p.sizes = make([]int64, len(p.cands))
-	for i, id := range p.cands {
-		if j, ok := slices.BinarySearchFunc(res.unreachable, id, func(n sizedNode, id uint32) int { return int(int64(n.id) - int64(id)) }); ok {
-			p.sizes[i] = res.unreachable[j].size
+	for _, n := range res.unreachable {
+		switch {
+		case n.marker == 0 || res.live.has(n.id) || g.recent.has(n.id):
+		case !recorded[n.marker]:
+			rep.Unrecorded++
+		case !eligible[n.marker]:
+			rep.Held++
+		case p.isCand.set(n.id):
+			p.cands = append(p.cands, n.id)
+			p.sizes = append(p.sizes, n.size)
+			p.markers = append(p.markers, n.marker)
 		}
 	}
 	p.outcome = make([]keyOutcome, len(p.cands))
-	rep := p.report
 	rep.Candidates = int64(len(p.cands))
 
 	p.planMapRows(res, evalAfter, allows)
