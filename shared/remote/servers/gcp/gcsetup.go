@@ -59,13 +59,17 @@ func serverTables(withGC bool) []tableFamilies {
 }
 
 // checkGCResources checks that the Spanner tables, the Bigtable table and the
-// column family of the garbage collector exist.
-func (s *GCPServer) checkGCResources(ctx context.Context) error {
+// column family of the garbage collector exist. Read-only, it writes nothing,
+// so it cannot check the family.
+func (s *GCPServer) checkGCResources(ctx context.Context, readOnly bool) error {
 	if err := s.casdb.CheckGCSchema(ctx); err != nil {
 		return err
 	}
 	if _, err := s.casdb.BTClient().Open(gc.TableName).ReadRow(ctx, "abfs-setup-check"); err != nil {
 		return fmt.Errorf("cannot read Bigtable table %s: %w", gc.TableName, err)
+	}
+	if readOnly {
+		return nil
 	}
 	// Reads ignore an unknown family, a mutation does not. Deleting a cell of
 	// a row that does not exist changes nothing.

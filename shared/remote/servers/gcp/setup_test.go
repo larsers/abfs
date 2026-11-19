@@ -440,6 +440,37 @@ func TestNew_ChecksSingleRowTransactions(t *testing.T) {
 	}
 }
 
+// A read-only server, as the collector's commands use, writes nothing to
+// Bigtable at start; a server with --gc probes with writes.
+func TestNew_ReadOnlyGCWritesNothingToBigtable(t *testing.T) {
+	for _, readOnly := range []bool{true, false} {
+		var writes atomic.Int32
+		count := func(method string) {
+			switch method[strings.LastIndexByte(method, '/')+1:] {
+			case "MutateRow", "MutateRows", "CheckAndMutateRow", "ReadModifyWriteRow":
+				writes.Add(1)
+			}
+		}
+		unary := grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			count(info.FullMethod)
+			return handler(ctx, req)
+		})
+		stream := grpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			count(info.FullMethod)
+			return handler(srv, ss)
+		})
+		newEmulatorBigtableWith(t, serverTables(true), unary, stream)
+		o := setupOpts(t, newEmulatorDatabase(t))
+		s, err := New(context.Background(), &NewServerOpts{
+			ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID, BtInstance: o.BtInstance, BucketName: o.BucketName,
+			MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCReadOnly: readOnly, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
+		})
+		require.NoError(t, err)
+		require.NoError(t, s.Close())
+		require.Equal(t, readOnly, writes.Load() == 0, writes.Load())
+	}
+}
+
 func createDatabase(t *testing.T, o *SetupOpts, ddl []string) {
 	t.Helper()
 	ctx := context.Background()

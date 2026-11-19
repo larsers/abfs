@@ -272,8 +272,8 @@ type NewServerOpts struct {
 	GCHeartbeatInterval time.Duration
 	// GCReadOnly, with GC, leaves the state of the garbage collector as it is:
 	// reads answer for condemned objects without rescuing them, and the server
-	// writes no touches and no heartbeat. The collector's own commands use it,
-	// so that what they read does not count as a use.
+	// writes no touches, no heartbeat and nothing at start. The collector's
+	// own commands use it, so that what they read does not count as a use.
 	GCReadOnly bool
 }
 
@@ -338,7 +338,11 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		return nil, err
 	}
 	// As file-based, so that trees and refs that link the empty file or
-	// directory pass link validation on a new database.
+	// directory pass link validation on a new database. The read-only server
+	// of a GC command writes nothing.
+	if opts.GC && opts.GCReadOnly {
+		return s, nil
+	}
 	if err := s.PutObject(ctx, entities.EmptyFileHash, remote.NewZStdContentReader(entities.EmptyFileContent)); err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("failed to put empty file: %w", err)
