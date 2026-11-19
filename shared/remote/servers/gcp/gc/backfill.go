@@ -242,6 +242,10 @@ func (b *backfill) handleBatch(ctx context.Context, keys, types []string, times 
 		}
 		hash, edges, malformed, err := b.edges(ctx, key, types[i])
 		if err != nil {
+			// A stopped run handles the batch again when it resumes.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Printf("Failed to backfill the gc row of %s (%s): %v", key, types[i], err)
 			counts.Failed++
 			continue

@@ -89,7 +89,8 @@ func TestLimiter_SpacesOutWork(t *testing.T) {
 	require.ErrorIs(l.wait(cancelled, 1), context.Canceled)
 }
 
-// treeServer serves an empty tree for every key and calls onGet first.
+// treeServer serves an empty tree for every key and calls onGet first. It
+// fails once ctx is done, as a server does.
 type treeServer struct {
 	remote.RemoteProvider
 	onGet func(key Hash)
@@ -100,12 +101,15 @@ func (s *treeServer) GetObject(ctx context.Context, key Hash) (remote.ContentRea
 	if s.onGet != nil {
 		s.onGet(key)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return remote.NewContentReader(io.NopCloser(bytes.NewReader([]byte("tree 0\x00"))), remote.EncodingRaw), nil
 }
 
 // A backfill stopped in the middle of its second shard, after the first one
-// finished, resumes in the second shard, and a run from the start finds the
-// first shard current.
+// finished, resumes in the second shard at the start of the batch it stopped
+// in, and a run from the start finds the first shard current.
 func TestBackfill_ResumesInTheShardItStoppedIn(t *testing.T) {
 	require := require.New(t)
 	client := newTestBigtable(t)
@@ -116,8 +120,8 @@ func TestBackfill_ResumesInTheShardItStoppedIn(t *testing.T) {
 		"3333333333333333333333333333333333333333": "blob",
 		"9111111111111111111111111111111111111111": "blob",
 		"9222222222222222222222222222222222222222": "blob",
-		"9333333333333333333333333333333333333333": "tree",
-		"9444444444444444444444444444444444444444": "blob",
+		"9333333333333333333333333333333333333333": "blob",
+		"9444444444444444444444444444444444444444": "tree",
 	}
 	for key, typ := range keys {
 		mut := bigtable.NewMutation()
@@ -144,14 +148,14 @@ func TestBackfill_ResumesInTheShardItStoppedIn(t *testing.T) {
 	require.Error(err)
 	require.False(stats.Done)
 	require.Equal("9222222222222222222222222222222222222222", stats.ResumeKey)
-	require.Nil(readGCRow(t, client, entities.NewHash("9333333333333333333333333333333333333333")))
+	require.Nil(readGCRow(t, client, entities.NewHash("9444444444444444444444444444444444444444")))
 
 	opts.Start = stats.ResumeKey
 	stats, err = Backfill(context.Background(), client, &treeServer{}, &opts)
 	require.NoError(err)
 	require.True(stats.Done)
 	require.Equal(int64(3), stats.Scanned)
-	require.Equal(int64(1), stats.Current)
+	require.Equal(int64(2), stats.Current)
 
 	stats, err = Backfill(context.Background(), client, &treeServer{}, &BackfillOpts{Shards: 2, BatchSize: 2})
 	require.NoError(err)

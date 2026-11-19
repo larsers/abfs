@@ -32,6 +32,8 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 )
@@ -447,6 +449,9 @@ type callLog struct {
 	slow      func(key string) bool
 	slowRead  func(keys [][]byte) time.Duration
 	after     func(c call)
+	// fail, when set, returns the error a write fails with in place of
+	// sending it.
+	fail func(c call) error
 }
 
 func (l *callLog) options() []grpc.DialOption {
@@ -467,7 +472,13 @@ func (l *callLog) options() []grpc.DialOption {
 		if l.slow != nil && l.slow(c.key) {
 			time.Sleep(20 * time.Millisecond)
 		}
-		err := invoker(ctx, method, req, reply, cc, opts...)
+		var err error
+		if l.fail != nil {
+			err = l.fail(c)
+		}
+		if err == nil {
+			err = invoker(ctx, method, req, reply, cc, opts...)
+		}
 		c.end = time.Now()
 		l.mu.Lock()
 		if c.table != TableName {
@@ -729,8 +740,8 @@ func TestDeleteGC_StopsBeforeLeaseExpiry(t *testing.T) {
 	}
 	res := f.mark(nil)
 	d := f.deleter(lease, func(o *DeleteOpts) { o.DeleteWorkers = 1 })
-	deleted, err := d.deleteStep(ctx, lease, res)
-	require.NoError(err)
+	_, err := d.deleteStep(ctx, lease, res)
+	require.ErrorIs(err, errLeaseExpiring)
 	rep := d.rep.Step
 	require.Equal(errLeaseExpiring.Error(), rep.Error)
 	require.Equal(int32(3), objectCalls.Load())
@@ -742,10 +753,68 @@ func TestDeleteGC_StopsBeforeLeaseExpiry(t *testing.T) {
 	}
 	require.Equal(2, gcCalls)
 	require.Equal(int64(3), rep.Deleted)
-	require.Equal(int64(3), deleted.count())
 	require.Equal(int64(7), rep.NotSent)
 	require.Equal(int64(1), rep.GCRowErrors)
 	require.Zero(rep.Unknown)
+}
+
+// A step whose run is cancelled sends no call after that, counts the keys
+// it did not reach as not sent, not as unknown, and returns the error, so
+// that the cycle writes no list.
+func TestDeleteStep_StopsWhenCancelled(t *testing.T) {
+	require := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := &callLog{rangeOf: func(string) int { return 0 }}
+	var objectCalls atomic.Int32
+	log.after = func(c call) {
+		if c.table == objectsTable && objectCalls.Add(1) == 3 {
+			cancel()
+		}
+	}
+	f := newStepFixture(t, 1, log.options()...)
+	for _, k := range testHashes(10) {
+		f.object(k, "blob", nil)
+	}
+	res := f.mark(nil)
+	d := f.deleter(farLease(), func(o *DeleteOpts) { o.DeleteWorkers = 1 })
+	_, err := d.deleteStep(ctx, farLease(), res)
+	require.ErrorIs(err, context.Canceled)
+	rep := d.rep.Step
+	require.Equal(int32(3), objectCalls.Load())
+	require.Equal(int64(3), rep.Deleted)
+	require.Equal(int64(7), rep.NotSent)
+	require.Zero(rep.Unknown)
+}
+
+// A delete that fails with an error that is not transient stops the step: no
+// other delete is sent, and the key it was sent for is read again.
+func TestDeleteStep_StopsAfterAPermanentError(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	log := &callLog{rangeOf: func(string) int { return 0 }}
+	var objectCalls atomic.Int32
+	log.fail = func(c call) error {
+		if c.table == objectsTable && objectCalls.Add(1) == 2 {
+			return status.Error(codes.PermissionDenied, "denied")
+		}
+		return nil
+	}
+	f := newStepFixture(t, 1, log.options()...)
+	for _, k := range testHashes(10) {
+		f.object(k, "blob", nil)
+	}
+	res := f.mark(nil)
+	d := f.deleter(farLease(), func(o *DeleteOpts) { o.DeleteWorkers = 1 })
+	_, err := d.deleteStep(ctx, farLease(), res)
+	require.NoError(err)
+	rep := d.rep.Step
+	require.Contains(rep.Error, "PermissionDenied")
+	require.Equal(int32(2), objectCalls.Load())
+	require.Equal(int64(1), rep.Deleted)
+	require.Equal(int64(1), rep.Unknown)
+	require.Equal(int64(1), rep.UnknownPresent)
+	require.Equal(int64(8), rep.NotSent)
 }
 
 // A map row whose result has no gc row still names its request: the scan

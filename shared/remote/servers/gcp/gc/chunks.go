@@ -160,7 +160,11 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 		s.rep.ListFailed = true
 		s.rep.Skipped = append(s.rep.Skipped, listErr.Error())
 	} else {
-		s.rep.Skipped = s.preconditions(ctx)
+		skipped, err := s.preconditions(ctx)
+		if err != nil {
+			return err
+		}
+		s.rep.Skipped = skipped
 	}
 	done := make(map[string]bool)
 	if listErr == nil {
@@ -212,18 +216,22 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 }
 
 // preconditions returns why the step must not delete chunks: settings of the
-// bucket that would keep a deleted chunk or refuse its delete.
-func (s *chunkStep) preconditions(ctx context.Context) []string {
+// bucket that would keep a deleted chunk or refuse its delete. It fails only
+// when the run ends.
+func (s *chunkStep) preconditions(ctx context.Context) ([]string, error) {
 	var attrs *storage.BucketAttrs
 	err := retryWith(ctx, firstRetryWait, s.reads, func(actx context.Context) error {
 		var err error
 		attrs, err = s.d.bucket.Attrs(actx)
 		return err
 	})
-	if err != nil {
-		return []string{fmt.Sprintf("cannot read the settings of the bucket%s: %v", permissionHint(err, "storage.buckets.get"), err)}
+	if stops(ctx, err) {
+		return nil, err
 	}
-	return bucketProblems(attrs)
+	if err != nil {
+		return []string{fmt.Sprintf("cannot read the settings of the bucket%s: %v", permissionHint(err, "storage.buckets.get"), err)}, nil
+	}
+	return bucketProblems(attrs), nil
 }
 
 // bucketProblems returns the settings of a bucket with attrs under which the
@@ -288,21 +296,19 @@ func (s *chunkStep) gcRows(ctx context.Context, attrs *storage.ObjectAttrs) erro
 		return ctx.Err()
 	}
 	gcRowDelete := conditionalDelete(newerCellPredicate(EdgesFamily, LinksColumn, h.gcRowsAfter), false)
-	var eg errgroup.Group
+	eg, ectx := errgroup.WithContext(ctx)
 	var mu sync.Mutex
 	allDone := true
 	for _, row := range rows {
 		if states[row].present {
 			continue
 		}
+		if !s.acquire(ectx) {
+			break
+		}
 		eg.Go(func() error {
-			select {
-			case s.calls <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
 			defer func() { <-s.calls }()
-			ok, err := s.gcRow(ctx, row, gcRowDelete)
+			ok, err := s.gcRow(ectx, row, gcRowDelete)
 			mu.Lock()
 			allDone = allDone && ok
 			mu.Unlock()
@@ -311,6 +317,9 @@ func (s *chunkStep) gcRows(ctx context.Context, attrs *storage.ObjectAttrs) erro
 	}
 	if err := eg.Wait(); err != nil || !allDone {
 		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	if err := s.flag(ctx, attrs, gcRowsDoneMetadata); err != nil {
 		if stops(ctx, err) {
@@ -355,18 +364,16 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 	if attrs.Metadata[gcRowsDoneMetadata] == "" {
 		gcRowDelete = conditionalDelete(newerCellPredicate(EdgesFamily, LinksColumn, h.gcRowsAfter), false)
 	}
-	var eg errgroup.Group
+	eg, ectx := errgroup.WithContext(ctx)
 	var mu sync.Mutex
 	allDone := true
 	for _, e := range keys {
+		if !s.acquire(ectx) {
+			break
+		}
 		eg.Go(func() error {
-			select {
-			case s.calls <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
 			defer func() { <-s.calls }()
-			ok, err := s.key(ctx, e, states[e.key.String()], attrs.Created, chunkRowDelete, gcRowDelete)
+			ok, err := s.key(ectx, e, states[e.key.String()], attrs.Created, chunkRowDelete, gcRowDelete)
 			mu.Lock()
 			allDone = allDone && ok
 			mu.Unlock()
@@ -375,6 +382,9 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 	}
 	if err := eg.Wait(); err != nil {
 		return false, err
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
 	}
 	if !allDone {
 		return false, nil
@@ -388,6 +398,16 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 	}
 	s.count(&s.rep.RecordsDone)
 	return true, nil
+}
+
+// acquire takes one of the calls in flight, unless ctx ends first.
+func (s *chunkStep) acquire(ctx context.Context) bool {
+	select {
+	case s.calls <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // flag sets the metadata key of the record to the cycle.

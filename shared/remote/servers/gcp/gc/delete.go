@@ -16,7 +16,6 @@ package gc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"slices"
@@ -241,9 +240,9 @@ type step struct {
 
 // deleteStep deletes the candidates of the plan of res, map rows first, then
 // level by level, each level in every range before the next one starts, and
-// reads again the keys whose outcome is unknown. It fails only when that
-// read fails, so that no key of unknown state is left out of the list of
-// this cycle.
+// reads again the keys whose outcome is unknown. It fails when that read
+// fails, so that no key of unknown state is left out of the list of this
+// cycle, and when the run must stop.
 func (d *deleter) deleteStep(ctx context.Context, lease *Lease, res *Result) (bitmap, error) {
 	start := time.Now()
 	p := res.plan
@@ -325,6 +324,10 @@ func (d *deleter) deleteStep(ctx context.Context, lease *Lease, res *Result) (bi
 	s.rep.Seconds = time.Since(start).Seconds()
 	log.Printf("GC cycle %d deleted %d objects of %d bytes; %d not matched, %d blocked, %d unknown, %d map rows deleted",
 		r.Cycle, s.rep.Deleted, s.rep.DeletedBytes, s.rep.NotMatched, s.rep.Blocked, s.rep.Unknown, s.rep.MapRowsDeleted)
+	// A run that must stop writes no list and no marker after the step.
+	if stops(ctx, s.err) {
+		return nil, fmt.Errorf("GC cycle %d stopped its delete step: %w", r.Cycle, s.err)
+	}
 	return deleted, nil
 }
 
@@ -363,9 +366,13 @@ func newerCellPredicate(family, column string, t time.Time) bigtable.Filter {
 
 // condApply applies the conditional mutation mut to row with the retries of
 // the collector, each attempt within the budget b. sent tells whether an
-// attempt was sent, so whether the row may have changed.
+// attempt was sent, so whether the row may have changed. No attempt is sent
+// once ctx is done.
 func condApply(ctx context.Context, b writeBudget, table *bigtable.Table, row string, mut *bigtable.Mutation) (matched, sent bool, err error) {
 	err = retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
 		sent = true
 		return table.Apply(actx, row, mut, bigtable.GetCondMutationResult(&matched))
 	})
@@ -412,8 +419,9 @@ func (s *step) runRanges(level int, items [][]int32, work func(rng int, items []
 
 // inFlight runs call for each of items, with at most share calls in flight,
 // started in order, and waits for all. It starts none after the step
-// stopped. A call returns an error only when the step must stop.
-func (s *step) inFlight(items []int32, call func(i int32) error) error {
+// stopped or ctx is done. A call returns an error only when the step must
+// stop.
+func (s *step) inFlight(ctx context.Context, items []int32, call func(i int32) error) error {
 	sem := make(chan struct{}, s.share)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -422,6 +430,16 @@ func (s *step) inFlight(items []int32, call func(i int32) error) error {
 		sem <- struct{}{}
 		if s.stop.Load() {
 			<-sem
+			break
+		}
+		if ctx.Err() != nil {
+			<-sem
+			mu.Lock()
+			if first == nil {
+				first = context.Cause(ctx)
+			}
+			mu.Unlock()
+			s.stop.Store(true)
 			break
 		}
 		wg.Go(func() {
@@ -462,6 +480,10 @@ func (s *step) runMapLevel(ctx context.Context) {
 				failed[rng] = append(failed[rng], its[lo:]...)
 				return nil
 			}
+			if ctx.Err() != nil {
+				failed[rng] = append(failed[rng], its[lo:]...)
+				return context.Cause(ctx)
+			}
 			if err := s.lim.wait(ctx, len(batch)); err != nil {
 				failed[rng] = append(failed[rng], its[lo:]...)
 				return err
@@ -476,7 +498,7 @@ func (s *step) runMapLevel(ctx context.Context) {
 				failed[rng] = append(failed[rng], its[lo:]...)
 				return err
 			}
-			err := s.inFlight(batch, func(i int32) error {
+			err := s.inFlight(ctx, batch, func(i int32) error {
 				m := &p.mapRows[i]
 				mut := s.deleteMapRow
 				if m.expired {
@@ -489,7 +511,7 @@ func (s *step) runMapLevel(ctx context.Context) {
 				case err != nil:
 					s.rep.MapRowErrors++
 					failed[rng] = append(failed[rng], i)
-					if errors.Is(err, errLeaseExpiring) {
+					if stops(ctx, err) {
 						return err
 					}
 				case kept:
@@ -537,6 +559,9 @@ func (s *step) runObjectLevel(ctx context.Context, l int) {
 		for lo := 0; lo < len(its); lo += s.d.opts.BatchSize {
 			if s.stop.Load() {
 				return nil
+			}
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
 			}
 			batch := its[lo:min(lo+s.d.opts.BatchSize, len(its))]
 			if err := s.lim.wait(ctx, len(batch)); err != nil {
@@ -599,12 +624,12 @@ func readObjectRows(ctx context.Context, objects *bigtable.Table, b writeBudget,
 // with each row, one call at a time.
 func readRowList(ctx context.Context, table *bigtable.Table, b writeBudget, rows []string, filter bigtable.Filter, keep func(bigtable.Row)) error {
 	var mu sync.Mutex
-	var eg errgroup.Group
+	eg, ectx := errgroup.WithContext(ctx)
 	eg.SetLimit(deleteReadsInFlight)
-	for lo := 0; lo < len(rows); lo += deleteReadBatch {
+	for lo := 0; lo < len(rows) && ectx.Err() == nil; lo += deleteReadBatch {
 		chunk := rows[lo:min(lo+deleteReadBatch, len(rows))]
 		eg.Go(func() error {
-			return retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
+			return retryWith(ectx, firstRetryWait, b, func(actx context.Context) error {
 				return table.ReadRows(actx, bigtable.RowList(chunk), func(row bigtable.Row) bool {
 					mu.Lock()
 					keep(row)
@@ -614,7 +639,10 @@ func readRowList(ctx context.Context, table *bigtable.Table, b writeBudget, rows
 			})
 		})
 	}
-	return eg.Wait()
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // readDeleteRows reads, of the objects rows, the newest cell of each column
@@ -676,7 +704,7 @@ func (s *step) deleteBatch(ctx context.Context, level, rng int, records *int, it
 	if err := s.writeRecords(ctx, level, rng, records, entries); err != nil {
 		return err
 	}
-	return s.inFlight(left, func(i int32) error {
+	return s.inFlight(ctx, left, func(i int32) error {
 		return s.deleteKey(ctx, int(i))
 	})
 }
@@ -684,19 +712,20 @@ func (s *step) deleteBatch(ctx context.Context, level, rng int, records *int, it
 // deleteKey deletes the objects row of candidate i if its newest marker is
 // the one the scan read, and then its gc row unless a write since the grace
 // start made it newer. A key that did not match is read again, because a
-// retry after a lost response finds the row deleted. It returns an error
-// only when the step must stop.
+// retry after a lost response finds the row deleted. A delete that was sent
+// and failed leaves the outcome unknown, for resolveUnknown. It returns an
+// error only when the step must stop: on a delete that was not sent or
+// failed with an error that is not transient, or when ctx is done.
 func (s *step) deleteKey(ctx context.Context, i int) error {
 	p := s.p
 	row := s.g.key(p.cands[i]).String()
 	matched, sent, err := condApply(ctx, s.d.budget, s.objects, row, s.deleteObjects[p.markers[i]])
 	if err != nil {
-		if !sent {
-			return err
+		if sent {
+			p.outcome[i] = outcomeUnknown
 		}
-		p.outcome[i] = outcomeUnknown
-		if errors.Is(err, errLeaseExpiring) {
-			return err
+		if !sent || !retryable(ctx, err) {
+			return fmt.Errorf("failed to delete the objects row of %s: %w", row, err)
 		}
 		return nil
 	}
@@ -705,6 +734,9 @@ func (s *step) deleteKey(ctx context.Context, i int) error {
 		switch {
 		case err != nil:
 			p.outcome[i] = outcomeUnknown
+			if stops(ctx, err) {
+				return err
+			}
 			return nil
 		case states[row].present:
 			p.outcome[i] = outcomeNotMatched
@@ -718,7 +750,7 @@ func (s *step) deleteKey(ctx context.Context, i int) error {
 	switch {
 	case err != nil:
 		s.rep.GCRowErrors++
-		if errors.Is(err, errLeaseExpiring) {
+		if stops(ctx, err) {
 			return err
 		}
 	case kept:

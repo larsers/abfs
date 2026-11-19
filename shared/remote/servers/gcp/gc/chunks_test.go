@@ -435,6 +435,23 @@ func TestChunkStep_BucketSettings(t *testing.T) {
 	require.False(f.objectExists(obj))
 }
 
+// A read of the bucket settings that the end of the run stops is no reason
+// to skip the chunks: the step fails with the run.
+func TestChunkStep_PreconditionsStopWithTheRun(t *testing.T) {
+	require := require.New(t)
+	f := newChunkFixture(t)
+	d := f.deleter(f.lease, nil)
+	s := &chunkStep{d: d, reads: writeBudget{deadline: d.opts.WriteDeadline}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	skipped, err := s.preconditions(ctx)
+	require.Equal(codes.Canceled, status.Code(err))
+	require.Empty(skipped)
+	skipped, err = s.preconditions(context.Background())
+	require.NoError(err)
+	require.Empty(skipped)
+}
+
 // A key the step cannot finish leaves its record without the flag, and the
 // next step reads it again: a chunk of a depot the step does not know, or a
 // bucket delete refused by an object hold or a retention policy.
