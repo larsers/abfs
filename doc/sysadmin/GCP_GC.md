@@ -78,7 +78,7 @@ Garbage collection is off unless it is turned on, on the servers and on the clie
 
    Snapshots taken before `gc-keepalive` was on have no ref, so the first delete cycles delete each one that no named workspace holds, with the work tree content only it holds. Before the first delete cycle, have users restore every such snapshot they want to keep into a spare workspace, such as a new `--tmp-ws` mount, with `abfs ws snapshot --restore <hash> <path>`, which writes its ref, or keep the work in a named workspace. A restore replaces the work tree at `<path>`, so never restore into a workspace with work in it. Widen `--delete-types` step by step, as the [operator rules](#operator-rules) say.
 
-A store on which an earlier version of the collector ran is not upgraded in place: remove its garbage collector state first, so that no earlier marker survives. Delete the Spanner tables `AbfsGcState`, `AbfsGcServers` and `AbfsGcLists`, the Bigtable table `abfsgc` and the column family `abfsgc` of `objects`, and the bucket objects under `abfsgc/`, then follow the steps above from step 1. A store of a version before these names holds instead the Spanner tables `GcState`, `GcServers`, `GcLists` and, if present, `GcReplicas`, the Bigtable table `gc` and the column family `g` of `objects`, and the bucket objects under `gc/`.
+A store on which an earlier version of the collector ran is not upgraded in place: remove its garbage collector state first, so that no earlier marker survives (see [Remove garbage collection](#remove-garbage-collection)), then follow the steps above from step 1. A store of a version before these names holds instead the Spanner tables `GcState`, `GcServers`, `GcLists` and, if present, `GcReplicas`, the Bigtable table `gc` and the column family `g` of `objects`, and the bucket objects under `gc/`.
 
 Off means the state before step 1. A server without `--gc` reads and writes only what a server without garbage collection does and starts on a deployment that plain `init` created; a client without `gc-keepalive` sends nothing extra. The garbage collector resources can stay in place.
 
@@ -89,7 +89,44 @@ These changes that come with garbage collection apply even when it is off. Each 
 * The git-pusher forgets the LFS objects it pushed for a project after a push of that project fails, so the next push checks them against the server again. It also forgets a cached deep tree that the server reports missing, and computes it again.
 * Cacheman serves a `/remote-headers` request, used only by the client keep-alive.
 
-To turn garbage collection off, stop the collector job, restart the servers without `--gc` and turn `gc-keepalive` off. Objects added while it is off get no `abfsgc` row, so turning it on again needs steps 2, 3 and 4 again; until the backfill ran, the consistency pass of the dry run reports the objects without a row, and the condemn and delete modes refuse to run while any are missing. Markers that a condemn cycle wrote stay on their rows while garbage collection is off, and servers without `--gc` do not rescue them, so a marked object used while it was off keeps a marker whose hold may have ended. Before turning it on again, remove the garbage collector state as for a store on which an earlier version of the collector ran (above). If the state stays, the collector covers the case in which objects were added while it was off: a condemn or delete cycle that finds an object without an `abfsgc` row, or one written during its scan by a server without `--gc`, deletes every row of `AbfsGcLists` of its state before it writes any marker (`condemn.records_cleared`), so no old marker counts for a delete and each is written again with a full hold. For that, run one condemn cycle after step 2 and before the backfill; it refuses because of the missing rows. It cannot tell an off period in which no object was added.
+To turn garbage collection off, stop the collector job, restart the servers without `--gc` and turn `gc-keepalive` off. Objects added while it is off get no `abfsgc` row, so turning it on again needs steps 2, 3 and 4 again; until the backfill ran, the consistency pass of the dry run reports the objects without a row, and the condemn and delete modes refuse to run while any are missing. Markers that a condemn cycle wrote stay on their rows while garbage collection is off, and servers without `--gc` do not rescue them, so a marked object used while it was off keeps a marker whose hold may have ended. Before turning it on again, remove the garbage collector state (see [Remove garbage collection](#remove-garbage-collection)). If the state stays, the collector covers the case in which objects were added while it was off: a condemn or delete cycle that finds an object without an `abfsgc` row, or one written during its scan by a server without `--gc`, deletes every row of `AbfsGcLists` of its state before it writes any marker (`condemn.records_cleared`), so no old marker counts for a delete and each is written again with a full hold. For that, run one condemn cycle after step 2 and before the backfill; it refuses because of the missing rows. It cannot tell an off period in which no object was added.
+
+### Remove garbage collection
+
+Removal deletes the garbage collector resources and all their state, the delete records included, so no `gc undo` is possible after it. The chunks of delete records without the flag `chunks-done` stay in the bucket and the `chunks` table for good. Refs and snapshot refs stay; without garbage collection a snapshot ref is an ordinary ref.
+
+1. Stop the collector job and let a running `gc backfill` finish. `SELECT LeaseExpiry FROM AbfsGcState` must return no time in the future.
+2. Restart every server without `--gc`. Wait until no server with `--gc` is live, 11 minutes 30 seconds at the default heartbeat; this query must return 0:
+
+   ```sh
+   gcloud spanner databases execute-sql <db> --instance=<spanner-instance> --sql="SELECT COUNT(*) FROM AbfsGcServers WHERE StoppedAt IS NULL AND LastSeen > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 12 MINUTE)"
+   ```
+
+3. Turn `gc-keepalive` off in the configurations step 4 of [Enable or disable garbage collection](#enable-or-disable-garbage-collection) turned it on in. A mount keeps it until it is mounted again, and cacheman keeps its local write check until it restarts.
+4. Delete the column family `abfsgc` of `objects`, the table `abfsgc` and the app profile of the collector. gcloud cannot delete a column family, so use `cbt`. When `objects` has deletion protection, turn it off for the family delete and on again after.
+
+   ```sh
+   cbt -project <project> -instance <bt-instance> deletefamily objects abfsgc
+   gcloud bigtable instances tables delete abfsgc --instance=<bt-instance> --quiet
+   gcloud bigtable app-profiles delete abfs-gc --instance=<bt-instance> --force --quiet
+   ```
+
+   A deployment that manages its Bigtable tables with a tool such as Config Connector or Terraform removes the family, the table and the profile there instead, or the tool creates them again.
+5. Drop the Spanner tables. Spanner backups keep them until the backups expire.
+
+   ```sh
+   gcloud spanner databases ddl update <db> --instance=<spanner-instance> --ddl='DROP TABLE IF EXISTS AbfsGcLists; DROP TABLE IF EXISTS AbfsGcServers; DROP TABLE IF EXISTS AbfsGcState'
+   ```
+
+6. Delete the bucket objects. On a store where no condemn or delete cycle ran, the prefix is empty and the command exits 1 with `matched no objects`, which means nothing was left to remove.
+
+   ```sh
+   gcloud storage rm --all-versions "gs://<bucket>/abfsgc/**"
+   ```
+
+7. Remove the roles of a separate collector account (see [Permissions of the collector](#permissions-of-the-collector)); keep those of the server account.
+
+After the removal, `objects` has the families `data` and `meta`, the instance has the tables `chunks`, `maps` and `objects`, the database has no `AbfsGc` table, and a server without `--gc` starts and reads the store. Do not undelete the table `abfsgc` to turn garbage collection on again, since its edges are stale. Turn it on with the steps of [Enable or disable garbage collection](#enable-or-disable-garbage-collection) from step 1; `init --gc` creates the table again at once.
 
 ### Upgrades
 
@@ -461,7 +498,7 @@ When every key of a record is done, the chunk step sets the custom metadata `chu
 
 ### Chunk step
 
-In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag. From 15 minutes after a record was created, it repeats the `abfsgc` row deletes of its objects without a row, which a delete step that stopped can leave, and sets `gc-rows-done=<cycle>` on it (`records_gc_rows_done`). From 7 days after, the undo window, it deletes the chunks, and repeats the `abfsgc` row deletes of a record without `gc-rows-done`. Younger records count in `records_waiting`. For each object of a record:
+In each delete cycle, also one whose deletes were refused, the chunk step reads the delete records without the flag. It runs before the delete step of its cycle, so the records a cycle writes show first in the chunk step of the next cycle. From 15 minutes after a record was created, it repeats the `abfsgc` row deletes of its objects without a row, which a delete step that stopped can leave, and sets `gc-rows-done=<cycle>` on it (`records_gc_rows_done`). From 7 days after, the undo window, it deletes the chunks, and repeats the `abfsgc` row deletes of a record without `gc-rows-done`. Younger records count in `records_waiting`. For each object of a record:
 
 | Object row | Outcome | Count |
 | --- | --- | --- |
