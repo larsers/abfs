@@ -69,9 +69,42 @@ func (c *gcpGCCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return clierr.NoSubcommandErr(fl)
 }
 
+type gcServer struct {
+	opts gcp.NewServerOpts
+}
+
+func (s *gcServer) registerFlags(fl *pflag.FlagSet, appProfileUsage string) {
+	registerStoreFlags(fl, &s.opts.ProjectID, &s.opts.InstanceID, &s.opts.DatabaseID, &s.opts.BtInstance, &s.opts.BucketName)
+	fl.StringVar(&s.opts.BtAppProfile, "bt-app-profile", "", appProfileUsage)
+	fl.BoolVar(&s.opts.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
+}
+
+func (s *gcServer) setOpts() {
+	s.opts.GC = true
+	s.opts.GCReadOnly = true
+	s.opts.MaxCachedHeaders = 1
+	s.opts.MaxCachedContents = 1
+	s.opts.SmallPools = true
+}
+
+func (s *gcServer) check() error {
+	return requireStoreFlags(s.opts.ProjectID, s.opts.InstanceID, s.opts.BucketName)
+}
+
+// open creates a read-only server: a command's reads must not rescue or count
+// as a use, or a command would keep what it reads.
+func (s *gcServer) open(ctx context.Context) (*gcp.GCPServer, error) {
+	s.setOpts()
+	server, err := gcp.New(ctx, &s.opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+	}
+	return server, nil
+}
+
 type gcpGCBackfillCmd struct {
 	*root.RootCmd
-	server gcp.NewServerOpts
+	server gcServer
 	opts   gc.BackfillOpts
 }
 
@@ -89,40 +122,24 @@ resources of 'abfs server gcp init --gc'.`,
 }
 
 func (c *gcpGCBackfillCmd) RegisterFlags(fl *pflag.FlagSet) {
-	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
-	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
-	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
-	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
-	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
-	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	c.server.registerFlags(fl, appProfileUsage)
 	fl.StringVar(&c.opts.Start, "start", "", "The first object key to scan, a lowercase hexadecimal hash or prefix (default: the start of the table)")
 	fl.IntVar(&c.opts.Shards, "shards", gc.DefaultBackfillShards, "The number of key ranges scanned in parallel")
 	fl.Float64Var(&c.opts.Rate, "rate", defaultBackfillRate, "The maximum number of object rows scanned per second (0 means no limit)")
 	fl.BoolVar(&c.opts.DryRun, "dry-run", false, "Count the gc rows to write and write none")
-	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
 }
 
 func (c *gcpGCBackfillCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
-	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+	if err := c.server.check(); err != nil {
 		return err
 	}
-	// The scan reads each object once, so caching them only costs memory.
-	// Its reads must not rescue condemned objects or count as a use.
-	c.server.GC = true
-	c.server.GCReadOnly = true
-	c.server.MaxCachedHeaders = 1
-	c.server.MaxCachedContents = 1
-	checkAppProfile(ctx, &c.server)
-	server, err := gcp.New(ctx, &c.server)
+	checkAppProfile(ctx, &c.server.opts)
+	server, err := c.server.open(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+		return err
 	}
-	defer func() {
-		if err := server.Close(); err != nil {
-			log.Printf("Warning: error closing ABFS server: %v", err)
-		}
-	}()
+	defer closeServer(server)
 	stats, err := server.BackfillGC(ctx, &c.opts)
 	if stats != nil {
 		printBackfillStats(stats, c.opts.DryRun)
@@ -154,7 +171,7 @@ func printBackfillStats(stats *gc.BackfillStats, dryRun bool) {
 
 type gcpGCRunCmd struct {
 	*root.RootCmd
-	server  gcp.NewServerOpts
+	server  gcServer
 	opts    gc.DeleteOpts
 	dryRun  bool
 	condemn bool
@@ -213,13 +230,7 @@ window. Of several, the lowest. A dry run exits 0 or 1.`,
 
 func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	c.opts = gc.DefaultDeleteOpts()
-	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
-	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
-	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
-	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
-	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
-	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
-	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	c.server.registerFlags(fl, appProfileUsage)
 	fl.BoolVar(&c.dryRun, "dry-run", false, "Report what a collection would remove and change nothing")
 	fl.BoolVar(&c.condemn, "condemn", false, "Mark the unreachable objects as condemned and delete nothing")
 	fl.BoolVar(&c.delete, "delete", false, "Delete the unreachable objects whose condemn marker has held long enough, then condemn as --condemn does")
@@ -242,12 +253,10 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringSliceVar(&c.explain, "explain", nil, "Object keys, separated by commas, whose gc row, reachability, first root, times and condemn marker the report explains")
 }
 
-// deleteOnlyFlags are the flags that only delete mode reads.
 var deleteOnlyFlags = []string{
 	"delete-types", "accept-mounts-without-keepalive", "delete-start-delay",
 }
 
-// checkOpts checks the mode flags set in fl and fills the keys to explain.
 func (c *gcpGCRunCmd) checkOpts(fl *pflag.FlagSet) error {
 	modes := 0
 	for _, m := range []bool{c.dryRun, c.condemn, c.delete} {
@@ -281,14 +290,8 @@ func (c *gcpGCRunCmd) checkOpts(fl *pflag.FlagSet) error {
 	if err != nil {
 		return err
 	}
-	c.opts.Explain = nil
-	for _, k := range c.explain {
-		if !entities.IsHash(k) {
-			return fmt.Errorf("invalid key %q for --explain", k)
-		}
-		c.opts.Explain = append(c.opts.Explain, entities.NewHash(k))
-	}
-	return nil
+	c.opts.Explain, err = parseKeys("--explain", c.explain)
+	return err
 }
 
 func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -298,8 +301,6 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return m.endCycle(c.mode(), r, err)
 }
 
-// endCycle sets the gauges of a cycle in mode that reported r and returned
-// err, and returns the error that gives the exit code.
 func (m *cycleMetrics) endCycle(mode string, r *gc.Report, err error) error {
 	result, code := cycleExit(r, err)
 	m.record(mode, result, r, time.Now())
@@ -309,7 +310,6 @@ func (m *cycleMetrics) endCycle(mode string, r *gc.Report, err error) error {
 	return clierr.CLIErrWithExitCode(code, "%s", outcomeMessage(r, err))
 }
 
-// mode returns the mode of the cycle, empty when no mode flag is set.
 func (c *gcpGCRunCmd) mode() string {
 	switch {
 	case c.delete:
@@ -333,9 +333,7 @@ var outcomeExitCodes = map[string]int{
 	gc.OutcomeChunksSkipped:  6,
 }
 
-// cycleExit returns the result label and the exit code of a cycle that
-// reported r and returned err. A cycle without a report failed, whatever its
-// outcome.
+// A cycle without a report failed, whatever its outcome.
 func cycleExit(r *gc.Report, err error) (string, int) {
 	var refused *gc.ErrCondemnRefused
 	switch {
@@ -350,8 +348,6 @@ func cycleExit(r *gc.Report, err error) (string, int) {
 	return outcome, outcomeExitCodes[outcome]
 }
 
-// outcomeMessage returns the error line of a cycle that exits with an
-// outcome other than OutcomeOK.
 func outcomeMessage(r *gc.Report, err error) string {
 	if err != nil {
 		return err.Error()
@@ -378,9 +374,8 @@ func outcomeMessage(r *gc.Report, err error) string {
 	return fmt.Sprintf("the GC cycle %d ended with outcome %s", r.Cycle, outcome)
 }
 
-// cycleMetrics are the gauges of a cycle, set once at its end. Each run is a
-// new series, so they are gauges: a counter would have one point, in which a
-// rate sees no increase.
+// Each run is a new series, so these are gauges: a counter would have one
+// point, in which a rate sees no increase.
 type cycleMetrics struct {
 	end    metrics.Gauge
 	keys   metrics.Gauge
@@ -395,9 +390,7 @@ func newCycleMetrics(p metrics.Provider) *cycleMetrics {
 	}
 }
 
-// record sets the gauges of a cycle that ended at end with result and
-// reported r, which may be nil. The counts are those of the steps the mode
-// runs, zero for a step that did not run.
+// record sets zero counts for the steps the mode does not run; r may be nil.
 func (m *cycleMetrics) record(mode, result string, r *gc.Report, end time.Time) {
 	m.end.Set(float64(end.Unix()), mode, result)
 	if r == nil || mode == gc.PhaseDryRun {
@@ -425,42 +418,32 @@ func (m *cycleMetrics) record(mode, result string, r *gc.Report, end time.Time) 
 	m.chunks.Set(float64(objects), "bucket")
 }
 
-// run runs the cycle, writes its report and returns it, nil when the cycle
-// stopped before it had one or the report could not be written.
+// run returns nil when the cycle stopped before its report was written.
 func (c *gcpGCRunCmd) run(ctx context.Context, fl *pflag.FlagSet) (*gc.Report, error) {
 	if err := c.checkOpts(fl); err != nil {
 		return nil, err
 	}
-	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+	if err := c.server.check(); err != nil {
 		return nil, err
 	}
-	// The run reads only the workspace snapshots, mount details and pinned
-	// manifests, once each, and must not rescue them.
-	c.server.GC = true
-	c.server.GCReadOnly = true
-	c.server.MaxCachedHeaders = 1
-	c.server.MaxCachedContents = 1
-	profile := checkAppProfile(ctx, &c.server)
+	profile := checkAppProfile(ctx, &c.server.opts)
 	if c.delete && len(profile.Problems) > 0 {
 		return nil, fmt.Errorf("the Bigtable app profile %s does not fit a delete cycle: %s", profile.ID, strings.Join(profile.Problems, "; "))
 	}
-	server, err := gcp.New(ctx, &c.server)
+	server, err := c.server.open(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+		return nil, err
 	}
-	defer func() {
-		if err := server.Close(); err != nil {
-			log.Printf("Warning: error closing ABFS server: %v", err)
-		}
-	}()
+	defer closeServer(server)
+	o := &c.server.opts
 	var res *gc.Result
 	switch {
 	case c.delete:
-		res, err = server.DeleteGC(ctx, c.server.BucketName, server.GCInstanceChecks(c.server.ProjectID, c.server.BtInstance), &c.opts)
+		res, err = server.DeleteGC(ctx, o.BucketName, server.GCInstanceChecks(o.ProjectID, o.BtInstance), &c.opts)
 	case c.condemn:
-		res, err = server.CondemnGC(ctx, c.server.BucketName, &c.opts.CondemnOpts)
+		res, err = server.CondemnGC(ctx, o.BucketName, &c.opts.CondemnOpts)
 	default:
-		res, err = server.DryRunGC(ctx, c.server.BucketName, &c.opts.DryRunOpts)
+		res, err = server.DryRunGC(ctx, &c.opts.DryRunOpts)
 	}
 	if res == nil {
 		return nil, err
@@ -474,7 +457,7 @@ func (c *gcpGCRunCmd) run(ctx context.Context, fl *pflag.FlagSet) (*gc.Report, e
 
 type gcpGCUndoCmd struct {
 	*root.RootCmd
-	server gcp.NewServerOpts
+	server gcServer
 	opts   gc.UndoOpts
 }
 
@@ -498,13 +481,7 @@ that lost the lease has stopped writing. Fails when something was not restored.`
 
 func (c *gcpGCUndoCmd) RegisterFlags(fl *pflag.FlagSet) {
 	c.opts = gc.DefaultUndoOpts()
-	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
-	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
-	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
-	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
-	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", appProfileUsage)
-	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
-	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	c.server.registerFlags(fl, appProfileUsage)
 	fl.Int64Var(&c.opts.Cycle, "cycle", 0, "The first delete cycle whose deletes are undone (required)")
 	fl.Int64Var(&c.opts.Through, "through", 0, "The last delete cycle whose deletes are undone (default: --cycle)")
 }
@@ -521,22 +498,16 @@ func (c *gcpGCUndoCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	if err := c.checkOpts(); err != nil {
 		return err
 	}
-	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+	if err := c.server.check(); err != nil {
 		return err
 	}
-	c.server.GC = true
-	c.server.GCReadOnly = true
-	checkAppProfile(ctx, &c.server)
-	server, err := gcp.New(ctx, &c.server)
+	checkAppProfile(ctx, &c.server.opts)
+	server, err := c.server.open(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+		return err
 	}
-	defer func() {
-		if err := server.Close(); err != nil {
-			log.Printf("Warning: error closing ABFS server: %v", err)
-		}
-	}()
-	rep, err := server.UndoGC(ctx, c.server.BucketName, &c.opts)
+	defer closeServer(server)
+	rep, err := server.UndoGC(ctx, c.server.opts.BucketName, &c.opts)
 	if rep != nil {
 		printUndo(rep)
 	}
@@ -563,7 +534,7 @@ func printUndo(rep *gc.UndoReport) {
 
 type gcpGCWalkCmd struct {
 	*root.RootCmd
-	server  gcp.NewServerOpts
+	server  gcServer
 	opts    gc.WalkOpts
 	details []string
 	keys    []string
@@ -585,13 +556,7 @@ are not hashes, or objects it could not read; a key outside may then be inside.`
 }
 
 func (c *gcpGCWalkCmd) RegisterFlags(fl *pflag.FlagSet) {
-	fl.StringVar(&c.server.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
-	fl.StringVar(&c.server.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
-	fl.StringVar(&c.server.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
-	fl.StringVar(&c.server.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
-	fl.StringVar(&c.server.BtAppProfile, "bt-app-profile", "", "The GCP Bigtable App Profile ID (empty uses the instance default app profile)")
-	fl.BoolVar(&c.server.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
-	fl.StringVar(&c.server.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	c.server.registerFlags(fl, "The GCP Bigtable App Profile ID (empty uses the instance default app profile)")
 	fl.StringSliceVar(&c.details, "mount-details", nil, "The mount details, separated by commas, whose pinned revisions are walked: the targets of the mount refs of a client (required)")
 	fl.StringSliceVar(&c.keys, "key", nil, "The object keys, separated by commas, to look for (required)")
 }
@@ -624,22 +589,14 @@ func (c *gcpGCWalkCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	if err := c.checkOpts(); err != nil {
 		return err
 	}
-	if err := requireFlags(map[string]string{"--project": c.server.ProjectID, "--instance": c.server.InstanceID, "--bucket": c.server.BucketName}); err != nil {
+	if err := c.server.check(); err != nil {
 		return err
 	}
-	// Its reads must not rescue condemned objects or count as a use, or the
-	// walk would keep what it is asked about.
-	c.server.GC = true
-	c.server.GCReadOnly = true
-	server, err := gcp.New(ctx, &c.server)
+	server, err := c.server.open(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
+		return err
 	}
-	defer func() {
-		if err := server.Close(); err != nil {
-			log.Printf("Warning: error closing ABFS server: %v", err)
-		}
-	}()
+	defer closeServer(server)
 	res, err := server.WalkGC(ctx, &c.opts)
 	if err != nil {
 		return err
@@ -676,8 +633,6 @@ func printWalk(res *gc.WalkResult) {
 	}
 }
 
-// checkAppProfile reads the Bigtable app profile of a GC command and warns
-// about each setting the collector needs that it lacks.
 func checkAppProfile(ctx context.Context, o *gcp.NewServerOpts) *gc.ProfileReport {
 	rep := gc.ReadAppProfile(ctx, o.ProjectID, o.BtInstance, o.BtAppProfile)
 	for _, p := range rep.Problems {

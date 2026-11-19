@@ -227,7 +227,7 @@ abfs server gcp gc run --dry-run --project <project> --instance <spanner-instanc
 
    The command deletes the `AbfsGcServers` rows whose last heartbeat and stop are older than the longest of a day, the largest `--grace` of any condemn or delete cycle plus 10 hours, and its own `--grace` plus 10 hours (`replicas.servers_removed`); the 10 hours are an hour and the 9 hours before the window in which a lost map row touch is still reported (`replicas.map_row_loss_time`). Lost touches are reported, not checked.
 3. Reads every ref at one snapshot time, with low priority, and sorts the refs into retention classes (below).
-4. For each live mount (see [Mounts and unmounts](#mounts-and-unmounts)), reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
+4. For each live mount (see [Mounts and unmounts](#mounts-and-unmounts)), reads its mount details and its pinned manifest, and keeps the project revisions that are object hashes: the commits the mount reads, and the workspace trees that a mount pins in the project annotation `abfs.dir.hash.tag` and uses in place of a commit's tree. For each workspace ref and each snapshot ref, reads its workspace snapshot, the mount details it was taken from and their pinned manifest, and keeps their revisions the same way: the commits the workspace is based on, which the snapshot does not link. Other revisions, such as branch names, are counted and ignored.
 5. Scans the `abfsgc` table twice in 16 key ranges: first keys, types and times, then the edges, and the keys of the `maps` table. It reads no object content.
 6. Marks in memory everything the roots reach. It walks the roots one at a time in a fixed order: the refs of the classes source, workspaces, snapshots, mounts and unmount records, then the pinned revisions, builds, other `abfs-meta` refs, empty objects, recent objects and map rows, so that the report can name the root that reached an object first. Edges to objects without an `abfsgc` row are skipped and counted. An `abfsgc` row with an object type the binary does not know stops the run.
 7. Scans the `meta` family and the newest condemn marker of the `objects` table to check that every object has an `abfsgc` row, to sum the sizes (`meta:size`) of reachable and unreachable objects and to read the marker of each. This reads every object row once. `consistency.marked` counts the objects with a marker and `consistency.marked_live` those the mark found live. In a delete cycle the scan also checks each object written during it (see [Delete checks](#delete-checks)).
@@ -349,7 +349,7 @@ The cycle condemns only when its own report is clean. It refuses, writes no mark
 * the consistency check did not run, or found objects without an `abfsgc` row. Such objects show that servers ran without `--gc`, so the cycle first deletes every row of `AbfsGcLists` of its state (`condemn.records_cleared`; see [Enable or disable garbage collection](#enable-or-disable-garbage-collection));
 * `abfsgc` rows with outdated or newer edge rules (`objects.outdated_rows`, `objects.newer_rows`);
 * `live_mounts.errors`, `workspaces.errors` or `snapshots.errors`: a pin that could not be read may hide commits a mount, workspace or snapshot needs;
-* a dangling root in the classes `source`, `project-status`, `pushed-packs`, `workspace`, `snapshot`, `mount` or `permanent`. Dangling `pinned-revisions` roots, for example of projects a mount skipped with `--ignore-missing-projects`, do not refuse; check them in `dangling_revisions` and its samples.
+* a dangling root in the classes `source`, `project-status`, `pushed-packs`, `config`, `acl`, `workspace`, `snapshot`, `mount` or `permanent`. Dangling `pinned-revisions` roots, for example of projects a mount skipped with `--ignore-missing-projects`, do not refuse; check them in `dangling_revisions` and its samples.
 
 ### Replica counts
 
@@ -486,7 +486,7 @@ Cacheman reports its checks in `remote_checks` of its stats. `skipped` counts th
 
 ### Map rows
 
-Before the objects, the step deletes the map rows that name a candidate, and the eval rows past `--map-retention` whose two ends stay live.
+Before the objects, the step deletes the map rows that name a candidate, and the eval rows past `--map-retention` whose request stays live and whose result stays live or has no `abfsgc` row.
 
 * Each delete is conditional: a row written or used since the start of the grace (for an expired eval row, since the start of the map retention) stays, and a row that stays keeps both its candidate ends.
 * A row goes only when both its ends are of types `--delete-types` allows; an end without an `abfsgc` row counts as allowed. Otherwise the row stays and keeps its candidate ends, so a cycle limited to some types drops no cached result of the others.
@@ -513,7 +513,9 @@ A chunk row goes only when it has no cell newer than the record, such as the cel
 The step deletes no chunks, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of the settings below. The `abfsgc` row deletes run either way. `records_skipped` counts the records past the undo window whose chunks it skipped. When the records cannot be listed, the step does nothing and reports `list_failed`. Either makes the cycle exit with status 6, as does a record that `unflagged` counts.
 
 * Object Versioning on: a delete would keep a noncurrent version;
-* a retention policy, a default event-based hold or object retention: each can refuse a delete.
+* a retention policy or a default event-based hold: each can refuse a delete.
+
+The gRPC API the servers use does not report object retention, so the step cannot check it; a delete that the retention of an object refuses counts in `delete_refused`.
 
 Bucket soft delete plays no part: a bucket with it on works as one without it.
 
@@ -604,11 +606,11 @@ A batch writes its record before its deletes, so a record can name a key that it
 What the undo does:
 
 * It fails when a cycle in the range has pruned records, or a record of the range is of format version 1. When a restored object links an absent object, it reads the keys of the records of every cycle, and then any record of format version 1 under `abfsgc/deleted/<state>/` fails it. Delete those records first (see [Upgrades](#upgrades)).
-* It takes the lease in the phase `undo`, which does not raise the largest grace. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two write attempts of 30 seconds each and a minute.
+* It takes the lease in the phase `undo`, which does not raise the largest grace, and lists the records again then, so that no collector removes them meanwhile. A range it refuses fails before the lease and leaves the GC state as it was. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two write attempts of 30 seconds each and a minute.
 * It restores the newest cycle first and in each cycle the deepest level first, so children come back before their parents.
 * For each object whose row is absent: its chunks must exist; its bucket chunks get the custom metadata `abfs-undo=<cycle>` and its chunk rows a cell `data:undo` with a new time, so that a chunk step that read them earlier cannot delete them; its `abfsgc` row is written from the record with a new time and a touch, so it is recent for `--grace`; its `objects` row comes last, with the cells and times of the record, without the marker.
 * An object is not restored, nor anything that links it, when a chunk is gone (`missing_chunks`; the log names the chunk), it had no `abfsgc` row when it was deleted (`without_gc_row`), or it links an absent object that this run did not restore and that a delete record of another cycle names, or, when the records of a cycle were pruned, any absent object (`blocked_by_child`).
-* Map rows come back with a new time. What is present stays as it is.
+* Map rows come back with a new time. A map row is not restored when an end was not restored, or is absent under the same rules as a linked object (`map_rows_blocked`; the log names the end). What is present stays as it is.
 
 ## Operator rules
 

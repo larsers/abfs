@@ -96,7 +96,7 @@ func TestApplyBulk_AttemptDeadline(t *testing.T) {
 			keys := testHashes(3)
 			mut := bigtable.NewMutation()
 			mut.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), markerValue(4))
-			err := applyBulk(ctx, writeBudget{deadline: 200 * time.Millisecond}, client.Open(objectsTableName), rowKeys(keys), mut)
+			err := applyBulk(ctx, writeBudget{deadline: 200 * time.Millisecond}, client.Open(objectsTable), rowKeys(keys), mut)
 			require.NoError(ctx.Err(), "the run's context ended first")
 			if tt.wantErr {
 				require.Error(err)
@@ -165,7 +165,7 @@ func TestLease_CheckWrite(t *testing.T) {
 	client := newHooksTestBigtable(t, stalls.options()...)
 	mut := bigtable.NewMutation()
 	mut.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), markerValue(4))
-	err := applyBulk(context.Background(), writeBudget{deadline: d, lease: l}, client.Open(objectsTableName), rowKeys(testHashes(2)), mut)
+	err := applyBulk(context.Background(), writeBudget{deadline: d, lease: l}, client.Open(objectsTable), rowKeys(testHashes(2)), mut)
 	require.ErrorIs(err, errLeaseExpiring)
 	require.Zero(stalls.calls.Load(), "a write was sent")
 }

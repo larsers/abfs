@@ -35,58 +35,48 @@ import (
 )
 
 const (
-	// The keep-alive's batch size, which is also the per-call key limit of the gRPC client.
+	// The keep-alive's batch size, also the per-call key limit of the gRPC client.
 	localWriteCheckBatchSize = 50000
-	// Headers calls the start pass has in flight.
 	localWriteStartPassCalls = 4
 	localWriteRetryWait      = time.Second
 	maxLocalWriteRetryWait   = time.Minute
-	// Restored entries whose hash the start logs.
 	localWriteRestoredLogged = 10
 
-	// Keys the start pass sends per second at most, the rate of a mount's keep-alive. Each key
-	// the server finds can queue a touch, and the server drops touches when its buffer is full.
+	// Keys the start pass sends per second at most, the rate of a mount's keep-alive.
 	localWriteStartPassRate = 10000
 )
 
 var (
-	// localWriteCheckPeriod is the longest a queued check waits before it is sent.
-	localWriteCheckPeriod = time.Second
-	// localWriteStartPassBatch is the number of keys per Headers call of the start pass.
+	localWriteCheckPeriod    = time.Second
 	localWriteStartPassBatch = localWriteStartPassRate
 	newStartPassPacer        = func() *keyPacer { return newKeyPacer(localWriteStartPassRate) }
-	// unconfirmedPushDropAfter is how long a push of content the server lacks may wait for an
-	// object that is in no local store. dagsync retries such an object at waits that grow by
-	// 5 s per try, about 27 tries in this time, while content a mount writes reaches the store
-	// within seconds. The next keep-alive or start pushes a dropped entry again.
+	// How long a push waits for an object in no local store. Content a mount writes reaches
+	// the store within seconds.
 	unconfirmedPushDropAfter = 30 * time.Minute
-	// localWriteParkTime is how long an entry the server lacks stays parked, out of eviction
-	// and not pushed, unless a mount names it. It is longer than the time the server GC lets a
-	// mount's keep-alive pause at its default settings, about 82 hours.
+	// Longer than the time the server GC lets a mount's keep-alive pause at its default
+	// settings, about 82 hours.
 	localWriteParkTime = 96 * time.Hour
 )
 
 // localWriteCheck keeps content written locally in the cache until the server has confirmed
-// that it holds the object. A local write can equal an object the cache fetched or pushed
-// long ago and that the server GC has deleted since; evicting it under the old remote flag
-// would leave the bytes nowhere. It runs only while the applied config has gc-keepalive on,
-// and once on it stays on for the life of the process, since mount details record it.
+// that it holds the object. Once on it stays on for the life of the process, since mount
+// details record it.
 type localWriteCheck struct {
 	on atomic.Bool
 
-	mu     sync.Mutex
-	ctx    context.Context
-	index  localWriteIndex
-	worker bool
-	queue  map[entities.Hash]EntryType
-	full   chan struct{}
+	mu         sync.Mutex
+	ctx        context.Context
+	index      localWriteIndex
+	worker     bool
+	cancelPass context.CancelFunc
+	queue      map[entities.Hash]EntryType
+	full       chan struct{}
 
-	// phonySync is the dagsync whose phony callbacks report an answer of the server. A
-	// dagsync with an offline threshold skips requests and then calls back without an
-	// error and without a server call, so phony requests sent to it confirm nothing.
+	// phonySync is the dagsync whose phony callbacks report an answer of the server. A dagsync
+	// with an offline threshold calls back without a server call.
 	phonySync atomic.Pointer[dagsync.DAGSync]
-	// phonies counts the phony requests in flight per list of hashes. dagsync joins a phony
-	// request to a running identical one, whose answer can predate the joining request.
+	// phonies counts the phony requests in flight per list of hashes, since dagsync joins a
+	// request to a running identical one.
 	phonies map[string]int
 
 	sent            atomic.Int64
@@ -125,7 +115,6 @@ func (lw *localWriteCheck) enqueueLocked(hash entities.Hash, entryType EntryType
 	}
 }
 
-// take removes up to n queued hashes and returns them with their entry types.
 func (lw *localWriteCheck) take(n int) ([]entities.Hash, []EntryType) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
@@ -157,25 +146,22 @@ func (c *CacheMan) checkedIndex() (localWriteIndex, bool) {
 	return idx, ok
 }
 
-// applyLocalWriteCheck turns the check on once config has gc-keepalive on. A config that turns
-// it off later takes effect at the next start.
+// applyLocalWriteCheck turns the check on once config has gc-keepalive on. Turning it off
+// takes effect at the next start.
 func (c *CacheMan) applyLocalWriteCheck(config *instance.Config) {
 	if config.GCKeepAlive && config.EnableIndex && !config.LocalOnly {
 		c.localWrites.on.Store(true)
 	}
-	idx, ok := c.checkedIndex()
-	if !ok {
-		return
+	if idx, ok := c.checkedIndex(); ok {
+		idx.enableLocalWriteCheck()
 	}
-	idx.enableLocalWriteCheck()
 
 	c.localWrites.mu.Lock()
 	defer c.localWrites.mu.Unlock()
 	c.startLocalWriteCheckLocked()
 }
 
-// startLocalWriteCheck starts the check worker and the start pass. Serve calls it before
-// it starts the new-object workers.
+// startLocalWriteCheck starts the check worker and the start pass.
 func (c *CacheMan) startLocalWriteCheck(ctx context.Context) {
 	c.localWrites.mu.Lock()
 	defer c.localWrites.mu.Unlock()
@@ -186,17 +172,24 @@ func (c *CacheMan) startLocalWriteCheck(ctx context.Context) {
 func (c *CacheMan) startLocalWriteCheckLocked() {
 	lw := &c.localWrites
 	idx, ok := c.checkedIndex()
-	if !ok || lw.ctx == nil || idx == lw.index {
+	if lw.ctx == nil || (ok && idx == lw.index) {
 		return
 	}
+	// A config reload closed the index of the running pass.
+	if lw.cancelPass != nil {
+		lw.cancelPass()
+		lw.cancelPass = nil
+	}
 	lw.index = idx
+	if !ok {
+		return
+	}
 
 	// An entry cleared before a restart is not Remote, so nothing else would check it.
 	markers, err := idx.checkMarkers()
 	if err != nil {
 		c.printer.Printf("Failed to read the check markers: %v\n", err)
 	}
-	// A few restored hashes go to the log, so that an operator can look them up.
 	var restored []entities.Hash
 	var restoredCount int
 	for _, h := range markers {
@@ -230,8 +223,10 @@ func (c *CacheMan) startLocalWriteCheckLocked() {
 	if err != nil {
 		c.printer.Printf("Failed to read the LRU, eviction waits for the cache to fill: %v\n", err)
 	} else {
+		var passCtx context.Context
+		passCtx, lw.cancelPass = context.WithCancel(lw.ctx)
 		c.activeWorkers.Add(1)
-		go c.localWriteStartPass(lw.ctx, idx, slices.Collect(slices.Chunk(lru, localWriteStartPassBatch)))
+		go c.localWriteStartPass(passCtx, idx, slices.Collect(slices.Chunk(lru, localWriteStartPassBatch)))
 	}
 
 	if !lw.worker {
@@ -242,7 +237,6 @@ func (c *CacheMan) startLocalWriteCheckLocked() {
 	}
 }
 
-// stopContext returns a context that is canceled when cacheman stops.
 func (c *CacheMan) stopContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -255,12 +249,11 @@ func (c *CacheMan) stopContext(ctx context.Context) (context.Context, context.Ca
 	return ctx, cancel
 }
 
-// localWriteHeaders asks the server whether it has keys, retrying with backoff until it
-// answers or ctx is done.
+// localWriteHeaders asks the server whether it has keys, retrying until it answers or ctx is done.
 func (c *CacheMan) localWriteHeaders(ctx context.Context, keys []entities.Hash) ([]bool, error) {
 	wait := localWriteRetryWait
 	for {
-		hdrs, err := c.abfsClient.Headers(ctx, keys)
+		hdrs, err := c.remoteClient().Headers(ctx, keys)
 		if err == nil && len(hdrs) != len(keys) {
 			err = fmt.Errorf("server answered %d headers for %d keys", len(hdrs), len(keys))
 		}
@@ -285,7 +278,6 @@ func (c *CacheMan) localWriteHeaders(ctx context.Context, keys []entities.Hash) 
 	}
 }
 
-// localWriteCheckWorker sends the queued checks at least once per period.
 func (c *CacheMan) localWriteCheckWorker(ctx context.Context, full <-chan struct{}, period time.Duration) {
 	defer c.activeWorkers.Done()
 	defer c.logPanic()
@@ -336,8 +328,7 @@ func (c *CacheMan) confirmLocalWrite(hash entities.Hash, entryType EntryType) {
 	}
 }
 
-// pushUnconfirmed handles a hash the server lacks: it pushes the local copy, after which
-// onPush marks the entry remote. The entry stays local and out of the LRU until then.
+// pushUnconfirmed pushes the local copy of a hash the server lacks; onPush then marks it remote.
 func (c *CacheMan) pushUnconfirmed(ctx context.Context, hash entities.Hash, entryType EntryType) {
 	lw := &c.localWrites
 	lw.missing.Add(1)
@@ -350,8 +341,8 @@ func (c *CacheMan) pushUnconfirmed(ctx context.Context, hash entities.Hash, entr
 		c.printer.Printf("Warning: %s %s was written locally, but the cache no longer holds it and the server does not have it\n", entryType, hash)
 		return
 	}
-	// dagsync skips objects over the offline threshold and calls no onPush for them, and a
-	// remote read-only cacheman pushes nothing: such entries stay local and keep their marker.
+	// dagsync calls no onPush for objects over the offline threshold, and a remote read-only
+	// cacheman pushes nothing.
 	if c.noRemotePush() || (entry != nil && entry.Offline) || c.overOfflineThreshold(ctx, hash) {
 		lw.unpushable.Add(1)
 		return
@@ -373,8 +364,7 @@ func (c *CacheMan) pushUnconfirmed(ctx context.Context, hash entities.Hash, entr
 	default:
 		c.pushObjectsStat.Request.Add(1)
 	}
-	// A child that is in no store and that the server lacks would hold the push in dagsync
-	// for good. The entry keeps its marker when the push is dropped.
+	// A child that is in no store and that the server lacks would hold the push for good.
 	go sync.PutObjectOrDrop(hash, objType, unconfirmedPushDropAfter, func(err error) {
 		if errors.Is(err, dagsync.ErrDropped) {
 			lw.dropped.Add(1)
@@ -385,8 +375,7 @@ func (c *CacheMan) pushUnconfirmed(ctx context.Context, hash entities.Hash, entr
 }
 
 // parkDropped parks an entry whose push was dropped in place of its check marker, so that a
-// start does not push it again. A mount that holds the content names it in its keep-alive,
-// which pushes it again.
+// start does not push it again.
 func (c *CacheMan) parkDropped(hash entities.Hash) {
 	idx, ok := c.checkedIndex()
 	if !ok {
@@ -408,8 +397,8 @@ func (c *CacheMan) hasLocalCopy(ctx context.Context, hash entities.Hash, entryTy
 	return err == nil && has
 }
 
-// lacksLocalCopy reports whether the store confirms that it holds no file under hash. An error
-// other than not found counts as a copy, so that a failing disk keeps an entry checked.
+// lacksLocalCopy reports whether the store confirms that it holds no file under hash. Other
+// errors count as a copy, so that a failing disk keeps an entry checked.
 func (c *CacheMan) lacksLocalCopy(ctx context.Context, hash entities.Hash, entryType EntryType) bool {
 	has, err := c.storeHas(ctx, hash, entryType)
 	return err == nil && !has
@@ -431,22 +420,17 @@ func (c *CacheMan) overOfflineThreshold(ctx context.Context, hash entities.Hash)
 	return err == nil && uint64(hdr.Size) > threshold
 }
 
-// checksEntry reports whether the check covers a cached entry: a blob, tree or object whose
-// content the cache holds. ARI entries come from an ARI server. An RBE CAS blob is indexed as a
-// blob under a key derived from its digest, while its content is stored under the digest, so
-// neither the store nor the ABFS server holds a blob under its key.
+// checksEntry reports whether the check covers a cached entry. Neither the store nor the ABFS
+// server holds ARI entries or RBE CAS blobs under their key.
 func (c *CacheMan) checksEntry(ctx context.Context, hash entities.Hash, entry *IndexEntry) bool {
 	return entry != nil && entry.Local && localWriteChecked(entry.EntryType) && !c.lacksLocalCopy(ctx, hash, entry.EntryType)
 }
 
-// isCachedRemote reports whether hash has a Local and Remote entry, which eviction may take.
 func (c *CacheMan) isCachedRemote(hash entities.Hash) bool {
 	entry := c.index.Get(hash)
 	return entry != nil && entry.Local && entry.Remote
 }
 
-// recheckCachedObject handles a cached entry the server lacks: it takes the entry out of the
-// LRU with a check marker and pushes it.
 func (c *CacheMan) recheckCachedObject(ctx context.Context, hash entities.Hash, entryType EntryType) {
 	idx, ok := c.checkedIndex()
 	if !ok {
@@ -467,11 +451,8 @@ func (c *CacheMan) recheckCachedObject(ctx context.Context, hash entities.Hash, 
 	}
 }
 
-// parkCachedObject handles a cached entry the start pass found missing on the server: it parks
-// the entry, out of eviction and without a push. A mount that holds the content names it in its
-// keep-alive, which pushes it; other entries go back to the LRU after localWriteParkTime. An
-// entry released so and not used since moves to the young end of the LRU instead, so that a
-// mount's keep-alive can still name it before eviction takes it.
+// parkCachedObject parks a cached entry the start pass found missing on the server, out of
+// eviction and without a push, until a mount names it or localWriteParkTime ends.
 func (c *CacheMan) parkCachedObject(ctx context.Context, idx localWriteIndex, hash entities.Hash) error {
 	if !c.checksEntry(ctx, hash, c.index.Get(hash)) {
 		c.localWrites.skipped.Add(1)
@@ -490,8 +471,6 @@ func (c *CacheMan) parkCachedObject(ctx context.Context, idx localWriteIndex, ha
 	return nil
 }
 
-// releaseParked returns the entries parked for localWriteParkTime to the LRU, at their place
-// before the park.
 func (c *CacheMan) releaseParked() {
 	idx, ok := c.index.(localWriteIndex)
 	if !ok {
@@ -507,17 +486,14 @@ func (c *CacheMan) releaseParked() {
 	}
 }
 
-// isParked reports whether hash is parked: the server lacked it at the last check, so its
-// Remote flag does not hold.
 func (c *CacheMan) isParked(hash entities.Hash) bool {
 	idx, ok := c.index.(localWriteIndex)
 	return ok && idx.isParked(hash)
 }
 
-// localWriteStartPass checks every LRU entry with the server, in batches oldest first and at
-// most localWriteStartPassRate entries per second, and lets eviction take the entries checked
-// so far. Its calls ask the server to record no use, since a start does not use the content.
-// The calls look up the entries of their batch, which reads the disk.
+// localWriteStartPass checks every LRU entry with the server, oldest first and paced, and lets
+// eviction take the entries checked so far. A start does not use the content, so its calls ask
+// the server to record no use.
 func (c *CacheMan) localWriteStartPass(ctx context.Context, idx localWriteIndex, batches [][]KeyTimestamp) {
 	defer c.activeWorkers.Done()
 	defer c.logPanic()
@@ -534,12 +510,12 @@ func (c *CacheMan) localWriteStartPass(ctx context.Context, idx localWriteIndex,
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.SetLimit(localWriteStartPassCalls)
 	for i, batch := range batches {
-		if err := pacer.wait(ctx, len(batch)); err != nil {
+		keys := c.startPassKeys(ctx, batch)
+		if err := pacer.wait(ctx, len(keys)); err != nil {
 			stopped = true
 			break
 		}
 		eg.Go(func() error {
-			keys := c.startPassKeys(ctx, batch)
 			var found []bool
 			if len(keys) > 0 {
 				var err error
@@ -581,7 +557,6 @@ func (c *CacheMan) localWriteStartPass(ctx context.Context, idx localWriteIndex,
 	c.printer.Printf("Checked the cached objects with the server in %s\n", time.Since(start).Round(time.Millisecond))
 }
 
-// startPassKeys returns the keys of batch that the check covers.
 func (c *CacheMan) startPassKeys(ctx context.Context, batch []KeyTimestamp) []entities.Hash {
 	keys := make([]entities.Hash, 0, len(batch))
 	for _, kt := range batch {
@@ -594,9 +569,8 @@ func (c *CacheMan) startPassKeys(ctx context.Context, batch []KeyTimestamp) []en
 	return keys
 }
 
-// keyPacer spaces calls so that a call of n keys starts at least n/rate seconds after the
-// previous one. A caller that was slow gets no credit for the time it lost, so after a pause
-// keys still go out at rate.
+// keyPacer spaces calls so that the call after one of n keys starts at least n/rate seconds
+// after it. A caller that was slow gets no credit for the time it lost.
 type keyPacer struct {
 	rate  int
 	next  time.Time
@@ -608,7 +582,6 @@ func newKeyPacer(rate int) *keyPacer {
 	return &keyPacer{rate: rate, now: time.Now, sleep: sleepContext}
 }
 
-// wait returns when n more keys may be sent, or with an error once ctx is done.
 func (p *keyPacer) wait(ctx context.Context, n int) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -637,8 +610,7 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 }
 
 // putIndexEntry adds an entry to the index. With the check on, a local write goes through
-// clearRemote, which never drops the write on a conflict and keeps content the cache fetched
-// or pushed before out of the LRU until the server confirms it.
+// clearRemote, which keeps the entry out of the LRU until the server confirms it.
 func (c *CacheMan) putIndexEntry(ke *IndexKeyEntry, remote bool) (*IndexEntry, error) {
 	idx, ok := c.checkedIndex()
 	if remote || !ok || !localWriteChecked(ke.EntryType) {
@@ -648,8 +620,7 @@ func (c *CacheMan) putIndexEntry(ke *IndexKeyEntry, remote bool) (*IndexEntry, e
 	prevEnt, cleared, retries, err := idx.clearRemote(ke.Key, ke.IndexEntry, c.closeChan)
 	c.localWrites.clearRetries.Add(int64(retries))
 	if err != nil {
-		// The old entry can still be Remote and evictable: the check takes it out of the LRU
-		// when the server lacks it.
+		// The check takes the old entry out of the LRU if the server lacks it.
 		c.localWrites.clearFailures.Add(1)
 		c.localWrites.enqueue(ke.Key, ke.EntryType)
 		return nil, err
@@ -660,8 +631,7 @@ func (c *CacheMan) putIndexEntry(ke *IndexKeyEntry, remote bool) (*IndexEntry, e
 	return prevEnt, nil
 }
 
-// checkLostLocalWrite checks a locally written object that eviction removed before cacheman
-// indexed it: the server either has it, or the bytes are gone.
+// checkLostLocalWrite checks a local write that eviction removed before cacheman indexed it.
 func (c *CacheMan) checkLostLocalWrite(hash entities.Hash, objType protocol.RequestObjectType) {
 	if _, ok := c.checkedIndex(); !ok {
 		return
@@ -676,8 +646,7 @@ func (c *CacheMan) checkLostLocalWrite(hash entities.Hash, objType protocol.Requ
 	}
 }
 
-// reindexLocalWrite re-indexes an evicted entry whose file is on disk again as a local write,
-// since the file can be a write whose notification never reached cacheman.
+// reindexLocalWrite re-indexes an evicted entry whose file is on disk again as a local write.
 func (c *CacheMan) reindexLocalWrite(hash entities.Hash, entry *IndexEntry) bool {
 	if _, ok := c.checkedIndex(); !ok || entry == nil || entry.Local || !entry.Remote || !localWriteChecked(entry.EntryType) {
 		return false
@@ -688,7 +657,6 @@ func (c *CacheMan) reindexLocalWrite(hash entities.Hash, entry *IndexEntry) bool
 	return true
 }
 
-// useSync records the dagsync that setupDAGSync created for offlineThreshold.
 func (lw *localWriteCheck) useSync(sync *dagsync.DAGSync, offlineThreshold uint64) {
 	if offlineThreshold > 0 {
 		sync = nil
@@ -696,11 +664,8 @@ func (lw *localWriteCheck) useSync(sync *dagsync.DAGSync, offlineThreshold uint6
 	lw.phonySync.Store(sync)
 }
 
-// checkUntrackedEntry handles a Local and Remote entry that maintenance found outside the
-// LRU. The start pass checked only the LRU entries, and the entry can be a local write whose
-// notification was lost, so it stays out of eviction until the server confirms it. An index
-// that does not track use evicts nothing and holds every entry outside the LRU, so it needs no
-// check.
+// checkUntrackedEntry keeps a Local and Remote entry that maintenance found outside the LRU
+// out of eviction until the server confirms it, since the start pass checked only the LRU.
 func (c *CacheMan) checkUntrackedEntry(hash entities.Hash, entry *IndexEntry) bool {
 	if c.isParked(hash) {
 		return true
@@ -721,11 +686,9 @@ func (c *CacheMan) checkUntrackedEntry(hash entities.Hash, entry *IndexEntry) bo
 	return true
 }
 
-// confirmAfterPhony wraps the callback of a phony request sent to ds: on success every hash
-// it sent is on the server, so entries waiting for a check are confirmed and parked entries go
-// back to the LRU as used now. Only the entries that waited when the request was sent are
-// confirmed, since the answer can predate a later local write, and a request that joins an
-// identical one in flight confirms nothing.
+// confirmAfterPhony wraps the callback of a phony request sent to ds: on success it confirms
+// the entries that waited for a check when the request was sent and unparks parked ones. A
+// request that joins an identical one in flight confirms nothing.
 func (c *CacheMan) confirmAfterPhony(ds *dagsync.DAGSync, hashes []entities.Hash, callback dagsync.Callback) dagsync.Callback {
 	idx, ok := c.checkedIndex()
 	if !ok || c.localWrites.phonySync.Load() != ds {
@@ -764,8 +727,6 @@ func (c *CacheMan) confirmAfterPhony(ds *dagsync.DAGSync, hashes []entities.Hash
 	}
 }
 
-// startPhony records a phony request for hashes in flight and reports whether an identical one
-// was in flight already.
 func (lw *localWriteCheck) startPhony(hashes []entities.Hash) (string, bool) {
 	var b strings.Builder
 	for _, h := range hashes {
@@ -789,9 +750,7 @@ func (lw *localWriteCheck) endPhony(key string) {
 	}
 }
 
-// checkRemoteHeaders updates the index from the answer to a keep-alive Headers call. Content
-// the cache holds and the server lacks is pushed; local content the server has becomes
-// evictable.
+// checkRemoteHeaders updates the index from the answer to a keep-alive Headers call.
 func (c *CacheMan) checkRemoteHeaders(ctx context.Context, keys []entities.Hash, found []bool) {
 	idx, ok := c.checkedIndex()
 	if !ok {
@@ -804,8 +763,7 @@ func (c *CacheMan) checkRemoteHeaders(ctx context.Context, keys []entities.Hash,
 		}
 		switch {
 		case found[i] && idx.hasCheckMarker(key):
-			// The answer can be older than a local write that cleared the entry while the
-			// call was in flight, so the check worker asks again.
+			// The answer can predate a local write that cleared the entry during the call.
 			c.localWrites.enqueue(key, entry.EntryType)
 		case found[i] && !entry.Remote:
 			if err := c.index.markObjectRemote(key); err != nil {

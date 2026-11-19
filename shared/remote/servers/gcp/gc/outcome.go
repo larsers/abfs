@@ -14,8 +14,7 @@
 
 package gc
 
-// The outcomes of a cycle that ended without an error, in the order of
-// Report.Outcome.
+// The outcomes of a cycle that ended without an error, in the order Outcome checks.
 const (
 	OutcomeOK             = "ok"
 	OutcomeCondemnRefused = "condemn_refused"
@@ -24,12 +23,7 @@ const (
 	OutcomeChunksSkipped  = "chunks_skipped"
 )
 
-// Outcome returns the first outcome in this order that the cycle had: the
-// cycle refused to condemn, refused to delete, a worker error stopped its
-// delete step, or the chunk step deleted no chunks of a record that was due,
-// could not list the records, or left a record without the flag a day past
-// the undo window. Else it returns OutcomeOK, as for every dry run and for a
-// list the cycle did not complete.
+// Outcome returns the first outcome the cycle had, or OutcomeOK, as for a dry run.
 func (r *Report) Outcome() string {
 	switch {
 	case r.Condemn != nil && len(r.Condemn.Refused) > 0:

@@ -395,7 +395,6 @@ func TestChunkStep_BucketSettings(t *testing.T) {
 		{"versioning", storage.BucketAttrs{VersioningEnabled: true}, "Object Versioning on"},
 		{"retention policy", storage.BucketAttrs{RetentionPolicy: &storage.RetentionPolicy{RetentionPeriod: time.Hour}}, "retention policy of 1h0m0s"},
 		{"default event-based hold", storage.BucketAttrs{DefaultEventBasedHold: true}, "event-based hold on each new object"},
-		{"object retention", storage.BucketAttrs{ObjectRetentionMode: "Enabled"}, "object retention Enabled"},
 	}
 	for _, tt := range tests {
 		got := bucketProblems(&tt.attrs)
@@ -433,6 +432,23 @@ func TestChunkStep_BucketSettings(t *testing.T) {
 	require.Empty(rep.Skipped)
 	require.Equal("6", f.flagOf(name))
 	require.False(f.objectExists(obj))
+}
+
+// A read of the bucket settings that the end of the run stops is no reason
+// to skip the chunks: the step fails with the run.
+func TestChunkStep_PreconditionsStopWithTheRun(t *testing.T) {
+	require := require.New(t)
+	f := newChunkFixture(t)
+	d := f.deleter(f.lease, nil)
+	s := &chunkStep{d: d, reads: writeBudget{deadline: d.opts.WriteDeadline}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	skipped, err := s.preconditions(ctx)
+	require.Equal(codes.Canceled, status.Code(err))
+	require.Empty(skipped)
+	skipped, err = s.preconditions(context.Background())
+	require.NoError(err)
+	require.Empty(skipped)
 }
 
 // A key the step cannot finish leaves its record without the flag, and the

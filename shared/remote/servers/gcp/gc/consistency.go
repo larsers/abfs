@@ -29,59 +29,46 @@ import (
 )
 
 const (
-	objectsMetaFamily = "meta"
-	objectsSizeColumn = "meta:size"
+	objectsSizeColumn = objectsMetaFamily + ":size"
 	maxMissingKept    = 10
-	// clockSkewMargin covers the skew between the clocks of the servers, which
-	// stamp object rows, and of the collector.
+	// clockSkewMargin covers the skew between server and collector clocks.
 	clockSkewMargin = time.Minute
 )
 
-// ConsistencyReport is the result of the check that every object has a gc
-// row.
+// ConsistencyReport is the result of the check that every object has a gc row.
 type ConsistencyReport struct {
 	Ran     bool  `json:"ran"`
 	Objects int64 `json:"objects"`
-	// MissingGCRows counts objects without a gc row, written before the scan
-	// of the table abfsgc started. Any of them stops a later condemn.
+	// Any MissingGCRows stops a later condemn.
 	MissingGCRows int64    `json:"missing_gc_rows"`
 	FirstMissing  []string `json:"first_missing,omitempty"`
-	// TooNew counts objects without a gc row written too close to the scan to
-	// tell. A delete cycle checks each of them again while the scan runs.
+	// A delete cycle checks each TooNew object again while the scan runs.
 	TooNew int64 `json:"too_new"`
-	// GCRowsWithoutObject counts gc rows without an object row: uploads in
-	// flight, or failed after the gc row was written.
+	// GCRowsWithoutObject counts uploads in flight or failed after the gc row write.
 	GCRowsWithoutObject int64 `json:"gc_rows_without_object"`
-	// Marked counts the objects with a condemn marker, and MarkedLive those
-	// of them the mark found live, whose markers a condemn cycle clears.
+	// MarkedLive counts marked objects the mark found live; a condemn clears them.
 	Marked     int64 `json:"marked"`
 	MarkedLive int64 `json:"marked_live"`
 }
 
-// objectBytes sums the sizes of the objects that the mark found reachable and
-// unreachable.
 type objectBytes struct {
 	reachable, unreachable int64
 }
 
-// sizedNode is a node, the size of its object and its condemn marker: zero
-// for none, else the position in the scan's table of marker values, from 1.
-// The marker fills the padding, so a node stays 16 bytes.
+// sizedNode.marker is 0 for none, else a marker number from 1. It fills the
+// padding, so a node stays 16 bytes.
 type sizedNode struct {
 	id     uint32
 	marker uint32
 	size   int64
 }
 
-// markerTable numbers the distinct condemn marker values that a scan reads
-// from 1, in the order it first reads them.
 type markerTable struct {
 	mu     sync.Mutex
 	index  map[string]uint32
 	values [][]byte
 }
 
-// id returns the number of the marker value v.
 func (t *markerTable) id(v []byte) uint32 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -94,32 +81,22 @@ func (t *markerTable) id(v []byte) uint32 {
 	return i
 }
 
-// consistencyScan is the result of the consistency check.
 type consistencyScan struct {
 	report *ConsistencyReport
 	sizes  objectBytes
 	// seen holds the nodes that have an objects row.
 	seen bitmap
-	// unreachable lists the unreachable nodes that have an objects row, in
-	// key order, and marked the live nodes whose objects row has a condemn
-	// marker, when the scan was asked to keep them. markers are the marker
-	// values that sizedNode.marker numbers, of every row the scan read.
+	// unreachable and marked are in key order and filled only with keep.
 	unreachable []sizedNode
 	marked      []sizedNode
 	markers     [][]byte
-	// tooNew is the check of the objects counted in TooNew, when the scan was
-	// asked to run it, and tooNewErr why it failed.
+	// tooNew is nil unless the scan ran the check.
 	tooNew    *TooNewReport
 	tooNewErr error
 }
 
-// checkConsistency scans the meta family and the newest condemn marker of the
-// table objects. It checks that every object written before checkBefore has
-// a node in g, and sums the sizes of the reachable and unreachable objects.
-// With keep it also lists the unreachable nodes that have an objects row and
-// the live nodes with a marker, each with its marker. With a check it sends
-// the keys of the objects written too close to the scan to tell to it, while
-// the scan runs. A failed or incomplete check does not fail the scan.
+// checkConsistency checks that every object written before checkBefore has a
+// node in g. A failed or incomplete too-new check does not fail the scan.
 func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []string, g *graph, live bitmap, checkBefore time.Time, keep bool, check *tooNewCheck) (*consistencyScan, error) {
 	filter := bigtable.InterleaveFilters(
 		bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.LatestNFilter(1)),
@@ -141,13 +118,9 @@ func checkConsistency(ctx context.Context, table *bigtable.Table, bounds []strin
 			var r ConsistencyReport
 			var b objectBytes
 			var pending []string
-			// local caches the numbers of the marker values of this range.
 			local := make(map[string]uint32)
 			sendFailed := false
-			// send hands pending to the check and reports whether the scan
-			// goes on, which it does unless gctx ended. A batch the check
-			// does not take is dropped: the check then counts fewer keys
-			// than TooNew, which refuses the deletes.
+			// A dropped batch leaves the check short of TooNew, which refuses the deletes.
 			send := func() bool {
 				check.send(gctx, pending)
 				pending = nil

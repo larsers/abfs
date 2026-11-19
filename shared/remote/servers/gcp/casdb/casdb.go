@@ -29,8 +29,8 @@ import (
 	"cloud.google.com/go/spanner"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -47,6 +47,8 @@ const (
 	maxLocalHeadersConcurrency = 40
 	defaultHeadersSemSize      = 2500
 	headersSemPoolMultiplier   = 50
+	// serverSpannerChannels is the number of Spanner channels of a server.
+	serverSpannerChannels = 50
 )
 
 type CASDB struct {
@@ -58,26 +60,58 @@ type CASDB struct {
 	gc           bool
 }
 
-// New connects to the Spanner database and the Bigtable instance. The client
-// libraries export their built-in metrics to Cloud Monitoring only when
-// clientMetrics is set. opts apply to both clients.
-func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile string, btConnPoolSize int, clientMetrics bool, opts ...option.ClientOption) (*CASDB, error) {
+// Options are the settings of New other than the names of the database and
+// the instance.
+type Options struct {
+	BtAppProfile string
+	// BtConnPoolSize is the number of Bigtable connections; a non-positive
+	// value keeps the library default.
+	BtConnPoolSize int
+	// ClientMetrics exports the built-in metrics of the client libraries to
+	// Cloud Monitoring.
+	ClientMetrics bool
+	// Small keeps the default Spanner channels of the library, for a short
+	// command, instead of those sized for a server.
+	Small bool
+	// UnaryInterceptor and StreamInterceptor, when set, see the calls of both
+	// clients. A client of the Bigtable emulator dials its own connection and
+	// ignores them.
+	UnaryInterceptor  grpc.UnaryClientInterceptor
+	StreamInterceptor grpc.StreamClientInterceptor
+}
+
+func (o *Options) interceptors() []option.ClientOption {
+	var opts []option.ClientOption
+	if o.UnaryInterceptor != nil {
+		opts = append(opts, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(o.UnaryInterceptor)))
+	}
+	if o.StreamInterceptor != nil {
+		opts = append(opts, option.WithGRPCDialOption(grpc.WithChainStreamInterceptor(o.StreamInterceptor)))
+	}
+	return opts
+}
+
+// New connects to the Spanner database and the Bigtable instance.
+func New(ctx context.Context, spannerDB, projectID, btInstance string, o Options) (*CASDB, error) {
 	sessionPoolConfig := spanner.SessionPoolConfig{
 		MinOpened:     400,
 		MaxOpened:     5000,
 		WriteSessions: 0.2,
 	}
 
-	numChannels := option.WithGRPCConnectionPool(int(sessionPoolConfig.MaxOpened) / 100)
+	var spannerOpts []option.ClientOption
+	if !o.Small {
+		spannerOpts = append(spannerOpts, option.WithGRPCConnectionPool(serverSpannerChannels))
+	}
 	client, err := spanner.NewClientWithConfig(ctx, spannerDB, spanner.ClientConfig{
 		SessionPoolConfig:    sessionPoolConfig,
-		DisableNativeMetrics: !clientMetrics,
-	}, append([]option.ClientOption{numChannels}, opts...)...)
+		DisableNativeMetrics: !o.ClientMetrics,
+	}, append(spannerOpts, o.interceptors()...)...)
 	if err != nil {
 		return nil, err
 	}
 
-	btClient, err := newBigtableClient(ctx, projectID, btInstance, btAppProfile, btConnPoolSize, clientMetrics, opts...)
+	btClient, err := newBigtableClient(ctx, projectID, btInstance, &o)
 	if err != nil {
 		client.Close()
 		return nil, err
@@ -86,8 +120,8 @@ func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile str
 	objectsTable := btClient.Open("objects")
 
 	semSize := defaultHeadersSemSize
-	if btConnPoolSize > 0 {
-		semSize = btConnPoolSize * headersSemPoolMultiplier
+	if o.BtConnPoolSize > 0 {
+		semSize = o.BtConnPoolSize * headersSemPoolMultiplier
 	}
 
 	cas := &CASDB{
@@ -100,9 +134,11 @@ func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile str
 	return cas, nil
 }
 
-// newBigtableClient creates the Bigtable client of New.
-func newBigtableClient(ctx context.Context, projectID, btInstance, btAppProfile string, btConnPoolSize int, clientMetrics bool, opts ...option.ClientOption) (*bigtable.Client, error) {
-	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, bigtableConfig(btAppProfile, clientMetrics, len(opts) > 0), append(bigtableClientOptions(btConnPoolSize), opts...)...)
+// newBigtableClient creates the Bigtable client of New. opts are added to
+// those of o.
+func newBigtableClient(ctx context.Context, projectID, btInstance string, o *Options, opts ...option.ClientOption) (*bigtable.Client, error) {
+	clientOpts := append(append(bigtableClientOptions(o.BtConnPoolSize), o.interceptors()...), opts...)
+	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, bigtableConfig(o), clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bigtable client: %w", err)
 	}
@@ -111,11 +147,11 @@ func newBigtableClient(ctx context.Context, projectID, btInstance, btAppProfile 
 
 // bigtableConfig returns the config of the Bigtable client. The session
 // transport of the library sends calls as messages on streams opened without
-// the context of the call, so the interceptors of options never see them;
-// a client with options keeps to the classic connections, which carry them.
-func bigtableConfig(btAppProfile string, clientMetrics, withOptions bool) bigtable.ClientConfig {
-	config := bigtable.ClientConfig{AppProfile: btAppProfile, DisableSession: withOptions}
-	if !clientMetrics {
+// the context of the call, so interceptors never see them; a client with
+// interceptors keeps to the classic connections, which carry them.
+func bigtableConfig(o *Options) bigtable.ClientConfig {
+	config := bigtable.ClientConfig{AppProfile: o.BtAppProfile, DisableSession: o.UnaryInterceptor != nil || o.StreamInterceptor != nil}
+	if !o.ClientMetrics {
 		config.MetricsProvider = bigtable.NoopMetricsProvider{}
 	}
 	return config
@@ -507,7 +543,7 @@ func (c *CASDB) XchgRefs(ctx context.Context, projectID int64, refs []remote.Ref
 		return nil
 	}
 	if len(refs) > maxRefsBatch {
-		return status.Errorf(codes.InvalidArgument, "cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)
+		return &remote.ErrInvalidArgument{Reason: fmt.Sprintf("cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)}
 	}
 
 	cols := []string{"ProjectId", "Ref", "UpdateTime", "Target"}

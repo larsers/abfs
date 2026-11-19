@@ -47,7 +47,7 @@ func TestValidationDeadline_FailsLateWrite(t *testing.T) {
 	cacheNow = clock.now.Load
 	t.Cleanup(func() { cacheNow = orig })
 	s := newEmulatorCASDBServerWith(t, clock.interceptor())
-	require.NoError(t, s.enableGCHooks(&NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
+	require.NoError(t, s.enableGCHooks(context.Background(), &NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	blob := putBlob(t, s, "linked")
 	other := putBlob(t, s, "other")
@@ -130,7 +130,7 @@ func TestValidationDeadline_FailsLateWrite(t *testing.T) {
 				err := tt.call(i)
 				clock.armed.Store(false)
 				if delay == bound {
-					require.Equal(codes.Unavailable, status.Code(err), err)
+					require.Equal(codes.Unavailable, clientCode(err), err)
 					require.False(tt.written(t, i))
 					continue
 				}
@@ -162,14 +162,14 @@ func TestValidationDeadline_ObjectRowAfterSlowGCRow(t *testing.T) {
 		return resp, err
 	})
 	s := newEmulatorCASDBServerWith(t, slowGCRow)
-	require.NoError(s.enableGCHooks(&NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
+	require.NoError(s.enableGCHooks(context.Background(), &NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	key, data := treeOf(putBlob(t, s, "linked"))
 
 	armed.Store(true)
 	err := putRaw(s, key, data)
 	armed.Store(false)
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	require.NotNil(readGCRow(t, s, key), "the gc row was written")
 	_, err = s.casdb.GetHeader(ctx, key)
 	require.ErrorIs(err, casdb.ErrNotFound)
@@ -239,7 +239,7 @@ func TestWriteBound_Interceptors(t *testing.T) {
 		require.Equal(codes.FailedPrecondition, status.Code(serr))
 		return err
 	})
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	require.Equal(2, sent)
 }
 
@@ -269,7 +269,7 @@ func TestWriteBound_LibraryRetry(t *testing.T) {
 	err := writeGuard{on: true, start: 100}.do(ctx, func(ctx context.Context) error {
 		return bt.Open(gc.TableName).Apply(ctx, "row", mut)
 	})
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	require.Equal(int32(1), attempts.Load())
 	row, err := bt.Open(gc.TableName).ReadRow(ctx, "row")
 	require.NoError(err)
@@ -296,7 +296,7 @@ func TestWriteBound_SpannerCommit(t *testing.T) {
 	now := uint32(100)
 	setCacheNow(t, &now)
 	s := newEmulatorCASDBServer(t)
-	cas, err := casdb.New(ctx, s.casdb.SpannerClient().DatabaseName(), emulatorProject, emulatorBigtable, "", 1, false, writeBoundOptions()...)
+	cas, err := casdb.New(ctx, s.casdb.SpannerClient().DatabaseName(), emulatorProject, emulatorBigtable, casdb.Options{BtConnPoolSize: 1, UnaryInterceptor: writeBoundUnary, StreamInterceptor: writeBoundStream})
 	require.NoError(err)
 	t.Cleanup(func() { _ = cas.Close() })
 	s.casdb = cas
@@ -307,7 +307,7 @@ func TestWriteBound_SpannerCommit(t *testing.T) {
 		now += uint32(gc.ValidationWriteBound / time.Second)
 		return cas.AddRefs(ctx, id, []remote.RefHash{{Ref: "refs/heads/late", Hash: blob}})
 	})
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	hashes, err := s.GetRefs(ctx, "example.com", "p", []string{"refs/heads/late"})
 	require.NoError(err)
 	require.True(hashes[0].IsZero())
@@ -328,7 +328,7 @@ func TestAnswerBound(t *testing.T) {
 	cacheNow = clock.now.Load
 	t.Cleanup(func() { cacheNow = orig })
 	s := newEmulatorCASDBServerWith(t, clock.interceptor())
-	require.NoError(t, s.enableGCHooks(&NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
+	require.NoError(t, s.enableGCHooks(context.Background(), &NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	// Objects of any size are sent as links to a client that takes them.
 	s.depot = depot.NewMasterDepot([]depot.Depot{newFakeURLDepot(depot.NewMemoryDepot("mem", 1000000))})
@@ -372,7 +372,7 @@ func TestAnswerBound(t *testing.T) {
 				err := tt.call()
 				clock.armed.Store(false)
 				if delay == bound {
-					require.Equal(codes.Unavailable, status.Code(err), err)
+					require.Equal(codes.Unavailable, clientCode(err), err)
 					continue
 				}
 				require.NoError(err)

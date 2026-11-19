@@ -277,7 +277,7 @@ func TestBackfillGC_ReadsLeaveCondemnMarkers(t *testing.T) {
 	require.NoError(err)
 	defer adm.Close()
 	require.NoError(adm.CreateColumnFamily(context.Background(), "objects", gc.ObjectsFamily))
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCReadOnly: true, GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCReadOnly: true, GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 	condemnObject(t, f.s, f.bigTree, 3)
 

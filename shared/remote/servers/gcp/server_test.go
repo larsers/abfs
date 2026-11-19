@@ -55,6 +55,7 @@ import (
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
+	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 	"github.com/google/abfs/shared/remote/servers/gcp/depot"
 )
@@ -606,7 +607,7 @@ func createTestServerWithCASDB(t *testing.T) (*GCPServer, *fakeSpannerServer) {
 	t.Setenv("BIGTABLE_EMULATOR_HOST", btSrv.Addr)
 	t.Setenv("SPANNER_EMULATOR_HOST", spLis.Addr().String())
 
-	db, err := casdb.New(ctx, "projects/test-proj/instances/test-inst/databases/test-db", "test-proj", "test-bt", "", 1, false)
+	db, err := casdb.New(ctx, "projects/test-proj/instances/test-inst/databases/test-db", "test-proj", "test-bt", casdb.Options{BtConnPoolSize: 1})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -898,4 +899,9 @@ func TestAddMapResult_RejectsZeroHashes(t *testing.T) {
 	require.ErrorAs(t, s.AddMapResult(ctx, entities.ZeroHash, h), &linkErr)
 	require.ErrorAs(t, s.AddMapResult(ctx, h, entities.ZeroHash), &linkErr)
 	require.NoError(t, s.AddMapResult(ctx, h, h))
+}
+
+// clientCode returns the gRPC code with which a client sees err of the server.
+func clientCode(err error) codes.Code {
+	return status.Code(abfsgrpc.WrapErrorInStatus(err))
 }

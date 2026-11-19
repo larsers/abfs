@@ -64,7 +64,7 @@ func newGCHooksServer(t *testing.T, opts *NewServerOpts) *GCPServer {
 	require.NoError(t, adm.CreateColumnFamily(ctx, "objects", gc.ObjectsFamily))
 	require.NoError(t, adm.CreateTable(ctx, "maps"))
 	require.NoError(t, adm.CreateColumnFamily(ctx, "maps", "cf"))
-	require.NoError(t, s.enableGCHooks(opts))
+	require.NoError(t, s.enableGCHooks(context.Background(), opts))
 	t.Cleanup(s.stopGCHooks)
 	return s
 }
@@ -1055,7 +1055,15 @@ func TestGCHooks_Metrics(t *testing.T) {
 	require := require.New(t)
 	ctx := rescueClientContext()
 	reader := sdkmetric.NewManualReader()
-	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	orig := otel.GetMeterProvider()
+	otel.SetMeterProvider(provider)
+	// The default provider of the package delegates to the first one set, so
+	// that one is shut down too.
+	t.Cleanup(func() {
+		otel.SetMeterProvider(orig)
+		_ = provider.Shutdown(context.Background())
+	})
 	s := newGCHooksServer(t, &NewServerOpts{GCTouchInterval: time.Hour})
 	key := putBlob(t, s, "hello")
 	condemnObject(t, s, key, 3)

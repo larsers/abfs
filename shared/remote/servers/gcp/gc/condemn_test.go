@@ -27,12 +27,12 @@ func TestCondemnBlockers(t *testing.T) {
 	o := DefaultCondemnOpts()
 	o.ExpectedReplicas = 3
 	now := time.Now()
-	replica := func(id string) Replica {
-		return Replica{ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now.Add(-time.Minute)}
+	replica := func(id string) Server {
+		return Server{ID: id, Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now.Add(-time.Minute)}
 	}
 	replicas := func(ids ...string) func(r *Report) {
 		return func(r *Report) {
-			var rows []Replica
+			var rows []Server
 			for _, id := range ids {
 				rows = append(rows, replica(id))
 			}
@@ -51,7 +51,7 @@ func TestCondemnBlockers(t *testing.T) {
 		{"replica warning", func(r *Report) {
 			bad := replica("srv-2-cc")
 			bad.TouchInterval = 0
-			r.Replicas = checkReplicas([]Replica{replica("srv-0-aa"), replica("srv-1-bb"), bad}, now, &o.DryRunOpts)
+			r.Replicas = checkReplicas([]Server{replica("srv-0-aa"), replica("srv-1-bb"), bad}, now, &o.DryRunOpts)
 		}, []string{"replica srv-2-cc: writes no touches"}},
 		{"one GC host short", replicas("srv-0-aa", "srv-1-bb"), []string{"2 server hosts write a GC heartbeat, but 3 are expected"}},
 		// One host more than expected can stand in for a host without GC.
@@ -73,6 +73,8 @@ func TestCondemnBlockers(t *testing.T) {
 		{"dangling source root", dangling("source"), []string{"1 roots of class source have no gc row"}},
 		{"dangling project-status root", dangling("project-status"), []string{"class project-status"}},
 		{"dangling pushed-packs root", dangling("pushed-packs"), []string{"class pushed-packs"}},
+		{"dangling config root", dangling("config"), []string{"class config"}},
+		{"dangling acl root", dangling("acl"), []string{"class acl"}},
 		{"dangling workspace root", dangling("workspace"), []string{"class workspace"}},
 		{"dangling snapshot root", dangling("snapshot"), []string{"class snapshot"}},
 		{"dangling mount root", dangling("mount"), []string{"class mount"}},

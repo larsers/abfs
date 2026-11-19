@@ -31,85 +31,54 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// A delete record is the object abfsgc/deleted/<state>/<cycle>/<level>-<range>-<batch>
-// in the server bucket, written by the delete step before it deletes the rows
-// of one batch, so that the chunks of every deleted object can be found after
-// its row is gone, and an undo can write the rows back. It holds a header,
-// then a key section with the kind and the 20-byte key of each entry, and
-// for a map row the key of its other end, then a row section with, per
-// object in the order of the key section, the newest cell of each column of
-// the families meta and data of its objects row, and the newest value of
-// each column of the family e of its gc row, none when it had no gc row.
-// Readers that need only the keys stop after the key section. Integers are
-// big-endian.
+// A delete record is written before the deletes of its batch, so the chunks can
+// be found and an undo can write the rows back. Integers are big-endian.
 const (
 	recordPrefix        = "abfsgc/deleted/"
 	recordMagic         = "ABFSGCD\n"
 	recordFormatVersion = 2
 	recordObject        = 1
 	recordMapRow        = 2
-	// inlineDepot is the depot of the server that keeps content in the
-	// descriptor itself, which needs no delete.
+	// inlineDepot keeps content in the descriptor, which needs no delete.
 	inlineDepot = "inline"
-	// prunedMarker is the object <cycle>/pruned among the delete records,
-	// written before the records of the cycle are pruned, so that an undo of
-	// the cycle fails instead of finding nothing to restore. It carries the
-	// flag of a done record, so that the chunk step skips it.
+	// prunedMarker carries the flag of a done record, so the chunk step skips it.
 	prunedMarker = "pruned"
-	// undoWindow is how long after its record the chunk step deletes the
-	// chunks of a deleted object, so the time in which an undo restores every
-	// object it deleted. Later an undo restores the objects whose content is
-	// inline, and the map rows, while the records exist.
+	// undoWindow is how long after its record the chunk step deletes chunks.
 	undoWindow = 7 * 24 * time.Hour
-	// recordRetention is how long ref records are kept after they were
-	// written, and delete records after they were flagged, so that an undo
-	// finds them.
+	// recordRetention keeps the records an undo needs.
 	recordRetention = undoWindow
 )
 
-// maxRecordBytes is the most bytes of entries in one delete record; the
-// delete step writes a larger batch as several records. Tests change it.
+// maxRecordBytes is the most bytes of entries in one delete record. Tests change it.
 var maxRecordBytes = 16 << 20
 
-// recordPrefixOf returns the prefix of the delete records of the garbage
-// collector state.
 func recordPrefixOf(state string) string {
 	return recordPrefix + state + "/"
 }
 
-// recordObjectName returns the name of the delete record of one batch of a
-// range and level of the delete step of cycle.
 func recordObjectName(state string, cycle int64, level, rng, batch int) string {
 	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + strconv.Itoa(level) + "-" + strconv.Itoa(rng) + "-" + strconv.Itoa(batch)
 }
 
-// prunedMarkerName returns the name of the marker of the pruned records of
-// cycle.
 func prunedMarkerName(state string, cycle int64) string {
 	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + prunedMarker
 }
 
-// recordHeader is the header of a delete record.
 type recordHeader struct {
 	cycle int64
 	runID string
-	// gcRowsAfter is the grace start of the cycle: a gc row whose newest
-	// e:links cell is newer belongs to an object written again after the
-	// mark, and stays.
+	// gcRowsAfter is the grace start; a gc row with a newer e:links cell stays.
 	gcRowsAfter time.Time
 	count       int64
 }
 
-// recordCell is a cell of a row kept in a delete record.
 type recordCell struct {
 	family, column string
 	ts             bigtable.Timestamp
 	value          []byte
 }
 
-// recordEntry is an entry of a delete record: an object with the cells of
-// its objects row and the values of the edges family of its gc row, or a map
-// row from key to mapTo. An object without edges had no gc row.
+// An object entry without edges had no gc row.
 type recordEntry struct {
 	kind  uint8
 	key   Hash
@@ -118,8 +87,6 @@ type recordEntry struct {
 	edges []recordCell
 }
 
-// objectEntry returns the record entry of the object key whose objects row
-// and gc row were read as object and gc.
 func objectEntry(key Hash, object, gc bigtable.Row) recordEntry {
 	e := recordEntry{kind: recordObject, key: key}
 	for _, family := range []string{objectsMetaFamily, objectsDataFamily} {
@@ -133,7 +100,6 @@ func objectEntry(key Hash, object, gc bigtable.Row) recordEntry {
 	return e
 }
 
-// content returns the data:content descriptor of the object e.
 func (e *recordEntry) content() []byte {
 	for _, c := range e.cells {
 		if c.family == objectsDataFamily && c.column == objectsContentColumn {
@@ -143,7 +109,6 @@ func (e *recordEntry) content() []byte {
 	return nil
 }
 
-// edge returns the value of the column of the edges of the object e.
 func (e *recordEntry) edge(column string) ([]byte, bool) {
 	for _, c := range e.edges {
 		if c.column == column {
@@ -153,7 +118,6 @@ func (e *recordEntry) edge(column string) ([]byte, bool) {
 	return nil, false
 }
 
-// size returns the number of bytes of e in a record.
 func (e *recordEntry) size() int {
 	n := 1 + entities.HashSize
 	if e.kind == recordMapRow {
@@ -179,77 +143,77 @@ func (h *recordHeader) write(w io.Writer) (int, error) {
 	return w.Write(b)
 }
 
-// writeRecord writes the delete record name with the header h and entries,
-// only if no object of that name exists or this run wrote it, and returns
-// its size.
+// writeRecord writes only if no object of that name exists or this run wrote it.
 func writeRecord(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *recordHeader, entries []recordEntry) (int64, error) {
-	h.count = int64(len(entries))
 	var size int64
 	err := createObject(ctx, b, bucket, name, h.runID, "application/octet-stream", func(w io.Writer) error {
-		size = 0
-		n, err := h.write(w)
-		size += int64(n)
-		if err != nil {
-			return err
-		}
-		var buf []byte
-		for i := range entries {
-			e := &entries[i]
-			buf = append(buf[:0], e.kind)
-			buf = append(buf, e.key[:]...)
-			switch e.kind {
-			case recordObject:
-			case recordMapRow:
-				buf = append(buf, e.mapTo[:]...)
-			default:
-				return fmt.Errorf("invalid delete record entry kind %d", e.kind)
-			}
-			n, err := w.Write(buf)
-			size += int64(n)
-			if err != nil {
-				return err
-			}
-		}
-		for i := range entries {
-			e := &entries[i]
-			if e.kind != recordObject {
-				continue
-			}
-			if len(e.cells) > 1<<16-1 || len(e.edges) > 1<<8-1 {
-				return fmt.Errorf("the object %s has too many cells for a delete record", e.key)
-			}
-			buf = binary.BigEndian.AppendUint16(buf[:0], uint16(len(e.cells)))
-			for _, c := range e.cells {
-				buf = appendString(appendString(buf, c.family), c.column)
-				buf = binary.BigEndian.AppendUint64(buf, uint64(c.ts))
-				buf = appendBytes(buf, c.value)
-			}
-			buf = append(buf, uint8(len(e.edges)))
-			for _, c := range e.edges {
-				buf = appendBytes(appendString(buf, c.column), c.value)
-			}
-			n, err := w.Write(buf)
-			size += int64(n)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
+		var err error
+		size, err = encodeRecord(w, h, entries)
+		return err
 	})
 	return size, err
+}
+
+func encodeRecord(w io.Writer, h *recordHeader, entries []recordEntry) (int64, error) {
+	h.count = int64(len(entries))
+	n, err := h.write(w)
+	size := int64(n)
+	if err != nil {
+		return size, err
+	}
+	var buf []byte
+	for i := range entries {
+		e := &entries[i]
+		buf = append(buf[:0], e.kind)
+		buf = append(buf, e.key[:]...)
+		switch e.kind {
+		case recordObject:
+		case recordMapRow:
+			buf = append(buf, e.mapTo[:]...)
+		default:
+			return size, fmt.Errorf("invalid delete record entry kind %d", e.kind)
+		}
+		n, err := w.Write(buf)
+		size += int64(n)
+		if err != nil {
+			return size, err
+		}
+	}
+	for i := range entries {
+		e := &entries[i]
+		if e.kind != recordObject {
+			continue
+		}
+		if len(e.cells) > 1<<16-1 || len(e.edges) > 1<<8-1 {
+			return size, fmt.Errorf("the object %s has too many cells for a delete record", e.key)
+		}
+		buf = binary.BigEndian.AppendUint16(buf[:0], uint16(len(e.cells)))
+		for _, c := range e.cells {
+			buf = appendString(appendString(buf, c.family), c.column)
+			buf = binary.BigEndian.AppendUint64(buf, uint64(c.ts))
+			buf = appendBytes(buf, c.value)
+		}
+		buf = append(buf, uint8(len(e.edges)))
+		for _, c := range e.edges {
+			buf = appendBytes(appendString(buf, c.column), c.value)
+		}
+		n, err := w.Write(buf)
+		size += int64(n)
+		if err != nil {
+			return size, err
+		}
+	}
+	return size, nil
 }
 
 func appendBytes(b, v []byte) []byte {
 	return append(binary.BigEndian.AppendUint32(b, uint32(len(v))), v...)
 }
 
-// readRecord reads the delete record name.
 func readRecord(ctx context.Context, bucket *storage.BucketHandle, name string) (*recordHeader, []recordEntry, error) {
 	return readRecordSections(ctx, bucket, name, true)
 }
 
-// readRecordKeys reads the header and the key section of the delete record
-// name, so its entries hold no cells.
 func readRecordKeys(ctx context.Context, bucket *storage.BucketHandle, name string) (*recordHeader, []recordEntry, error) {
 	return readRecordSections(ctx, bucket, name, false)
 }
@@ -265,16 +229,28 @@ func readRecordSections(ctx context.Context, bucket *storage.BucketHandle, name 
 		// Closed before the end, the reader stops the download.
 		defer func() { _ = r.Close() }()
 	}
-	br := bufio.NewReader(r)
-	h, err := readRecordHeader(br)
+	h, entries, err := decodeRecord(r, r.Attrs.Size, rows)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read the header of the delete record %s: %w", name, err)
+		return nil, nil, fmt.Errorf("failed to read the delete record %s: %w", name, err)
+	}
+	return h, entries, nil
+}
+
+func decodeRecord(r io.Reader, size int64, rows bool) (*recordHeader, []recordEntry, error) {
+	br := bufio.NewReader(r)
+	sr := &sizedReader{r: br, left: size}
+	h, err := readRecordHeader(sr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read the header: %w", err)
+	}
+	if err := sr.checkCount(h.count, 1+entities.HashSize); err != nil {
+		return nil, nil, fmt.Errorf("invalid header: %w", err)
 	}
 	entries := make([]recordEntry, 0, h.count)
 	for range h.count {
-		e, err := readRecordKey(br)
+		e, err := readRecordKey(sr)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read the delete record %s after %d keys: %w", name, len(entries), err)
+			return nil, nil, fmt.Errorf("failed to read the key after %d keys: %w", len(entries), err)
 		}
 		entries = append(entries, e)
 	}
@@ -286,12 +262,12 @@ func readRecordSections(ctx context.Context, bucket *storage.BucketHandle, name 
 		if e.kind != recordObject {
 			continue
 		}
-		if err := readRecordRow(br, e); err != nil {
-			return nil, nil, fmt.Errorf("failed to read the row of %s in the delete record %s: %w", e.key, name, err)
+		if err := readRecordRow(sr, e); err != nil {
+			return nil, nil, fmt.Errorf("failed to read the row of %s: %w", e.key, err)
 		}
 	}
-	if _, err := br.ReadByte(); err != io.EOF {
-		return nil, nil, fmt.Errorf("the delete record %s has more than the %d entries its header counts", name, h.count)
+	if err := checkEnd(br, h.count); err != nil {
+		return nil, nil, err
 	}
 	return h, entries, nil
 }
@@ -326,7 +302,7 @@ func readRecordHeader(r io.Reader) (*recordHeader, error) {
 	if err := binary.Read(r, binary.BigEndian, &times); err != nil {
 		return nil, err
 	}
-	h.gcRowsAfter, h.count = time.UnixMicro(times.GCRowsAfter), times.Count
+	h.gcRowsAfter, h.count = time.UnixMicro(times.GCRowsAfter).UTC(), times.Count
 	return h, nil
 }
 
@@ -351,7 +327,7 @@ func readRecordKey(r io.Reader) (recordEntry, error) {
 	return e, nil
 }
 
-func readRecordRow(r io.Reader, e *recordEntry) error {
+func readRecordRow(r *sizedReader, e *recordEntry) error {
 	var cells uint16
 	if err := binary.Read(r, binary.BigEndian, &cells); err != nil {
 		return err
@@ -393,10 +369,13 @@ func readRecordRow(r io.Reader, e *recordEntry) error {
 	return nil
 }
 
-func readBytes(r io.Reader) ([]byte, error) {
+func readBytes(r *sizedReader) ([]byte, error) {
 	var n uint32
 	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
 		return nil, err
+	}
+	if int64(n) > r.left {
+		return nil, fmt.Errorf("a value of %d bytes is longer than the %d bytes left", n, r.left)
 	}
 	b := make([]byte, n)
 	if _, err := io.ReadFull(r, b); err != nil {

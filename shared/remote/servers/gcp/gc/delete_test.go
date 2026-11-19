@@ -15,6 +15,7 @@
 package gc
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -32,6 +33,8 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 )
@@ -243,11 +246,12 @@ func TestPlanDeletes(t *testing.T) {
 // where an end without an object has no type and allows it, and one that
 // names a candidate and stays keeps that candidate. An eval row
 // past the map retention whose ends are live goes only when the cycle may
-// delete eval requests and responses.
+// delete eval requests and responses. So does one whose request is live and
+// whose response has no gc row.
 func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	require := require.New(t)
 	f := newStepFixture(t, 4)
-	h := testHashes(8)
+	h := testHashes(10)
 	old := f.now.Add(-1000 * time.Hour)
 	// Both ends are candidates.
 	req, resp := h[0], h[1]
@@ -268,9 +272,13 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	absReq, absResp := h[6], h[7]
 	f.object(absReq, "eval-request", nil)
 	f.mapRow(absReq, absResp, old)
+	// The request is live and the response has no object.
+	danglingReq, danglingResp := h[8], h[9]
+	f.object(danglingReq, "eval-request", nil)
+	f.mapRow(danglingReq, danglingResp, old)
 
 	res := f.mark(nil)
-	for _, k := range []Hash{liveReq, liveResp} {
+	for _, k := range []Hash{liveReq, liveResp, danglingReq} {
 		res.live.set(res.graph.find(k))
 	}
 	eligible, lists := f.eligible(res)
@@ -287,17 +295,17 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	row := func(from, to Hash) string { return from.String() + "#" + to.String() }
 
 	p := plan(func(string) bool { return true })
-	require.ElementsMatch([]string{row(req, resp), row(outReq, outResp), row(liveReq, liveResp), row(absReq, absResp)}, rows(p))
+	require.ElementsMatch([]string{row(req, resp), row(outReq, outResp), row(liveReq, liveResp), row(absReq, absResp), row(danglingReq, danglingResp)}, rows(p))
 	require.Equal(int64(3), p.report.MapRows)
-	require.Equal(int64(1), p.report.ExpiredEvalMapRows)
+	require.Equal(int64(2), p.report.ExpiredEvalMapRows)
 	require.Zero(p.report.MapRowsKeptForTypes)
 	require.Equal(int64(4), p.report.WouldDelete)
 
 	// An end without a node has no type and allows the row.
 	p = plan(func(t string) bool { return t == "eval-request" })
-	require.Equal([]string{row(absReq, absResp)}, rows(p))
+	require.ElementsMatch([]string{row(absReq, absResp), row(danglingReq, danglingResp)}, rows(p))
 	require.Equal(int64(2), p.report.MapRowsKeptForTypes)
-	require.Zero(p.report.ExpiredEvalMapRows)
+	require.Equal(int64(1), p.report.ExpiredEvalMapRows)
 	outcome := func(k Hash) keyOutcome { return p.outcome[p.index(res.graph.find(k))] }
 	require.Equal(outcomeBlocked, outcome(req))
 	require.Equal(outcomeTypeNotAllowed, outcome(resp))
@@ -374,7 +382,7 @@ func TestDeleteRecord_WriteRead(t *testing.T) {
 		}},
 		{kind: recordObject, key: h[2], cells: []recordCell{{family: objectsMetaFamily, column: "type", ts: 3000, value: []byte("blob")}}},
 	}
-	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000)}
+	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000).UTC()}
 	name := recordObjectName("default", 5, 1, 3, 0)
 	require.Equal("abfsgc/deleted/default/5/1-3-0", name)
 	size, err := writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, hdr, entries)
@@ -447,6 +455,9 @@ type callLog struct {
 	slow      func(key string) bool
 	slowRead  func(keys [][]byte) time.Duration
 	after     func(c call)
+	// fail, when set, returns the error a write fails with in place of
+	// sending it.
+	fail func(c call) error
 }
 
 func (l *callLog) options() []grpc.DialOption {
@@ -467,7 +478,13 @@ func (l *callLog) options() []grpc.DialOption {
 		if l.slow != nil && l.slow(c.key) {
 			time.Sleep(20 * time.Millisecond)
 		}
-		err := invoker(ctx, method, req, reply, cc, opts...)
+		var err error
+		if l.fail != nil {
+			err = l.fail(c)
+		}
+		if err == nil {
+			err = invoker(ctx, method, req, reply, cc, opts...)
+		}
 		c.end = time.Now()
 		l.mu.Lock()
 		if c.table != TableName {
@@ -729,8 +746,8 @@ func TestDeleteGC_StopsBeforeLeaseExpiry(t *testing.T) {
 	}
 	res := f.mark(nil)
 	d := f.deleter(lease, func(o *DeleteOpts) { o.DeleteWorkers = 1 })
-	deleted, err := d.deleteStep(ctx, lease, res)
-	require.NoError(err)
+	_, err := d.deleteStep(ctx, lease, res)
+	require.ErrorIs(err, errLeaseExpiring)
 	rep := d.rep.Step
 	require.Equal(errLeaseExpiring.Error(), rep.Error)
 	require.Equal(int32(3), objectCalls.Load())
@@ -742,10 +759,135 @@ func TestDeleteGC_StopsBeforeLeaseExpiry(t *testing.T) {
 	}
 	require.Equal(2, gcCalls)
 	require.Equal(int64(3), rep.Deleted)
-	require.Equal(int64(3), deleted.count())
 	require.Equal(int64(7), rep.NotSent)
 	require.Equal(int64(1), rep.GCRowErrors)
 	require.Zero(rep.Unknown)
+}
+
+// errReader fails every read with err.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// A delete record that is truncated, counts more entries or a longer value
+// than its size holds, or has bytes after its entries fails to decode
+// without a large allocation, and a read error at its end is returned as it
+// is. Times decode in UTC.
+func TestDecodeRecord_Malformed(t *testing.T) {
+	require := require.New(t)
+	h := testHashes(2)
+	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000)}
+	var buf bytes.Buffer
+	_, err := encodeRecord(&buf, hdr, []recordEntry{
+		{kind: recordObject, key: h[0], cells: []recordCell{{family: "m", column: "t", ts: 1, value: []byte("v")}}},
+		{kind: recordMapRow, key: h[0], mapTo: h[1]},
+	})
+	require.NoError(err)
+	valid := buf.Bytes()
+	hdrLen, err := hdr.write(io.Discard)
+	require.NoError(err)
+	// The count ends the header; the length of the value follows the key
+	// section, the cell count, the family, the column and the time.
+	countAt := hdrLen - 8
+	valueLenAt := hdrLen + 2*(1+entities.HashSize) + entities.HashSize + 2 + 3 + 3 + 8
+	patched := func(at int, v []byte) []byte {
+		b := slices.Clone(valid)
+		copy(b[at:], v)
+		return b
+	}
+	got, entries, err := decodeRecord(bytes.NewReader(valid), int64(len(valid)), true)
+	require.NoError(err)
+	require.Len(entries, 2)
+	require.Equal([]byte("v"), entries[0].cells[0].value)
+	require.Equal(time.UTC, got.gcRowsAfter.Location())
+
+	// A truncated record is read with the size of the whole one, as when a
+	// download ends early, and else with its own size.
+	tests := []struct {
+		name string
+		data []byte
+		size int
+		want string
+	}{
+		{"truncated header", valid[:hdrLen-3], len(valid), "failed to read the header"},
+		{"negative count", patched(countAt, binary.BigEndian.AppendUint64(nil, 1<<63)), len(valid), "counts"},
+		{"count past the size", patched(countAt, binary.BigEndian.AppendUint64(nil, 1<<40)), len(valid), "counts 1099511627776 entries"},
+		{"keys past the size", valid[:hdrLen+30], hdrLen + 30, "counts 2 entries, but 30 bytes are left"},
+		{"truncated keys", valid[:hdrLen+30], len(valid), "after 1 keys"},
+		{"value past the size", patched(valueLenAt, binary.BigEndian.AppendUint32(nil, 1<<31)), len(valid), "longer than"},
+		{"truncated row", valid[:len(valid)-1], len(valid), "failed to read the row"},
+		{"extra byte", append(slices.Clone(valid), 0), len(valid) + 1, "more than the 2 entries its header counts"},
+	}
+	for _, tt := range tests {
+		_, _, err := decodeRecord(bytes.NewReader(tt.data), int64(tt.size), true)
+		require.ErrorContains(err, tt.want, tt.name)
+	}
+	_, entries, err = decodeRecord(bytes.NewReader(valid[:hdrLen+2*(1+entities.HashSize)+entities.HashSize]), int64(len(valid)), false)
+	require.NoError(err, "the keys alone")
+	require.Len(entries, 2)
+
+	boom := errors.New("boom")
+	_, _, err = decodeRecord(io.MultiReader(bytes.NewReader(valid), errReader{boom}), int64(len(valid)), true)
+	require.ErrorIs(err, boom)
+}
+
+// A step whose run is cancelled sends no call after that, counts the keys
+// it did not reach as not sent, not as unknown, and returns the error, so
+// that the cycle writes no list.
+func TestDeleteStep_StopsWhenCancelled(t *testing.T) {
+	require := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := &callLog{rangeOf: func(string) int { return 0 }}
+	var objectCalls atomic.Int32
+	log.after = func(c call) {
+		if c.table == objectsTable && objectCalls.Add(1) == 3 {
+			cancel()
+		}
+	}
+	f := newStepFixture(t, 1, log.options()...)
+	for _, k := range testHashes(10) {
+		f.object(k, "blob", nil)
+	}
+	res := f.mark(nil)
+	d := f.deleter(farLease(), func(o *DeleteOpts) { o.DeleteWorkers = 1 })
+	_, err := d.deleteStep(ctx, farLease(), res)
+	require.ErrorIs(err, context.Canceled)
+	rep := d.rep.Step
+	require.Equal(int32(3), objectCalls.Load())
+	require.Equal(int64(3), rep.Deleted)
+	require.Equal(int64(7), rep.NotSent)
+	require.Zero(rep.Unknown)
+}
+
+// A delete that fails with an error that is not transient stops the step: no
+// other delete is sent, and the key it was sent for is read again.
+func TestDeleteStep_StopsAfterAPermanentError(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	log := &callLog{rangeOf: func(string) int { return 0 }}
+	var objectCalls atomic.Int32
+	log.fail = func(c call) error {
+		if c.table == objectsTable && objectCalls.Add(1) == 2 {
+			return status.Error(codes.PermissionDenied, "denied")
+		}
+		return nil
+	}
+	f := newStepFixture(t, 1, log.options()...)
+	for _, k := range testHashes(10) {
+		f.object(k, "blob", nil)
+	}
+	res := f.mark(nil)
+	d := f.deleter(farLease(), func(o *DeleteOpts) { o.DeleteWorkers = 1 })
+	_, err := d.deleteStep(ctx, farLease(), res)
+	require.NoError(err)
+	rep := d.rep.Step
+	require.Contains(rep.Error, "PermissionDenied")
+	require.Equal(int32(2), objectCalls.Load())
+	require.Equal(int64(1), rep.Deleted)
+	require.Equal(int64(1), rep.Unknown)
+	require.Equal(int64(1), rep.UnknownPresent)
+	require.Equal(int64(8), rep.NotSent)
 }
 
 // A map row whose result has no gc row still names its request: the scan

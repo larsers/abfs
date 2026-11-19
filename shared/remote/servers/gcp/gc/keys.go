@@ -23,7 +23,6 @@ import (
 	"cloud.google.com/go/bigtable"
 )
 
-// keyReadBatch is the number of rows of one read of keys by name.
 const keyReadBatch = 1000
 
 // keyState is what the gc row and the objects row of a key hold.
@@ -32,11 +31,9 @@ type keyState struct {
 	written   time.Time
 	touched   time.Time
 	objectRow bool
-	// marker is the value of abfsgc:condemned, nil when the row has none.
-	marker []byte
+	marker    []byte
 }
 
-// readKeyStates reads the gc rows and the objects rows of keys, in batches.
 func readKeyStates(ctx context.Context, bt *bigtable.Client, keys []Hash) ([]keyState, error) {
 	states := make([]keyState, len(keys))
 	gcFilter := bigtable.ChainFilters(bigtable.LatestNFilter(1), bigtable.InterleaveFilters(
@@ -83,8 +80,7 @@ func readKeyStates(ctx context.Context, bt *bigtable.Client, keys []Hash) ([]key
 	return states, nil
 }
 
-// markerCycle returns the cycle number of a condemn marker, or -1 for a value
-// that is not one.
+// markerCycle returns the cycle of a condemn marker, or -1 for an invalid one.
 func markerCycle(marker []byte) int64 {
 	if len(marker) != 8 {
 		return -1
@@ -94,19 +90,15 @@ func markerCycle(marker []byte) int64 {
 
 // KeyReport explains the state of one key.
 type KeyReport struct {
-	Key string `json:"key"`
-	// GCRow tells whether the key has a gc row in the scan, Type is its type.
+	Key       string `json:"key"`
 	GCRow     bool   `json:"gc_row"`
 	Type      string `json:"type,omitempty"`
 	Reachable bool   `json:"reachable"`
-	// FirstRoot is the root whose walk reached the key first.
-	FirstRoot *Root `json:"first_root,omitempty"`
-	// WriteTime and TouchTime are the first write and the last touch in its
-	// gc row, read after the mark.
+	FirstRoot *Root  `json:"first_root,omitempty"`
+	// WriteTime and TouchTime are read after the mark.
 	WriteTime *time.Time `json:"write_time,omitempty"`
 	TouchTime *time.Time `json:"touch_time,omitempty"`
-	// ObjectRow tells whether its objects row exists; Condemned is the cycle
-	// number of its condemn marker.
+	// Condemned is the cycle of the condemn marker.
 	ObjectRow bool   `json:"object_row"`
 	Condemned *int64 `json:"condemned,omitempty"`
 }
@@ -118,7 +110,6 @@ func optTime(t time.Time) *time.Time {
 	return &t
 }
 
-// explainKeys reports the state of keys after the mark.
 func (r *Result) explainKeys(ctx context.Context, bt *bigtable.Client, keys []Hash) ([]KeyReport, error) {
 	states, err := readKeyStates(ctx, bt, keys)
 	if err != nil {

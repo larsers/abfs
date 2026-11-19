@@ -83,13 +83,21 @@ func TestMapResults_InsertionOrder(t *testing.T) {
 	require.Equal([]entities.Hash{tos[1], tos[2], tos[3], tos[0]}, got)
 }
 
-// A Bigtable client made with options takes the classic connections for
-// every call, so the interceptors of the options see each write.
-func TestNewBigtableClient_OptionsSeeWrites(t *testing.T) {
+// A Bigtable client made with interceptors takes the classic connections for
+// every call, so the interceptors see each write. Other options keep the
+// session transport.
+func TestNewBigtableClient_InterceptorsSeeWrites(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
-	require.True(bigtableConfig("", false, true).DisableSession)
-	require.False(bigtableConfig("", false, false).DisableSession)
+	var writes atomic.Int32
+	count := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if _, ok := req.(*bigtablepb.MutateRowRequest); ok {
+			writes.Add(1)
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+	require.True(bigtableConfig(&Options{UnaryInterceptor: count}).DisableSession)
+	require.False(bigtableConfig(&Options{BtConnPoolSize: 4, ClientMetrics: true}).DisableSession)
 
 	srv, err := bttest.NewServer("localhost:0")
 	require.NoError(err)
@@ -103,16 +111,9 @@ func TestNewBigtableClient_OptionsSeeWrites(t *testing.T) {
 	require.NoError(adm.CreateTable(ctx, "maps"))
 	require.NoError(adm.CreateColumnFamily(ctx, "maps", "cf"))
 
-	var writes atomic.Int32
-	count := grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		if _, ok := req.(*bigtablepb.MutateRowRequest); ok {
-			writes.Add(1)
-		}
-		return invoker(ctx, method, req, reply, cc, opts...)
-	})
-	bt, err := newBigtableClient(ctx, "test-proj", "test-bt", "", 1, false,
+	bt, err := newBigtableClient(ctx, "test-proj", "test-bt", &Options{BtConnPoolSize: 1, UnaryInterceptor: count},
 		option.WithEndpoint(srv.Addr), option.WithoutAuthentication(),
-		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())), option.WithGRPCDialOption(count))
+		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())))
 	require.NoError(err)
 	t.Cleanup(func() { _ = bt.Close() })
 	mut := bigtable.NewMutation()

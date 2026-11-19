@@ -24,42 +24,34 @@ import (
 
 const (
 	serversTable = "AbfsGcServers"
-	// MaxHeartbeatInterval is the longest heartbeat interval of a server with
-	// GC.
+	// MaxHeartbeatInterval is the longest heartbeat interval of a server with GC.
 	MaxHeartbeatInterval = 10 * time.Minute
-	// ValidationWriteBound bounds the time from the start of a server's link
-	// validation to the end of the last write that records the reference it
-	// validated: a new object, ref or map result. It also bounds the time
-	// from the start of a call to an answer that objects are present.
+	// ValidationWriteBound bounds the time from the start of a link validation to
+	// the end of the write it validated, and from a call to a presence answer.
 	ValidationWriteBound = 2 * time.Minute
-	// HeartbeatTimeout is the deadline of the write of a heartbeat. A server
-	// stops serving two heartbeat intervals and this long after its last
-	// successful heartbeat.
+	// HeartbeatTimeout is the deadline of a heartbeat write. A server stops serving
+	// two heartbeat intervals and this long after its last successful heartbeat.
 	HeartbeatTimeout = 30 * time.Second
 )
 
-// Server is the heartbeat row of a server process in AbfsGcServers. It stays
-// when the process stops, so that the collector can tell for any time window
-// which processes ran, with which version of the GC rules and settings.
+// Server is the heartbeat row of a server process. It stays when the process
+// stops, so the collector can tell which processes ran in any time window.
 type Server struct {
 	// ID is made by NewReplicaID.
 	ID string
-	// Version, GC, TouchInterval and CacheTTL are as in Replica.
-	Version       int64
-	GC            bool
+	// Version is the version of the GC rules the process follows, 0 for none.
+	Version int64
+	// GC reports whether the process runs the garbage collector hooks.
+	GC bool
+	// Zero TouchInterval or CacheTTL means no touches or no cache TTL.
 	TouchInterval time.Duration
 	CacheTTL      time.Duration
 	// HeartbeatInterval is the time between two heartbeats.
 	HeartbeatInterval time.Duration
-	// LinkValidation reports whether the server validates the links of new
-	// objects, refs and map results, which rescues the objects they link.
+	// LinkValidation also rescues the objects that new objects, refs and maps link.
 	LinkValidation bool
-	// The fields below are set by ReadServers. LastSeen is the commit time
-	// of the last heartbeat. TouchLossTime is the commit time of the first heartbeat or stop that
-	// recorded an object touch the server lost, the newest one when there
-	// were several, and StoppedAt the commit time of a clean stop.
-	// MapRowLossTime is as TouchLossTime for the map row touches. The losses
-	// are reported, not checked. All three are zero when unset.
+	// The fields below are commit times set by ReadServers, zero when unset. The
+	// losses are reported, not checked.
 	LastSeen       time.Time
 	TouchLossTime  time.Time
 	StoppedAt      time.Time
@@ -68,9 +60,7 @@ type Server struct {
 
 var serverColumns = []string{"ServerId", "Version", "GcEnabled", "TouchIntervalSeconds", "CacheTTLSeconds", "HeartbeatIntervalSeconds", "LinkValidation", "LastSeen", "TouchLossTime", "StoppedAt", "MapRowLossTime"}
 
-// WriteServer writes the heartbeat of the server process s. lost records that
-// the process lost object touches since its last heartbeat was written, and
-// mapRowsLost that it lost map row touches.
+// WriteServer writes a heartbeat; lost and mapRowsLost record lost touches.
 func WriteServer(ctx context.Context, client *spanner.Client, s *Server, lost, mapRowsLost bool) error {
 	cols := serverColumns[:8:8]
 	vals := []any{s.ID, s.Version, s.GC, int64(s.TouchInterval / time.Second), int64(s.CacheTTL / time.Second),
@@ -82,9 +72,7 @@ func WriteServer(ctx context.Context, client *spanner.Client, s *Server, lost, m
 	return nil
 }
 
-// StopServer records that the server process id stopped after writing its
-// buffered touches, and that it lost object or map row touches since its last
-// heartbeat when lost or mapRowsLost is set. The row stays.
+// StopServer records a clean stop after the buffered touches were written.
 func StopServer(ctx context.Context, client *spanner.Client, id string, lost, mapRowsLost bool) error {
 	cols, vals := appendLosses([]string{"ServerId", "StoppedAt"}, []any{id, spanner.CommitTimestamp}, lost, mapRowsLost)
 	if _, err := client.Apply(ctx, []*spanner.Mutation{spanner.Update(serversTable, cols, vals)}); err != nil {
@@ -93,8 +81,6 @@ func StopServer(ctx context.Context, client *spanner.Client, id string, lost, ma
 	return nil
 }
 
-// appendLosses adds the loss times that lost and mapRowsLost record to the
-// columns and values of a write.
 func appendLosses(cols []string, vals []any, lost, mapRowsLost bool) ([]string, []any) {
 	if lost {
 		cols = append(cols, "TouchLossTime")
@@ -113,8 +99,7 @@ func ReadServers(ctx context.Context, client *spanner.Client) ([]Server, error) 
 	return servers, err
 }
 
-// readServers returns the rows of AbfsGcServers and the time of the read, a
-// Spanner time like the times in the rows.
+// readServers also returns the Spanner time of the read.
 func readServers(ctx context.Context, client *spanner.Client) ([]Server, time.Time, error) {
 	var servers []Server
 	ro := client.Single()
@@ -143,10 +128,8 @@ func readServers(ctx context.Context, client *spanner.Client) ([]Server, time.Ti
 	return servers, read, nil
 }
 
-// PruneServers deletes the rows of AbfsGcServers whose process neither wrote a
-// heartbeat nor stopped since before, crashed ones included, and returns how
-// many it deleted.
-func PruneServers(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {
+// pruneServers also deletes the rows of crashed processes.
+func pruneServers(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {
 	var n int64
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		var err error

@@ -237,9 +237,8 @@ func (b *BadgerIndexStore) CheckMarkers() ([]entities.Hash, error) {
 	return hashes, nil
 }
 
-// keepUnconfirmedLocked keeps an eviction candidate whose entry is not Remote or holds a check
-// marker: it deletes only the LRU key, so the entry stays local, and returns the size the LRU
-// no longer tracks.
+// keepUnconfirmedLocked deletes only the LRU key of an eviction candidate that is not Remote
+// or holds a check marker, and returns the size the LRU no longer tracks.
 // Caller should be holding the timestamps lock for the hash.
 // Should only be called from the context of an open transaction.
 func (b *BadgerIndexStore) keepUnconfirmedLocked(txn *badger.Txn, hash entities.Hash, timestamp int64) (bool, int64, error) {

@@ -84,6 +84,16 @@ func testHashes(n int) []entities.Hash {
 	return hashes
 }
 
+// step runs at now what the refresh and touch loops of Run would run.
+func (k *GCKeepAlive) step(ctx context.Context, now time.Time) {
+	k.refStep(ctx, now)
+	k.touchStep(ctx, now)
+}
+
+func (k *GCKeepAlive) untilNext(now time.Time) time.Duration {
+	return min(k.untilRef(now), k.untilTouch(now))
+}
+
 func TestGCKeepAlive_Step(t *testing.T) {
 	require := require.New(t)
 
@@ -555,10 +565,36 @@ func TestGCKeepAlive_TouchPaces(t *testing.T) {
 	require.Len(remote.batches, 1)
 }
 
+// Time spent in a scan earns the touch no credit: its batches stay spaced at
+// the rate.
+func TestGCKeepAlive_TouchScanEarnsNoCredit(t *testing.T) {
+	require := require.New(t)
+
+	gap := 100 * time.Millisecond
+	var sent []time.Time
+	remote := &fakeGCRemote{onHeaders: func() { sent = append(sent, time.Now()) }}
+	k := &GCKeepAlive{
+		Remote:    remote,
+		TouchRate: gcTouchBatchSize / gap.Seconds(),
+		Scan: func(ctx context.Context, roots []string) (MountScan, error) {
+			time.Sleep(3 * gap)
+			return MountScan{Hashes: testHashes(3 * gcTouchBatchSize)}, nil
+		},
+	}
+	_, _, err := k.touch(context.Background())
+	require.NoError(err)
+	require.Len(sent, 3)
+	for i := 1; i < len(sent); i++ {
+		require.GreaterOrEqual(sent[i].Sub(sent[i-1]), 9*gap/10)
+	}
+}
+
 // runRemote reports each ref write and touch batch on a channel.
 type runRemote struct {
 	refs    chan struct{}
 	touches chan int
+	// hold, if set, holds each touch batch until it is closed.
+	hold chan struct{}
 }
 
 func (r *runRemote) PutRefs(server string, project string, refs []entities.RefHash, blocking bool) error {
@@ -568,6 +604,9 @@ func (r *runRemote) PutRefs(server string, project string, refs []entities.RefHa
 
 func (r *runRemote) RemoteHeaders(keys []entities.Hash) ([]bool, error) {
 	r.touches <- len(keys)
+	if r.hold != nil {
+		<-r.hold
+	}
 	return make([]bool, len(keys)), nil
 }
 
@@ -614,4 +653,45 @@ func TestGCKeepAlive_Run(t *testing.T) {
 
 	// Without intervals Run returns at once.
 	(&GCKeepAlive{Remote: remote}).Run(context.Background())
+}
+
+// A touch that takes long does not delay the ref refresh.
+func TestGCKeepAlive_RunRefreshesDuringTouch(t *testing.T) {
+	remote := &runRemote{refs: make(chan struct{}, 100), touches: make(chan int, 100), hold: make(chan struct{})}
+	k := &GCKeepAlive{
+		Remote:        remote,
+		Server:        "s",
+		Ref:           "refs/abfs/mount/user/u/1",
+		Target:        entities.EmptyDirHash,
+		RefInterval:   20 * time.Millisecond,
+		TouchInterval: 10 * time.Millisecond,
+		Scan:          hashesScan(testHashes(3), nil, nil),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		k.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		close(remote.hold)
+		<-done
+	}()
+
+	select {
+	case <-remote.touches:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no touch")
+	}
+	for range len(remote.refs) {
+		<-remote.refs
+	}
+	for range 3 {
+		select {
+		case <-remote.refs:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no ref refresh while a touch runs")
+		}
+	}
 }

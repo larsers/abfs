@@ -21,27 +21,20 @@ import (
 )
 
 const (
-	// DefaultWriteDeadline is the deadline of one attempt of a collector
-	// write call, the library's own retries included.
+	// DefaultWriteDeadline bounds one attempt of a collector write, library retries included.
 	DefaultWriteDeadline = 30 * time.Second
-	// streamRate is the throughput in bytes per second that a streamed
-	// object write gets on top of the write deadline.
+	// streamRate is the bytes per second a streamed write gets on top of the deadline.
 	streamRate = 8 << 20
 )
 
-// writeBudget bounds the writes of the collector. Without a deadline, a call
-// that the library retries runs until the run's context ends, which only a
-// lost lease does, so a stalled write would have no bound. Each attempt of a
-// write call runs under the deadline, and no attempt starts when the lease
-// could expire before two attempts and the clock skew margin have passed, so
-// a holder that lost its renewals stops writing before another can take the
-// lease over. The zero value adds no deadline and no lease check.
+// writeBudget bounds the collector writes: each attempt runs under the deadline,
+// and none starts unless the lease outlives two attempts and the clock skew
+// margin, so a holder that lost its renewals stops writing before a takeover.
 type writeBudget struct {
 	deadline time.Duration
 	lease    *Lease
 }
 
-// attempt returns the context of one attempt of a write call.
 func (b writeBudget) attempt(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	if b.lease != nil {
 		if err := b.lease.checkWrite(b.deadline); err != nil {
@@ -55,10 +48,8 @@ func (b writeBudget) attempt(ctx context.Context) (context.Context, context.Canc
 	return actx, cancel, nil
 }
 
-// stream returns the context of a streamed object write, and wrap, which
-// returns the writer through which the write sends its data to w. The context
-// ends when the write runs longer than the deadline plus the time to send
-// what it wrote so far at streamRate. stop releases the timer.
+// stream returns the context of a streamed write, which ends after the deadline
+// plus the time to send the bytes written so far at streamRate.
 func (b writeBudget) stream(ctx context.Context) (_ context.Context, wrap func(w io.Writer) io.Writer, stop func(), _ error) {
 	if b.lease != nil {
 		if err := b.lease.checkWrite(b.deadline); err != nil {
@@ -78,8 +69,6 @@ func (b writeBudget) stream(ctx context.Context) (_ context.Context, wrap func(w
 	return sctx, wrap, func() { dw.timer.Stop(); cancel() }, nil
 }
 
-// deadlineWriter moves the end of a streamed write later by the time to send
-// each byte written at streamRate.
 type deadlineWriter struct {
 	w        io.Writer
 	start    time.Time
@@ -88,7 +77,6 @@ type deadlineWriter struct {
 	timer    *time.Timer
 }
 
-// Write implements io.Writer.
 func (w *deadlineWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
 	w.n += int64(n)

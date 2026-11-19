@@ -30,7 +30,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 )
@@ -50,10 +52,10 @@ func newHooksTestBigtable(t *testing.T, opts ...grpc.DialOption) *bigtable.Clien
 	adm, err := bigtable.NewAdminClient(ctx, "test-proj", "test-bt", option.WithGRPCConn(conn))
 	require.NoError(t, err)
 	tables := map[string][]string{
-		objectsTableName: {"meta", "data", ObjectsFamily},
-		mapsTableName:    {mapsFamily},
-		TableName:        {EdgesFamily, TouchFamily},
-		chunksTableName:  {objectsDataFamily},
+		objectsTable:    {"meta", "data", ObjectsFamily},
+		mapsTableName:   {mapsFamily},
+		TableName:       {EdgesFamily, TouchFamily},
+		chunksTableName: {objectsDataFamily},
 	}
 	for table, families := range tables {
 		require.NoError(t, adm.CreateTable(ctx, table))
@@ -429,6 +431,92 @@ func TestToucher_CountsALateTouchBeforeItsWrite(t *testing.T) {
 	close(release)
 	<-done
 	require.Equal(TouchStats{Written: 1, Failed: 1}, tc.Stats())
+}
+
+// A late touch whose write fails counts as failed once, as does a late map
+// row touch.
+func TestToucher_CountsALateFailedTouchOnce(t *testing.T) {
+	require := require.New(t)
+	deny := grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		if strings.HasSuffix(method, "/MutateRows") {
+			return nil, status.Error(codes.PermissionDenied, "denied")
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	})
+	tc := newToucher(newHooksTestBigtable(t, deny), 10)
+	keys := testHashes(2)
+	require.True(tc.TouchObject(keys[0]))
+	require.True(tc.TouchMapRow(keys[0].String() + "#" + keys[1].String()))
+	tc.now = func() time.Time { return time.Now().Add(TouchDrainBound) }
+	require.True(tc.TouchObject(keys[1]))
+	tc.flush(context.Background(), []touch{<-tc.queue, <-tc.queue, <-tc.queue})
+	require.Equal(TouchStats{Failed: 2, MapRowsFailed: 1}, tc.Stats())
+	require.False(tc.Late())
+}
+
+// The drain at Close writes all the batches within one deadline, so that a
+// hanging Bigtable cannot hold Close for a write timeout per batch, and
+// counts the touches it could not write as failed.
+func TestToucher_DrainEndsWithinOneDeadline(t *testing.T) {
+	require := require.New(t)
+	hang := grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		if strings.HasSuffix(method, "/MutateRows") {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	})
+	keys := testHashes(3 * touchBatchSize)
+	tc := newToucher(newHooksTestBigtable(t, hang), len(keys))
+	for _, key := range keys {
+		require.True(tc.TryTouchObject(key))
+	}
+	const deadline = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	start := time.Now()
+	tc.drain(ctx, nil)
+	require.Less(time.Since(start), 2*deadline)
+	require.Empty(tc.queue)
+	require.Equal(TouchStats{Failed: int64(len(keys))}, tc.Stats())
+	require.False(tc.Late())
+}
+
+// Touches queued while Close runs are each written or counted as dropped:
+// none is left in the buffer after the workers drained it.
+func TestToucher_CloseLeavesNoTouchBehind(t *testing.T) {
+	require := require.New(t)
+	client := newHooksTestBigtable(t)
+	keys := testHashes(64)
+	for range 20 {
+		toucher := NewToucher(client, 1000)
+		var wg sync.WaitGroup
+		var attempts atomic.Int64
+		start := make(chan struct{})
+		for g := range 8 {
+			wg.Go(func() {
+				<-start
+				for i := 0; ; i++ {
+					attempts.Add(1)
+					if !toucher.TryTouchObject(keys[(g*8+i)%len(keys)]) {
+						select {
+						case <-toucher.stop:
+							return
+						default:
+						}
+					}
+				}
+			})
+		}
+		close(start)
+		time.Sleep(5 * time.Millisecond)
+		toucher.Close()
+		wg.Wait()
+		s := toucher.Stats()
+		require.Empty(toucher.queue)
+		require.Equal(attempts.Load(), s.Written+s.Dropped+s.Failed)
+		require.False(toucher.Late())
+	}
 }
 
 // Late reports a touch that waited past the late bound while no worker took

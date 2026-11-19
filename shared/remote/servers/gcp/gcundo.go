@@ -21,8 +21,7 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// UndoGC writes back what delete cycles deleted, from the delete records in
-// bucket; see gc.Undo.
+// UndoGC runs gc.Undo with the delete records in bucket.
 func (s *GCPServer) UndoGC(ctx context.Context, bucket string, opts *gc.UndoOpts) (*gc.UndoReport, error) {
 	if s.storage == nil {
 		return nil, errors.New("the server has no Cloud Storage client for the delete records")

@@ -133,6 +133,30 @@ func (e *ErrPermissionDenied) Error() string {
 
 var _ error = (*ErrPermissionDenied)(nil)
 
+// ErrUnavailable reports that the server cannot answer a call now; the client
+// may send it again.
+type ErrUnavailable struct { //nolint:errname // named as the other typed errors of this file
+	Reason string
+}
+
+func (e *ErrUnavailable) Error() string {
+	return e.Reason
+}
+
+var _ error = (*ErrUnavailable)(nil)
+
+// ErrInvalidArgument reports a call that the server refuses whatever its
+// state.
+type ErrInvalidArgument struct { //nolint:errname // named as the other typed errors of this file
+	Reason string
+}
+
+func (e *ErrInvalidArgument) Error() string {
+	return e.Reason
+}
+
+var _ error = (*ErrInvalidArgument)(nil)
+
 type ErrMessageTooLarge struct {
 	Size    int
 	MaxSize int

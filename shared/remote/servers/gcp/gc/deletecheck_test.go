@@ -263,10 +263,10 @@ func TestDeleteBlockers(t *testing.T) {
 // and its maximum is optional.
 func TestReplicaCounts(t *testing.T) {
 	now := time.Now()
-	live := func(n int, prefix string) []Replica {
-		var rows []Replica
+	live := func(n int, prefix string) []Server {
+		var rows []Server
 		for i := range n {
-			rows = append(rows, Replica{ID: prefix + string(rune('a'+i)) + "-x", GC: true, Version: ExtractorVersion, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now})
+			rows = append(rows, Server{ID: prefix + string(rune('a'+i)) + "-x", GC: true, Version: ExtractorVersion, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now})
 		}
 		return rows
 	}
@@ -331,7 +331,7 @@ func TestLiveBlockers_ServeLimit(t *testing.T) {
 
 	// Two live rows of one host count once, and refuse nothing.
 	e.servers[3] = liveServer("srv-1-cafe", now)
-	rep := checkReplicas(func() []Replica { r, _ := serverReplicas(e.servers); return r }(), now, &o.DryRunOpts)
+	rep := checkReplicas(func() []Server { r, _ := serverReplicas(e.servers); return r }(), now, &o.DryRunOpts)
 	require.Equal(int64(3), rep.Hosts)
 	require.Equal(int64(2), rep.RowsPerHost["srv-1"])
 	require.Empty(liveBlockers(e, &o))

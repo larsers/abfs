@@ -72,13 +72,9 @@ func (c *gcpCmd) Spec() cmd.CmdSpec {
 }
 
 func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
-	fl.StringVar(&c.project, "project", "", "The GCP Project which contains the databases (required)")
-	fl.StringVar(&c.instance, "instance", "", "The GCP Spanner Database Instance (required)")
-	fl.StringVar(&c.database, "db", defaultDatabase, "The GCP Spanner Database Name")
-	fl.StringVar(&c.btInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
+	registerStoreFlags(fl, &c.project, &c.instance, &c.database, &c.btInstance, &c.bucket)
 	fl.StringVar(&c.btAppProfile, "bt-app-profile", "", "The GCP Bigtable App Profile ID (empty uses the instance default app profile)")
 	fl.IntVar(&c.btConnPool, "bt-conn-pool", defaultBtConnPool, fmt.Sprintf("Number of gRPC connections in the Bigtable client pool. A non-positive value uses %d. Avoid excessively high values (fd/memory pressure).", gcp.DefaultBtConnPool))
-	fl.StringVar(&c.bucket, "bucket", "", "The GCS Bucket Name (required)")
 	fl.IntVarP(&c.maxCachedHeaders, "headers-cache", "", defaultMaxCachedHeaders, "The maximum number of cached objects' headers")
 	fl.IntVarP(&c.maxCachedContents, "contents-cache", "", defaultMaxCachedContents, "The maximum number of cached objects' content")
 	fl.BoolVar(&c.clientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
@@ -95,7 +91,7 @@ func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 }
 
 func (c *gcpCmd) validate() error {
-	return requireFlags(map[string]string{"--project": c.project, "--instance": c.instance, "--bucket": c.bucket})
+	return requireStoreFlags(c.project, c.instance, c.bucket)
 }
 
 func (c *gcpCmd) run(ctx context.Context) error {
@@ -124,11 +120,7 @@ func (c *gcpCmd) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
 	}
-	defer func() {
-		if err := server.Close(); err != nil {
-			log.Printf("WARNING: error closing ABFS server: %v", err)
-		}
-	}()
+	defer closeServer(server)
 	return c.Serve(ctx, gcp.NewFilterServer(server, nil))
 }
 
@@ -150,17 +142,13 @@ the tables of the garbage collector.`,
 }
 
 func (c *gcpInitCmd) RegisterFlags(fl *pflag.FlagSet) {
-	fl.StringVar(&c.opts.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
-	fl.StringVar(&c.opts.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
-	fl.StringVar(&c.opts.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
-	fl.StringVar(&c.opts.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
-	fl.StringVar(&c.opts.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+	registerStoreFlags(fl, &c.opts.ProjectID, &c.opts.InstanceID, &c.opts.DatabaseID, &c.opts.BtInstance, &c.opts.BucketName)
 	fl.BoolVar(&c.opts.GC, "gc", false, "Also create the garbage collector resources: the Bigtable table abfsgc, the column family abfsgc of the table objects and the Spanner tables AbfsGcState, AbfsGcServers and AbfsGcLists")
 }
 
 func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
-	if err := requireFlags(map[string]string{"--project": c.opts.ProjectID, "--instance": c.opts.InstanceID, "--bucket": c.opts.BucketName}); err != nil {
+	if err := requireStoreFlags(c.opts.ProjectID, c.opts.InstanceID, c.opts.BucketName); err != nil {
 		return err
 	}
 	if err := gcp.Setup(ctx, &c.opts); err != nil {
@@ -168,6 +156,24 @@ func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	}
 	fmt.Println("The GCP server resources are ready.")
 	return nil
+}
+
+func registerStoreFlags(fl *pflag.FlagSet, project, instance, database, btInstance, bucket *string) {
+	fl.StringVar(project, "project", "", "The GCP Project which contains the databases (required)")
+	fl.StringVar(instance, "instance", "", "The GCP Spanner Database Instance (required)")
+	fl.StringVar(database, "db", defaultDatabase, "The GCP Spanner Database Name")
+	fl.StringVar(btInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
+	fl.StringVar(bucket, "bucket", "", "The GCS Bucket Name (required)")
+}
+
+func requireStoreFlags(project, instance, bucket string) error {
+	return requireFlags(map[string]string{"--project": project, "--instance": instance, "--bucket": bucket})
+}
+
+func closeServer(server *gcp.GCPServer) {
+	if err := server.Close(); err != nil {
+		log.Printf("Warning: error closing ABFS server: %v", err)
+	}
 }
 
 func requireFlags(flags map[string]string) error {

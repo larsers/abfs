@@ -23,31 +23,30 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// remoteHeadersTimeout bounds one request. A batch of condemned objects takes
-// the server a while to rescue, so it is generous; it only keeps a server that
-// does not answer from holding the keep-alive forever.
+// remoteHeadersTimeout is generous, since the server can take a while to rescue
+// a batch of condemned objects.
 var remoteHeadersTimeout = 10 * time.Minute
 
-// handleRemoteHeaders asks the remote server for the headers of the given keys
-// and returns for each key whether the server has it. Mounts use it to touch
-// the objects they hold, so the server GC sees them as in use.
+// handleRemoteHeaders returns for each key whether the remote server has it.
+// Mounts use it to touch the objects they hold for the server GC.
 func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 	var keys []entities.Hash
 	if !c.ReadJSON(w, r, &keys) {
 		return
 	}
-	if c.abfsClient == nil {
+	abfsClient := c.remoteClient()
+	if abfsClient == nil {
 		c.ErrorJSON(w, r, errors.New("remote client not initialized"), http.StatusServiceUnavailable)
 		return
 	}
-	if _, ok := c.abfsClient.(*localOnlyClient); ok {
+	if _, ok := abfsClient.(*localOnlyClient); ok {
 		c.ErrorJSON(w, r, errors.New("cacheman is running in local-only mode"), http.StatusServiceUnavailable)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), remoteHeadersTimeout)
 	defer cancel()
-	hdrs, err := c.abfsClient.Headers(ctx, keys)
+	hdrs, err := abfsClient.Headers(ctx, keys)
 	if err != nil {
 		c.ErrorJSON(w, r, err, http.StatusInternalServerError)
 		return
@@ -60,4 +59,17 @@ func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 		c.checkRemoteHeaders(ctx, keys, found)
 	}
 	c.WriteJSON(w, r, found)
+}
+
+// remoteClient returns the ABFS client, which a config reload can replace.
+func (c *CacheMan) remoteClient() ABFSClient {
+	c.abfsClientLock.RLock()
+	defer c.abfsClientLock.RUnlock()
+	return c.abfsClient
+}
+
+func (c *CacheMan) setABFSClient(abfsClient ABFSClient) {
+	c.abfsClientLock.Lock()
+	defer c.abfsClientLock.Unlock()
+	c.abfsClient = abfsClient
 }

@@ -23,7 +23,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -104,5 +103,5 @@ func TestXchgRefs_TooManyRefsIsInvalidArgument(t *testing.T) {
 		refs[i] = remote.RefXchg{Ref: fmt.Sprintf("refs/heads/b%d", i)}
 	}
 	err := s.XchgRefs(context.Background(), "srv", "proj", refs)
-	require.Equal(t, codes.InvalidArgument, status.Code(err), "%v", err)
+	require.Equal(t, codes.InvalidArgument, clientCode(err), "%v", err)
 }

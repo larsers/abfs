@@ -68,6 +68,8 @@ type checkRemote struct {
 
 	calls atomic.Int64
 	keys  atomic.Int64
+	// canceled counts the held Headers calls whose context ended.
+	canceled atomic.Int64
 }
 
 func newCheckRemote() *checkRemote {
@@ -167,6 +169,7 @@ func (r *checkRemote) Headers(ctx context.Context, keys []remote.Hash) ([]entiti
 		select {
 		case <-ch:
 		case <-ctx.Done():
+			r.canceled.Add(1)
 			return nil, ctx.Err()
 		}
 	}
@@ -1155,6 +1158,97 @@ func TestCacheman_StartPassIsPaced(t *testing.T) {
 	require.Equal(t, int64(3), r.calls.Load())
 	// Two keys at 10,000 per second each time.
 	require.Equal(t, []time.Duration{200 * time.Microsecond, 200 * time.Microsecond}, clock.slept())
+}
+
+// The start pass paces the keys it sends, not the entries the check leaves out.
+func TestCacheman_StartPassPacesSentKeys(t *testing.T) {
+	oldBatch, oldPacer := localWriteStartPassBatch, newStartPassPacer
+	localWriteStartPassBatch = 2
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	newStartPassPacer = func() *keyPacer { return clock.pacer(localWriteStartPassRate) }
+	defer func() { localWriteStartPassBatch, newStartPassPacer = oldBatch, oldPacer }()
+
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	ariKey, casKey := fetchARIAndCASBlob(t, c)
+	lru := []entities.Hash{ariKey, casKey}
+	for _, content := range []string{"a", "b", "c"} {
+		lru = append(lru, fetchedBlob(t, c, content))
+		putOnServer(t, r, content)
+	}
+	for i, h := range lru {
+		setLRUTime(t, store, h, int64(100*(i+1)))
+	}
+
+	c.startLocalWriteCheck(context.Background())
+	waitForStartPass(t, c)
+	require.Equal(t, int64(3), c.Stats().RemoteChecks.StartPass)
+	require.Equal(t, []time.Duration{200 * time.Microsecond}, clock.slept())
+}
+
+// A config reload that reopens the index stops the start pass on the old index.
+func TestCacheman_ReloadStopsStartPass(t *testing.T) {
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	h := fetchedBlob(t, c1, "cached")
+	putOnServer(t, r, "cached")
+	require.NoError(t, c1.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	release := r.holdHeaders()
+	c.startLocalWriteCheck(context.Background())
+	require.Eventually(t, func() bool { return r.calls.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
+	oldIndex := c.index
+
+	config := *c.config
+	config.FsyncObjects = !config.FsyncObjects
+	require.NoError(t, c.applyLocalConfig(&config, false))
+	require.NotSame(t, oldIndex, c.index)
+	require.Eventually(t, func() bool { return r.canceled.Load() == 1 && r.calls.Load() == 2 }, 5*time.Second, 10*time.Millisecond)
+	release()
+	waitForStartPass(t, c)
+	require.True(t, confirmed(c, h))
+	require.Equal(t, int64(1), r.canceled.Load())
+}
+
+// The keep-alive's Headers calls and the check read the ABFS client while a config reload
+// replaces it.
+func TestCacheman_RemoteClientReplacedDuringChecks(t *testing.T) {
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+	h := fetchedBlob(t, c, "cached")
+	putOnServer(t, r, "cached")
+	body, err := json.Marshal([]entities.Hash{h})
+	require.NoError(t, err)
+	localOnly := *c.config
+	localOnly.LocalOnly = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			w := httptest.NewRecorder()
+			c.httpHandler().ServeHTTP(w, httptest.NewRequest("POST", "http://localhost/remote-headers", bytes.NewReader(body)))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			callCtx, callCancel := context.WithTimeout(ctx, time.Millisecond)
+			_, _ = c.localWriteHeaders(callCtx, []entities.Hash{h})
+			callCancel()
+		}
+	}()
+	for range 100 {
+		require.NoError(t, c.setupABFSClient(&localOnly, true))
+		c.setABFSClient(r)
+	}
+	cancel()
+	wg.Wait()
 }
 
 // A cacheman that stops during the start pass keeps eviction held at the batches answered so

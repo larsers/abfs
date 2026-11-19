@@ -65,7 +65,7 @@ func (s *PBServer) Headers(ctx context.Context, req *pb.HeadersRequest) (*pb.Hea
 	}
 	headers, err := s.server.Headers(ctx, keys)
 	if err != nil {
-		return nil, err
+		return nil, WrapErrorInStatus(err)
 	}
 	pbHeaders := make([]*pb.ObjectHeader, len(headers))
 	flatHeaders := make([]pb.ObjectHeader, len(headers))
@@ -81,7 +81,7 @@ func (s *PBServer) SHA256(ctx context.Context, req *pb.SHA256Request) (*pb.SHA25
 	keys := HashesFromInputBytes(req.Keys)
 	shas, err := s.server.SHA256(ctx, keys)
 	if err != nil {
-		return nil, err
+		return nil, WrapErrorInStatus(err)
 	}
 
 	return &pb.SHA256Reply{Sha256: OutputBytesFromSHA256(shas)}, nil
@@ -96,7 +96,7 @@ func (s *PBServer) GetObject(req *pb.GetObjectRequest, stream pb.ABFS_GetObjectS
 			return status.Error(codes.NotFound, "object not found on the server")
 		}
 
-		return err
+		return WrapErrorInStatus(err)
 	}
 	defer entities.CloseErrCheck(reader, &retErr)
 
@@ -106,7 +106,7 @@ func (s *PBServer) GetObject(req *pb.GetObjectRequest, stream pb.ABFS_GetObjectS
 		if entities.IsNotExist(err) {
 			return status.Error(codes.NotFound, "object not found on the server")
 		}
-		return err
+		return WrapErrorInStatus(err)
 	}
 	return nil
 }
@@ -130,7 +130,7 @@ func (s *PBServer) MapResults(ctx context.Context, req *pb.MapResultsRequest) (*
 	key := HashFromInputBytes(req.Id)
 	results, err := s.server.MapResults(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, WrapErrorInStatus(err)
 	}
 	return &pb.MapResultsReply{Results: OutputBytesFromHashes(results)}, nil
 }
@@ -153,9 +153,7 @@ func (s *PBServer) GetRefs(ctx context.Context, req *pb.GetRefsRequest) (*pb.Get
 		return nil, status.Errorf(codes.NotFound, "the server %q not found", req.Server)
 	}
 	if err != nil {
-		// Currently, these errors don't need wrapped in a gRPC status because we just log and don't return an error
-		// if there is permission denied.
-		return nil, err
+		return nil, WrapErrorInStatus(err)
 	}
 	return &pb.GetRefsReply{Hashes: OutputBytesFromHashes(hashes)}, nil
 }
@@ -167,9 +165,7 @@ func (s *PBServer) SearchRefs(ctx context.Context, req *pb.SearchRefsRequest) (*
 		return nil, status.Errorf(codes.NotFound, "the server %q not found", req.Server)
 	}
 	if err != nil {
-		// Currently, these errors don't need wrapped in a gRPC status because we just log and don't return an error
-		// if there is permission denied.
-		return nil, err
+		return nil, WrapErrorInStatus(err)
 	}
 
 	refs := make([]*pb.ProjectRefHash, len(result))
@@ -238,7 +234,7 @@ func (s *PBServer) XchgRefs(ctx context.Context, req *pb.XchgRefsRequest) (*pb.X
 func (s *PBServer) GetVersion(ctx context.Context, req *pb.GetVersionRequest) (*pb.GetVersionReply, error) {
 	version, err := s.server.Version(ctx)
 	if err != nil {
-		return nil, err
+		return nil, WrapErrorInStatus(err)
 	}
 	return &pb.GetVersionReply{Version: version}, nil
 }

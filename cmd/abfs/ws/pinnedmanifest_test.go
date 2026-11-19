@@ -62,12 +62,14 @@ func TestSetPinnedManifest(t *testing.T) {
 		name      string
 		opts      MountRepoOpts
 		keepAlive bool
+		localOnly bool
 		want      entities.Hash
 	}{
 		{name: "manifest hash", opts: MountRepoOpts{ManifestHash: givenHash}, keepAlive: true, want: givenHash},
 		{name: "manifest file", opts: MountRepoOpts{ManifestFile: manFile}, keepAlive: true, want: fileHash},
 		{name: "unreadable snapshot", opts: MountRepoOpts{ManifestHash: givenHash, IsSnapshot: true}, keepAlive: true},
 		{name: "keep-alive off", opts: MountRepoOpts{ManifestFile: manFile}},
+		{name: "local only", opts: MountRepoOpts{ManifestFile: manFile}, keepAlive: true, localOnly: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,6 +79,7 @@ func TestSetPinnedManifest(t *testing.T) {
 			casStore := remote.NewRemoteStore(srv)
 			config := instance.DefaultConfig(t.TempDir())
 			config.GCKeepAlive = tt.keepAlive
+			config.LocalOnly = tt.localOnly
 			c := &mountRepoCmd{
 				wsCmd: &wsCmd{
 					StoreProvider:  &cmd.StoreProvider{Store: casStore},
@@ -303,5 +306,14 @@ func TestSnapshotPin(t *testing.T) {
 		cmd.workspaces = ws
 		cmd.setSnapshotPin(ctx, &got)
 		require.Equal(pinnedHash, got.pinned)
+	})
+	t.Run("local only", func(t *testing.T) {
+		require := require.New(t)
+		var got fakeManifestHashes
+		cmd := &mountCmd{wsCmd: newTestBranchCmd(t, s, MountRepoOpts{}, true).wsCmd, MountOpts: MountOpts{WSName: "w"}}
+		cmd.Config.LocalOnly = true
+		cmd.workspaces = ws
+		cmd.setSnapshotPin(ctx, &got)
+		require.False(got.called)
 	})
 }

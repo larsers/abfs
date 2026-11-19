@@ -108,7 +108,7 @@ func TestCacheAge_FromReadStart(t *testing.T) {
 	cacheNow = clock.now.Load
 	t.Cleanup(func() { cacheNow = orig })
 	s := newEmulatorCASDBServerWith(t, clock.interceptor())
-	require.NoError(t, s.enableGCHooks(&NewServerOpts{CacheTTL: time.Minute, GCTouchInterval: time.Hour}))
+	require.NoError(t, s.enableGCHooks(context.Background(), &NewServerOpts{CacheTTL: time.Minute, GCTouchInterval: time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	key := putBlob(t, s, "read start")
 	data := []byte("blob 10\x00read start")
@@ -133,7 +133,7 @@ func TestCacheAge_FromReadStart(t *testing.T) {
 				err := tt.call()
 				clock.armed.Store(false)
 				if delay == 60 {
-					require.Equal(codes.Unavailable, status.Code(err), err)
+					require.Equal(codes.Unavailable, clientCode(err), err)
 					continue
 				}
 				require.NoError(err)

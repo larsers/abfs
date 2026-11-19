@@ -24,29 +24,29 @@ import (
 func TestCheckReplicas(t *testing.T) {
 	o := DefaultDryRunOpts()
 	now := time.Now()
-	good := Replica{Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now.Add(-time.Minute)}
+	good := Server{Version: ExtractorVersion, GC: true, TouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour, LastSeen: now.Add(-time.Minute)}
 	tests := []struct {
 		name   string
-		change func(r *Replica)
+		change func(r *Server)
 		want   string
 	}{
-		{"default settings", func(r *Replica) {}, ""},
-		{"stale", func(r *Replica) { r.LastSeen = now.Add(-time.Hour); r.TouchInterval = 0 }, ""},
-		{"no GC", func(r *Replica) { r.GC = false }, "runs without the garbage collector hooks"},
-		{"old GC rules", func(r *Replica) { r.Version = ExtractorVersion - 1 }, "older than version"},
-		{"no touches", func(r *Replica) { r.TouchInterval = 0 }, "writes no touches"},
-		{"long touch interval", func(r *Replica) { r.TouchInterval = 37 * time.Hour }, "touch interval 37h0m0s is longer than half the grace (36h0m0s)"},
-		{"no TTL", func(r *Replica) { r.CacheTTL = 0 }, "without a TTL"},
+		{"default settings", func(r *Server) {}, ""},
+		{"stale", func(r *Server) { r.LastSeen = now.Add(-time.Hour); r.TouchInterval = 0 }, ""},
+		{"no GC", func(r *Server) { r.GC = false }, "runs without the garbage collector hooks"},
+		{"old GC rules", func(r *Server) { r.Version = ExtractorVersion - 1 }, "older than version"},
+		{"no touches", func(r *Server) { r.TouchInterval = 0 }, "writes no touches"},
+		{"long touch interval", func(r *Server) { r.TouchInterval = 37 * time.Hour }, "touch interval 37h0m0s is longer than half the grace (36h0m0s)"},
+		{"no TTL", func(r *Server) { r.CacheTTL = 0 }, "without a TTL"},
 		// The grace check of the TTL counts every server of the window
 		// (TestGraceProblem), so a long TTL is no problem of a replica.
-		{"long TTL", func(r *Replica) { r.CacheTTL = 70 * time.Hour }, ""},
+		{"long TTL", func(r *Server) { r.CacheTTL = 70 * time.Hour }, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := good
 			r.ID = "r1"
 			tt.change(&r)
-			rep := checkReplicas([]Replica{r}, now, &o)
+			rep := checkReplicas([]Server{r}, now, &o)
 			if tt.want == "" {
 				require.Empty(t, rep.Warnings)
 				return
@@ -57,7 +57,7 @@ func TestCheckReplicas(t *testing.T) {
 		})
 	}
 	good.ID = "srv-0-1a2b3c"
-	rep := checkReplicas([]Replica{good, {ID: "srv-1-4d5e6f", LastSeen: now.Add(-time.Hour)}}, now, &o)
+	rep := checkReplicas([]Server{good, {ID: "srv-1-4d5e6f", LastSeen: now.Add(-time.Hour)}}, now, &o)
 	require.Equal(t, ReplicaReport{Live: 1, Stale: 1, Hosts: 1, RowsPerHost: map[string]int64{"srv-0": 1}}, rep)
 }
 

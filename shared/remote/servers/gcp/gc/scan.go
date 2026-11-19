@@ -17,6 +17,7 @@ package gc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -35,8 +36,7 @@ const (
 	maxDanglingKept = 10
 )
 
-// typeNames lists the object types this binary knows, sorted; a node stores
-// its type as an index into it.
+// A node stores its type as an index into typeNames.
 var typeNames, typeIndex = knownTypes()
 
 // TypeNames returns the object types the collector knows, sorted.
@@ -61,15 +61,12 @@ func knownTypes() ([]string, map[string]uint8) {
 	return names, index
 }
 
-// graph is the object graph of one scan of the table abfsgc. Nodes are the row
-// keys, numbered in key order across the scan shards; the edges of each node
-// are in compressed sparse rows, one segment per scan shard. The keys stay in
-// the arrays their shards filled, so the scan never copies them.
+// graph holds the edges in compressed sparse rows, one segment per scan shard.
+// The keys stay in the arrays their shards filled, so the scan never copies them.
 type graph struct {
 	shards []keyShard
 	n      int
-	// prefix[p] is the first node whose key starts with the 16 bits p, and
-	// prefixShard[p] the shard that holds those keys.
+	// prefix[p] is the first node whose key starts with the 16 bits p.
 	prefix      []uint32
 	prefixShard []uint16
 	types       []uint8
@@ -77,7 +74,6 @@ type graph struct {
 	segs        []segment
 }
 
-// keyShard holds the sorted keys of the nodes lo to lo+len(keys)-1.
 type keyShard struct {
 	lo   uint32
 	keys []Hash
@@ -88,19 +84,14 @@ const (
 	maxEdgeBlock = 1 << 20
 )
 
-// segment holds the edges of the nodes from lo on, in blocks that never
-// grow, so that the scan copies no edges and leaves at most one partly used
-// block. starts[i] is where the edges of node lo+i start: the block index in
-// the high 32 bits, the position in the block in the low 32 bits. They end
-// where the edges of the next node start, or at the end of the block when the
-// next node starts in a later one.
+// segment holds edges in blocks that never grow. starts[i] holds the block index
+// in the high 32 bits and the position in the block in the low 32 bits.
 type segment struct {
 	lo     uint32
 	starts []uint64
 	blocks [][]uint32
 }
 
-// add appends the edges of the next node.
 func (s *segment) add(ids []uint32) {
 	b := len(s.blocks) - 1
 	if b < 0 || cap(s.blocks[b])-len(s.blocks[b]) < len(ids) {
@@ -115,7 +106,6 @@ func (s *segment) add(ids []uint32) {
 	s.blocks[b] = append(s.blocks[b], ids...)
 }
 
-// finish ends the edges of the last node.
 func (s *segment) finish() {
 	b := max(len(s.blocks)-1, 0)
 	var used int
@@ -129,7 +119,6 @@ func (s *segment) nodes() int {
 	return len(s.starts) - 1
 }
 
-// nodeEdges returns the edges of node lo+k.
 func (s *segment) nodeEdges(k uint32) []uint32 {
 	start, next := s.starts[k], s.starts[k+1]
 	block := s.blocks[start>>32]
@@ -140,7 +129,6 @@ func (s *segment) nodeEdges(k uint32) []uint32 {
 	return block[uint32(start):end]
 }
 
-// bytes returns the memory the segment holds.
 func (s *segment) bytes() int64 {
 	n := int64(cap(s.starts)) * 8
 	for _, b := range s.blocks {
@@ -157,7 +145,6 @@ func keyPrefix16(h Hash) int {
 	return int(h[0])<<8 | int(h[1])
 }
 
-// size returns the number of nodes.
 func (g *graph) size() int {
 	return g.n
 }
@@ -177,7 +164,6 @@ func (g *graph) find(h Hash) uint32 {
 	return lo + uint32(i)
 }
 
-// edges returns the edges of node id.
 func (g *graph) edges(id uint32) []uint32 {
 	i, ok := slices.BinarySearchFunc(g.segs, id, func(s segment, id uint32) int {
 		switch {
@@ -195,7 +181,6 @@ func (g *graph) edges(id uint32) []uint32 {
 	return s.nodeEdges(id - s.lo)
 }
 
-// keysBytes returns the memory the keys and their indexes hold.
 func (g *graph) keysBytes() int64 {
 	n := int64(cap(g.types)) + int64(len(g.prefix))*4 + int64(len(g.prefixShard))*2
 	for _, s := range g.shards {
@@ -204,9 +189,7 @@ func (g *graph) keysBytes() int64 {
 	return n
 }
 
-// prefixBounds cuts the inner bounds of a key range split to 16-bit key
-// prefixes, so that the keys of each prefix fall in one shard, as the graph
-// needs.
+// prefixBounds aligns shard bounds to 16-bit key prefixes, as the graph needs.
 func prefixBounds(bounds []string) []string {
 	out := []string{bounds[0]}
 	for _, b := range bounds[1 : len(bounds)-1] {
@@ -218,14 +201,10 @@ func prefixBounds(bounds []string) []string {
 	return append(out, bounds[len(bounds)-1])
 }
 
-// nodeStats counts the rows of the first scan.
 type nodeStats struct {
-	// TouchOnly counts rows that hold a touch but no edges: objects without a
-	// gc row that a server touched.
+	// TouchOnly counts touched objects without a gc row.
 	TouchOnly int64
-	// Outdated counts rows of an older edge extractor than their type
-	// requires, per type index in OutdatedTypes. Newer counts rows of a newer
-	// edge extractor than this binary's.
+	// Outdated and Newer count rows of an older or a newer edge extractor.
 	Outdated      int64
 	OutdatedTypes []int64
 	Newer         int64
@@ -238,9 +217,7 @@ type nodeShard struct {
 	stats  nodeStats
 }
 
-// scanNodes reads the key, type, first write and touch of every row of the
-// table abfsgc, without the edges. A row is recent when it was written or touched
-// after recentAfter. An object type this binary does not know stops the scan.
+// scanNodes reads every row of abfsgc without the edges. An unknown type stops it.
 func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, recentAfter time.Time) (*graph, nodeStats, error) {
 	filter := bigtable.ChainFilters(bigtable.LatestNFilter(1), bigtable.InterleaveFilters(
 		bigtable.ChainFilters(bigtable.FamilyFilter(EdgesFamily), bigtable.ColumnFilter(LinksColumn), bigtable.StripValueFilter()),
@@ -327,7 +304,7 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 	for i := range shards {
 		s := &shards[i]
 		if !slices.IsSortedFunc(s.keys, compareHash) || (last != nil && len(s.keys) > 0 && compareHash(*last, s.keys[0]) >= 0) {
-			return nil, stats, fmt.Errorf("the scan of the table abfsgc returned keys out of order")
+			return nil, stats, errors.New("the scan of the table abfsgc returned keys out of order")
 		}
 		if len(s.keys) > 0 {
 			last = &s.keys[len(s.keys)-1]
@@ -370,8 +347,7 @@ type EdgeCounts struct {
 	Total int64 `json:"total"`
 	// Dangling counts edges to objects without a gc row; the mark skips them.
 	Dangling int64 `json:"dangling"`
-	// DanglingFromRecent counts the dangling edges of recent objects, which
-	// include uploads in flight during the scan.
+	// DanglingFromRecent includes uploads in flight during the scan.
 	DanglingFromRecent int64 `json:"dangling_from_recent"`
 	// DanglingSample lists a few dangling edges as "from>to".
 	DanglingSample []string `json:"dangling_sample,omitempty"`
@@ -385,8 +361,6 @@ type edgeShard struct {
 	perType []int64
 }
 
-// scanEdges reads the edges of every node of g, shard by shard over the same
-// bounds as scanNodes. It returns the edge counts per type index.
 func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *graph) (EdgeCounts, []int64, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(EdgesFamily), bigtable.ColumnFilter(LinksColumn), bigtable.LatestNFilter(1))
 	shards := make([]edgeShard, len(bounds)-1)
@@ -482,24 +456,19 @@ func scanEdges(ctx context.Context, table *bigtable.Table, bounds []string, gr *
 	return counts, perType, nil
 }
 
-// mapRow is a row of the table maps: nodes of from and to (noNode when they
-// have no gc row) and the cell time in microseconds.
+// mapRow ends are noNode when they have no gc row; time is in microseconds.
 type mapRow struct {
 	from, to uint32
 	time     int64
 }
 
-// mapScan is the result of scanMaps: the rows of each scan shard, which are
-// not copied into one array, so that they do not take twice their memory
-// while the edges are scanned, and the keys of the rows with an end without a
-// node, by shard and index, which the node ids cannot give.
+// mapScan keeps the rows per shard so they do not take twice their memory.
 type mapScan struct {
 	rows      [][]mapRow
 	rawKeys   []map[int]string
 	malformed int64
 }
 
-// rowKey returns the key of the row i of shard s.
 func (m *mapScan) rowKey(g *graph, s, i int) string {
 	r := &m.rows[s][i]
 	if r.from == noNode || r.to == noNode {
@@ -508,7 +477,6 @@ func (m *mapScan) rowKey(g *graph, s, i int) string {
 	return g.key(r.from).String() + "#" + g.key(r.to).String()
 }
 
-// scanMaps reads the keys and cell times of the table maps.
 func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *graph) (*mapScan, error) {
 	filter := bigtable.ChainFilters(bigtable.FamilyFilter(mapsFamily), bigtable.LatestNFilter(1), bigtable.StripValueFilter())
 	rows := make([][]mapRow, len(bounds)-1)
@@ -552,7 +520,6 @@ func scanMaps(ctx context.Context, table *bigtable.Table, bounds []string, gr *g
 	return scan, nil
 }
 
-// key returns the key of node id.
 func (g *graph) key(id uint32) Hash {
 	i, _ := slices.BinarySearchFunc(g.shards, id, func(s keyShard, id uint32) int {
 		switch {

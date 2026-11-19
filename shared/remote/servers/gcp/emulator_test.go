@@ -157,7 +157,7 @@ func newEmulatorCASDBServerWith(t *testing.T, opt ...grpc.ServerOption) *GCPServ
 	dbID := newEmulatorDatabase(t)
 	newEmulatorBigtableWith(t, serverTables(true), opt...)
 
-	db, err := casdb.New(context.Background(), fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID), emulatorProject, emulatorBigtable, "", 1, false)
+	db, err := casdb.New(context.Background(), fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID), emulatorProject, emulatorBigtable, casdb.Options{BtConnPoolSize: 1})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 

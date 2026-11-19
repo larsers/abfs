@@ -247,7 +247,7 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	serveErr := serveGRPC(ctx, s, hs, lis, c.drainDelay, c.shutdownTimeout)
 	if aresProxy != nil {
 		if err := aresProxy.Close(); err != nil {
-			log.Printf("WARNING: error stopping ares proxy: %v", err)
+			log.Printf("Warning: error stopping ares proxy: %v", err)
 		}
 	}
 	return serveErr

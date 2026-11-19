@@ -330,7 +330,7 @@ func TestDeleteGC_RescuedParentKeepsItsChildren(t *testing.T) {
 	f.delete(nil)
 	f.age()
 
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 	f.checks.hook = func() {
 		f.s.forget(commit)
@@ -1023,7 +1023,7 @@ func TestDeleteGC_ChecksObjectsWrittenDuringTheScan(t *testing.T) {
 	require.Empty(readsOf())
 
 	o := f.deleteOpts().DryRunOpts
-	res, err = gc.DryRun(ctx, f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), f.s, &o)
+	res, err = gc.DryRun(ctx, f.s.casdb.SpannerClient(), bt, f.s, &o)
 	require.NoError(err)
 	require.Equal(int64(n), res.Report.Consistency.TooNew)
 	require.Nil(res.Report.Delete.TooNew)
@@ -1090,7 +1090,7 @@ func TestDeleteGC_RescuedDuringHoldSurvives(t *testing.T) {
 	_, err := f.condemn(nil)
 	require.NoError(err)
 
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 	f.s.forget(rescued)
 	_, err = f.s.Headers(ctx, []entities.Hash{rescued})
@@ -1177,6 +1177,8 @@ func TestDeleteGC_OffAndOnAgainHoldsAnew(t *testing.T) {
 	require.ErrorAs(err, &refused)
 	require.Equal(int64(1), res.Report.Consistency.MissingGCRows)
 	require.True(res.Report.Condemn.RecordsCleared)
+	require.NotNil(res.Report.Delete)
+	require.Nil(res.Report.Delete.Plan, "the plan rests on the cleared records")
 	require.Nil(f.listRecord(1))
 	f.requirePresent(used)
 	require.Equal([][]byte{marker(1)}, f.markerCells(used))

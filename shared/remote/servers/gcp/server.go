@@ -58,14 +58,12 @@ type (
 // the 20-byte hash. It reduces heap allocations and GC pointer scans.
 type CachedHeader struct {
 	Size int64
-	// Loaded is the cacheNow time at which the Bigtable read of the header
-	// started; without GC, at which it was cached.
+	// Loaded is the cacheNow time the Bigtable read of the header started.
 	Loaded uint32
 	// Passing for up to 2^16 unique object types
 	Type  uint16
 	Valid bool
-	// Touched marks the touch period in which this server last touched the
-	// object; see touchMark.
+	// Touched is the touch period of this server's last touch of the object.
 	Touched uint8
 }
 
@@ -245,36 +243,23 @@ type NewServerOpts struct {
 	MaxCachedContents int
 	NoLinkValidation  bool
 	NoHashValidation  bool
-	// ClientMetrics exports the built-in metrics of the Spanner, Bigtable and
-	// Cloud Storage client libraries to Cloud Monitoring.
+	// ClientMetrics exports the client libraries' metrics to Cloud Monitoring.
 	ClientMetrics bool
-	// LinksContent makes GetObject return signed Cloud Storage URLs instead of the
-	// content for objects larger than LinksContentThreshold bytes.
+	// LinksContent returns signed URLs for content above LinksContentThreshold.
 	LinksContent          bool
 	LinksContentThreshold int64
-	// GC turns on the server side of the garbage collector: PutObject writes
-	// the GC edges of new objects, reads rescue condemned objects, and the
-	// options below apply. Off, the server reads and writes only what a server
-	// without garbage collection does.
+	// GC turns on the server side of the garbage collector.
 	GC bool
-	// CacheTTL is how long cached headers and content are used before they are
-	// read again; zero keeps them until they are evicted. With GC and not
-	// GCReadOnly it must be above zero.
+	// CacheTTL bounds the age of cache entries; GC needs it unless GCReadOnly.
 	CacheTTL time.Duration
-	// GCTouchInterval is the length of the period in which this server touches
-	// each object and map row at most once; zero disables touches. With GC
-	// and not GCReadOnly it must be above zero.
+	// GCTouchInterval is the touch period; GC needs it unless GCReadOnly.
 	GCTouchInterval time.Duration
-	// GCHeartbeatInterval is the time between two heartbeats of this server in
-	// the table AbfsGcServers; zero uses DefaultGCHeartbeatInterval, and tests set
-	// shorter ones. It is at most gc.MaxHeartbeatInterval, and the server
-	// stops serving while its last successful heartbeat is older than two
-	// intervals and 30 s.
+	// GCHeartbeatInterval is at most gc.MaxHeartbeatInterval; zero uses the default.
 	GCHeartbeatInterval time.Duration
-	// GCReadOnly, with GC, leaves the state of the garbage collector as it is:
-	// reads answer for condemned objects without rescuing them, and the server
-	// writes no touches and no heartbeat. The collector's own commands use it,
-	// so that what they read does not count as a use.
+	// SmallPools uses the client libraries' default pools, for a short command.
+	SmallPools bool
+	// GCReadOnly, with GC, writes no rescues, touches or heartbeat, so that the
+	// reads of the collector's own commands do not count as a use.
 	GCReadOnly bool
 }
 
@@ -302,14 +287,17 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	}
 
 	btConnPool := opts.BtConnPool
-	if btConnPool <= 0 {
+	switch {
+	case opts.SmallPools:
+		btConnPool = 0
+	case btConnPool <= 0:
 		btConnPool = DefaultBtConnPool
 	}
-	var clientOpts []option.ClientOption
+	dbOpts := casdb.Options{BtAppProfile: opts.BtAppProfile, BtConnPoolSize: btConnPool, ClientMetrics: opts.ClientMetrics, Small: opts.SmallPools}
 	if opts.GC && !opts.GCReadOnly {
-		clientOpts = writeBoundOptions()
+		dbOpts.UnaryInterceptor, dbOpts.StreamInterceptor = writeBoundUnary, writeBoundStream
 	}
-	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool, opts.ClientMetrics, clientOpts...)
+	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, dbOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -339,8 +327,10 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		_ = s.Close()
 		return nil, err
 	}
-	// As file-based, so that trees and refs that link the empty file or
-	// directory pass link validation on a new database.
+	// As file-based, so that links to the empty file and directory validate.
+	if opts.GC && opts.GCReadOnly {
+		return s, nil
+	}
 	if err := s.PutObject(ctx, entities.EmptyFileHash, remote.NewZStdContentReader(entities.EmptyFileContent)); err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("failed to put empty file: %w", err)
@@ -352,8 +342,6 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	return s, nil
 }
 
-// newShardedCache returns cacheShards LRU caches that hold size entries
-// together, at least one per shard.
 func newShardedCache[V any](size int) ([]*lru.Cache[entities.Hash, V], error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
@@ -586,9 +574,8 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 			return
 		}
 		if addAttempted {
-			// A failed AddObject call may still have written the object row, for
-			// example when the response was lost, and other replicas may have
-			// read it, so the content stays for a later orphan sweep.
+			// A failed AddObject may still have written the row, which others may
+			// have read, so the content stays for a later orphan sweep.
 			log.Printf("Kept content of failed PutObject (%s): the object row may reference it", key)
 			return
 		}
@@ -605,8 +592,7 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 		return err
 	}
 	// The edges go first, so that no object row exists without them. Their
-	// e:links cell is the touch of the object, made after written, so the
-	// cached header names the touch period of written.
+	// touch is made after written, so the cached touch period holds.
 	written := cacheNow()
 	if s.gcEdges != nil {
 		if err := guard.do(ctx, func(ctx context.Context) error {
@@ -638,8 +624,6 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	return err
 }
 
-// removeFailedContent removes the content stored by a PutObject that failed
-// before it tried to write the object row.
 func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
@@ -752,8 +736,7 @@ func (s *GCPServer) GetRefs(ctx context.Context, server string, project string, 
 	return s.casdb.GetRefs(ctx, id, refs)
 }
 
-// checkServerExists returns a not-exist error when no project of server has
-// been created, as file-based does for a server it has no refs file for.
+// checkServerExists fails as file-based does for a server without refs.
 func (s *GCPServer) checkServerExists(ctx context.Context, server string) error {
 	exists, err := s.casdb.HostExists(ctx, server)
 	if err != nil {
@@ -966,10 +949,8 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 	return cached, nil
 }
 
-// getHeaders returns the headers of hashes. With noTouch it records no use of
-// the objects it finds and rescues none: a condemned object it reads is
-// answered as missing and is not cached, so that a later read rescues it. A
-// header cached before the condemn answers present until its cache TTL ends.
+// With noTouch, getHeaders records no use and rescues nothing: a condemned
+// object is answered as missing and not cached, so a later read rescues it.
 func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []entities.Hash, noTouch bool) ([]CachedHeader, error) {
 	result := make([]CachedHeader, len(hashes))
 	var misses []entities.Hash

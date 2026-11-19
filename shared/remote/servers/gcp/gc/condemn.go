@@ -40,26 +40,18 @@ const (
 // CondemnOpts sets a condemn cycle of the garbage collector.
 type CondemnOpts struct {
 	DryRunOpts
-	// ExpectedReplicas is the number of distinct server hosts that must
-	// write a GC heartbeat. A fleet whose size changes, such as an autoscaled
-	// one, sets MinReplicas instead, and MaxReplicas when it has a bound; zero
-	// means no upper bound. The evidence of each server comes from its own
-	// heartbeat rows, so the count only notices servers that write none.
+	// ExpectedReplicas is the number of server hosts that must write a GC
+	// heartbeat. An autoscaled fleet sets MinReplicas and MaxReplicas instead.
 	ExpectedReplicas int
 	MinReplicas      int
 	MaxReplicas      int
-	// Rate is the maximum number of rows marked per second; zero means no
-	// limit.
-	Rate float64
-	// KeepLists is the number of condemned lists kept in the bucket.
+	// Rate is in rows per second; zero means no limit.
+	Rate      float64
 	KeepLists int
-	// BatchSize is the number of rows of one bulk write; zero uses
-	// DefaultCondemnBatch.
 	BatchSize int
 }
 
-// DefaultCondemnOpts returns the default options; the replica counts have no
-// default.
+// DefaultCondemnOpts returns the default options.
 func DefaultCondemnOpts() CondemnOpts {
 	return CondemnOpts{DryRunOpts: DefaultDryRunOpts(), Rate: DefaultCondemnRate, KeepLists: DefaultKeepLists}
 }
@@ -90,41 +82,22 @@ func (o *CondemnOpts) Validate() error {
 
 // CondemnReport reports the condemn step of a cycle.
 type CondemnReport struct {
-	ExpectedReplicas int `json:"expected_replicas,omitempty"`
-	MinReplicas      int `json:"min_replicas,omitempty"`
-	MaxReplicas      int `json:"max_replicas,omitempty"`
-	// Refused lists the reasons why the cycle did not condemn. It then wrote
-	// no marker and no list.
-	Refused []string `json:"refused,omitempty"`
-	// Cleared counts the markers of live objects the cycle deleted, and
-	// LiveList names the object that lists them.
-	Cleared  int64  `json:"cleared"`
-	LiveList string `json:"live_list,omitempty"`
-	// List is the condemned list of the cycle in the server bucket.
-	List string `json:"list,omitempty"`
-	// Condemned counts the objects marked, per type in Types, and their
-	// size: the unreachable objects without a marker or with the marker of a
-	// list without a complete record. Kept counts the unreachable objects
-	// whose recorded marker the cycle kept.
-	Condemned      int64            `json:"condemned"`
-	CondemnedBytes int64            `json:"condemned_bytes"`
-	Types          map[string]int64 `json:"types,omitempty"`
-	Kept           int64            `json:"kept"`
-	// CacheTTLHours is the largest cache TTL of the servers that the list
-	// record holds. NotCompleted lists why the cycle did not complete its
-	// list; a later cycle then writes its markers again.
-	CacheTTLHours float64  `json:"cache_ttl_hours"`
-	NotCompleted  []string `json:"not_completed,omitempty"`
-	// ListsRemoved counts the list objects of older cycles deleted, and
-	// RecordsRemoved the rows of AbfsGcLists of lists no object holds the marker
-	// of.
-	ListsRemoved   int64 `json:"lists_removed"`
-	RecordsRemoved int64 `json:"records_removed"`
-	// RecordsCleared reports that the cycle found objects without a gc row,
-	// which only servers without --gc write, and deleted every row of
-	// AbfsGcLists before any other step, so that every marker is written again
-	// and held anew.
-	RecordsCleared bool `json:"records_cleared,omitempty"`
+	ExpectedReplicas int              `json:"expected_replicas,omitempty"`
+	MinReplicas      int              `json:"min_replicas,omitempty"`
+	MaxReplicas      int              `json:"max_replicas,omitempty"`
+	Refused          []string         `json:"refused,omitempty"`
+	Cleared          int64            `json:"cleared"`
+	LiveList         string           `json:"live_list,omitempty"`
+	List             string           `json:"list,omitempty"`
+	Condemned        int64            `json:"condemned"`
+	CondemnedBytes   int64            `json:"condemned_bytes"`
+	Types            map[string]int64 `json:"types,omitempty"`
+	Kept             int64            `json:"kept"`
+	CacheTTLHours    float64          `json:"cache_ttl_hours"`
+	NotCompleted     []string         `json:"not_completed,omitempty"`
+	ListsRemoved     int64            `json:"lists_removed"`
+	RecordsRemoved   int64            `json:"records_removed"`
+	RecordsCleared   bool             `json:"records_cleared,omitempty"`
 }
 
 // ErrCondemnRefused reports that a condemn cycle found its preconditions
@@ -139,13 +112,8 @@ func (e *ErrCondemnRefused) Error() string {
 	return "the GC cycle refused to condemn: " + strings.Join(e.Reasons, "; ")
 }
 
-// Condemn runs one garbage collection cycle that condemns: the steps of a dry
-// run, then, unless condemnBlockers finds a reason to refuse, it clears the
-// markers of the live objects, publishes the list of the unreachable objects
-// that hold no marker of a complete list in bucket, sets their marker
-// abfsgc:condemned to the cycle number and completes the list in AbfsGcLists. A
-// marker of a complete list is never written again. It deletes nothing. A
-// refused cycle returns its result with an *ErrCondemnRefused.
+// Condemn runs one garbage collection cycle that condemns the unreachable
+// objects. A refused cycle returns its result with an *ErrCondemnRefused.
 func Condemn(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, opts *CondemnOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
@@ -155,18 +123,16 @@ func Condemn(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucke
 		o.BatchSize = DefaultCondemnBatch
 	}
 	c := &condemner{opts: &o, bt: bt, bucket: bucket}
-	return runCycle(ctx, sp, bt, bucket, objs, &o.DryRunOpts, c)
+	return runCycle(ctx, sp, bt, objs, &o.DryRunOpts, c)
 }
 
 // blockingRootClasses are the root classes in which a root without a gc row
 // stops a condemn: what such a root keeps is not known.
 var blockingRootClasses = []string{
-	string(RefSource), string(RefProjectStatus), string(RefPushedPacks), string(RefWorkspace), string(RefSnapshot), string(RefMount), RootPermanent,
+	string(RefSource), string(RefProjectStatus), string(RefPushedPacks), string(RefConfig), string(RefACL), string(RefWorkspace), string(RefSnapshot), string(RefMount), RootPermanent,
 }
 
-// condemnBlockers returns the reasons in the report r why the cycle must not
-// condemn: a server that could answer for a condemned object without
-// rescuing it, or a mark that may have missed what a root keeps.
+// condemnBlockers returns the reasons why the cycle must not condemn.
 func condemnBlockers(r *Report, o *CondemnOpts) []string {
 	var reasons []string
 	add := func(format string, args ...any) {
@@ -205,9 +171,6 @@ func condemnBlockers(r *Report, o *CondemnOpts) []string {
 	return reasons
 }
 
-// replicaCountProblems checks the number of hosts with a live heartbeat row
-// against the expected number or range, which notices servers that write no
-// row.
 func replicaCountProblems(rep *ReplicaReport, o *CondemnOpts) []string {
 	switch {
 	case o.ExpectedReplicas > 0 && rep.Hosts != int64(o.ExpectedReplicas):
@@ -226,9 +189,8 @@ type condemner struct {
 	bt     *bigtable.Client
 	bucket *storage.BucketHandle
 	budget writeBudget
-	// prev is the list of the last condemn cycle, for the report.
-	prev previousList
-	// del runs the delete steps of a delete cycle, nil in a condemn cycle.
+	prev   previousList
+	// del is nil in a condemn cycle.
 	del *deleter
 }
 
@@ -257,31 +219,27 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		}
 	}
 
-	// The markers of live keys are cleared before the delete step, so that
-	// the targets of a root that came back get a full hold when they are
-	// condemned again.
+	// Cleared before the delete step, so a target of a root that came back
+	// gets a full hold when condemned again.
 	cleared, err := c.clearMarked(ctx, lease, res, rep)
 	if err != nil {
 		return err
 	}
 	r.PreviousList = c.reportPrevious(res, cleared)
-	nodes := res.unreachable
+	nodes := slices.Clone(res.unreachable)
 	if c.del != nil {
 		deleted, err := c.del.run(ctx, lease, res)
 		if err != nil {
 			return err
 		}
-		// A marker written to a deleted or gone row would make a row of its
-		// own.
+		// A marker written to a deleted row would make a row of its own.
 		if deleted != nil {
-			nodes = slices.DeleteFunc(slices.Clone(nodes), func(n sizedNode) bool { return deleted.has(n.id) })
+			nodes = slices.DeleteFunc(nodes, func(n sizedNode) bool { return deleted.has(n.id) })
 		}
 	}
-	// A recorded marker is never written again: its value is what a later
-	// delete of the key matches. A marker without a complete record may be
-	// of a run that never completed, and is replaced.
+	// A recorded marker is never written again: a later delete matches it.
 	before := len(nodes)
-	nodes = slices.DeleteFunc(slices.Clone(nodes), func(n sizedNode) bool {
+	nodes = slices.DeleteFunc(nodes, func(n sizedNode) bool {
 		return n.marker != 0 && res.holds.recorded(res.markers[n.marker-1])
 	})
 	rep.Kept = int64(before - len(nodes))
@@ -296,9 +254,8 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		}
 	}
 
-	// The list comes before any marker, and its record too, so that every
-	// marker a crashed run leaves is of a list without a complete record,
-	// which a later cycle writes again.
+	// The list and its record come before any marker, so a crashed run leaves
+	// only markers of an incomplete list, which a later cycle rewrites.
 	name := listObjectName(c.opts.StateName, r.Cycle)
 	h := &listHeader{cycle: r.Cycle, snapshot: r.SnapshotTime, holder: c.opts.Holder, epoch: lease.Epoch, count: int64(len(nodes)), types: typeNames}
 	next := 0
@@ -326,9 +283,8 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		return err
 	}
 	rep.Condemned = int64(len(nodes))
-	// Every marker batch returned, so every attempt applied or died before
-	// this read. Each server that held information from before a marker
-	// landed has a row in the window of the cycle.
+	// Read after every marker batch returned, so each server that cached
+	// state from before a marker has a row in the window.
 	servers, err := readServerEvidence(ctx, lease.client)
 	if err != nil {
 		return err
@@ -358,11 +314,8 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 }
 
 // clearRecords deletes every list record when the scan found objects without
-// a gc row: servers without --gc ran, which do not rescue, so an object used
-// then may hold a marker whose hold has ended. Without a record no marker is
-// eligible, and the condemn writes each one again with a hold of its own.
-// It runs before the checks, since a cycle that finds such objects before
-// the backfill refuses, and none is left after it.
+// a gc row: servers without --gc do not rescue, so no old marker can be
+// trusted. It runs before the checks, which refuse such a cycle.
 func (c *condemner) clearRecords(ctx context.Context, lease *Lease, res *Result) error {
 	r := res.Report
 	n := r.Consistency.MissingGCRows
@@ -376,21 +329,20 @@ func (c *condemner) clearRecords(ctx context.Context, lease *Lease, res *Result)
 		return err
 	}
 	res.holds, res.plan = &listHolds{}, nil
+	if r.Delete != nil {
+		r.Delete.Plan = nil
+	}
 	r.Condemn.RecordsCleared = true
 	log.Printf("Warning: GC cycle %d found %d objects without a gc row, which a server without --gc wrote; it deleted the records of every condemned list, so that every marker is written again and held anew", r.Cycle, n)
 	return nil
 }
 
-// markerValue returns the value of the condemn marker of cycle.
 func markerValue(cycle int64) []byte {
 	return binary.BigEndian.AppendUint64(nil, uint64(cycle))
 }
 
-// mark sets the condemn marker of the objects nodes of g to cycle, in key
-// order. Only rows the consistency scan saw are written, so the write never
-// creates an objects row, unless the row was deleted since. The mutation
-// deletes the cells of the column first, so the row holds exactly the new
-// number whatever cells a run without a complete list left.
+// mark sets the condemn marker of nodes to cycle. The mutation deletes the
+// column first, so the row holds only the new value.
 func (c *condemner) mark(ctx context.Context, g *graph, nodes []sizedNode, cycle int64) error {
 	table := c.bt.Open(objectsTable)
 	lim := newLimiter(c.opts.Rate)
@@ -415,8 +367,7 @@ func (c *condemner) mark(ctx context.Context, g *graph, nodes []sizedNode, cycle
 }
 
 // applyBulk applies mut to rows and retries the rows that fail with a
-// transient error, with the waits of EdgeWriter, each attempt within the
-// budget b. It fails on the first row that fails otherwise.
+// transient error.
 func applyBulk(ctx context.Context, b writeBudget, table *bigtable.Table, rows []string, mut *bigtable.Mutation) error {
 	wait := firstRetryWait
 	for attempt := 1; ; attempt++ {

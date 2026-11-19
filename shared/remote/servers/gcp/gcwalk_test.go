@@ -75,7 +75,7 @@ func TestGCWalk_FindsKeysByContent(t *testing.T) {
 	for _, h := range read {
 		condemnObject(t, f.s, h, 3)
 	}
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCReadOnly: true, GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCReadOnly: true, GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 
 	got, err := f.s.WalkGC(ctx, &gc.WalkOpts{MountDetails: []entities.Hash{details}, Keys: []entities.Hash{lib, written, src, commit, pinned, lib}, Workers: 2})
