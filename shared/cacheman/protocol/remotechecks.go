@@ -29,14 +29,15 @@ type RemoteCheckStats struct {
 	Unpushable int64 `json:"unpushable"`
 	// Dropped counts the drops of entry pushes by dagsync, because an object they needed was
 	// in no local store and missing on the server. A drop counts once for each entry, also
-	// when later checks sent its push again while it waited. The entries stay local until a
-	// later check pushes them.
+	// when later checks sent its push again while it waited. The entries are parked.
 	Dropped int64 `json:"dropped"`
 	// ClearRetries counts the retries of index transactions that took a local write out of
-	// the LRU after a conflict.
+	// the LRU, or parked an entry, after a conflict.
 	ClearRetries int64 `json:"clear_retries"`
 	// ClearFailures counts local writes whose index transaction failed with an error other
 	// than a conflict; their check takes the entry out of the LRU when the server lacks it.
+	// It also counts failed parks of the check after a start, which then stops and leaves
+	// eviction held.
 	ClearFailures int64 `json:"clear_failures"`
 	// EvictSkippedUnconfirmed counts the entries eviction kept because no check confirmed them.
 	EvictSkippedUnconfirmed int64 `json:"evict_skipped_unconfirmed"`
@@ -57,4 +58,15 @@ type RemoteCheckStats struct {
 	// Restored counts such entries that held a check marker and went back to the LRU at a
 	// start.
 	Restored int64 `json:"restored"`
+	// Parked counts the entries parked: cached entries the check after a start found missing
+	// on the server, and entries whose push was dropped. A parked entry stays out of eviction
+	// without a push until a mount names it or its release. ParkedSize is the size of the
+	// entries parked now, which counts toward the eviction threshold.
+	Parked     int64 `json:"parked"`
+	ParkedSize int64 `json:"parked_size"`
+	// Released counts the parked entries that went back to the LRU after their park time.
+	Released int64 `json:"released"`
+	// EvictedParked counts the parked entries evicted because the cache was above its
+	// eviction target with no other entry left to evict.
+	EvictedParked int64 `json:"evicted_parked"`
 }

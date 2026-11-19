@@ -414,7 +414,7 @@ func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities
 	if err := s.gcHooks.checkHeartbeat(); err != nil {
 		return nil, err
 	}
-	headers, err := s.getHeaders(ctx, pathHeaders, keys)
+	headers, err := s.getHeaders(ctx, pathHeaders, keys, remote.NoTouch(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -680,7 +680,7 @@ func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remot
 	}
 	// Unlike object links, a zero hash is not allowed here, as in file-based.
 	guard := s.validationGuard()
-	hdrs, err := s.getHeaders(ctx, pathValidation, []entities.Hash{from, to})
+	hdrs, err := s.getHeaders(ctx, pathValidation, []entities.Hash{from, to}, false)
 	if err != nil {
 		return err
 	}
@@ -966,7 +966,11 @@ func (s *GCPServer) getHeader(ctx context.Context, hash entities.Hash) (CachedHe
 	return cached, nil
 }
 
-func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []entities.Hash) ([]CachedHeader, error) {
+// getHeaders returns the headers of hashes. With noTouch it records no use of
+// the objects it finds and rescues none: a condemned object it reads is
+// answered as missing and is not cached, so that a later read rescues it. A
+// header cached before the condemn answers present until its cache TTL ends.
+func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []entities.Hash, noTouch bool) ([]CachedHeader, error) {
 	result := make([]CachedHeader, len(hashes))
 	var misses []entities.Hash
 	missesIdx := make(map[entities.Hash][]int)
@@ -976,7 +980,9 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 		if cached, ok := s.lookupHeader(h); ok {
 			result[i] = cached
 			s.headersRespCount.Add(1)
-			s.touchHit(path, h, cached)
+			if !noTouch {
+				s.touchHit(path, h, cached)
+			}
 		} else if m, ok := missesIdx[h]; ok {
 			missesIdx[h] = append(m, i)
 			missCount++
@@ -997,7 +1003,7 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 	objs, err := s.casdb.GetHeaders(ctx, misses)
 	var rescued map[entities.Hash]bool
 	if err == nil && s.gcHooks.on {
-		if err = s.gcHooks.checkReadAge(start); err == nil {
+		if err = s.gcHooks.checkReadAge(start); err == nil && !noTouch {
 			objs, rescued, err = s.rescueHeaders(ctx, path, objs)
 		}
 	}
@@ -1008,8 +1014,13 @@ func (s *GCPServer) getHeaders(ctx context.Context, path rescuePath, hashes []en
 
 	foundCount := 0
 	for _, o := range objs {
+		if noTouch && o.Condemned != nil {
+			continue
+		}
 		cached := s.storeHeader(o, start, rescued[o.Id])
-		s.touchHit(path, o.Id, cached)
+		if !noTouch {
+			s.touchHit(path, o.Id, cached)
+		}
 		for _, i := range missesIdx[o.Id] {
 			foundCount++
 			result[i] = cached
@@ -1039,7 +1050,7 @@ func (s *GCPServer) validateObjectLinks(ctx context.Context, links []entities.Ha
 	}
 	links = nonZeroLinks
 
-	objs, err := s.getHeaders(ctx, pathValidation, links)
+	objs, err := s.getHeaders(ctx, pathValidation, links, false)
 	if err != nil {
 		return err
 	}

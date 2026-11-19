@@ -65,7 +65,7 @@ type TouchStats struct {
 	// Written counts the object touches written.
 	Written int64
 	// Dropped counts the object touches dropped because the buffer stayed
-	// full.
+	// full, or about 80% full for TouchObject.
 	Dropped int64
 	// Failed counts the object touches that could not be written, and those
 	// whose write could end later than TouchDrainBound after they were
@@ -93,10 +93,12 @@ type touch struct {
 // Toucher writes touches in the background: the touch cell of an object's gc
 // row, and the cell of a map row, whose timestamp then records the last use.
 // Touches wait in a bounded buffer and are written in batches by several
-// workers. When the buffer is full, TouchObject waits up to touchEnqueueWait
-// for room and then drops the touch; after such a timeout, object touches are
-// dropped without waiting until the buffer has room again, so that writes that
-// stall delay the calls only once. TryTouchObject never waits. TouchMapRow
+// workers. TouchObject queues only while the buffer is less than about 80%
+// full, and otherwise waits up to touchEnqueueWait for that room and then
+// drops the touch; after such a timeout, it drops touches without waiting
+// until the buffer has that room again, so that writes that stall delay the
+// calls only once. TryTouchObject never waits and may use the whole buffer, so
+// it finds room during a burst of TouchObject calls. TouchMapRow
 // never waits either, and queues a touch only while the buffer is less than
 // half full when it looks, so that map row touches take at most about half of
 // the buffer: concurrent calls may each find room and overshoot by a few.
@@ -120,6 +122,13 @@ type Toucher struct {
 	done        chan struct{}
 	objects     touchCounts
 	mapRows     touchCounts
+	// waitLimit is the length of the buffer from which TouchObject waits.
+	// It waits on room, which the workers signal, and not on the channel: a
+	// receive from a full channel hands the freed slot to a parked sender, so
+	// senders parked on it would keep the buffer full for the touches that do
+	// not wait.
+	waitLimit int
+	room      chan struct{}
 }
 
 // NewToucher returns a running Toucher for the tables of client's instance that
@@ -137,6 +146,8 @@ func newToucher(client *bigtable.Client, size int) *Toucher {
 		queue:       make(chan touch, size),
 		retryWait:   firstRetryWait,
 		enqueueWait: touchEnqueueWait,
+		waitLimit:   size - size/5,
+		room:        make(chan struct{}, 1),
 		lateAfter:   TouchDrainBound - touchWriteTimeout,
 		epoch:       time.Now(),
 		now:         time.Now,
@@ -146,7 +157,7 @@ func newToucher(client *bigtable.Client, size int) *Toucher {
 }
 
 // TouchObject queues a touch of the object key. It returns false when the
-// buffer stayed full and the touch was dropped.
+// buffer stayed about 80% full or more and the touch was dropped.
 func (t *Toucher) TouchObject(key Hash) bool {
 	return t.add(touch{row: key.String()}, true)
 }
@@ -206,26 +217,54 @@ func (t *Toucher) enqueue(tc touch, wait bool) bool {
 			return false
 		}
 	}
-	select {
-	case t.queue <- tc:
-		if t.stalled.Load() {
-			t.stalled.Store(false)
-		}
-		return true
-	default:
-	}
-	if wait && !t.stalled.Load() {
-		timer := time.NewTimer(t.enqueueWait)
-		defer timer.Stop()
+	// Only a touch queued below waitLimit ends a stall: one queued above it
+	// leaves no room for the touches that wait.
+	below := len(t.queue) < t.waitLimit
+	if below || !wait {
 		select {
 		case t.queue <- tc:
+			if below && t.stalled.Load() {
+				t.stalled.Store(false)
+			}
 			return true
-		case <-timer.C:
-			t.stalled.Store(true)
-		case <-t.stop:
+		default:
 		}
 	}
-	return false
+	if !wait || t.stalled.Load() {
+		return false
+	}
+	timer := time.NewTimer(t.enqueueWait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-t.room:
+		case <-timer.C:
+			t.stalled.Store(true)
+			return false
+		case <-t.stop:
+			return false
+		}
+		if len(t.queue) < t.waitLimit {
+			select {
+			case t.queue <- tc:
+				// Receives that came together left one wake; pass it on to
+				// the next waiting touch.
+				t.freed()
+				return true
+			default:
+			}
+		}
+	}
+}
+
+// freed wakes a waiting TouchObject when the buffer is below waitLimit.
+func (t *Toucher) freed() {
+	if len(t.queue) < t.waitLimit {
+		select {
+		case t.room <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // Stats returns the counts of the touches so far.
@@ -291,6 +330,7 @@ func (t *Toucher) work() {
 	for {
 		select {
 		case tc := <-t.queue:
+			t.freed()
 			batch = append(batch, tc)
 			if len(batch) < touchBatchSize {
 				continue

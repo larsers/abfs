@@ -527,6 +527,26 @@ func TestHeadersSimple(t *testing.T) {
 	require.True(t, headers[1].IsEmpty())
 }
 
+func TestHeadersNoTouch(t *testing.T) {
+	var noTouch []bool
+	server := &ServerImpl{
+		HeadersImpl: func(ctx context.Context, keys []remote.Hash) ([]entities.ObjectHeader, error) {
+			noTouch = append(noTouch, remote.NoTouch(ctx))
+			return make([]entities.ObjectHeader, len(keys)), nil
+		},
+	}
+
+	client, stop := grpcPipe(t, server)
+	defer stop()
+
+	keys := []remote.Hash{entities.NewHash("a0423896973644771497bdc03eb99d5281615b50")}
+	_, err := client.Headers(context.Background(), keys)
+	require.NoError(t, err)
+	_, err = client.Headers(remote.WithNoTouch(context.Background()), keys)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false, true}, noTouch)
+}
+
 func TestHeadersLong(t *testing.T) {
 	n := 100000 // long enough to make sure of input split
 

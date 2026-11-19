@@ -129,6 +129,14 @@ type BadgerIndexStore struct {
 	// clearRemoteHook, if set, runs inside each ClearRemote transaction, which fails with its
 	// error.
 	clearRemoteHook func(hash entities.Hash) error
+	// parkHook, if set, runs inside each Park transaction, which fails with its error.
+	parkHook func(hash entities.Hash) error
+
+	// parked holds the parked entries and released the release times of entries that went
+	// back from the park to the LRU, both under the timestamps lock of the hash.
+	parked     [timestampShards]map[entities.Hash]parkedEntry
+	released   [timestampShards]map[entities.Hash]int64
+	parkedSize atomic.Int64
 }
 
 // NewBadgerIndexStore creates a BadgerIndexStore.
@@ -141,14 +149,20 @@ func NewBadgerIndexStore(path string, printer Printer, evictBatchSize uint, trac
 	}
 
 	var timestamps [timestampShards]map[entities.Hash]int64
+	var parked [timestampShards]map[entities.Hash]parkedEntry
+	var released [timestampShards]map[entities.Hash]int64
 	for i := range timestampShards {
 		timestamps[i] = make(map[entities.Hash]int64)
+		parked[i] = make(map[entities.Hash]parkedEntry)
+		released[i] = make(map[entities.Hash]int64)
 	}
 
 	return &BadgerIndexStore{
 		BaseBadgerStore: BaseBadgerStore{path: path, printer: PrinterOrDefault(printer)},
 		trackUse:        trackUse,
 		timestamps:      timestamps,
+		parked:          parked,
+		released:        released,
 		evictBatchSize:  evictBatchSize,
 		done:            make(chan struct{}, 1),
 	}
@@ -326,7 +340,9 @@ func (b *BadgerIndexStore) Put(hash entities.Hash, entry *IndexEntry) (newSize i
 				b.lockTimestamps(hash)
 				locked = true
 			}
-			lruTime, lruSizeDelta, err = maybeAddLRUItemLocked(newEnt.LocalSize(), sizeDelta, hash, txn)
+			if !b.isParkedLocked(hash) {
+				lruTime, lruSizeDelta, err = maybeAddLRUItemLocked(newEnt.LocalSize(), sizeDelta, hash, txn)
+			}
 		}
 
 		return err
@@ -417,7 +433,7 @@ func (b *BadgerIndexStore) preparePendingPut(txn *badger.Txn, hash entities.Hash
 	var lruSizeDelta int64
 	var oldTimestamp int64
 
-	if newEnt.Remote && b.isLRUCandidate(hash) {
+	if newEnt.Remote && b.isLRUCandidate(hash) && !b.isParkedLocked(hash) {
 		prevTimestamp := b.readTimestampLocked(hash)
 		oldTimestamp = prevTimestamp
 		lruTime = now
@@ -580,11 +596,15 @@ func (b *BadgerIndexStore) ForEach(fn func(key entities.Hash, entry *IndexEntry,
 }
 
 // MarkObjectRemote implements IndexStore.
+// A parked entry goes back to the LRU, since the server holds it now.
 func (b *BadgerIndexStore) MarkObjectRemote(key entities.Hash) error {
 	if b.localWriteCheck.Load() {
 		if _, err := b.ConfirmRemote(key); err != nil {
 			return err
 		}
+	}
+	if _, err := b.Unpark(key, time.Now().Unix()); err != nil {
+		return err
 	}
 
 	var (
@@ -706,6 +726,7 @@ func (b *BadgerIndexStore) Delete(hash entities.Hash) (*IndexKeyEntry, int64, in
 		b.localCount.Add(localCountDelta)
 		b.indexCount.Add(indexCountDelta)
 		b.deleteTimestampLocked(hash)
+		b.forgetParkLocked(hash)
 	} else {
 		newSz = b.totalSize.Load()
 		newLRUSz = b.lruSize.Load()
@@ -853,6 +874,9 @@ func (b *BadgerIndexStore) EvictUpTo(maxTimestamp int64) ([]*IndexKeyEntry, int6
 	b.indexCount.Add(indexCountDelta)
 	for _, c := range candidates {
 		b.deleteTimestampLocked(c.Key)
+	}
+	for _, ke := range keyEntries {
+		b.forgetParkLocked(ke.Key)
 	}
 	b.evictSkippedUnconfirmed.Add(skipped)
 
@@ -1071,6 +1095,7 @@ func (b *BadgerIndexStore) deleteWithTimestampLocked(txn *badger.Txn, hash entit
 			entryErr = errors.Join(entryErr, txn.Delete(checkKey(hash)))
 		}
 	}
+	entryErr = errors.Join(entryErr, b.deleteParkLocked(txn, hash))
 
 	lruErr := txn.Delete(lruKey(timestamp, hash))
 
@@ -1178,7 +1203,7 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 
 			entry, _ := b.get(txn, hash)
 			// Migration/Cleanup: If entry doesn't exist, is not Remote, or is not an LRU candidate, it shouldn't be in LRU.
-			if entry == nil || !entry.Remote || !b.isLRUCandidate(hash) {
+			if entry == nil || !entry.Remote || !b.isLRUCandidate(hash) || b.isParkedLocked(hash) {
 				if err := txn.Delete(key); err != nil {
 					return err
 				}
@@ -1244,7 +1269,7 @@ func (b *BadgerIndexStore) ensureLRUConsistency() (int64, error) {
 				continue // Skip malformed entries
 			}
 
-			if entry.Local && entry.Remote && b.isLRUCandidate(hash) {
+			if entry.Local && entry.Remote && b.isLRUCandidate(hash) && !b.isParkedLocked(hash) {
 				// If it's not in the timestamp map, it's missing from LRU
 				if b.readTimestampLocked(hash) == 0 {
 					now := time.Now().Unix()
@@ -1292,6 +1317,9 @@ func (b *BadgerIndexStore) updateDerivedFields() error {
 	if err := b.restoreIndexStats(); err != nil {
 		return err
 	}
+	if err := b.restoreParked(); err != nil {
+		return err
+	}
 	if err := b.restoreLRU(); err != nil {
 		return err
 	}
@@ -1330,6 +1358,15 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	if (currTimestamp - prevTimestamp) < useCooldownSec {
 		return nil
 	}
+	// A parked entry stays out of the LRU until it is unparked.
+	if prevTimestamp == 0 && b.isParkedLocked(hash) {
+		return nil
+	}
+	// A use after the release of an earlier park makes the entry parkable again, so its
+	// release time is no longer needed.
+	released, ok := b.released[shardForHash(hash)][hash]
+	dropRelease := ok && currTimestamp > released
+	var releaseDropped bool
 
 	// Use accesses both entry:: and lru:: timestamps
 	// We're protected from concurrent lru:: accesses with
@@ -1363,7 +1400,13 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 
 		addErr := txn.Set(lruKey(currTimestamp, hash), nil)
 
-		return errors.Join(deleteErr, addErr)
+		var releaseErr error
+		if dropRelease {
+			releaseErr = txn.Delete(releasedKey(hash))
+			releaseDropped = true
+		}
+
+		return errors.Join(deleteErr, addErr, releaseErr)
 	})
 	if err != nil {
 		return err
@@ -1371,6 +1414,9 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	if success {
 		b.writeTimestampLocked(hash, currTimestamp)
 		b.lruSize.Add(sizeDelta)
+		if releaseDropped {
+			delete(b.released[shardForHash(hash)], hash)
+		}
 	}
 
 	return nil
@@ -1521,6 +1567,7 @@ func (b *BadgerIndexStore) deleteMany(hashes []entities.Hash) (int64, int64, err
 		b.indexCount.Add(indexCountDelta)
 		for _, hash := range hashes {
 			b.deleteTimestampLocked(hash)
+			b.forgetParkLocked(hash)
 		}
 	} else {
 		newSz = b.totalSize.Load()

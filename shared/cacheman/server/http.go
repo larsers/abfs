@@ -715,7 +715,7 @@ func (c *CacheMan) handleIsObjectRemote(w http.ResponseWriter, r *http.Request) 
 		c.WriteJSON(w, r, true)
 		return
 	}
-	c.WriteJSON(w, r, entry.Remote)
+	c.WriteJSON(w, r, entry.Remote && !c.isParked(key))
 }
 
 func (c *CacheMan) handleLocalGC(w http.ResponseWriter, r *http.Request) {

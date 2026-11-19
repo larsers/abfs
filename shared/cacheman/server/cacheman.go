@@ -2680,7 +2680,7 @@ func (c *CacheMan) Phony(priority dagsync.RequestPriority, objects []entities.Ha
 
 	for _, h := range objects {
 		ent := c.index.Get(h)
-		if ent == nil || !ent.Remote {
+		if ent == nil || !ent.Remote || c.isParked(h) {
 			misses = append(misses, h)
 		}
 	}
@@ -3233,6 +3233,10 @@ func (c *CacheMan) maintenanceWork() error {
 	defer func() {
 		c.printer.Println("Maintenance completed in", time.Since(t))
 	}()
+
+	// Before the LRU is read, so that the released entries count as tracked. Park keeps
+	// them in the LRU until they are used again.
+	c.releaseParked()
 
 	// Read the full LRU list to find what is tracked
 	lruList, err := c.index.ReadLRU()
