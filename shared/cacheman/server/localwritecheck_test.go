@@ -24,11 +24,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,8 +61,10 @@ type checkRemote struct {
 	putHold  chan struct{}
 	// answerHold holds the answers of Headers calls after the server read them.
 	answerHold chan struct{}
-	// asked counts the Headers calls that asked for each key.
-	asked map[entities.Hash]int
+	// asked counts the Headers calls that asked for each key, and askedNoTouch those with a
+	// no-touch context.
+	asked        map[entities.Hash]int
+	askedNoTouch map[entities.Hash]int
 
 	calls atomic.Int64
 	keys  atomic.Int64
@@ -68,10 +72,11 @@ type checkRemote struct {
 
 func newCheckRemote() *checkRemote {
 	return &checkRemote{
-		ABFSClient: inmemory.New(),
-		holdKeys:   make(map[entities.Hash]chan struct{}),
-		hidden:     make(map[entities.Hash]bool),
-		asked:      make(map[entities.Hash]int),
+		ABFSClient:   inmemory.New(),
+		holdKeys:     make(map[entities.Hash]chan struct{}),
+		hidden:       make(map[entities.Hash]bool),
+		asked:        make(map[entities.Hash]int),
+		askedNoTouch: make(map[entities.Hash]int),
 	}
 }
 
@@ -148,6 +153,9 @@ func (r *checkRemote) Headers(ctx context.Context, keys []remote.Hash) ([]entiti
 	for _, k := range keys {
 		waits = append(waits, r.holdKeys[k])
 		r.asked[k]++
+		if remote.NoTouch(ctx) {
+			r.askedNoTouch[k]++
+		}
 	}
 	fail := r.fail
 	answerHold := r.answerHold
@@ -207,6 +215,12 @@ func (r *checkRemote) askedFor(h entities.Hash) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.asked[h]
+}
+
+func (r *checkRemote) askedNoTouchFor(h entities.Hash) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.askedNoTouch[h]
 }
 
 func (r *checkRemote) has(t *testing.T, h entities.Hash) bool {
@@ -363,7 +377,30 @@ func requireUnconfirmed(t *testing.T, c *CacheMan, h entities.Hash) {
 
 func confirmed(c *CacheMan, h entities.Hash) bool {
 	entry := c.index.Get(h)
-	return entry != nil && entry.Remote && !hasMarker(c, h)
+	return entry != nil && entry.Remote && !hasMarker(c, h) && !c.isParked(h)
+}
+
+// requireParked checks that h is held locally as Remote, out of the LRU without a marker.
+func requireParked(t *testing.T, c *CacheMan, h entities.Hash) {
+	t.Helper()
+	entry := c.index.Get(h)
+	require.NotNil(t, entry)
+	require.True(t, entry.Local)
+	require.True(t, entry.Remote)
+	require.True(t, c.isParked(h))
+	require.False(t, hasMarker(c, h))
+	require.False(t, inLRU(t, c, h))
+	require.True(t, hasBlobOrObject(t, c, h))
+}
+
+func hasBlobOrObject(t *testing.T, c *CacheMan, h entities.Hash) bool {
+	t.Helper()
+	if hasBlob(t, c, h) {
+		return true
+	}
+	has, err := c.store.HasObject(context.Background(), h)
+	require.NoError(t, err)
+	return has
 }
 
 func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
@@ -484,7 +521,8 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 	})
 
 	// A notification lost in a restart, for a blob the store already held: the start pass
-	// holds eviction until it has asked the server, and pushes what the server lacks.
+	// holds eviction until it has asked the server, and parks what the server lacks. The
+	// mount's keep-alive names it and pushes it.
 	t.Run("restart with a lost notification", func(t *testing.T) {
 		dir := t.TempDir()
 		r := newCheckRemote()
@@ -497,9 +535,13 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		c.startLocalWriteCheck(ctx)
 		require.Empty(t, evictAll(t, c))
 		release()
-		require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Pushed == 1 }, 5*time.Second, 10*time.Millisecond)
-		require.Eventually(t, func() bool { return confirmed(c, h) && r.has(t, h) }, 5*time.Second, 10*time.Millisecond)
+		waitForStartPass(t, c)
+		requireParked(t, c, h)
 		require.Equal(t, int64(1), c.Stats().RemoteChecks.StartPass)
+
+		c.checkRemoteHeaders(ctx, []entities.Hash{h}, []bool{false})
+		require.Eventually(t, func() bool { return confirmed(c, h) && r.has(t, h) && inLRU(t, c, h) }, 5*time.Second, 10*time.Millisecond)
+		require.Equal(t, int64(1), c.Stats().RemoteChecks.Pushed)
 	})
 
 	// While the start pass runs, an answered entry can be evicted, an entry not answered yet
@@ -911,8 +953,8 @@ func TestCacheman_RemoteHeadersLeavesMarkersToTheCheck(t *testing.T) {
 }
 
 // A push of a cached tree the server lacks, whose child is in no store and missing on the
-// server, is dropped after its wait. The entry stays local with its marker, and a later push
-// succeeds once the child is in the cache.
+// server, is dropped after its wait. The entry is parked, and a later push succeeds once the
+// child is in the cache.
 func TestCacheman_DropsStuckPush(t *testing.T) {
 	old := unconfirmedPushDropAfter
 	unconfirmedPushDropAfter = 100 * time.Millisecond
@@ -945,18 +987,6 @@ func TestCacheman_DropsStuckPush(t *testing.T) {
 		}
 		return n
 	}
-	requireMarked := func() {
-		t.Helper()
-		entry := c.index.Get(tree)
-		require.NotNil(t, entry)
-		require.True(t, entry.Local)
-		require.False(t, entry.Remote)
-		require.True(t, hasMarker(c, tree))
-		has, err := c.store.HasObject(ctx, tree)
-		require.NoError(t, err)
-		require.True(t, has)
-	}
-
 	c.checkRemoteHeaders(ctx, []entities.Hash{tree}, []bool{false})
 	require.Eventually(t, func() bool {
 		s, _ := c.getSync().State(child.String())
@@ -964,7 +994,8 @@ func TestCacheman_DropsStuckPush(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 	require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Dropped == 1 }, 15*time.Second, 10*time.Millisecond)
 	require.Zero(t, busy())
-	requireMarked()
+	require.Eventually(t, func() bool { return c.isParked(tree) }, 5*time.Second, 10*time.Millisecond)
+	requireParked(t, c, tree)
 	require.False(t, r.has(t, tree))
 
 	writeBlob(t, c, childContent)
@@ -1151,8 +1182,8 @@ func TestCacheman_StartPassStopped(t *testing.T) {
 	require.Equal(t, hashes[:1], evictAll(t, c))
 }
 
-// The start pass checks trees and objects as it checks blobs: it keeps those the server lacks
-// out of eviction and pushes them.
+// The start pass checks trees and objects as it checks blobs: it parks those the server lacks,
+// without a push.
 func TestCacheman_StartPassChecksTreesAndObjects(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -1183,25 +1214,16 @@ func TestCacheman_StartPassChecksTreesAndObjects(t *testing.T) {
 	require.NoError(t, c1.Stop())
 
 	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
-	release := r.holdPuts()
 	c.startLocalWriteCheck(ctx)
-	require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Pushed == 2 }, 5*time.Second, 10*time.Millisecond)
-	for _, h := range []entities.Hash{tree, commit} {
-		entry := c.index.Get(h)
-		require.True(t, entry.Local)
-		require.False(t, entry.Remote)
-		require.True(t, hasMarker(c, h))
-		require.False(t, inLRU(t, c, h))
-	}
-	require.NotContains(t, evictAll(t, c), tree)
-
-	release()
-	require.Eventually(t, func() bool {
-		return confirmed(c, tree) && confirmed(c, commit) && r.has(t, tree) && r.has(t, commit)
-	}, 5*time.Second, 10*time.Millisecond)
 	waitForStartPass(t, c)
+	for _, h := range []entities.Hash{tree, commit} {
+		requireParked(t, c, h)
+		require.False(t, r.has(t, h))
+	}
 	stats := c.Stats().RemoteChecks
 	require.Equal(t, int64(3), stats.StartPass)
+	require.Equal(t, int64(2), stats.Parked)
+	require.Zero(t, stats.Pushed)
 	require.Zero(t, stats.Skipped)
 	require.Equal(t, EntryTypeTree, c.index.Get(tree).EntryType)
 	require.Equal(t, EntryTypeObject, c.index.Get(commit).EntryType)
@@ -1275,7 +1297,7 @@ func TestCacheman_StartPassChecksUnreadableEntries(t *testing.T) {
 	waitForStartPass(t, c)
 	require.Equal(t, 1, r.askedFor(h))
 	require.Zero(t, c.Stats().RemoteChecks.Skipped)
-	require.True(t, hasMarker(c, h))
+	require.True(t, c.isParked(h))
 	require.False(t, inLRU(t, c, h))
 }
 
@@ -1304,7 +1326,7 @@ func TestCacheman_LocalWriteCheckLeavesARIAndCASBlobs(t *testing.T) {
 	requireEvictable(t, c, ariKey)
 	requireEvictable(t, c, casKey)
 	requireEvictable(t, c, present)
-	require.Eventually(t, func() bool { return confirmed(c, deleted) && r.has(t, deleted) }, 5*time.Second, 10*time.Millisecond)
+	require.True(t, c.isParked(deleted))
 
 	// A missing answer from another check leaves them as well.
 	c.checkRemoteHeaders(ctx, []entities.Hash{ariKey, casKey}, []bool{false, false})
@@ -1313,7 +1335,8 @@ func TestCacheman_LocalWriteCheckLeavesARIAndCASBlobs(t *testing.T) {
 	requireEvictable(t, c, ariKey)
 	requireEvictable(t, c, casKey)
 
-	require.Subset(t, evictAll(t, c), []entities.Hash{ariKey, casKey, present, deleted})
+	require.Subset(t, evictAll(t, c), []entities.Hash{ariKey, casKey, present})
+	requireParked(t, c, deleted)
 	has, err := c.store.HasARI(ctx, ariKey)
 	require.NoError(t, err)
 	require.False(t, has)
@@ -1360,4 +1383,576 @@ func TestCacheman_StartRestoresMarkedARIAndCASBlobs(t *testing.T) {
 	requireEvictable(t, c, ariKey)
 	requireEvictable(t, c, casKey)
 	require.Subset(t, evictAll(t, c), []entities.Hash{ariKey, casKey, blob})
+}
+
+// restartWithMissing caches the contents in a cacheman, none of them on the server, at LRU
+// times 100, 200 and so on, and returns a restarted cacheman whose start pass has run.
+func restartWithMissing(t *testing.T, r *checkRemote, contents ...string) (*CacheMan, []entities.Hash) {
+	t.Helper()
+	dir := t.TempDir()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	store := c1.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	var hashes []entities.Hash
+	for i, content := range contents {
+		h := fetchedBlob(t, c1, content)
+		setLRUTime(t, store, h, int64(100*(i+1)))
+		hashes = append(hashes, h)
+	}
+	require.NoError(t, c1.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	c.startLocalWriteCheck(context.Background())
+	waitForStartPass(t, c)
+	return c, hashes
+}
+
+// lruTime returns the LRU timestamp of h, 0 when it is not in the LRU.
+func lruTime(t *testing.T, c *CacheMan, h entities.Hash) int64 {
+	t.Helper()
+	lru, err := c.index.ReadLRU()
+	require.NoError(t, err)
+	for _, kt := range lru {
+		if kt.Key == h {
+			return kt.Timestamp
+		}
+	}
+	return 0
+}
+
+// parkTimes returns the park times of the parked entries as stored.
+func parkTimes(t *testing.T, c *CacheMan) map[entities.Hash]int64 {
+	t.Helper()
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	times := make(map[entities.Hash]int64)
+	require.NoError(t, store.db.View(func(txn *badger.Txn) error {
+		keys, err := oldestParked(txn, math.MaxInt64, 1000)
+		for _, kt := range keys {
+			times[kt.Key] = kt.Timestamp
+		}
+		return err
+	}))
+	return times
+}
+
+// setParkTime moves the park of h to timestamp.
+func setParkTime(t *testing.T, c *CacheMan, h entities.Hash, timestamp int64) {
+	t.Helper()
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	store.lockTimestamps(h)
+	defer store.unlockTimestamps(h)
+	p, ok := store.parked[shardForHash(h)][h]
+	require.True(t, ok)
+	require.NoError(t, store.db.Update(func(txn *badger.Txn) error {
+		if err := txn.Delete(parkKey(p.time, h)); err != nil {
+			return err
+		}
+		return txn.Set(parkKey(timestamp, h), []byte(strconv.FormatInt(p.lruTime, 10)))
+	}))
+	p.time = timestamp
+	store.parked[shardForHash(h)][h] = p
+}
+
+// The start pass parks a cached entry the server lacks: no push, out of the LRU, and kept
+// while eviction has other entries to take.
+func TestCacheman_StartPassParksMissing(t *testing.T) {
+	r := newCheckRemote()
+	putOnServer(t, r, "on the server")
+	c, hashes := restartWithMissing(t, r, "deleted on the server", "on the server")
+	missing, present := hashes[0], hashes[1]
+
+	requireParked(t, c, missing)
+	require.False(t, r.has(t, missing))
+	stats := c.Stats().RemoteChecks
+	require.Equal(t, int64(1), stats.Parked)
+	require.Equal(t, int64(c.index.Get(missing).Size), stats.ParkedSize)
+	require.Zero(t, stats.Pushed)
+	require.Zero(t, c.pushBlobsStat.Request.Load())
+
+	// Over the threshold eviction takes the LRU entries before any parked one.
+	bi := c.index.(*badgerIndex)
+	size := bi.evictableSize()
+	victims, _, err := bi.evictBatch(size, size)
+	require.NoError(t, err)
+	require.Len(t, victims, 1)
+	require.Equal(t, present, victims[0].Key)
+	_, _, err = bi.evictBatch(bi.evictableSize(), size)
+	require.ErrorIs(t, err, errNothingToEvict)
+	requireParked(t, c, missing)
+}
+
+// Every Headers call of the start pass asks the server to record no use; the calls of the
+// check worker and of the keep-alive do not.
+func TestCacheman_StartPassNoTouch(t *testing.T) {
+	ctx := context.Background()
+	r := newCheckRemote()
+	putOnServer(t, r, "present")
+	c, hashes := restartWithMissing(t, r, "missing", "present")
+	for _, h := range hashes {
+		require.Equal(t, 1, r.askedFor(h))
+		require.Equal(t, 1, r.askedNoTouchFor(h))
+	}
+
+	written := fetchedBlob(t, c, "written over a fetched blob")
+	c.NewObject(written, protocol.TypeBlob)
+	require.Eventually(t, func() bool { return r.askedFor(written) == 1 }, 5*time.Second, 10*time.Millisecond)
+	c.checkRemoteHeaders(ctx, hashes, []bool{false, true})
+	b, err := json.Marshal(hashes)
+	require.NoError(t, err)
+	w := httptest.NewRecorder()
+	c.httpHandler().ServeHTTP(w, httptest.NewRequest("POST", "http://localhost/remote-headers", bytes.NewReader(b)))
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, 2, r.askedFor(hashes[1]))
+	for _, h := range append(hashes, written) {
+		require.LessOrEqual(t, r.askedNoTouchFor(h), 1, h)
+	}
+	require.Zero(t, r.askedNoTouchFor(written))
+}
+
+// Past the park time maintenance returns a parked entry to the LRU at its LRU time before the
+// park, Remote and without a marker, so that eviction takes it first.
+func TestCacheman_ParkedReleasedAfterParkTime(t *testing.T) {
+	r := newCheckRemote()
+	putOnServer(t, r, "used later")
+	c, hashes := restartWithMissing(t, r, "garbage", "used later")
+	garbage, used := hashes[0], hashes[1]
+	require.True(t, c.isParked(garbage))
+
+	require.NoError(t, c.maintenanceWork())
+	require.True(t, c.isParked(garbage), "released before its park time")
+
+	old := localWriteParkTime
+	localWriteParkTime = 0
+	defer func() { localWriteParkTime = old }()
+	require.NoError(t, c.maintenanceWork())
+	require.False(t, c.isParked(garbage))
+	requireEvictable(t, c, garbage)
+	require.Equal(t, int64(100), lruTime(t, c, garbage))
+	stats := c.Stats().RemoteChecks
+	require.Equal(t, int64(1), stats.Released)
+	require.Zero(t, stats.ParkedSize)
+	require.Empty(t, parkTimes(t, c))
+	require.Equal(t, []entities.Hash{garbage, used}, evictAll(t, c))
+}
+
+// releasedKeys returns the hashes that have a release time, in memory and as stored.
+func releasedKeys(t *testing.T, c *CacheMan) (inMemory, stored []entities.Hash) {
+	t.Helper()
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	for _, shard := range store.released {
+		for h := range shard {
+			inMemory = append(inMemory, h)
+		}
+	}
+	require.NoError(t, store.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(keyOnlyIterationOpts())
+		defer it.Close()
+		prefix := []byte(releasedPrefix)
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			stored = append(stored, stripPrefix(releasedPrefix, it.Item().KeyCopy(nil)))
+		}
+		return nil
+	}))
+	return inMemory, stored
+}
+
+// An entry released after its park time is not parked again by the next start until it is
+// used, so that a machine that restarts often does not keep garbage out of eviction. A use
+// deletes its release time.
+func TestCacheman_ReleasedNotParkedAgain(t *testing.T) {
+	r := newCheckRemote()
+	c, hashes := restartWithMissing(t, r, "garbage")
+	h := hashes[0]
+	old := localWriteParkTime
+	localWriteParkTime = 0
+	defer func() { localWriteParkTime = old }()
+	c.releaseParked()
+	require.False(t, c.isParked(h))
+	dir := filepath.Dir(c.config.CacheDir)
+	require.NoError(t, c.Stop())
+
+	c = newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	c.startLocalWriteCheck(context.Background())
+	waitForStartPass(t, c)
+	require.Equal(t, 2, r.askedFor(h))
+	require.False(t, c.isParked(h))
+	requireEvictable(t, c, h)
+
+	// A use since the release makes the entry count as held again.
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	require.NoError(t, store.useWithTimestamp(h, time.Now().Unix()+useCooldownSec))
+	inMemory, stored := releasedKeys(t, c)
+	require.Empty(t, inMemory)
+	require.Empty(t, stored)
+	require.NoError(t, c.Stop())
+	c = newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	c.startLocalWriteCheck(context.Background())
+	waitForStartPass(t, c)
+	requireParked(t, c, h)
+}
+
+// A start that finds a released entry still missing, and not used since, moves it to the young
+// end of the LRU: it can be a write cacheman never indexed, which a mount names in its next
+// keep-alive, so eviction takes the other entries first.
+func TestCacheman_ReleasedMovesToYoungEnd(t *testing.T) {
+	r := newCheckRemote()
+	putOnServer(t, r, "held by the server")
+	putOnServer(t, r, "held by the server too")
+	c, hashes := restartWithMissing(t, r, "released, then written again", "held by the server", "held by the server too")
+	h := hashes[0]
+	old := localWriteParkTime
+	localWriteParkTime = 0
+	defer func() { localWriteParkTime = old }()
+	c.releaseParked()
+	require.Equal(t, int64(100), lruTime(t, c, h))
+	dir := filepath.Dir(c.config.CacheDir)
+	require.NoError(t, c.Stop())
+
+	// A build writes the same content, and cacheman restarts before it indexes the write.
+	start := time.Now().Unix()
+	c = newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	c.startLocalWriteCheck(context.Background())
+	waitForStartPass(t, c)
+	require.False(t, c.isParked(h))
+	requireEvictable(t, c, h)
+	require.GreaterOrEqual(t, lruTime(t, c, h), start)
+	require.Equal(t, []entities.Hash{hashes[1], hashes[2], h}, evictAll(t, c))
+}
+
+// A keep-alive answer that names a parked entry: missing, it is pushed and confirmed; found,
+// it goes back to the LRU as used now.
+func TestCacheman_KeepAliveNamesParked(t *testing.T) {
+	ctx := context.Background()
+	r := newCheckRemote()
+	c, hashes := restartWithMissing(t, r, "written by the mount", "written by another cache")
+	written, other := hashes[0], hashes[1]
+	requireParked(t, c, written)
+	requireParked(t, c, other)
+
+	c.checkRemoteHeaders(ctx, []entities.Hash{written}, []bool{false})
+	require.Eventually(t, func() bool { return confirmed(c, written) && r.has(t, written) && inLRU(t, c, written) }, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, int64(1), c.Stats().RemoteChecks.Pushed)
+
+	putOnServer(t, r, "written by another cache")
+	before := time.Now().Unix()
+	c.checkRemoteHeaders(ctx, []entities.Hash{other}, []bool{true})
+	require.False(t, c.isParked(other))
+	requireEvictable(t, c, other)
+	require.GreaterOrEqual(t, lruTime(t, c, other), before)
+	require.Zero(t, c.Stats().RemoteChecks.ParkedSize)
+}
+
+// A local write over a parked entry ends the park: the entry gets a check marker and is pushed.
+func TestCacheman_LocalWriteOverParked(t *testing.T) {
+	r := newCheckRemote()
+	c, hashes := restartWithMissing(t, r, "written again")
+	h := hashes[0]
+	requireParked(t, c, h)
+
+	release := r.holdPuts()
+	c.NewObject(h, protocol.TypeBlob)
+	require.False(t, c.isParked(h))
+	require.Zero(t, c.Stats().RemoteChecks.ParkedSize)
+	require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Pushed == 1 }, 5*time.Second, 10*time.Millisecond)
+	requireUnconfirmed(t, c, h)
+	require.Empty(t, parkTimes(t, c))
+
+	release()
+	require.Eventually(t, func() bool { return confirmed(c, h) && r.has(t, h) && inLRU(t, c, h) }, 5*time.Second, 10*time.Millisecond)
+}
+
+// A parked entry stays parked through a use and through maintenance, which neither clears nor
+// pushes it, and its bytes count once.
+func TestCacheman_ParkedStaysParked(t *testing.T) {
+	r := newCheckRemote()
+	c, hashes := restartWithMissing(t, r, "parked")
+	h := hashes[0]
+	size := int64(c.index.Get(h).Size)
+	asked := r.askedFor(h)
+
+	require.NoError(t, c.index.Use(h))
+	require.NoError(t, c.index.UseMany([]entities.Hash{h}))
+	_, err := c.addFetchedObjectToIndex(h, EntryTypeBlob)
+	require.NoError(t, err)
+	requireParked(t, c, h)
+	require.Zero(t, c.index.LRUSize())
+	require.Equal(t, size, c.Stats().RemoteChecks.ParkedSize)
+
+	require.NoError(t, c.maintenanceWork())
+	time.Sleep(50 * time.Millisecond)
+	requireParked(t, c, h)
+	require.Equal(t, asked, r.askedFor(h))
+	require.Zero(t, c.pushBlobsStat.Request.Load())
+	require.Zero(t, c.index.LRUSize())
+	require.Equal(t, size, c.Stats().RemoteChecks.ParkedSize)
+}
+
+// The park state survives a restart: parks keep their time and size, and a start during the
+// pass checks again only the entries still in the LRU.
+func TestCacheman_ParkSurvivesRestart(t *testing.T) {
+	old := localWriteStartPassBatch
+	localWriteStartPassBatch = 1
+	defer func() { localWriteStartPassBatch = old }()
+
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	store := c1.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	var hashes []entities.Hash
+	for i, content := range []string{"first", "second", "third", "fourth"} {
+		h := fetchedBlob(t, c1, content)
+		setLRUTime(t, store, h, int64(100*(i+1)))
+		hashes = append(hashes, h)
+	}
+	require.NoError(t, c1.Stop())
+
+	c2 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	release2, release3 := r.holdKey(hashes[2]), r.holdKey(hashes[3])
+	c2.startLocalWriteCheck(context.Background())
+	require.Eventually(t, func() bool { return c2.Stats().RemoteChecks.Parked == 2 }, 5*time.Second, 10*time.Millisecond)
+	parked := parkTimes(t, c2)
+	require.Len(t, parked, 2)
+	require.NoError(t, c2.Stop())
+	release2()
+	release3()
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	require.Equal(t, int64(c.index.Get(hashes[0]).Size+c.index.Get(hashes[1]).Size), c.index.(*badgerIndex).parkedSize())
+	for h, parkTime := range parked {
+		require.True(t, c.isParked(h))
+		require.False(t, inLRU(t, c, h))
+		require.Equal(t, parkTime, parkTimes(t, c)[h])
+	}
+	asked := r.askedFor(hashes[0])
+	c.startLocalWriteCheck(context.Background())
+	waitForStartPass(t, c)
+	require.Equal(t, asked, r.askedFor(hashes[0]))
+	require.Equal(t, asked, r.askedFor(hashes[1]))
+	for _, h := range hashes {
+		requireParked(t, c, h)
+	}
+	for h, parkTime := range parked {
+		require.Equal(t, parkTime, parkTimes(t, c)[h])
+	}
+}
+
+// A deleted entry leaves no park behind, and a reopened index counts only the entries still
+// parked and puts none of them in the LRU.
+func TestCacheman_ParkBookkeeping(t *testing.T) {
+	r := newCheckRemote()
+	c, hashes := restartWithMissing(t, r, "deleted", "kept")
+	deleted, kept := hashes[0], hashes[1]
+	keptSize := int64(c.index.Get(kept).Size)
+	require.Equal(t, int64(c.index.Get(deleted).Size)+keptSize, c.Stats().RemoteChecks.ParkedSize)
+
+	require.NoError(t, c.index.Delete(deleted))
+	require.False(t, c.isParked(deleted))
+	require.NotContains(t, parkTimes(t, c), deleted)
+	require.Equal(t, keptSize, c.Stats().RemoteChecks.ParkedSize)
+
+	dir := filepath.Dir(c.config.CacheDir)
+	require.NoError(t, c.Stop())
+	c = newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	require.Equal(t, keptSize, c.Stats().RemoteChecks.ParkedSize)
+	require.Zero(t, c.index.LRUSize())
+	requireParked(t, c, kept)
+	require.NoError(t, c.index.Use(kept))
+	require.False(t, inLRU(t, c, kept))
+}
+
+// A park that conflicts with another transaction on the entry, such as a keep-alive time
+// written by a mount, is retried until it commits; the entry never becomes evictable.
+func TestCacheman_StartPassParkRetriesConflicts(t *testing.T) {
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c1 := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	h := fetchedBlob(t, c1, "parked after conflicts")
+	require.NoError(t, c1.Stop())
+
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir})
+	store := c.index.(*badgerIndex).indexStore.(*BadgerIndexStore)
+	var conflicts atomic.Int64
+	store.parkHook = func(hash entities.Hash) error {
+		if conflicts.Add(1) > 3 {
+			return nil
+		}
+		return store.KeepAlive(hash)
+	}
+	c.startLocalWriteCheck(context.Background())
+	require.Empty(t, evictAll(t, c))
+	waitForStartPass(t, c)
+	requireParked(t, c, h)
+	require.Equal(t, int64(3), c.Stats().RemoteChecks.ClearRetries)
+}
+
+// At the threshold, with no other entry left, eviction takes parked entries, oldest park first,
+// and counts them; below the threshold it takes none.
+func TestCacheman_EvictsParkedAtThreshold(t *testing.T) {
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+	bi := c.index.(*badgerIndex)
+	first := fetchedBlob(t, c, "parked first")
+	last := fetchedBlob(t, c, "parked last")
+	lru := fetchedBlob(t, c, "in the LRU")
+	for _, h := range []entities.Hash{last, first} {
+		parked, _, err := bi.park(h, nil)
+		require.NoError(t, err)
+		require.True(t, parked)
+	}
+	setParkTime(t, c, first, 1000)
+	setParkTime(t, c, last, 2000)
+	bi.releaseEviction()
+	bi.evictThreshold = uint64(bi.parkedSize())
+	bi.indexStore.(*BadgerIndexStore).evictBatchSize = 1
+
+	require.NoError(t, bi.evictIndexAndCache())
+	require.False(t, hasBlob(t, c, lru))
+	require.False(t, hasBlob(t, c, first))
+	require.False(t, c.isParked(first))
+	require.False(t, c.index.Get(first).Local)
+	requireParked(t, c, last)
+	require.Equal(t, int64(1), c.Stats().RemoteChecks.EvictedParked)
+	require.Equal(t, int64(c.index.Get(last).Size), c.Stats().RemoteChecks.ParkedSize)
+
+	// Below the threshold the last one stays, and the run ends without an error.
+	require.NoError(t, bi.evictIndexAndCache())
+	requireParked(t, c, last)
+	require.Equal(t, int64(1), c.Stats().RemoteChecks.EvictedParked)
+}
+
+// With the LRU empty and the cache above its eviction target, eviction takes parked entries,
+// oldest park first, down to the target, so that a later fetch below the background trigger
+// stays.
+func TestCacheman_EvictsParkedDownToTarget(t *testing.T) {
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true})
+	bi := c.index.(*badgerIndex)
+	var parked []entities.Hash
+	for i := range 4 {
+		h := fetchedBlob(t, c, fmt.Sprintf("parked %d", i))
+		ok, _, err := bi.park(h, nil)
+		require.NoError(t, err)
+		require.True(t, ok)
+		setParkTime(t, c, h, int64(1000*(i+1)))
+		parked = append(parked, h)
+	}
+	bi.releaseEviction()
+	bi.indexStore.(*BadgerIndexStore).evictBatchSize = 1
+	// Parked entries fill 85 % of the threshold; two fetches take the cache over 90 %.
+	threshold := uint64(bi.parkedSize() * 100 / 85)
+	fetched := []entities.Hash{fetchedBlob(t, c, "fetched first"), fetchedBlob(t, c, "fetched second")}
+	require.Greater(t, float64(bi.evictableSize()), float64(threshold)*evictBackgroundTrigger)
+
+	bi.evictThreshold = threshold
+	require.NoError(t, bi.evictIndexAndCache())
+	bi.evictThreshold = 0
+	for _, h := range fetched {
+		require.False(t, hasBlob(t, c, h))
+	}
+	require.False(t, c.isParked(parked[0]))
+	require.False(t, hasBlob(t, c, parked[0]))
+	for _, h := range parked[1:] {
+		requireParked(t, c, h)
+	}
+	require.Equal(t, int64(1), c.Stats().RemoteChecks.EvictedParked)
+	require.LessOrEqual(t, bi.evictableSize(), evictTarget(int64(threshold)))
+
+	// The next fetch stays below the background trigger, so no eviction starts.
+	bi.evictThreshold = threshold
+	later := fetchedBlob(t, c, "fetched later")
+	unlock := bi.LockEviction()
+	bi.evictThreshold = 0
+	unlock()
+	require.True(t, hasBlob(t, c, later))
+	requireEvictable(t, c, later)
+}
+
+// A phony request that finds a parked entry on the server returns it to the LRU as used now,
+// without a push.
+func TestCacheman_PhonyUnparksFound(t *testing.T) {
+	r := newCheckRemote()
+	c, hashes := restartWithMissing(t, r, "pushed again by another cache")
+	h := hashes[0]
+	requireParked(t, c, h)
+	putOnServer(t, r, "pushed again by another cache")
+
+	before := time.Now().Unix()
+	done := make(chan error, 1)
+	c.Phony(0, []entities.Hash{h}, func(err error) {
+		if err == nil {
+			done <- err
+		}
+	})
+	require.NoError(t, <-done)
+	require.False(t, c.isParked(h))
+	requireEvictable(t, c, h)
+	require.GreaterOrEqual(t, lruTime(t, c, h), before)
+	require.Zero(t, c.Stats().RemoteChecks.ParkedSize)
+	require.Zero(t, c.pushBlobsStat.Request.Load())
+}
+
+// The server lacks a parked entry, so WaitFor and /is-object-remote treat it as not Remote: a phony
+// request pushes it, which returns it to the LRU.
+func TestCacheman_ParkedIsNotRemote(t *testing.T) {
+	r := newCheckRemote()
+	c, hashes := restartWithMissing(t, r, "an output a build waits for")
+	h := hashes[0]
+
+	b, err := json.Marshal(h)
+	require.NoError(t, err)
+	w := httptest.NewRecorder()
+	c.httpHandler().ServeHTTP(w, httptest.NewRequest("POST", "http://localhost/is-object-remote", bytes.NewReader(b)))
+	require.Equal(t, http.StatusOK, w.Code)
+	var remoteFlag bool
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&remoteFlag))
+	require.False(t, remoteFlag)
+
+	done := make(chan error, 1)
+	c.Phony(0, []entities.Hash{h}, func(err error) {
+		if err == nil {
+			done <- err
+		}
+	})
+	require.NoError(t, <-done)
+	require.True(t, r.has(t, h))
+	require.Eventually(t, func() bool { return confirmed(c, h) && inLRU(t, c, h) }, 5*time.Second, 10*time.Millisecond)
+}
+
+// A push dropped because a child is in no store parks the entry in place of its marker, so a
+// restart does not push it again.
+func TestCacheman_DroppedPushParks(t *testing.T) {
+	old := unconfirmedPushDropAfter
+	unconfirmedPushDropAfter = 100 * time.Millisecond
+	t.Cleanup(func() { unconfirmedPushDropAfter = old })
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	r := newCheckRemote()
+	c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir, period: 10 * time.Millisecond})
+	c.startLocalWriteCheck(ctx)
+	child := objects.HashBlobBytes([]byte("never read by the mount"))
+	content, err := gitobjects.EncodeTree([]entities.FileEntry{
+		{Name: "file", Mode: entities.FileModeRegular, Hash: child},
+	})
+	require.NoError(t, err)
+	tree := entities.Hash(sha1.Sum(content))
+	require.NoError(t, c.store.PutTree(ctx, tree, content, entities.TreeMeta{Sizes: []int64{1}}))
+	_, err = c.addFetchedObjectToIndex(tree, EntryTypeTree)
+	require.NoError(t, err)
+
+	c.NewObject(tree, protocol.TypeTree)
+	require.Eventually(t, func() bool { return c.Stats().RemoteChecks.Dropped == 1 }, 15*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return c.isParked(tree) }, 5*time.Second, 10*time.Millisecond)
+	requireParked(t, c, tree)
+	require.Equal(t, int64(1), c.Stats().RemoteChecks.Parked)
+	require.NoError(t, c.Stop())
+
+	c = newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, dir: dir, period: 10 * time.Millisecond})
+	asked := r.askedFor(tree)
+	c.startLocalWriteCheck(ctx)
+	waitForStartPass(t, c)
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, asked, r.askedFor(tree))
+	require.Zero(t, c.Stats().RemoteChecks.Queued)
+	requireParked(t, c, tree)
+	require.False(t, r.has(t, tree))
 }

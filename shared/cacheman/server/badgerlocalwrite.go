@@ -110,6 +110,9 @@ func (b *BadgerIndexStore) ClearRemote(hash entities.Hash, entry *IndexEntry) (p
 			if err := txn.Set(checkKey(hash), nil); err != nil {
 				return err
 			}
+			if err := b.deleteParkLocked(txn, hash); err != nil {
+				return err
+			}
 			if prevTimestamp = b.readTimestampLocked(hash); prevTimestamp != 0 {
 				if err := txn.Delete(lruKey(prevTimestamp, hash)); err != nil {
 					return err
@@ -138,6 +141,9 @@ func (b *BadgerIndexStore) ClearRemote(hash entities.Hash, entry *IndexEntry) (p
 	if prevTimestamp != 0 {
 		b.deleteTimestampLocked(hash)
 		b.lruSize.Add(lruSizeDelta)
+	}
+	if cleared {
+		b.forgetParkLocked(hash)
 	}
 	return prevEnt, cleared, nil
 }
@@ -181,7 +187,7 @@ func (b *BadgerIndexStore) ConfirmRemote(hash entities.Hash) (bool, error) {
 				return err
 			}
 		}
-		if b.isLRUCandidate(hash) && b.readTimestampLocked(hash) == 0 {
+		if b.isLRUCandidate(hash) && b.readTimestampLocked(hash) == 0 && !b.isParkedLocked(hash) {
 			now := time.Now().Unix()
 			if err := txn.Set(lruKey(now, hash), nil); err != nil {
 				return err

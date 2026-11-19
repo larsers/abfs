@@ -153,6 +153,35 @@ type IndexStore interface {
 	// EvictSkippedUnconfirmed returns how many LRU entries eviction kept because the server
 	// had not confirmed them.
 	EvictSkippedUnconfirmed() int64
+
+	// Park takes a Local and Remote entry without a check marker out of the LRU until
+	// Unpark or its release, and reports whether it is parked. An entry released from an
+	// earlier park and not used since is not parked but moves to the young end of the LRU.
+	// It makes one attempt and returns ErrTxnConflict on a conflict. ClearRemote and deletes
+	// end a park.
+	Park(hash entities.Hash) (bool, error)
+
+	// ParkUnconfirmed parks an entry in place of its check marker and marks it Remote. It
+	// makes one attempt and returns ErrTxnConflict on a conflict.
+	ParkUnconfirmed(hash entities.Hash) (bool, error)
+
+	// Unpark ends the park of hash and tracks the entry in the LRU at timestamp. It
+	// reports whether hash was parked.
+	Unpark(hash entities.Hash, timestamp int64) (bool, error)
+
+	// IsParked reports whether hash is parked.
+	IsParked(hash entities.Hash) bool
+
+	// ParkedSize returns the size of the parked entries.
+	ParkedSize() int64
+
+	// ReleaseParked returns up to limit entries parked at or before the time before to the
+	// LRU, oldest park first, each at its LRU timestamp before the park, or at its park time
+	// if it had none. It reports how many it released and whether none are left.
+	ReleaseParked(before int64, limit int) (int, bool, error)
+
+	// EvictParked is Evict for parked entries, oldest park first.
+	EvictParked() ([]*IndexKeyEntry, int64, int64, error)
 }
 
 type EntryType int
@@ -560,13 +589,15 @@ func (i *badgerIndex) PutMany(entries []*IndexKeyEntry) (newSize int64, newLRUSi
 	return newSize, newLRUSize, nil
 }
 
+// maybeTriggerEviction starts an eviction when the LRU and the parked entries together reach
+// the background trigger.
 func (i *badgerIndex) maybeTriggerEviction(newLRUSize int64) {
 	if i.evictThreshold == 0 || i.closed.Load() {
 		return
 	}
 
 	bgThreshold := int64(float64(i.evictThreshold) * evictBackgroundTrigger)
-	if newLRUSize <= bgThreshold {
+	if newLRUSize+i.indexStore.ParkedSize() <= bgThreshold {
 		return
 	}
 
@@ -615,7 +646,7 @@ func (i *badgerIndex) evictIndexAndCache() error {
 		return nil
 	}
 	i.evictStart = time.Now()
-	startLRUSz := i.indexStore.LRUSize()
+	startLRUSz := i.evictableSize()
 	currLRUSz := startLRUSz
 	i.printer.Printf("Starting eviction process with starting LRU size %s...\n", humanize.Bytes(uint64(currLRUSz)))
 
@@ -628,7 +659,7 @@ func (i *badgerIndex) evictIndexAndCache() error {
 		i.writeEvictionLog(startLRUSz, currLRUSz, allVictims)
 	}()
 
-	targetSize := int64(float64(i.evictThreshold) * (1.0 - evictHeadroom))
+	targetSize := evictTarget(int64(i.evictThreshold))
 
 	for currLRUSz > targetSize {
 		// Evict from the index store while holding the lock for DB metadata updates.
@@ -636,7 +667,8 @@ func (i *badgerIndex) evictIndexAndCache() error {
 		// a cached item from the index, but before removing it from disk.
 		// This will get rectified on a cacheman maintenance run.
 		victims, lruSz, err := i.evictBatch(currLRUSz, int64(i.evictThreshold))
-		if errors.Is(err, errEvictionHeld) {
+		// Nothing is left when the LRU and the park emptied while the run went.
+		if errors.Is(err, errEvictionHeld) || errors.Is(err, errNothingToEvict) {
 			return nil
 		}
 		if err != nil {
@@ -671,6 +703,11 @@ func (i *badgerIndex) evictIndexAndCache() error {
 	return nil
 }
 
+// evictTarget returns the size an eviction run brings a cache with threshold down to.
+func evictTarget(threshold int64) int64 {
+	return int64(float64(threshold) * (1.0 - evictHeadroom))
+}
+
 // writeEvictionLog records a dedicated, atomic eviction log (recent_eviction.log) containing the
 // metadata and all evicted object hashes from the most recent eviction run.
 func (i *badgerIndex) writeEvictionLog(startLRUSz, endLRUSz int64, victims []*IndexKeyEntry) {
@@ -694,7 +731,7 @@ func (i *badgerIndex) writeEvictionLog(startLRUSz, endLRUSz int64, victims []*In
 	fmt.Fprintf(w, "Duration: %s\n", i.evictEnd.Sub(i.evictStart))
 	fmt.Fprintf(w, "StartingLRUSize: %s (%d bytes)\n", humanize.Bytes(uint64(startLRUSz)), startLRUSz)
 	fmt.Fprintf(w, "EndingLRUSize: %s (%d bytes)\n", humanize.Bytes(uint64(endLRUSz)), endLRUSz)
-	targetSize := int64(float64(i.evictThreshold) * (1.0 - evictHeadroom))
+	targetSize := evictTarget(int64(i.evictThreshold))
 	fmt.Fprintf(w, "TargetLRUSize: %s (%d bytes)\n", humanize.Bytes(uint64(targetSize)), targetSize)
 	fmt.Fprintf(w, "TotalEvicted: %d\n\n", len(victims))
 	fmt.Fprintf(w, "# Format: <hash> <type> <size_bytes>\n")
