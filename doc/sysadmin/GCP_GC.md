@@ -486,7 +486,7 @@ Cacheman reports its checks in `remote_checks` of its stats. `skipped` counts th
 
 ### Map rows
 
-Before the objects, the step deletes the map rows that name a candidate, and the eval rows past `--map-retention` whose two ends stay live.
+Before the objects, the step deletes the map rows that name a candidate, and the eval rows past `--map-retention` whose request stays live and whose result stays live or has no `abfsgc` row.
 
 * Each delete is conditional: a row written or used since the start of the grace (for an expired eval row, since the start of the map retention) stays, and a row that stays keeps both its candidate ends.
 * A row goes only when both its ends are of types `--delete-types` allows; an end without an `abfsgc` row counts as allowed. Otherwise the row stays and keeps its candidate ends, so a cycle limited to some types drops no cached result of the others.

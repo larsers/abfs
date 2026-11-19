@@ -245,11 +245,12 @@ func TestPlanDeletes(t *testing.T) {
 // where an end without an object has no type and allows it, and one that
 // names a candidate and stays keeps that candidate. An eval row
 // past the map retention whose ends are live goes only when the cycle may
-// delete eval requests and responses.
+// delete eval requests and responses. So does one whose request is live and
+// whose response has no gc row.
 func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	require := require.New(t)
 	f := newStepFixture(t, 4)
-	h := testHashes(8)
+	h := testHashes(10)
 	old := f.now.Add(-1000 * time.Hour)
 	// Both ends are candidates.
 	req, resp := h[0], h[1]
@@ -270,9 +271,13 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	absReq, absResp := h[6], h[7]
 	f.object(absReq, "eval-request", nil)
 	f.mapRow(absReq, absResp, old)
+	// The request is live and the response has no object.
+	danglingReq, danglingResp := h[8], h[9]
+	f.object(danglingReq, "eval-request", nil)
+	f.mapRow(danglingReq, danglingResp, old)
 
 	res := f.mark(nil)
-	for _, k := range []Hash{liveReq, liveResp} {
+	for _, k := range []Hash{liveReq, liveResp, danglingReq} {
 		res.live.set(res.graph.find(k))
 	}
 	eligible, lists := f.eligible(res)
@@ -289,17 +294,17 @@ func TestPlanDeletes_MapRowTypes(t *testing.T) {
 	row := func(from, to Hash) string { return from.String() + "#" + to.String() }
 
 	p := plan(func(string) bool { return true })
-	require.ElementsMatch([]string{row(req, resp), row(outReq, outResp), row(liveReq, liveResp), row(absReq, absResp)}, rows(p))
+	require.ElementsMatch([]string{row(req, resp), row(outReq, outResp), row(liveReq, liveResp), row(absReq, absResp), row(danglingReq, danglingResp)}, rows(p))
 	require.Equal(int64(3), p.report.MapRows)
-	require.Equal(int64(1), p.report.ExpiredEvalMapRows)
+	require.Equal(int64(2), p.report.ExpiredEvalMapRows)
 	require.Zero(p.report.MapRowsKeptForTypes)
 	require.Equal(int64(4), p.report.WouldDelete)
 
 	// An end without a node has no type and allows the row.
 	p = plan(func(t string) bool { return t == "eval-request" })
-	require.Equal([]string{row(absReq, absResp)}, rows(p))
+	require.ElementsMatch([]string{row(absReq, absResp), row(danglingReq, danglingResp)}, rows(p))
 	require.Equal(int64(2), p.report.MapRowsKeptForTypes)
-	require.Zero(p.report.ExpiredEvalMapRows)
+	require.Equal(int64(1), p.report.ExpiredEvalMapRows)
 	outcome := func(k Hash) keyOutcome { return p.outcome[p.index(res.graph.find(k))] }
 	require.Equal(outcomeBlocked, outcome(req))
 	require.Equal(outcomeTypeNotAllowed, outcome(resp))

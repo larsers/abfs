@@ -78,7 +78,7 @@ type deletePlan struct {
 
 // plannedMapRow is a row of the table maps that the delete step removes
 // before the objects: a row that names a candidate, or an eval row past the
-// map retention whose two ends stay.
+// map retention whose ends stay or whose result has no gc row.
 type plannedMapRow struct {
 	key      string
 	from, to uint32
@@ -297,7 +297,8 @@ func (p *deletePlan) blockNoncandidateParents(res *Result) {
 }
 
 // planMapRows selects the map rows that name a candidate and the eval rows
-// past the map retention whose two ends are live. A row goes only when the
+// past the map retention whose request is live and whose result is live or
+// has no gc row. A row goes only when the
 // cycle may delete the types of both its ends; an end without a node has no
 // type and allows it. So a cycle limited to some types drops no cached result
 // of the others. A row that names a candidate and stays for its types keeps
@@ -314,7 +315,7 @@ func (p *deletePlan) planMapRows(res *Result, evalAfter int64, allows func(strin
 		for i := range rows {
 			r := &rows[i]
 			names := (r.from != noNode && p.isCand.has(r.from)) || (r.to != noNode && p.isCand.has(r.to))
-			expired := !names && g.mapClass(r) == MapEval && r.time < evalAfter && r.to != noNode && res.live.has(r.from) && res.live.has(r.to)
+			expired := !names && g.mapClass(r) == MapEval && r.time < evalAfter && res.live.has(r.from) && (r.to == noNode || res.live.has(r.to))
 			if !names && !expired {
 				continue
 			}
