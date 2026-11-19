@@ -60,7 +60,7 @@ func (f *statsToucher) set(st gc.TouchStats) {
 func newHeartbeatServer(t *testing.T, interval time.Duration) (*GCPServer, *statsToucher) {
 	t.Helper()
 	s := newEmulatorCASDBServer(t)
-	require.NoError(t, s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: interval, GCTouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}))
+	require.NoError(t, s.enableGCHooks(context.Background(), &NewServerOpts{GCHeartbeatInterval: interval, GCTouchInterval: 36 * time.Hour, CacheTTL: 6 * time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	s.gcHooks.toucher.Close()
 	st := &statsToucher{}
@@ -244,12 +244,31 @@ func TestGCHooks_FirstHeartbeatFailureStopsStart(t *testing.T) {
 		return status.Error(codes.PermissionDenied, "injected")
 	}
 	firstHeartbeatTimeout = 200 * time.Millisecond
-	err := s.enableGCHooks(&NewServerOpts{GCHeartbeatInterval: time.Minute, GCTouchInterval: time.Hour, CacheTTL: time.Hour})
+	err := s.enableGCHooks(context.Background(), &NewServerOpts{GCHeartbeatInterval: time.Minute, GCTouchInterval: time.Hour, CacheTTL: time.Hour})
 	require.ErrorContains(err, "failed to write the first GC heartbeat")
 	require.Nil(s.gcHooks.stopHeartbeat)
 	servers, err := gc.ReadServers(context.Background(), s.casdb.SpannerClient())
 	require.NoError(err)
 	require.Empty(servers)
+}
+
+// A start that is cancelled, for example by a stop signal, stops retrying
+// the first heartbeat at once.
+func TestGCHooks_FirstHeartbeatStopsWithStartContext(t *testing.T) {
+	require := require.New(t)
+	s := newEmulatorCASDBServer(t)
+	orig := writeServer
+	t.Cleanup(func() { writeServer = orig })
+	writeServer = func(context.Context, *spanner.Client, *gc.Server, bool, bool) error {
+		return status.Error(codes.Unavailable, "injected")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	err := s.enableGCHooks(ctx, &NewServerOpts{GCHeartbeatInterval: time.Minute, GCTouchInterval: time.Hour, CacheTTL: time.Hour})
+	require.ErrorIs(err, context.Canceled)
+	require.Less(time.Since(start), firstHeartbeatRetry)
+	require.Nil(s.gcHooks.stopHeartbeat)
 }
 
 // Once the last successful heartbeat is older than two intervals plus the

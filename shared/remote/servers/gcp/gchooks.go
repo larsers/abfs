@@ -173,7 +173,7 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 			return err
 		}
 	}
-	return s.enableGCHooks(&o)
+	return s.enableGCHooks(ctx, &o)
 }
 
 // gcHookOpts checks the GC options of opts and returns them with the default
@@ -204,8 +204,8 @@ func gcHookOpts(opts *NewServerOpts) (NewServerOpts, error) {
 }
 
 // enableGCHooks turns the hooks on and starts the toucher and the heartbeat.
-// It fails when it cannot write the first heartbeat.
-func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
+// It fails when it cannot write the first heartbeat before ctx ends.
+func (s *GCPServer) enableGCHooks(ctx context.Context, opts *NewServerOpts) error {
 	s.casdb.EnableGC()
 	s.gcEdges = gc.NewEdgeWriter(s.casdb.BTClient())
 	g := &s.gcHooks
@@ -253,7 +253,7 @@ func (s *GCPServer) enableGCHooks(opts *NewServerOpts) error {
 			HeartbeatInterval: time.Duration(seconds(opts.GCHeartbeatInterval)) * time.Second,
 			LinkValidation:    s.validateLinks,
 		}
-		if err := s.startHeartbeat(opts.GCHeartbeatInterval); err != nil {
+		if err := s.startHeartbeat(ctx, opts.GCHeartbeatInterval); err != nil {
 			s.stopGCHooks()
 			return err
 		}
@@ -716,13 +716,13 @@ func (s *GCPServer) chunkMissing(ctx context.Context, key entities.Hash, content
 }
 
 // startHeartbeat writes the first heartbeat of this server, retrying for up
-// to firstHeartbeatTimeout, so that the server has a row before it serves,
-// and then one every interval until stopGCHooks.
-func (s *GCPServer) startHeartbeat(interval time.Duration) error {
+// to firstHeartbeatTimeout while ctx lives, so that the server has a row
+// before it serves, and then one every interval until stopGCHooks.
+func (s *GCPServer) startHeartbeat(ctx context.Context, interval time.Duration) error {
 	g := &s.gcHooks
 	log.Printf("GC server ID %s, heartbeat every %s", g.server.ID, interval)
 	g.lastAttempt = 0
-	first, cancelFirst := context.WithTimeout(context.Background(), firstHeartbeatTimeout)
+	first, cancelFirst := context.WithTimeout(ctx, firstHeartbeatTimeout)
 	defer cancelFirst()
 	for {
 		err := s.heartbeat(first)
@@ -731,12 +731,17 @@ func (s *GCPServer) startHeartbeat(interval time.Duration) error {
 		}
 		select {
 		case <-first.Done():
+			if ctx.Err() != nil {
+				return fmt.Errorf("failed to write the first GC heartbeat: %w", context.Cause(ctx))
+			}
 			return fmt.Errorf("failed to write the first GC heartbeat within %s: %w", firstHeartbeatTimeout, err)
 		case <-time.After(firstHeartbeatRetry):
 		}
 	}
 	g.heartbeatStale = seconds(2*interval + heartbeatTimeout)
-	ctx, cancel := context.WithCancel(context.Background())
+	// The later heartbeats run until stopGCHooks, not until ctx ends, so that
+	// a server that drains its calls after a stop signal keeps its row fresh.
+	loop, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -744,11 +749,11 @@ func (s *GCPServer) startHeartbeat(interval time.Duration) error {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-loop.Done():
 				return
 			case <-ticker.C:
 			}
-			_ = s.heartbeat(ctx)
+			_ = s.heartbeat(loop)
 		}
 	}()
 	g.stopHeartbeat = func() {

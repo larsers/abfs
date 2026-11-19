@@ -651,7 +651,7 @@ func TestDryRunGC_KeepsEmptyObjects(t *testing.T) {
 func TestDryRunGC_ReadsLeaveCondemnMarkers(t *testing.T) {
 	require := require.New(t)
 	f := newGCFixture(t)
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCReadOnly: true, GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCReadOnly: true, GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 	commit := f.commit(f.tree(f.old, f.blob("file", f.old)), "pinned", f.old)
 	details, pinned := f.mount("refs/abfs/mount/user/u/1", []string{commit.String()}, f.now.Add(-time.Hour))

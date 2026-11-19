@@ -330,7 +330,7 @@ func TestDeleteGC_RescuedParentKeepsItsChildren(t *testing.T) {
 	f.delete(nil)
 	f.age()
 
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 	f.checks.hook = func() {
 		f.s.forget(commit)
@@ -1090,7 +1090,7 @@ func TestDeleteGC_RescuedDuringHoldSurvives(t *testing.T) {
 	_, err := f.condemn(nil)
 	require.NoError(err)
 
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 	f.s.forget(rescued)
 	_, err = f.s.Headers(ctx, []entities.Hash{rescued})

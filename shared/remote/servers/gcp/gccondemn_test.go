@@ -254,7 +254,7 @@ func TestCondemnGC_ServerRescuesCondemnedObjects(t *testing.T) {
 	require.NoError(err)
 	require.Equal([][]byte{marker(1)}, f.markerCells(blob))
 
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{GCTouchInterval: time.Hour}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{GCTouchInterval: time.Hour}))
 	t.Cleanup(f.s.stopGCHooks)
 	f.s.forget(blob)
 	f.s.forget(tree)
@@ -456,7 +456,7 @@ func TestCondemnGC_ListsLiveKeysOfPreviousList(t *testing.T) {
 	refTime := f.now.Add(-time.Minute)
 	f.ref("platform/b", "refs/heads/again", reRooted, refTime)
 	f.touch(touched, f.now.Add(-2*time.Minute))
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{}))
 	t.Cleanup(f.s.stopGCHooks)
 	f.s.forget(rescued)
 	_, err = f.s.Headers(ctx, []entities.Hash{rescued})
@@ -592,7 +592,7 @@ func TestCondemnGC_ReappliedMarkerAfterRescue(t *testing.T) {
 	require.Equal([][]byte{marker(1)}, f.markerCells(k))
 
 	// No toucher, so the only touch is the rescue's.
-	require.NoError(f.s.enableGCHooks(&NewServerOpts{}))
+	require.NoError(f.s.enableGCHooks(context.Background(), &NewServerOpts{}))
 	t.Cleanup(f.s.stopGCHooks)
 	rescue := f.s.gcHooks.rescue
 	failTouches := newBigtableClientWith(t, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {

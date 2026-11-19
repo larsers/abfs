@@ -47,7 +47,7 @@ func TestValidationDeadline_FailsLateWrite(t *testing.T) {
 	cacheNow = clock.now.Load
 	t.Cleanup(func() { cacheNow = orig })
 	s := newEmulatorCASDBServerWith(t, clock.interceptor())
-	require.NoError(t, s.enableGCHooks(&NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
+	require.NoError(t, s.enableGCHooks(context.Background(), &NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	blob := putBlob(t, s, "linked")
 	other := putBlob(t, s, "other")
@@ -162,7 +162,7 @@ func TestValidationDeadline_ObjectRowAfterSlowGCRow(t *testing.T) {
 		return resp, err
 	})
 	s := newEmulatorCASDBServerWith(t, slowGCRow)
-	require.NoError(s.enableGCHooks(&NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
+	require.NoError(s.enableGCHooks(context.Background(), &NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	key, data := treeOf(putBlob(t, s, "linked"))
 
@@ -328,7 +328,7 @@ func TestAnswerBound(t *testing.T) {
 	cacheNow = clock.now.Load
 	t.Cleanup(func() { cacheNow = orig })
 	s := newEmulatorCASDBServerWith(t, clock.interceptor())
-	require.NoError(t, s.enableGCHooks(&NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
+	require.NoError(t, s.enableGCHooks(context.Background(), &NewServerOpts{CacheTTL: time.Hour, GCTouchInterval: time.Hour}))
 	t.Cleanup(s.stopGCHooks)
 	// Objects of any size are sent as links to a client that takes them.
 	s.depot = depot.NewMasterDepot([]depot.Depot{newFakeURLDepot(depot.NewMemoryDepot("mem", 1000000))})

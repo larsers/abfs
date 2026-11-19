@@ -64,7 +64,7 @@ func newGCHooksServer(t *testing.T, opts *NewServerOpts) *GCPServer {
 	require.NoError(t, adm.CreateColumnFamily(ctx, "objects", gc.ObjectsFamily))
 	require.NoError(t, adm.CreateTable(ctx, "maps"))
 	require.NoError(t, adm.CreateColumnFamily(ctx, "maps", "cf"))
-	require.NoError(t, s.enableGCHooks(opts))
+	require.NoError(t, s.enableGCHooks(context.Background(), opts))
 	t.Cleanup(s.stopGCHooks)
 	return s
 }
