@@ -67,8 +67,7 @@ func (c *CASDB) headerFamilies() string {
 }
 
 // CheckGCSchema checks that the garbage collector tables a server uses are
-// readable, with the columns added after they were first created. AbfsGcLists is
-// the collector's alone.
+// readable with their columns. AbfsGcLists is the collector's alone.
 func (c *CASDB) CheckGCSchema(ctx context.Context) error {
 	for _, q := range []struct{ table, columns string }{
 		{"AbfsGcState", "ListLocation, ListSnapshotTime, ListComplete, ListCompleteTime, MaxGraceSeconds"},
