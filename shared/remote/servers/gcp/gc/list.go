@@ -117,7 +117,7 @@ func readListHeader(r io.Reader) (*listHeader, error) {
 	if fixed.Version != listFormatVersion {
 		return nil, fmt.Errorf("unsupported condemned list format version %d", fixed.Version)
 	}
-	h := &listHeader{cycle: fixed.Cycle, snapshot: time.UnixMicro(fixed.Snapshot)}
+	h := &listHeader{cycle: fixed.Cycle, snapshot: time.UnixMicro(fixed.Snapshot).UTC()}
 	var err error
 	if h.holder, err = readString(r); err != nil {
 		return nil, err
@@ -153,6 +153,41 @@ func readString(r io.Reader) (string, error) {
 	return string(b), nil
 }
 
+// sizedReader reads an object of a known size and counts the bytes left, so
+// that a count or a length read from the object can be checked against what
+// is left before anything is allocated for it.
+type sizedReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (s *sizedReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	s.left -= int64(n)
+	return n, err
+}
+
+// checkCount fails unless count items of at least size bytes each fit in
+// what is left of r.
+func (s *sizedReader) checkCount(count, size int64) error {
+	if count < 0 || count > s.left/size {
+		return fmt.Errorf("it counts %d entries, but %d bytes are left", count, s.left)
+	}
+	return nil
+}
+
+// checkEnd fails unless r is at its end.
+func checkEnd(r io.ByteReader, count int64) error {
+	_, err := r.ReadByte()
+	switch {
+	case err == nil:
+		return fmt.Errorf("it has more than the %d entries its header counts", count)
+	case !errors.Is(err, io.EOF):
+		return err
+	}
+	return nil
+}
+
 // listRecord is one record of a condemned list.
 type listRecord struct {
 	key  Hash
@@ -165,25 +200,31 @@ type listRecord struct {
 // only if it does not exist.
 func writeList(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *listHeader, next func() (listRecord, bool)) error {
 	return createObject(ctx, b, bucket, name, h.runID(), "application/octet-stream", func(w io.Writer) error {
-		if err := h.write(w); err != nil {
+		return encodeList(w, h, next)
+	})
+}
+
+// encodeList writes a condemned list with the header h and the records that
+// next returns to w.
+func encodeList(w io.Writer, h *listHeader, next func() (listRecord, bool)) error {
+	if err := h.write(w); err != nil {
+		return err
+	}
+	var n int64
+	b := make([]byte, 0, listRecordSize)
+	for rec, ok := next(); ok; rec, ok = next() {
+		b = append(b[:0], rec.key[:]...)
+		b = append(b, rec.typ)
+		b = binary.BigEndian.AppendUint64(b, uint64(rec.size))
+		if _, err := w.Write(b); err != nil {
 			return err
 		}
-		var n int64
-		b := make([]byte, 0, listRecordSize)
-		for rec, ok := next(); ok; rec, ok = next() {
-			b = append(b[:0], rec.key[:]...)
-			b = append(b, rec.typ)
-			b = binary.BigEndian.AppendUint64(b, uint64(rec.size))
-			if _, err := w.Write(b); err != nil {
-				return err
-			}
-			n++
-		}
-		if n != h.count {
-			return fmt.Errorf("wrote %d records, the header counts %d", n, h.count)
-		}
-		return nil
-	})
+		n++
+	}
+	if n != h.count {
+		return fmt.Errorf("wrote %d records, the header counts %d", n, h.count)
+	}
+	return nil
 }
 
 // createObject writes the object name with write, only if no object of that
@@ -261,22 +302,35 @@ func readList(ctx context.Context, bucket *storage.BucketHandle, name string) (_
 		return nil, fmt.Errorf("failed to read the condemned list %s: %w", name, err)
 	}
 	defer entities.CloseErrCheck(r, &retErr)
-	br := bufio.NewReaderSize(r, 1<<20)
-	h, err := readListHeader(br)
+	l, err := decodeList(r, r.Attrs.Size)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read the header of the condemned list %s: %w", name, err)
+		return nil, fmt.Errorf("failed to read the condemned list %s: %w", name, err)
+	}
+	return l, nil
+}
+
+// decodeList decodes a condemned list of size bytes from r.
+func decodeList(r io.Reader, size int64) (*condemnedList, error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	sr := &sizedReader{r: br, left: size}
+	h, err := readListHeader(sr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the header: %w", err)
+	}
+	if err := sr.checkCount(h.count, listRecordSize); err != nil {
+		return nil, fmt.Errorf("invalid header: %w", err)
 	}
 	l := &condemnedList{header: h, keys: make([]Hash, 0, h.count), types: make([]uint8, 0, h.count)}
 	b := make([]byte, listRecordSize)
 	for range h.count {
-		if _, err := io.ReadFull(br, b); err != nil {
-			return nil, fmt.Errorf("failed to read the condemned list %s after %d records: %w", name, len(l.keys), err)
+		if _, err := io.ReadFull(sr, b); err != nil {
+			return nil, fmt.Errorf("failed to read the record after %d records: %w", len(l.keys), err)
 		}
 		l.keys = append(l.keys, Hash(b[:entities.HashSize]))
 		l.types = append(l.types, b[entities.HashSize])
 	}
-	if _, err := br.ReadByte(); err != io.EOF {
-		return nil, fmt.Errorf("the condemned list %s has more than the %d records its header counts", name, h.count)
+	if err := checkEnd(br, h.count); err != nil {
+		return nil, err
 	}
 	return l, nil
 }

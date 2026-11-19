@@ -15,10 +15,15 @@
 package gc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"io"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -70,7 +75,7 @@ func TestList_WriteReadAndCreateOnce(t *testing.T) {
 		{key: objects.HashBlobBytes([]byte("b")), typ: typeIndex["tree"], size: 1 << 40},
 		{key: objects.HashBlobBytes([]byte("c")), typ: typeIndex["commit"], size: 300},
 	}
-	h := &listHeader{cycle: 7, snapshot: time.UnixMicro(time.Now().UnixMicro()), holder: "gc-host-1", epoch: 3, count: int64(len(recs)), types: typeNames}
+	h := &listHeader{cycle: 7, snapshot: time.UnixMicro(time.Now().UnixMicro()).UTC(), holder: "gc-host-1", epoch: 3, count: int64(len(recs)), types: typeNames}
 	name := listObjectName("default", 7)
 	require.Equal("abfsgc/condemned/default/7", name)
 	require.NoError(writeList(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, h, listOf(recs)))
@@ -94,6 +99,59 @@ func TestList_WriteReadAndCreateOnce(t *testing.T) {
 	require.Error(writeList(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, listObjectName("default", 8), &short, listOf(recs[:2])))
 	_, err = bucket.Object(listObjectName("default", 8)).Attrs(ctx)
 	require.ErrorIs(err, storage.ErrObjectNotExist)
+}
+
+// A condemned list that is truncated, counts more records than its size
+// holds, or has bytes after its records fails to decode without a large
+// allocation, and a read error at its end is returned as it is. Times decode
+// in UTC.
+func TestDecodeList_Malformed(t *testing.T) {
+	require := require.New(t)
+	recs := []listRecord{
+		{key: objects.HashBlobBytes([]byte("a")), typ: typeIndex["blob"], size: 1},
+		{key: objects.HashBlobBytes([]byte("b")), typ: typeIndex["tree"], size: 2},
+	}
+	h := &listHeader{cycle: 7, snapshot: time.UnixMicro(1000), holder: "gc", epoch: 3, count: int64(len(recs)), types: []string{"blob", "tree"}}
+	var buf bytes.Buffer
+	require.NoError(encodeList(&buf, h, listOf(recs)))
+	valid := buf.Bytes()
+	hdrLen := len(valid) - len(recs)*listRecordSize
+	// The count follows the magic, the version, the cycle, the snapshot, the
+	// holder and the epoch.
+	countAt := len(listMagic) + 4 + 8 + 8 + 2 + len(h.holder) + 8
+	patched := func(v uint64) []byte {
+		b := slices.Clone(valid)
+		binary.BigEndian.PutUint64(b[countAt:], v)
+		return b
+	}
+	l, err := decodeList(bytes.NewReader(valid), int64(len(valid)))
+	require.NoError(err)
+	require.Equal([]Hash{recs[0].key, recs[1].key}, l.keys)
+	require.Equal(time.UTC, l.header.snapshot.Location())
+
+	// A truncated list is read with the size of the whole one, as when a
+	// download ends early, and else with its own size.
+	tests := []struct {
+		name string
+		data []byte
+		size int
+		want string
+	}{
+		{"truncated header", valid[:countAt+3], len(valid), "failed to read the header"},
+		{"negative count", patched(1 << 63), len(valid), "counts"},
+		{"count past the size", patched(1 << 40), len(valid), "counts 1099511627776 entries"},
+		{"records past the size", valid[:hdrLen+listRecordSize+5], hdrLen + listRecordSize + 5, "counts 2 entries, but 34 bytes are left"},
+		{"truncated records", valid[:hdrLen+listRecordSize+5], len(valid), "after 1 records"},
+		{"extra byte", append(slices.Clone(valid), 0), len(valid) + 1, "more than the 2 entries its header counts"},
+	}
+	for _, tt := range tests {
+		_, err := decodeList(bytes.NewReader(tt.data), int64(tt.size))
+		require.ErrorContains(err, tt.want, tt.name)
+	}
+
+	boom := errors.New("boom")
+	_, err = decodeList(io.MultiReader(bytes.NewReader(valid), errReader{boom}), int64(len(valid)))
+	require.ErrorIs(err, boom)
 }
 
 // Pruning keeps the newest cycles' lists and their companions and leaves

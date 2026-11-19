@@ -183,60 +183,67 @@ func (h *recordHeader) write(w io.Writer) (int, error) {
 // only if no object of that name exists or this run wrote it, and returns
 // its size.
 func writeRecord(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *recordHeader, entries []recordEntry) (int64, error) {
-	h.count = int64(len(entries))
 	var size int64
 	err := createObject(ctx, b, bucket, name, h.runID, "application/octet-stream", func(w io.Writer) error {
-		size = 0
-		n, err := h.write(w)
-		size += int64(n)
-		if err != nil {
-			return err
-		}
-		var buf []byte
-		for i := range entries {
-			e := &entries[i]
-			buf = append(buf[:0], e.kind)
-			buf = append(buf, e.key[:]...)
-			switch e.kind {
-			case recordObject:
-			case recordMapRow:
-				buf = append(buf, e.mapTo[:]...)
-			default:
-				return fmt.Errorf("invalid delete record entry kind %d", e.kind)
-			}
-			n, err := w.Write(buf)
-			size += int64(n)
-			if err != nil {
-				return err
-			}
-		}
-		for i := range entries {
-			e := &entries[i]
-			if e.kind != recordObject {
-				continue
-			}
-			if len(e.cells) > 1<<16-1 || len(e.edges) > 1<<8-1 {
-				return fmt.Errorf("the object %s has too many cells for a delete record", e.key)
-			}
-			buf = binary.BigEndian.AppendUint16(buf[:0], uint16(len(e.cells)))
-			for _, c := range e.cells {
-				buf = appendString(appendString(buf, c.family), c.column)
-				buf = binary.BigEndian.AppendUint64(buf, uint64(c.ts))
-				buf = appendBytes(buf, c.value)
-			}
-			buf = append(buf, uint8(len(e.edges)))
-			for _, c := range e.edges {
-				buf = appendBytes(appendString(buf, c.column), c.value)
-			}
-			n, err := w.Write(buf)
-			size += int64(n)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
+		var err error
+		size, err = encodeRecord(w, h, entries)
+		return err
 	})
 	return size, err
+}
+
+// encodeRecord writes a delete record with the header h and entries to w,
+// and returns its size.
+func encodeRecord(w io.Writer, h *recordHeader, entries []recordEntry) (int64, error) {
+	h.count = int64(len(entries))
+	n, err := h.write(w)
+	size := int64(n)
+	if err != nil {
+		return size, err
+	}
+	var buf []byte
+	for i := range entries {
+		e := &entries[i]
+		buf = append(buf[:0], e.kind)
+		buf = append(buf, e.key[:]...)
+		switch e.kind {
+		case recordObject:
+		case recordMapRow:
+			buf = append(buf, e.mapTo[:]...)
+		default:
+			return size, fmt.Errorf("invalid delete record entry kind %d", e.kind)
+		}
+		n, err := w.Write(buf)
+		size += int64(n)
+		if err != nil {
+			return size, err
+		}
+	}
+	for i := range entries {
+		e := &entries[i]
+		if e.kind != recordObject {
+			continue
+		}
+		if len(e.cells) > 1<<16-1 || len(e.edges) > 1<<8-1 {
+			return size, fmt.Errorf("the object %s has too many cells for a delete record", e.key)
+		}
+		buf = binary.BigEndian.AppendUint16(buf[:0], uint16(len(e.cells)))
+		for _, c := range e.cells {
+			buf = appendString(appendString(buf, c.family), c.column)
+			buf = binary.BigEndian.AppendUint64(buf, uint64(c.ts))
+			buf = appendBytes(buf, c.value)
+		}
+		buf = append(buf, uint8(len(e.edges)))
+		for _, c := range e.edges {
+			buf = appendBytes(appendString(buf, c.column), c.value)
+		}
+		n, err := w.Write(buf)
+		size += int64(n)
+		if err != nil {
+			return size, err
+		}
+	}
+	return size, nil
 }
 
 func appendBytes(b, v []byte) []byte {
@@ -265,16 +272,30 @@ func readRecordSections(ctx context.Context, bucket *storage.BucketHandle, name 
 		// Closed before the end, the reader stops the download.
 		defer func() { _ = r.Close() }()
 	}
-	br := bufio.NewReader(r)
-	h, err := readRecordHeader(br)
+	h, entries, err := decodeRecord(r, r.Attrs.Size, rows)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read the header of the delete record %s: %w", name, err)
+		return nil, nil, fmt.Errorf("failed to read the delete record %s: %w", name, err)
+	}
+	return h, entries, nil
+}
+
+// decodeRecord decodes a delete record of size bytes from r, with the row
+// section when rows is set.
+func decodeRecord(r io.Reader, size int64, rows bool) (*recordHeader, []recordEntry, error) {
+	br := bufio.NewReader(r)
+	sr := &sizedReader{r: br, left: size}
+	h, err := readRecordHeader(sr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read the header: %w", err)
+	}
+	if err := sr.checkCount(h.count, 1+entities.HashSize); err != nil {
+		return nil, nil, fmt.Errorf("invalid header: %w", err)
 	}
 	entries := make([]recordEntry, 0, h.count)
 	for range h.count {
-		e, err := readRecordKey(br)
+		e, err := readRecordKey(sr)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read the delete record %s after %d keys: %w", name, len(entries), err)
+			return nil, nil, fmt.Errorf("failed to read the key after %d keys: %w", len(entries), err)
 		}
 		entries = append(entries, e)
 	}
@@ -286,12 +307,12 @@ func readRecordSections(ctx context.Context, bucket *storage.BucketHandle, name 
 		if e.kind != recordObject {
 			continue
 		}
-		if err := readRecordRow(br, e); err != nil {
-			return nil, nil, fmt.Errorf("failed to read the row of %s in the delete record %s: %w", e.key, name, err)
+		if err := readRecordRow(sr, e); err != nil {
+			return nil, nil, fmt.Errorf("failed to read the row of %s: %w", e.key, err)
 		}
 	}
-	if _, err := br.ReadByte(); err != io.EOF {
-		return nil, nil, fmt.Errorf("the delete record %s has more than the %d entries its header counts", name, h.count)
+	if err := checkEnd(br, h.count); err != nil {
+		return nil, nil, err
 	}
 	return h, entries, nil
 }
@@ -326,7 +347,7 @@ func readRecordHeader(r io.Reader) (*recordHeader, error) {
 	if err := binary.Read(r, binary.BigEndian, &times); err != nil {
 		return nil, err
 	}
-	h.gcRowsAfter, h.count = time.UnixMicro(times.GCRowsAfter), times.Count
+	h.gcRowsAfter, h.count = time.UnixMicro(times.GCRowsAfter).UTC(), times.Count
 	return h, nil
 }
 
@@ -351,7 +372,7 @@ func readRecordKey(r io.Reader) (recordEntry, error) {
 	return e, nil
 }
 
-func readRecordRow(r io.Reader, e *recordEntry) error {
+func readRecordRow(r *sizedReader, e *recordEntry) error {
 	var cells uint16
 	if err := binary.Read(r, binary.BigEndian, &cells); err != nil {
 		return err
@@ -393,10 +414,13 @@ func readRecordRow(r io.Reader, e *recordEntry) error {
 	return nil
 }
 
-func readBytes(r io.Reader) ([]byte, error) {
+func readBytes(r *sizedReader) ([]byte, error) {
 	var n uint32
 	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
 		return nil, err
+	}
+	if int64(n) > r.left {
+		return nil, fmt.Errorf("a value of %d bytes is longer than the %d bytes left", n, r.left)
 	}
 	b := make([]byte, n)
 	if _, err := io.ReadFull(r, b); err != nil {

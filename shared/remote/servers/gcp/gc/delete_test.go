@@ -15,6 +15,7 @@
 package gc
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -381,7 +382,7 @@ func TestDeleteRecord_WriteRead(t *testing.T) {
 		}},
 		{kind: recordObject, key: h[2], cells: []recordCell{{family: objectsMetaFamily, column: "type", ts: 3000, value: []byte("blob")}}},
 	}
-	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000)}
+	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000).UTC()}
 	name := recordObjectName("default", 5, 1, 3, 0)
 	require.Equal("abfsgc/deleted/default/5/1-3-0", name)
 	size, err := writeRecord(ctx, writeBudget{deadline: DefaultWriteDeadline}, bucket, name, hdr, entries)
@@ -761,6 +762,73 @@ func TestDeleteGC_StopsBeforeLeaseExpiry(t *testing.T) {
 	require.Equal(int64(7), rep.NotSent)
 	require.Equal(int64(1), rep.GCRowErrors)
 	require.Zero(rep.Unknown)
+}
+
+// errReader fails every read with err.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// A delete record that is truncated, counts more entries or a longer value
+// than its size holds, or has bytes after its entries fails to decode
+// without a large allocation, and a read error at its end is returned as it
+// is. Times decode in UTC.
+func TestDecodeRecord_Malformed(t *testing.T) {
+	require := require.New(t)
+	h := testHashes(2)
+	hdr := &recordHeader{cycle: 5, runID: "collector#3", gcRowsAfter: time.UnixMicro(1000)}
+	var buf bytes.Buffer
+	_, err := encodeRecord(&buf, hdr, []recordEntry{
+		{kind: recordObject, key: h[0], cells: []recordCell{{family: "m", column: "t", ts: 1, value: []byte("v")}}},
+		{kind: recordMapRow, key: h[0], mapTo: h[1]},
+	})
+	require.NoError(err)
+	valid := buf.Bytes()
+	hdrLen, err := hdr.write(io.Discard)
+	require.NoError(err)
+	// The count ends the header; the length of the value follows the key
+	// section, the cell count, the family, the column and the time.
+	countAt := hdrLen - 8
+	valueLenAt := hdrLen + 2*(1+entities.HashSize) + entities.HashSize + 2 + 3 + 3 + 8
+	patched := func(at int, v []byte) []byte {
+		b := slices.Clone(valid)
+		copy(b[at:], v)
+		return b
+	}
+	got, entries, err := decodeRecord(bytes.NewReader(valid), int64(len(valid)), true)
+	require.NoError(err)
+	require.Len(entries, 2)
+	require.Equal([]byte("v"), entries[0].cells[0].value)
+	require.Equal(time.UTC, got.gcRowsAfter.Location())
+
+	// A truncated record is read with the size of the whole one, as when a
+	// download ends early, and else with its own size.
+	tests := []struct {
+		name string
+		data []byte
+		size int
+		want string
+	}{
+		{"truncated header", valid[:hdrLen-3], len(valid), "failed to read the header"},
+		{"negative count", patched(countAt, binary.BigEndian.AppendUint64(nil, 1<<63)), len(valid), "counts"},
+		{"count past the size", patched(countAt, binary.BigEndian.AppendUint64(nil, 1<<40)), len(valid), "counts 1099511627776 entries"},
+		{"keys past the size", valid[:hdrLen+30], hdrLen + 30, "counts 2 entries, but 30 bytes are left"},
+		{"truncated keys", valid[:hdrLen+30], len(valid), "after 1 keys"},
+		{"value past the size", patched(valueLenAt, binary.BigEndian.AppendUint32(nil, 1<<31)), len(valid), "longer than"},
+		{"truncated row", valid[:len(valid)-1], len(valid), "failed to read the row"},
+		{"extra byte", append(slices.Clone(valid), 0), len(valid) + 1, "more than the 2 entries its header counts"},
+	}
+	for _, tt := range tests {
+		_, _, err := decodeRecord(bytes.NewReader(tt.data), int64(tt.size), true)
+		require.ErrorContains(err, tt.want, tt.name)
+	}
+	_, entries, err = decodeRecord(bytes.NewReader(valid[:hdrLen+2*(1+entities.HashSize)+entities.HashSize]), int64(len(valid)), false)
+	require.NoError(err, "the keys alone")
+	require.Len(entries, 2)
+
+	boom := errors.New("boom")
+	_, _, err = decodeRecord(io.MultiReader(bytes.NewReader(valid), errReader{boom}), int64(len(valid)), true)
+	require.ErrorIs(err, boom)
 }
 
 // A step whose run is cancelled sends no call after that, counts the keys
