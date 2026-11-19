@@ -161,7 +161,7 @@ func Condemn(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucke
 // blockingRootClasses are the root classes in which a root without a gc row
 // stops a condemn: what such a root keeps is not known.
 var blockingRootClasses = []string{
-	string(RefSource), string(RefProjectStatus), string(RefPushedPacks), string(RefWorkspace), string(RefSnapshot), string(RefMount), RootPermanent,
+	string(RefSource), string(RefProjectStatus), string(RefPushedPacks), string(RefConfig), string(RefACL), string(RefWorkspace), string(RefSnapshot), string(RefMount), RootPermanent,
 }
 
 // condemnBlockers returns the reasons in the report r why the cycle must not
@@ -265,7 +265,7 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		return err
 	}
 	r.PreviousList = c.reportPrevious(res, cleared)
-	nodes := res.unreachable
+	nodes := slices.Clone(res.unreachable)
 	if c.del != nil {
 		deleted, err := c.del.run(ctx, lease, res)
 		if err != nil {
@@ -274,14 +274,14 @@ func (c *condemner) run(ctx context.Context, lease *Lease, res *Result) error {
 		// A marker written to a deleted or gone row would make a row of its
 		// own.
 		if deleted != nil {
-			nodes = slices.DeleteFunc(slices.Clone(nodes), func(n sizedNode) bool { return deleted.has(n.id) })
+			nodes = slices.DeleteFunc(nodes, func(n sizedNode) bool { return deleted.has(n.id) })
 		}
 	}
 	// A recorded marker is never written again: its value is what a later
 	// delete of the key matches. A marker without a complete record may be
 	// of a run that never completed, and is replaced.
 	before := len(nodes)
-	nodes = slices.DeleteFunc(slices.Clone(nodes), func(n sizedNode) bool {
+	nodes = slices.DeleteFunc(nodes, func(n sizedNode) bool {
 		return n.marker != 0 && res.holds.recorded(res.markers[n.marker-1])
 	})
 	rep.Kept = int64(before - len(nodes))
@@ -376,6 +376,9 @@ func (c *condemner) clearRecords(ctx context.Context, lease *Lease, res *Result)
 		return err
 	}
 	res.holds, res.plan = &listHolds{}, nil
+	if r.Delete != nil {
+		r.Delete.Plan = nil
+	}
 	r.Condemn.RecordsCleared = true
 	log.Printf("Warning: GC cycle %d found %d objects without a gc row, which a server without --gc wrote; it deleted the records of every condemned list, so that every marker is written again and held anew", r.Cycle, n)
 	return nil

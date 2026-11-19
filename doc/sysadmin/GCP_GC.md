@@ -349,7 +349,7 @@ The cycle condemns only when its own report is clean. It refuses, writes no mark
 * the consistency check did not run, or found objects without an `abfsgc` row. Such objects show that servers ran without `--gc`, so the cycle first deletes every row of `AbfsGcLists` of its state (`condemn.records_cleared`; see [Enable or disable garbage collection](#enable-or-disable-garbage-collection));
 * `abfsgc` rows with outdated or newer edge rules (`objects.outdated_rows`, `objects.newer_rows`);
 * `live_mounts.errors`, `workspaces.errors` or `snapshots.errors`: a pin that could not be read may hide commits a mount, workspace or snapshot needs;
-* a dangling root in the classes `source`, `project-status`, `pushed-packs`, `workspace`, `snapshot`, `mount` or `permanent`. Dangling `pinned-revisions` roots, for example of projects a mount skipped with `--ignore-missing-projects`, do not refuse; check them in `dangling_revisions` and its samples.
+* a dangling root in the classes `source`, `project-status`, `pushed-packs`, `config`, `acl`, `workspace`, `snapshot`, `mount` or `permanent`. Dangling `pinned-revisions` roots, for example of projects a mount skipped with `--ignore-missing-projects`, do not refuse; check them in `dangling_revisions` and its samples.
 
 ### Replica counts
 

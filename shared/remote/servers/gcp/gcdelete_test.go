@@ -1177,6 +1177,8 @@ func TestDeleteGC_OffAndOnAgainHoldsAnew(t *testing.T) {
 	require.ErrorAs(err, &refused)
 	require.Equal(int64(1), res.Report.Consistency.MissingGCRows)
 	require.True(res.Report.Condemn.RecordsCleared)
+	require.NotNil(res.Report.Delete)
+	require.Nil(res.Report.Delete.Plan, "the plan rests on the cleared records")
 	require.Nil(f.listRecord(1))
 	f.requirePresent(used)
 	require.Equal([][]byte{marker(1)}, f.markerCells(used))

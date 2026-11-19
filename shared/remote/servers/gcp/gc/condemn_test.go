@@ -73,6 +73,8 @@ func TestCondemnBlockers(t *testing.T) {
 		{"dangling source root", dangling("source"), []string{"1 roots of class source have no gc row"}},
 		{"dangling project-status root", dangling("project-status"), []string{"class project-status"}},
 		{"dangling pushed-packs root", dangling("pushed-packs"), []string{"class pushed-packs"}},
+		{"dangling config root", dangling("config"), []string{"class config"}},
+		{"dangling acl root", dangling("acl"), []string{"class acl"}},
 		{"dangling workspace root", dangling("workspace"), []string{"class workspace"}},
 		{"dangling snapshot root", dangling("snapshot"), []string{"class snapshot"}},
 		{"dangling mount root", dangling("mount"), []string{"class mount"}},
