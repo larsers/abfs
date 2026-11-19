@@ -58,6 +58,8 @@ func TestGraceProblem(t *testing.T) {
 	server := func(id string, ttl time.Duration, lastSeen time.Time) Server {
 		return Server{ID: id, GC: true, CacheTTL: ttl, LastSeen: lastSeen}
 	}
+	// ttl is the cache TTL of the server graceTTL finds, zero when it finds
+	// none.
 	tests := []struct {
 		name    string
 		servers []Server
@@ -65,7 +67,7 @@ func TestGraceProblem(t *testing.T) {
 		ttl     time.Duration
 	}{
 		{"no rows", nil, "no server that may have run within the grace wrote a GC heartbeat", 0},
-		{"only rows before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot.Add(-80*time.Hour))}, "no server that may have run", 6 * time.Hour},
+		{"only rows before the window", []Server{server("srv-0-aa", 6*time.Hour, snapshot.Add(-80*time.Hour))}, "no server that may have run", 0},
 		{"default TTL", []Server{server("srv-0-aa", 6*time.Hour, snapshot)}, "", 6 * time.Hour},
 		{"TTL that fits exactly", []Server{server("srv-0-aa", 69*time.Hour, snapshot)}, "", 69 * time.Hour},
 		{"stopped server with a long TTL", []Server{
@@ -83,9 +85,9 @@ func TestGraceProblem(t *testing.T) {
 			} else {
 				require.Contains(t, got, tt.want)
 			}
-			if r, found := e.graceTTL(start); found {
-				require.Equal(t, tt.ttl, r.CacheTTL)
-			}
+			r, found := e.graceTTL(start)
+			require.Equal(t, tt.ttl != 0, found)
+			require.Equal(t, tt.ttl, r.CacheTTL)
 		})
 	}
 }
