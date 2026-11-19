@@ -21,7 +21,6 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -103,6 +102,8 @@ func checkWriteBound(ctx context.Context) error {
 	return status.Error(codes.FailedPrecondition, "the GC write bound of the call has passed")
 }
 
+// writeBoundUnary and writeBoundStream are the interceptors of the write
+// bound on the connections of the server's clients.
 func writeBoundUnary(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 	if err := checkWriteBound(ctx); err != nil {
 		return err
@@ -115,17 +116,6 @@ func writeBoundStream(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.Clien
 		return nil, err
 	}
 	return streamer(ctx, desc, cc, method, opts...)
-}
-
-// writeBoundOptions install the interceptors of the write bound on the
-// connections of a client. casdb.New turns the Bigtable session transport off
-// when it gets options, since the interceptors do not see the calls it sends.
-// A client of the Bigtable emulator dials its own connection and ignores them.
-func writeBoundOptions() []option.ClientOption {
-	return []option.ClientOption{
-		option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(writeBoundUnary)),
-		option.WithGRPCDialOption(grpc.WithChainStreamInterceptor(writeBoundStream)),
-	}
 }
 
 // answerTimer is the start of a call that may answer that objects are

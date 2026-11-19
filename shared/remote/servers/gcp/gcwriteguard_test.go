@@ -296,7 +296,7 @@ func TestWriteBound_SpannerCommit(t *testing.T) {
 	now := uint32(100)
 	setCacheNow(t, &now)
 	s := newEmulatorCASDBServer(t)
-	cas, err := casdb.New(ctx, s.casdb.SpannerClient().DatabaseName(), emulatorProject, emulatorBigtable, "", 1, false, writeBoundOptions()...)
+	cas, err := casdb.New(ctx, s.casdb.SpannerClient().DatabaseName(), emulatorProject, emulatorBigtable, casdb.Options{BtConnPoolSize: 1, UnaryInterceptor: writeBoundUnary, StreamInterceptor: writeBoundStream})
 	require.NoError(err)
 	t.Cleanup(func() { _ = cas.Close() })
 	s.casdb = cas

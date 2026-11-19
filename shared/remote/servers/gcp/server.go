@@ -304,11 +304,11 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if btConnPool <= 0 {
 		btConnPool = DefaultBtConnPool
 	}
-	var clientOpts []option.ClientOption
+	dbOpts := casdb.Options{BtAppProfile: opts.BtAppProfile, BtConnPoolSize: btConnPool, ClientMetrics: opts.ClientMetrics}
 	if opts.GC && !opts.GCReadOnly {
-		clientOpts = writeBoundOptions()
+		dbOpts.UnaryInterceptor, dbOpts.StreamInterceptor = writeBoundUnary, writeBoundStream
 	}
-	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool, opts.ClientMetrics, clientOpts...)
+	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, dbOpts)
 	if err != nil {
 		return nil, err
 	}
