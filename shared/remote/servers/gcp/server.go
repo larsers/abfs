@@ -270,6 +270,10 @@ type NewServerOpts struct {
 	// stops serving while its last successful heartbeat is older than two
 	// intervals and 30 s.
 	GCHeartbeatInterval time.Duration
+	// SmallPools opens the default connection pools of the client libraries,
+	// for a short command, instead of those sized for a server; BtConnPool
+	// is then ignored.
+	SmallPools bool
 	// GCReadOnly, with GC, leaves the state of the garbage collector as it is:
 	// reads answer for condemned objects without rescuing them, and the server
 	// writes no touches, no heartbeat and nothing at start. The collector's
@@ -301,10 +305,13 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	}
 
 	btConnPool := opts.BtConnPool
-	if btConnPool <= 0 {
+	switch {
+	case opts.SmallPools:
+		btConnPool = 0
+	case btConnPool <= 0:
 		btConnPool = DefaultBtConnPool
 	}
-	dbOpts := casdb.Options{BtAppProfile: opts.BtAppProfile, BtConnPoolSize: btConnPool, ClientMetrics: opts.ClientMetrics}
+	dbOpts := casdb.Options{BtAppProfile: opts.BtAppProfile, BtConnPoolSize: btConnPool, ClientMetrics: opts.ClientMetrics, Small: opts.SmallPools}
 	if opts.GC && !opts.GCReadOnly {
 		dbOpts.UnaryInterceptor, dbOpts.StreamInterceptor = writeBoundUnary, writeBoundStream
 	}

@@ -441,7 +441,8 @@ func TestNew_ChecksSingleRowTransactions(t *testing.T) {
 }
 
 // A read-only server, as the collector's commands use, writes nothing to
-// Bigtable at start; a server with --gc probes with writes.
+// Bigtable at start, with the small pools of a command; a server with --gc
+// probes with writes.
 func TestNew_ReadOnlyGCWritesNothingToBigtable(t *testing.T) {
 	for _, readOnly := range []bool{true, false} {
 		var writes atomic.Int32
@@ -463,7 +464,7 @@ func TestNew_ReadOnlyGCWritesNothingToBigtable(t *testing.T) {
 		o := setupOpts(t, newEmulatorDatabase(t))
 		s, err := New(context.Background(), &NewServerOpts{
 			ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID, BtInstance: o.BtInstance, BucketName: o.BucketName,
-			MaxCachedHeaders: 1024, MaxCachedContents: 1024, GC: true, GCReadOnly: readOnly, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
+			MaxCachedHeaders: 1024, MaxCachedContents: 1024, SmallPools: readOnly, GC: true, GCReadOnly: readOnly, CacheTTL: time.Hour, GCTouchInterval: time.Hour, GCHeartbeatInterval: time.Minute,
 		})
 		require.NoError(t, err)
 		require.NoError(t, s.Close())

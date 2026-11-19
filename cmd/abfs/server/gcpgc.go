@@ -81,6 +81,14 @@ func (s *gcServer) registerFlags(fl *pflag.FlagSet, appProfileUsage string) {
 	fl.BoolVar(&s.opts.ClientMetrics, "gcp-client-metrics", false, clientMetricsUsage)
 }
 
+func (s *gcServer) setOpts() {
+	s.opts.GC = true
+	s.opts.GCReadOnly = true
+	s.opts.MaxCachedHeaders = 1
+	s.opts.MaxCachedContents = 1
+	s.opts.SmallPools = true
+}
+
 // check fails when a required flag is missing.
 func (s *gcServer) check() error {
 	return requireStoreFlags(s.opts.ProjectID, s.opts.InstanceID, s.opts.BucketName)
@@ -88,10 +96,10 @@ func (s *gcServer) check() error {
 
 // open creates the server of the command. It is read-only: its reads must
 // not rescue condemned objects or count as a use, or a command would keep
-// what it reads.
+// what it reads. A command reads each object it needs once and runs for a
+// short time, so its caches hold one entry and its clients open small pools.
 func (s *gcServer) open(ctx context.Context) (*gcp.GCPServer, error) {
-	s.opts.GC = true
-	s.opts.GCReadOnly = true
+	s.setOpts()
 	server, err := gcp.New(ctx, &s.opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create the ABFS GCP server: %w", err)
@@ -131,9 +139,6 @@ func (c *gcpGCBackfillCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	if err := c.server.check(); err != nil {
 		return err
 	}
-	// The scan reads each object once, so caching them only costs memory.
-	c.server.opts.MaxCachedHeaders = 1
-	c.server.opts.MaxCachedContents = 1
 	checkAppProfile(ctx, &c.server.opts)
 	server, err := c.server.open(ctx)
 	if err != nil {
@@ -439,10 +444,6 @@ func (c *gcpGCRunCmd) run(ctx context.Context, fl *pflag.FlagSet) (*gc.Report, e
 	if err := c.server.check(); err != nil {
 		return nil, err
 	}
-	// The run reads only the workspace snapshots, mount details and pinned
-	// manifests, once each.
-	c.server.opts.MaxCachedHeaders = 1
-	c.server.opts.MaxCachedContents = 1
 	profile := checkAppProfile(ctx, &c.server.opts)
 	if c.delete && len(profile.Problems) > 0 {
 		return nil, fmt.Errorf("the Bigtable app profile %s does not fit a delete cycle: %s", profile.ID, strings.Join(profile.Problems, "; "))

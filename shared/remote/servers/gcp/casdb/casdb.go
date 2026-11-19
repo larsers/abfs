@@ -48,6 +48,8 @@ const (
 	maxLocalHeadersConcurrency = 40
 	defaultHeadersSemSize      = 2500
 	headersSemPoolMultiplier   = 50
+	// serverSpannerChannels is the number of Spanner channels of a server.
+	serverSpannerChannels = 50
 )
 
 type CASDB struct {
@@ -69,6 +71,9 @@ type Options struct {
 	// ClientMetrics exports the built-in metrics of the client libraries to
 	// Cloud Monitoring.
 	ClientMetrics bool
+	// Small keeps the default Spanner channels of the library, for a short
+	// command, instead of those sized for a server.
+	Small bool
 	// UnaryInterceptor and StreamInterceptor, when set, see the calls of both
 	// clients. A client of the Bigtable emulator dials its own connection and
 	// ignores them.
@@ -95,11 +100,14 @@ func New(ctx context.Context, spannerDB, projectID, btInstance string, o Options
 		WriteSessions: 0.2,
 	}
 
-	numChannels := option.WithGRPCConnectionPool(int(sessionPoolConfig.MaxOpened) / 100)
+	var spannerOpts []option.ClientOption
+	if !o.Small {
+		spannerOpts = append(spannerOpts, option.WithGRPCConnectionPool(serverSpannerChannels))
+	}
 	client, err := spanner.NewClientWithConfig(ctx, spannerDB, spanner.ClientConfig{
 		SessionPoolConfig:    sessionPoolConfig,
 		DisableNativeMetrics: !o.ClientMetrics,
-	}, append([]option.ClientOption{numChannels}, o.interceptors()...)...)
+	}, append(spannerOpts, o.interceptors()...)...)
 	if err != nil {
 		return nil, err
 	}

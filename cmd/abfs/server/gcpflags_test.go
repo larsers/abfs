@@ -196,3 +196,31 @@ func TestGCPGCUndoFlags(t *testing.T) {
 		require.Equal(t, gc.DefaultWriteDeadline, c.opts.WriteDeadline)
 	}
 }
+
+// Every GC command opens a read-only server whose caches hold one entry and
+// whose clients open small pools.
+func TestGCServer_Opts(t *testing.T) {
+	run := &gcpGCRunCmd{RootCmd: root.NewRootCommand()}
+	backfill := &gcpGCBackfillCmd{RootCmd: root.NewRootCommand()}
+	undo := &gcpGCUndoCmd{RootCmd: root.NewRootCommand()}
+	walk := &gcpGCWalkCmd{RootCmd: root.NewRootCommand()}
+	for _, tt := range []struct {
+		register func(*pflag.FlagSet)
+		server   *gcServer
+	}{
+		{run.RegisterFlags, &run.server},
+		{backfill.RegisterFlags, &backfill.server},
+		{undo.RegisterFlags, &undo.server},
+		{walk.RegisterFlags, &walk.server},
+	} {
+		fl := pflag.NewFlagSet("gc", pflag.ContinueOnError)
+		tt.register(fl)
+		require.NoError(t, fl.Parse([]string{"--project=p", "--instance=i", "--bucket=b"}))
+		require.NoError(t, tt.server.check())
+		tt.server.setOpts()
+		o := tt.server.opts
+		require.True(t, o.GC && o.GCReadOnly && o.SmallPools)
+		require.Equal(t, 1, o.MaxCachedHeaders)
+		require.Equal(t, 1, o.MaxCachedContents)
+	}
+}
