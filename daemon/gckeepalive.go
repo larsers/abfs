@@ -152,22 +152,34 @@ func (k *GCKeepAlive) refInterval() time.Duration {
 	return k.RefInterval
 }
 
-// Run refreshes the ref and touches the objects until ctx is done. Errors are
-// logged and never stop it.
+// Run refreshes the ref and touches the objects until ctx is done. The refresh
+// runs on its own, so that a long touch does not delay it. Errors are logged
+// and never stop it.
 func (k *GCKeepAlive) Run(ctx context.Context) {
 	if k.tick() <= 0 {
 		return
 	}
 	k.start(time.Now())
-	timer := time.NewTimer(k.untilNext(time.Now()))
+	var wg sync.WaitGroup
+	if k.refInterval() > 0 || k.localWrites != nil {
+		wg.Go(func() { runSteps(ctx, k.untilRef, k.refStep) })
+	}
+	if k.TouchInterval > 0 {
+		wg.Go(func() { runSteps(ctx, k.untilTouch, k.touchStep) })
+	}
+	wg.Wait()
+}
+
+func runSteps(ctx context.Context, until func(time.Time) time.Duration, step func(context.Context, time.Time)) {
+	timer := time.NewTimer(until(time.Now()))
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-timer.C:
-			k.step(ctx, now)
-			timer.Reset(k.untilNext(time.Now()))
+			step(ctx, now)
+			timer.Reset(until(time.Now()))
 		}
 	}
 }
@@ -204,20 +216,27 @@ func waitOr(wait, d time.Duration) time.Duration {
 	return d
 }
 
-// untilNext returns the time from now to the next refresh or touch, at most
+// untilRef returns the time from now to the next refresh, at most
 // gcKeepAliveMaxTick.
-func (k *GCKeepAlive) untilNext(now time.Time) time.Duration {
+func (k *GCKeepAlive) untilRef(now time.Time) time.Duration {
 	wait := gcKeepAliveMaxTick
 	if d := k.refInterval(); d > 0 {
 		wait = min(wait, k.lastRef.Add(waitOr(k.refWait, d)).Sub(now))
 	}
+	return max(wait, 0)
+}
+
+// untilTouch returns the time from now to the next touch, at most
+// gcKeepAliveMaxTick.
+func (k *GCKeepAlive) untilTouch(now time.Time) time.Duration {
+	wait := gcKeepAliveMaxTick
 	if k.TouchInterval > 0 {
 		wait = min(wait, k.lastTouch.Add(waitOr(k.touchWait, k.TouchInterval)).Sub(now))
 	}
 	return max(wait, 0)
 }
 
-func (k *GCKeepAlive) step(ctx context.Context, now time.Time) {
+func (k *GCKeepAlive) refStep(ctx context.Context, now time.Time) {
 	k.checkLocalWrites(ctx)
 	if d := k.refInterval(); d > 0 && now.Sub(k.lastRef) >= waitOr(k.refWait, d) {
 		k.lastRef = now
@@ -226,6 +245,9 @@ func (k *GCKeepAlive) step(ctx context.Context, now time.Time) {
 			log.Printf("Failed to refresh mount ref %s: %v", k.Ref, err)
 		}
 	}
+}
+
+func (k *GCKeepAlive) touchStep(ctx context.Context, now time.Time) {
 	if k.TouchInterval > 0 && now.Sub(k.lastTouch) >= waitOr(k.touchWait, k.TouchInterval) {
 		k.lastTouch = now
 		found, total, err := k.touch(ctx)
@@ -266,7 +288,7 @@ func (k *GCKeepAlive) refreshRef() error {
 // which happens when the directory was changed and hashed locally. A scan
 // error does not stop the hashes found so far.
 func (k *GCKeepAlive) touch(ctx context.Context) (int, int, error) {
-	p := &touchPacer{rate: k.TouchRate, start: time.Now()}
+	p := &touchPacer{rate: k.TouchRate}
 	sent := make(map[entities.Hash]struct{})
 	// The directory hashes asked so far, and whether the server has them.
 	dirPresent := make(map[entities.Hash]bool)
@@ -345,7 +367,7 @@ func count(present []bool) int {
 func (k *GCKeepAlive) remoteHeaders(ctx context.Context, p *touchPacer, keys []entities.Hash) ([]bool, error) {
 	present := make([]bool, 0, len(keys))
 	for batch := range slices.Chunk(keys, gcTouchBatchSize) {
-		if err := p.wait(ctx); err != nil {
+		if err := p.wait(ctx, len(batch)); err != nil {
 			return present, err
 		}
 		found, err := k.Remote.RemoteHeaders(batch)
@@ -353,38 +375,36 @@ func (k *GCKeepAlive) remoteHeaders(ctx context.Context, p *touchPacer, keys []e
 			return present, fmt.Errorf("failed to read remote headers: %w", err)
 		}
 		present = append(present, found...)
-		p.sent += len(batch)
 	}
 	return present, nil
 }
 
-// touchPacer spaces the batches of a touch so that the keys sent since start
-// stay below rate per second.
+// touchPacer spaces the batches of a touch so that the batch after one of n
+// keys starts at least n/rate seconds after it. Time spent elsewhere, such as
+// in a scan, earns no credit beyond one batch.
 type touchPacer struct {
-	rate  float64
-	start time.Time
-	sent  int
+	rate float64
+	next time.Time
 }
 
-func (p *touchPacer) wait(ctx context.Context) error {
+func (p *touchPacer) wait(ctx context.Context, n int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if p.rate <= 0 || p.sent == 0 {
+	if p.rate <= 0 || n == 0 {
 		return nil
 	}
-	d := time.Until(p.start.Add(time.Duration(float64(p.sent) / p.rate * float64(time.Second))))
-	if d <= 0 {
-		return nil
+	if d := time.Until(p.next); d > 0 {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	p.next = time.Now().Add(time.Duration(float64(n) / p.rate * float64(time.Second)))
+	return nil
 }
 
 type mountAttrs interface {
