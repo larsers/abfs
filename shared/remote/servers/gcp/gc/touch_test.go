@@ -19,6 +19,7 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -226,7 +227,10 @@ func TestToucher_MapRowTouchesLeaveRoomForObjectTouches(t *testing.T) {
 	// touch waits for the room a worker makes.
 	require.False(tc.TouchMapRow(keys[3].String() + "#" + keys[3].String()))
 	require.False(tc.stalled.Load(), "a dropped map row touch stalled the object touches")
-	time.AfterFunc(50*time.Millisecond, func() { <-tc.queue })
+	time.AfterFunc(50*time.Millisecond, func() {
+		<-tc.queue
+		tc.freed()
+	})
 	require.True(tc.TouchObject(keys[2]))
 	require.Equal(TouchStats{MapRowsDropped: 2}, tc.Stats())
 
@@ -243,6 +247,58 @@ func TestToucher_MapRowTouchesLeaveRoomForObjectTouches(t *testing.T) {
 	require.True(tc.TouchObject(keys[3]))
 	require.False(tc.stalled.Load())
 	require.Equal(TouchStats{Dropped: 1, MapRowsDropped: 2}, tc.Stats())
+}
+
+// A burst of TouchObject calls leaves room in the buffer for the touches that
+// do not wait, while a slow worker drains it.
+func TestToucher_BurstLeavesRoomForTryTouchObject(t *testing.T) {
+	require := require.New(t)
+	tc := newToucher(newHooksTestBigtable(t), 100)
+	tc.enqueueWait = time.Hour
+	stopWorker, stopBurst := make(chan struct{}), make(chan struct{})
+	var worker, burst sync.WaitGroup
+	worker.Go(func() {
+		for {
+			select {
+			case <-tc.queue:
+				tc.freed()
+				time.Sleep(10 * time.Microsecond)
+			case <-stopWorker:
+				return
+			}
+		}
+	})
+	keys := testHashes(500)
+	var burstDropped atomic.Int64
+	for range 8 {
+		burst.Go(func() {
+			for i := 0; ; i++ {
+				select {
+				case <-stopBurst:
+					return
+				default:
+				}
+				if !tc.TouchObject(keys[i%len(keys)]) {
+					burstDropped.Add(1)
+				}
+			}
+		})
+	}
+	require.Eventually(func() bool { return len(tc.queue) >= tc.waitLimit }, 5*time.Second, time.Millisecond)
+	accepted := 0
+	for _, key := range keys {
+		if tc.TryTouchObject(key) {
+			accepted++
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(stopBurst)
+	burst.Wait()
+	close(stopWorker)
+	worker.Wait()
+	require.Zero(burstDropped.Load(), "a TouchObject call was dropped")
+	require.Equal(len(keys), accepted)
+	require.Zero(tc.Stats().Dropped)
 }
 
 func TestToucher_WaitsForRoom(t *testing.T) {

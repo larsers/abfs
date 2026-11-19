@@ -677,9 +677,9 @@ When a call finds an object (`Headers`, `GetObject`, the existence check of `Put
 
 Touches wait in a buffer of 100,000, and four workers write them in batches of up to 1,000, at least once a second:
 
-* When the buffer is full, `Headers` and `MapResults`, the calls of the client keep-alive and of builds, wait up to half a second per object touch for room. A burst, such as the keep-alive of a large mount, is slowed to the rate the workers write instead of losing touches.
-* When a wait times out, touches are dropped and counted, without waiting, until the buffer has room again. So with `--gc` the latency of `Headers` and `MapResults` depends on the table `abfsgc`: while the buffer is full they run at the rate the workers write, and when the writes stall, the first of them waits half a second.
-* `GetObject`, the existence check of `PutObject` and the link checks never wait for room; they drop the touch and count it. The next use of a dropped object writes its touch.
+* When the buffer is 80% full, `Headers` and `MapResults`, the calls of the client keep-alive and of builds, wait up to half a second per object touch for room below that mark. A burst, such as the keep-alive of a large mount, is slowed to the rate the workers write instead of losing touches.
+* When a wait times out, touches are dropped and counted, without waiting, until the buffer is below 80% again. So with `--gc` the latency of `Headers` and `MapResults` depends on the table `abfsgc`: while the buffer is 80% full they run at the rate the workers write, and when the writes stall, the first of them waits half a second.
+* `GetObject`, the existence check of `PutObject` and the link checks never wait for room. They may use the whole buffer, so they find room during a burst of `Headers` or `MapResults`. When the buffer is full they drop the touch and count it. The next use of a dropped object writes its touch.
 * Map row touches never wait either, and are queued only while the buffer is less than half full, so they take at most about half of it and leave the rest to object touches. The next use of a row whose touch was dropped writes its touch.
 * A touch is written or counted as lost within 251 seconds of the use. A touch whose write starts later, because the process was frozen or starved, is written and also counted as failed.
 
@@ -728,7 +728,7 @@ Metrics, as OpenTelemetry counters and one histogram. Their names keep the dots 
 | `abfs.gcp.gc.rescues` | `call`, `type` | Marked objects rescued, by call: `headers`, `validation`, `put_object`, `get_object`, `map_results`, and by object type, `other` for a type the server does not know |
 | `abfs.gcp.gc.rescues_lost` | `call` | Marked objects that the collector deleted before the call could rescue them |
 | `abfs.gcp.gc.rescue_failures` | `call` | Rescues that failed, including those whose touch failed; each failed its call |
-| `abfs.gcp.gc.touches` | `kind`, `result` | Touches of an `object` or a `map_row`, `written`, `dropped` because the buffer was full (about half full for map rows), or `failed` |
+| `abfs.gcp.gc.touches` | `kind`, `result` | Touches of an `object` or a `map_row`, `written`, `dropped` because the buffer was full (80% full for the touches of `Headers` and `MapResults`, about half full for map rows), or `failed` |
 | `abfs.gcp.cache.ttl_expiries` | `cache` | Cache lookups of `headers` or `content` that found an entry older than `--cache-ttl` |
 | `abfs.gcp.gc.map_results_dropped` | | Map results left out because their object is missing |
 | `abfs.gcp.gc.heartbeat_failures` | | Failed heartbeat writes |
