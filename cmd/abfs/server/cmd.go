@@ -184,11 +184,11 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer metricsCancel()
 		if err := provider.Shutdown(metricsCtx); err != nil {
-			log.Printf("WARNING: error shutting down metrics provider: %v", err)
+			log.Printf("Warning: error shutting down metrics provider: %v", err)
 		}
 		if aresProxy != nil {
 			if err := aresProxy.Close(); err != nil {
-				log.Printf("WARNING: error stopping ares proxy: %v", err)
+				log.Printf("Warning: error stopping ares proxy: %v", err)
 			}
 		}
 	}()

@@ -17,6 +17,7 @@ package gc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -327,7 +328,7 @@ func scanNodes(ctx context.Context, table *bigtable.Table, bounds []string, rece
 	for i := range shards {
 		s := &shards[i]
 		if !slices.IsSortedFunc(s.keys, compareHash) || (last != nil && len(s.keys) > 0 && compareHash(*last, s.keys[0]) >= 0) {
-			return nil, stats, fmt.Errorf("the scan of the table abfsgc returned keys out of order")
+			return nil, stats, errors.New("the scan of the table abfsgc returned keys out of order")
 		}
 		if len(s.keys) > 0 {
 			last = &s.keys[len(s.keys)-1]

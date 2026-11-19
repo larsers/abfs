@@ -16,6 +16,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"slices"
@@ -266,7 +267,7 @@ func (b *backfill) handleBatch(ctx context.Context, keys, types []string, times 
 
 func (b *backfill) edges(ctx context.Context, key, typ string) (Hash, []Hash, int, error) {
 	if !entities.IsHash(key) {
-		return Hash{}, nil, 0, fmt.Errorf("invalid object key")
+		return Hash{}, nil, 0, errors.New("invalid object key")
 	}
 	hash := entities.NewHash(key)
 	if typ == string(entities.ObjectTypeBlob) {
