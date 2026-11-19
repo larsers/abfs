@@ -343,14 +343,14 @@ func TestUndo_RestoresInOrder(t *testing.T) {
 	events := f.takeEvents()
 	var rows []string
 	for _, e := range events {
-		if e.table == objectsTableName || e.table == mapsTableName {
+		if e.table == objectsTable || e.table == mapsTableName {
 			rows = append(rows, e.key)
 		}
 	}
 	require.Equal([]string{d.String(), c.String(), mapKey, b.String(), a.String()}, rows)
 	for _, k := range []Hash{a, b, c, d} {
 		order := slices.IndexFunc(events, func(e undoEvent) bool { return e.table == "bucket" && e.key == chunksOf[k][1] })
-		for _, want := range []undoEvent{{table: chunksTableName, key: chunksOf[k][0]}, {table: TableName, key: k.String()}, {table: objectsTableName, key: k.String()}} {
+		for _, want := range []undoEvent{{table: chunksTableName, key: chunksOf[k][0]}, {table: TableName, key: k.String()}, {table: objectsTable, key: k.String()}} {
 			next := slices.IndexFunc(events, func(e undoEvent) bool { return e.table == want.table && e.key == want.key })
 			require.Greater(next, order, "%s of %s", want.table, k)
 			order = next
@@ -366,7 +366,7 @@ func TestUndo_RestoresInOrder(t *testing.T) {
 
 	// The objects row keeps the times of the record and has no marker; the
 	// gc row is new, as after a put, and so is its touch.
-	object := f.cells(objectsTableName, d.String())
+	object := f.cells(objectsTable, d.String())
 	require.Empty(object[ObjectsFamily])
 	for _, cell := range f.entries[d].cells {
 		require.Equal(cell.ts, cellTimes(object)[cell.family+":"+cell.column], cell.column)
@@ -387,7 +387,7 @@ func TestUndo_RestoresInOrder(t *testing.T) {
 	attrs, err := f.bucket.Object(chunksOf[d][1]).Attrs(ctx)
 	require.NoError(err)
 	require.Equal(fmt.Sprint(undoCycle), attrs.Metadata[undoMetadata])
-	require.False(f.rowExists(objectsTableName, later.String()))
+	require.False(f.rowExists(objectsTable, later.String()))
 }
 
 // The undo writes nothing before the expiry of the lease it took over plus
@@ -517,12 +517,12 @@ func TestUndo_MissingChunkStopsTheKey(t *testing.T) {
 		return strings.HasPrefix(s, child.String()+": the chunk "+childObj+" is gone")
 	}), rep.NotRestoredSample)
 	for _, k := range []Hash{child, parent, rowless, noGCRow} {
-		require.False(f.rowExists(objectsTableName, k.String()), k)
+		require.False(f.rowExists(objectsTable, k.String()), k)
 		require.False(f.rowExists(TableName, k.String()), k)
 	}
 	require.Empty(cellTimes(f.cells(chunksTableName, childRow))[objectsDataFamily+":"+chunkUndoColumn])
 	require.False(f.rowExists(mapsTableName, mapKey))
-	require.True(f.rowExists(objectsTableName, other.String()))
+	require.True(f.rowExists(objectsTable, other.String()))
 }
 
 // A chunk step that read the attributes of a bucket chunk and found the row
@@ -582,7 +582,7 @@ func TestUndo_ChunkStepKeepsRestoredChunks(t *testing.T) {
 	for _, name := range []string{racedObj, afterObj} {
 		require.True(f.objectExists(name), name)
 	}
-	require.True(f.rowExists(objectsTableName, raced.String()))
+	require.True(f.rowExists(objectsTable, raced.String()))
 	require.True(f.rowExists(TableName, raced.String()))
 	require.Equal(int64(1), rep.GCRowsKept)
 	require.Zero(rep.GCRowsDeleted)
@@ -620,8 +620,8 @@ func TestUndo_BlocksAParentOfAGoneChild(t *testing.T) {
 		parentBefore.String() + ": links " + childBefore.String() + ", which cycle 4 deleted; undo cycle 4 too",
 		parentAfter.String() + ": links " + childAfter.String() + ", which cycle 6 deleted; undo cycle 6 too",
 	}, rep.NotRestoredSample)
-	require.True(f.rowExists(objectsTableName, withMissing.String()))
-	require.True(f.rowExists(objectsTableName, withPresent.String()))
+	require.True(f.rowExists(objectsTable, withMissing.String()))
+	require.True(f.rowExists(objectsTable, withPresent.String()))
 
 	// Past the undo window the chunks of the child may be gone.
 	f.clock.Add(int64(undoWindow + time.Minute))
@@ -636,8 +636,8 @@ func TestUndo_BlocksAParentOfAGoneChild(t *testing.T) {
 	rep = f.undo(undoLease(), 4, 6)
 	require.Zero(rep.NotRestored())
 	require.Equal(int64(1), rep.Restored)
-	require.True(f.rowExists(objectsTableName, parentBefore.String()))
-	require.True(f.rowExists(objectsTableName, parentAfter.String()))
+	require.True(f.rowExists(objectsTable, parentBefore.String()))
+	require.True(f.rowExists(objectsTable, parentAfter.String()))
 }
 
 // A map row whose end a cycle outside the run deleted is not restored, so
@@ -663,7 +663,7 @@ func TestUndo_MapRowOfAnEndDeletedLater(t *testing.T) {
 	require.Zero(rep.NotRestored())
 	require.Equal(int64(1), rep.MapRowsRestored)
 	require.True(f.rowExists(mapsTableName, row))
-	require.True(f.rowExists(objectsTableName, to.String()))
+	require.True(f.rowExists(objectsTable, to.String()))
 }
 
 // When the records of a cycle outside the run were pruned, a child that is
@@ -682,7 +682,7 @@ func TestUndo_PrunedCycleBlocksAbsentChildren(t *testing.T) {
 	rep := f.undo(undoLease(), 5, 5)
 	require.Equal(int64(1), rep.BlockedByChild)
 	require.Equal([]string{parent.String() + ": links " + missing.String() + ", which is absent and may have been deleted by a cycle whose records were removed, such as cycle 3; an undo cannot tell"}, rep.NotRestoredSample)
-	require.False(f.rowExists(objectsTableName, parent.String()))
+	require.False(f.rowExists(objectsTable, parent.String()))
 }
 
 // An objects row that holds only a condemn marker, as a stale condemn leaves
@@ -695,12 +695,12 @@ func TestUndo_ClearsAStaleMarker(t *testing.T) {
 	f.deleted(key)
 	marker := bigtable.NewMutation()
 	marker.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), markerValue(stepCycle))
-	require.NoError(f.client.Open(objectsTableName).Apply(ctx, key.String(), marker))
+	require.NoError(f.client.Open(objectsTable).Apply(ctx, key.String(), marker))
 	f.recordOf(5, 1, []Hash{key})
 
 	rep := f.undo(undoLease(), 5, 5)
 	require.Equal(int64(1), rep.Restored)
-	row := f.cells(objectsTableName, key.String())
+	row := f.cells(objectsTable, key.String())
 	require.NotEmpty(row[objectsMetaFamily])
 	require.Empty(row[ObjectsFamily])
 }
@@ -768,7 +768,7 @@ func TestUndo_StopsBeforeLeaseExpiry(t *testing.T) {
 			require.ErrorIs(err, errLeaseExpiring)
 			require.Empty(f.takeEvents())
 			require.False(f.rowExists(TableName, key.String()))
-			require.False(f.rowExists(objectsTableName, key.String()))
+			require.False(f.rowExists(objectsTable, key.String()))
 		})
 	}
 }
@@ -789,7 +789,7 @@ func TestUndo_RecordOfAnotherCycle(t *testing.T) {
 	_, err = f.undoWith(undoLease(), 5, 5)
 	require.ErrorContains(err, "holds the deletes of cycle 6")
 	require.Empty(f.takeEvents())
-	require.False(f.rowExists(objectsTableName, key.String()))
+	require.False(f.rowExists(objectsTable, key.String()))
 }
 
 // The undo restores no refs, and names the ref records of the cycle before

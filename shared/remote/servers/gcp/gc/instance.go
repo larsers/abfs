@@ -24,7 +24,42 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const adminCallTimeout = time.Minute
+const (
+	adminCallTimeout = time.Minute
+	// setupCheckRow is a row that never exists, which the probes of the setup
+	// checks read and write.
+	setupCheckRow = "abfs-setup-check"
+)
+
+// CheckTables checks that the table abfsgc exists and, unless readOnly, that
+// the family abfsgc of the objects table does. Reads ignore an unknown
+// family, a mutation does not; deleting a cell of a row that does not exist
+// changes nothing.
+func CheckTables(ctx context.Context, bt *bigtable.Client, readOnly bool) error {
+	if _, err := bt.Open(TableName).ReadRow(ctx, setupCheckRow); err != nil {
+		return fmt.Errorf("cannot read Bigtable table %s: %w", TableName, err)
+	}
+	if readOnly {
+		return nil
+	}
+	mut := bigtable.NewMutation()
+	mut.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
+	if err := bt.Open(objectsTable).Apply(ctx, setupCheckRow, mut); err != nil {
+		return fmt.Errorf("cannot use column family %s of Bigtable table %s: %w", ObjectsFamily, objectsTable, err)
+	}
+	return nil
+}
+
+// ProbeConditionalWrite sends one conditional write with the app profile of
+// bt that changes nothing: a delete of a cell of a row that does not exist,
+// under a condition. The client does not retry it.
+func ProbeConditionalWrite(ctx context.Context, bt *bigtable.Client) error {
+	predicate := bigtable.ChainFilters(bigtable.FamilyFilter(ObjectsFamily), bigtable.ColumnFilter(CondemnedColumn))
+	del := bigtable.NewMutation()
+	del.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
+	mut := bigtable.NewCondMutation(predicate, del, nil)
+	return bt.Open(objectsTable).Apply(ctx, setupCheckRow, mut)
+}
 
 // InstanceChecks reads what a delete cycle needs to know about the Bigtable
 // instance beyond its tables.
@@ -69,14 +104,10 @@ func (c *instanceChecks) Clusters(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// ProbeConditionalWrite implements InstanceChecks. It deletes a cell of a row
-// that does not exist, under a condition, as the server does at start.
+// ProbeConditionalWrite implements InstanceChecks, as the server does at
+// start.
 func (c *instanceChecks) ProbeConditionalWrite(ctx context.Context) error {
-	predicate := bigtable.ChainFilters(bigtable.FamilyFilter(ObjectsFamily), bigtable.ColumnFilter(CondemnedColumn))
-	del := bigtable.NewMutation()
-	del.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
-	mut := bigtable.NewCondMutation(predicate, del, nil)
-	return c.bt.Open(objectsTable).Apply(ctx, "abfs-setup-check", mut)
+	return ProbeConditionalWrite(ctx, c.bt)
 }
 
 // instanceEvidence is what the checks of the instance found.

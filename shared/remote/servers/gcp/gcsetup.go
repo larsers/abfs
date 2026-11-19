@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"slices"
 
-	"cloud.google.com/go/bigtable"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -65,34 +64,16 @@ func (s *GCPServer) checkGCResources(ctx context.Context, readOnly bool) error {
 	if err := s.casdb.CheckGCSchema(ctx); err != nil {
 		return err
 	}
-	if _, err := s.casdb.BTClient().Open(gc.TableName).ReadRow(ctx, "abfs-setup-check"); err != nil {
-		return fmt.Errorf("cannot read Bigtable table %s: %w", gc.TableName, err)
-	}
-	if readOnly {
-		return nil
-	}
-	// Reads ignore an unknown family, a mutation does not. Deleting a cell of
-	// a row that does not exist changes nothing.
-	mut := bigtable.NewMutation()
-	mut.DeleteCellsInColumn(gc.ObjectsFamily, gc.CondemnedColumn)
-	if err := s.casdb.BTClient().Open("objects").Apply(ctx, "abfs-setup-check", mut); err != nil {
-		return fmt.Errorf("cannot use column family %s of Bigtable table objects: %w", gc.ObjectsFamily, err)
-	}
-	return nil
+	return gc.CheckTables(ctx, s.casdb.BTClient(), readOnly)
 }
 
 // checkSingleRowTransactions checks that the Bigtable app profile allows the
 // conditional writes with which reads rescue condemned objects. Without them
-// every read of a condemned object would fail. The probe is a conditional
-// delete of a cell of a row that does not exist, so it writes nothing. The
+// every read of a condemned object would fail. The probe writes nothing. The
 // client does not retry conditional writes, so the probe retries transient
 // errors as a rescue does; only a refusal names the app profile.
 func (s *GCPServer) checkSingleRowTransactions(ctx context.Context, opts *NewServerOpts) error {
-	predicate := bigtable.ChainFilters(bigtable.FamilyFilter(gc.ObjectsFamily), bigtable.ColumnFilter(gc.CondemnedColumn))
-	del := bigtable.NewMutation()
-	del.DeleteCellsInColumn(gc.ObjectsFamily, gc.CondemnedColumn)
-	mut := bigtable.NewCondMutation(predicate, del, nil)
-	err := gc.Retry(ctx, func() error { return s.casdb.BTClient().Open("objects").Apply(ctx, "abfs-setup-check", mut) })
+	err := gc.Retry(ctx, func() error { return gc.ProbeConditionalWrite(ctx, s.casdb.BTClient()) })
 	if err == nil {
 		return nil
 	}

@@ -52,10 +52,10 @@ func newHooksTestBigtable(t *testing.T, opts ...grpc.DialOption) *bigtable.Clien
 	adm, err := bigtable.NewAdminClient(ctx, "test-proj", "test-bt", option.WithGRPCConn(conn))
 	require.NoError(t, err)
 	tables := map[string][]string{
-		objectsTableName: {"meta", "data", ObjectsFamily},
-		mapsTableName:    {mapsFamily},
-		TableName:        {EdgesFamily, TouchFamily},
-		chunksTableName:  {objectsDataFamily},
+		objectsTable:    {"meta", "data", ObjectsFamily},
+		mapsTableName:   {mapsFamily},
+		TableName:       {EdgesFamily, TouchFamily},
+		chunksTableName: {objectsDataFamily},
 	}
 	for table, families := range tables {
 		require.NoError(t, adm.CreateTable(ctx, table))

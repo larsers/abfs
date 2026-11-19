@@ -29,8 +29,7 @@ import (
 )
 
 const (
-	objectsMetaFamily = "meta"
-	objectsSizeColumn = "meta:size"
+	objectsSizeColumn = objectsMetaFamily + ":size"
 	maxMissingKept    = 10
 	// clockSkewMargin covers the skew between the clocks of the servers, which
 	// stamp object rows, and of the collector.

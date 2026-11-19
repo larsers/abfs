@@ -36,12 +36,12 @@ func putObjectRow(t *testing.T, client *bigtable.Client, key Hash, condemned []b
 	if condemned != nil {
 		mut.Set(ObjectsFamily, CondemnedColumn, bigtable.Now(), condemned)
 	}
-	require.NoError(t, client.Open(objectsTableName).Apply(context.Background(), key.String(), mut))
+	require.NoError(t, client.Open(objectsTable).Apply(context.Background(), key.String(), mut))
 }
 
 func condemnedOf(t *testing.T, client *bigtable.Client, key Hash) []byte {
 	t.Helper()
-	r, err := client.Open(objectsTableName).ReadRow(context.Background(), key.String(), bigtable.RowFilter(bigtable.LatestNFilter(1)))
+	r, err := client.Open(objectsTable).ReadRow(context.Background(), key.String(), bigtable.RowFilter(bigtable.LatestNFilter(1)))
 	require.NoError(t, err)
 	for _, item := range r[ObjectsFamily] {
 		if item.Column == ObjectsFamily+":"+CondemnedColumn {
@@ -85,7 +85,7 @@ func TestRescuer_Rescue(t *testing.T) {
 			_, touched := cellTime(t, client, TableName, key.String(), TouchFamily, TouchColumn)
 			require.Equal(tt.wantTouch, touched)
 			if tt.deleted {
-				r, err := client.Open(objectsTableName).ReadRow(context.Background(), key.String())
+				r, err := client.Open(objectsTable).ReadRow(context.Background(), key.String())
 				require.NoError(err)
 				require.Empty(r, "the rescue created the row again")
 			}
@@ -134,7 +134,7 @@ func TestRescuer_ConcurrentRescuesAndChangingMarker(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		objects := client.Open(objectsTableName)
+		objects := client.Open(objectsTable)
 		for cycle := int64(2); ; cycle++ {
 			select {
 			case <-stop:

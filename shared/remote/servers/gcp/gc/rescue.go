@@ -22,12 +22,9 @@ import (
 	"cloud.google.com/go/bigtable"
 )
 
-const (
-	objectsTableName = "objects"
-	// A marker that changes this often while being cleared means a collector
-	// that condemns faster than once per read; give up rather than loop.
-	maxRescueAttempts = 5
-)
+// A marker that changes this often while being cleared means a collector
+// that condemns faster than once per read; give up rather than loop.
+const maxRescueAttempts = 5
 
 // Rescuer clears the condemn marker of objects that are used again, so that
 // the collector does not delete them.
@@ -41,7 +38,7 @@ type Rescuer struct {
 // NewRescuer returns a Rescuer for the tables of client's instance.
 func NewRescuer(client *bigtable.Client) *Rescuer {
 	return &Rescuer{
-		objects:        client.Open(objectsTableName),
+		objects:        client.Open(objectsTable),
 		gcTable:        client.Open(TableName),
 		retryWait:      firstRetryWait,
 		attemptTimeout: touchWriteTimeout,
@@ -96,16 +93,9 @@ func (r *Rescuer) Rescue(ctx context.Context, key Hash, condemned []byte) (bool,
 // after a lost response that deleted the marker, the retry does not match and
 // the marker read finds it cleared.
 func (r *Rescuer) clear(ctx context.Context, row string, condemned []byte) (bool, error) {
-	end := append(append([]byte{}, condemned...), 0)
-	predicate := bigtable.ChainFilters(
-		bigtable.FamilyFilter(ObjectsFamily),
-		bigtable.ColumnFilter(CondemnedColumn),
-		bigtable.LatestNFilter(1),
-		bigtable.ValueRangeFilter(append([]byte{}, condemned...), end),
-	)
 	del := bigtable.NewMutation()
 	del.DeleteCellsInColumn(ObjectsFamily, CondemnedColumn)
-	mut := bigtable.NewCondMutation(predicate, del, nil)
+	mut := bigtable.NewCondMutation(markerPredicate(condemned), del, nil)
 	var matched bool
 	err := r.retry(ctx, func(ctx context.Context) error {
 		return r.objects.Apply(ctx, row, mut, bigtable.GetCondMutationResult(&matched))
@@ -120,10 +110,10 @@ func (r *Rescuer) marker(ctx context.Context, row string) (bool, []byte, error) 
 	err := r.retry(ctx, func(ctx context.Context) error {
 		var err error
 		res, err = r.objects.ReadRow(ctx, row, bigtable.RowFilter(bigtable.ChainFilters(
-			bigtable.FamilyFilter("meta|"+ObjectsFamily), bigtable.LatestNFilter(1))))
+			bigtable.FamilyFilter(objectsMetaFamily+"|"+ObjectsFamily), bigtable.LatestNFilter(1))))
 		return err
 	})
-	if err != nil || len(res["meta"]) == 0 {
+	if err != nil || len(res[objectsMetaFamily]) == 0 {
 		return false, nil, err
 	}
 	for _, item := range res[ObjectsFamily] {
@@ -142,8 +132,8 @@ func (r *Rescuer) retry(ctx context.Context, f func(ctx context.Context) error) 
 }
 
 // Retry calls f with the retries of a rescue: until it succeeds, fails with
-// an error that is not transient, or has run writeAttempts times, as
-// EdgeWriter.applyWithRetry does.
+// an error that is not transient, or has run writeAttempts times, as the
+// writes of the collector do.
 func Retry(ctx context.Context, f func() error) error {
 	return retryWith(ctx, firstRetryWait, writeBudget{}, func(context.Context) error { return f() })
 }

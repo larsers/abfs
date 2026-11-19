@@ -34,7 +34,6 @@ import (
 const (
 	DefaultBackfillShards    = 16
 	DefaultBackfillBatchSize = 500
-	objectsTable             = "objects"
 	backfillProgressInterval = time.Minute
 )
 
@@ -175,7 +174,7 @@ type backfill struct {
 
 // scanShard handles the keys in [start, end) in batches.
 func (b *backfill) scanShard(ctx context.Context, shard int, start, end string) error {
-	filter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter("meta"), bigtable.ColumnFilter("type"), bigtable.LatestNFilter(1)))
+	filter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.ColumnFilter("type"), bigtable.LatestNFilter(1)))
 	from := start
 	for {
 		if err := b.limiter.wait(ctx, b.opts.BatchSize); err != nil {
@@ -184,7 +183,7 @@ func (b *backfill) scanShard(ctx context.Context, shard int, start, end string) 
 		var keys, types []string
 		var times []bigtable.Timestamp
 		err := b.objectsTable.ReadRows(ctx, bigtable.NewRange(from, end), func(row bigtable.Row) bool {
-			for _, item := range row["meta"] {
+			for _, item := range row[objectsMetaFamily] {
 				keys = append(keys, row.Key())
 				types = append(types, string(item.Value))
 				times = append(times, item.Timestamp)
