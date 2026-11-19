@@ -26,15 +26,12 @@ import (
 
 const (
 	adminCallTimeout = time.Minute
-	// setupCheckRow is a row that never exists, which the probes of the setup
-	// checks read and write.
+	// setupCheckRow never exists; the setup probes read and write it.
 	setupCheckRow = "abfs-setup-check"
 )
 
-// CheckTables checks that the table abfsgc exists and, unless readOnly, that
-// the family abfsgc of the objects table does. Reads ignore an unknown
-// family, a mutation does not; deleting a cell of a row that does not exist
-// changes nothing.
+// CheckTables checks the table abfsgc and, unless readOnly, the family abfsgc of
+// the objects table with a write that changes nothing: reads ignore an unknown family.
 func CheckTables(ctx context.Context, bt *bigtable.Client, readOnly bool) error {
 	if _, err := bt.Open(TableName).ReadRow(ctx, setupCheckRow); err != nil {
 		return fmt.Errorf("cannot read Bigtable table %s: %w", TableName, err)
@@ -50,9 +47,7 @@ func CheckTables(ctx context.Context, bt *bigtable.Client, readOnly bool) error 
 	return nil
 }
 
-// ProbeConditionalWrite sends one conditional write with the app profile of
-// bt that changes nothing: a delete of a cell of a row that does not exist,
-// under a condition. The client does not retry it.
+// ProbeConditionalWrite sends a conditional write that changes nothing; it is not retried.
 func ProbeConditionalWrite(ctx context.Context, bt *bigtable.Client) error {
 	predicate := bigtable.ChainFilters(bigtable.FamilyFilter(ObjectsFamily), bigtable.ColumnFilter(CondemnedColumn))
 	del := bigtable.NewMutation()
@@ -61,18 +56,13 @@ func ProbeConditionalWrite(ctx context.Context, bt *bigtable.Client) error {
 	return bt.Open(objectsTable).Apply(ctx, setupCheckRow, mut)
 }
 
-// InstanceChecks reads what a delete cycle needs to know about the Bigtable
-// instance beyond its tables.
+// InstanceChecks reads what a delete cycle needs to know about the Bigtable instance.
 type InstanceChecks interface {
-	// Clusters returns the IDs of the clusters of the instance.
 	Clusters(ctx context.Context) ([]string, error)
-	// ProbeConditionalWrite sends one conditional write that changes nothing
-	// with the app profile of the collector; the caller retries it.
 	ProbeConditionalWrite(ctx context.Context) error
 }
 
-// NewInstanceChecks returns the checks of the Bigtable instance of project
-// that bt, a client with the app profile of the collector, writes to.
+// NewInstanceChecks returns the checks of instance; bt uses the collector's app profile.
 func NewInstanceChecks(project, instance string, bt *bigtable.Client) InstanceChecks {
 	return &instanceChecks{project: project, instance: instance, bt: bt}
 }
@@ -104,23 +94,18 @@ func (c *instanceChecks) Clusters(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// ProbeConditionalWrite implements InstanceChecks, as the server does at
-// start.
+// ProbeConditionalWrite implements InstanceChecks.
 func (c *instanceChecks) ProbeConditionalWrite(ctx context.Context) error {
 	return ProbeConditionalWrite(ctx, c.bt)
 }
 
-// instanceEvidence is what the checks of the instance found.
 type instanceEvidence struct {
 	clusters    []string
 	clustersErr error
 	probeErr    error
 }
 
-// readInstanceEvidence runs the checks of the instance that a delete needs:
-// the cluster count and the probe. The client does not retry conditional
-// writes, so the probe is retried here, each attempt within the budget b like
-// every other write of the collector.
+// readInstanceEvidence retries the probe: the client does not retry conditional writes.
 func readInstanceEvidence(ctx context.Context, checks InstanceChecks, b writeBudget) instanceEvidence {
 	var e instanceEvidence
 	e.clusters, e.clustersErr = checks.Clusters(ctx)
@@ -128,7 +113,6 @@ func readInstanceEvidence(ctx context.Context, checks InstanceChecks, b writeBud
 	return e
 }
 
-// instanceBlockers returns the reasons in e why a cycle must not delete.
 func instanceBlockers(e *instanceEvidence) []string {
 	var reasons []string
 	add := func(format string, args ...any) {
@@ -151,8 +135,6 @@ func instanceBlockers(e *instanceEvidence) []string {
 	return reasons
 }
 
-// permissionHint names the permission a call needs when err tells it lacks
-// one.
 func permissionHint(err error, permission string) string {
 	if status.Code(err) == codes.PermissionDenied {
 		return " (the collector needs " + permission + ")"

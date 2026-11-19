@@ -20,9 +20,7 @@ import (
 	"os"
 )
 
-// NewReplicaID returns an ID for the heartbeat of this server process: the
-// host name and a random suffix, so that a restarted process gets a new row
-// and the row of a process that stopped without recording its stop stays.
+// NewReplicaID returns the host name with a random suffix, new for each process.
 func NewReplicaID() string {
 	host, err := os.Hostname()
 	if err != nil {

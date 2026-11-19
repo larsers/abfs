@@ -25,22 +25,16 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// tableFamilies is the element type of bigtableTables.
 type tableFamilies = struct {
 	name     string
 	families []string
 }
 
-// gcBigtableTables lists the Bigtable tables and column families that the
-// garbage collector adds to bigtableTables: the family abfsgc of objects and the
-// table abfsgc.
 var gcBigtableTables = []tableFamilies{
 	{"objects", []string{gc.ObjectsFamily}},
 	{gc.TableName, []string{gc.EdgesFamily, gc.TouchFamily}},
 }
 
-// serverTables returns the Bigtable tables and families of the server, with
-// those of the garbage collector when gc is set.
 func serverTables(withGC bool) []tableFamilies {
 	tables := slices.Clone(bigtableTables)
 	if !withGC {
@@ -57,9 +51,7 @@ func serverTables(withGC bool) []tableFamilies {
 	return tables
 }
 
-// checkGCResources checks that the Spanner tables, the Bigtable table and the
-// column family of the garbage collector exist. Read-only, it writes nothing,
-// so it cannot check the family.
+// Read-only, checkGCResources writes nothing, so it cannot check the family.
 func (s *GCPServer) checkGCResources(ctx context.Context, readOnly bool) error {
 	if err := s.casdb.CheckGCSchema(ctx); err != nil {
 		return err
@@ -67,11 +59,9 @@ func (s *GCPServer) checkGCResources(ctx context.Context, readOnly bool) error {
 	return gc.CheckTables(ctx, s.casdb.BTClient(), readOnly)
 }
 
-// checkSingleRowTransactions checks that the Bigtable app profile allows the
-// conditional writes with which reads rescue condemned objects. Without them
-// every read of a condemned object would fail. The probe writes nothing. The
-// client does not retry conditional writes, so the probe retries transient
-// errors as a rescue does; only a refusal names the app profile.
+// checkSingleRowTransactions checks that the app profile allows the conditional
+// writes that rescue condemned objects. The client does not retry conditional
+// writes, so the probe retries transient errors itself.
 func (s *GCPServer) checkSingleRowTransactions(ctx context.Context, opts *NewServerOpts) error {
 	err := gc.Retry(ctx, func() error { return gc.ProbeConditionalWrite(ctx, s.casdb.BTClient()) })
 	if err == nil {

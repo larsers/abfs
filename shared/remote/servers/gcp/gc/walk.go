@@ -31,8 +31,6 @@ import (
 // DefaultWalkWorkers is the number of pinned revisions Walk walks in parallel.
 const DefaultWalkWorkers = 16
 
-// maxTagChain is the most annotated tags the walk follows from a pinned
-// revision to its commit.
 const maxTagChain = 10
 
 // What a walk found a key as.
@@ -45,76 +43,59 @@ const (
 	WalkTree           = "tree"
 	WalkBlob           = "blob"
 	WalkSubmodule      = "submodule"
-	// WalkRevision is a pinned revision, and WalkTagTarget the object a tag
-	// names, that could not be read or is neither a commit nor a tag.
+	// WalkRevision and WalkTagTarget could not be read or are no commit or tag.
 	WalkRevision  = "revision"
 	WalkTagTarget = "tag-target"
-	// WalkDirHash prefixes the type of what the walk found below the tree a
-	// pinned manifest names for a project in place of its commit's tree.
+	// WalkDirHash prefixes what the walk found below a pinned dir-hash tree.
 	WalkDirHash = "dir-hash-"
 )
 
 // WalkOpts are the options of Walk.
 type WalkOpts struct {
-	// MountDetails are the mount details whose pinned revisions are walked.
 	MountDetails []Hash
 	// Keys are the object keys to look for.
 	Keys []Hash
-	// Workers is the number of pinned revisions walked in parallel; zero
-	// uses DefaultWalkWorkers.
+	// Workers of zero uses DefaultWalkWorkers.
 	Workers int
 }
 
-// WalkKey tells whether a key is in the closure of the pinned revisions, and
-// how the walk reached it first.
+// WalkKey tells whether a key is in the closure and how the walk reached it first.
 type WalkKey struct {
 	Key     Hash
 	Reached bool
-	// Type is what the walk found the key as, one of the Walk constants.
+	// Type is one of the Walk constants.
 	Type string
-	// MountDetails and Commit are the mount details and the pinned revision
-	// whose walk reached the key first; Commit is zero for the mount details
-	// and their manifests.
+	// Commit is zero for the mount details and their manifests.
 	MountDetails Hash
 	Commit       Hash
-	// Path is the project path and, below it, the path in the project's tree.
+	// Path is the project path and the path in its tree.
 	Path string
 }
 
 // WalkResult is the result of Walk.
 type WalkResult struct {
-	// Keys has one entry per distinct key of WalkOpts.Keys, in their order.
 	Keys            []WalkKey
 	MountDetails    int64
 	PinnedManifests int64
 	Revisions       int64
 	Trees           int64
-	// Entries counts the file and submodule entries of the trees read. Their
-	// objects are not read.
+	// Entries counts tree entries; their objects are not read.
 	Entries int64
-	// Incomplete counts what the walk could not read or follow: mount details
-	// without a pinned manifest, revisions that are not hashes, and objects
-	// that are missing, cannot be read or have an unexpected type. With any,
-	// a key outside the closure may still be in it. IncompleteSamples
-	// describes up to maxSamples of them.
+	// With any Incomplete, a key outside the closure may still be in it.
 	Incomplete        int64
 	IncompleteSamples []string
 }
 
-// walkRevision is a project revision of a pinned manifest, or the tree its
-// annotation names in place of the commit's tree.
 type walkRevision struct {
 	details, commit Hash
 	path            string
 	dirHash         Hash
 }
 
-// walkHit is the first path of a revision's walk to a key.
 type walkHit struct {
 	typ, path string
 }
 
-// revisionWalk is the walk of one revision.
 type revisionWalk struct {
 	rev        *walkRevision
 	hits       map[int]walkHit
@@ -129,14 +110,10 @@ type walker struct {
 	res  *WalkResult
 }
 
-// Walk reads each mount details object and its pinned manifest, and walks
-// the commit and the trees of every pinned revision from object content, as
-// a client's checkout of the mount sees them. It reports, for each key,
-// whether the walk reached it and the first path that did. It does not read
-// the abfsgc table, so a gap in the edges the collector extracted does not hide
-// a key from it, and it reads trees only to list their entries, so a blob
-// need not exist to be found. objs must neither rescue nor touch what it
-// reads.
+// Walk walks every pinned revision of the mount details from object content and
+// reports whether it reached each key. It does not read the abfsgc table, so a
+// gap in the extracted edges does not hide a key. objs must neither rescue nor
+// touch what it reads.
 func Walk(ctx context.Context, objs remote.RemoteProvider, o *WalkOpts) (*WalkResult, error) {
 	w := &walker{objs: objs, want: make(map[Hash]int, len(o.Keys)), res: &WalkResult{}}
 	for _, k := range o.Keys {
@@ -165,8 +142,7 @@ func Walk(ctx context.Context, objs remote.RemoteProvider, o *WalkOpts) (*WalkRe
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	// Revisions are merged in manifest order, so the first path does not
-	// depend on which walk finished first.
+	// Merge in manifest order so the first path does not depend on timing.
 	for _, rw := range walks {
 		w.res.Trees += rw.trees
 		w.res.Entries += rw.entries
@@ -180,8 +156,7 @@ func Walk(ctx context.Context, objs remote.RemoteProvider, o *WalkOpts) (*WalkRe
 	return w.res, nil
 }
 
-// Err fails when the walk is incomplete: a key it did not reach may then be in
-// the closure.
+// Err fails when the walk is incomplete.
 func (r *WalkResult) Err() error {
 	if r.Incomplete > 0 {
 		return fmt.Errorf("the walk is incomplete: %d mount details, revisions or objects could not be read or followed", r.Incomplete)
@@ -196,7 +171,6 @@ func (w *walker) incomplete(s string) {
 	}
 }
 
-// reach records the first way to the key with the index i.
 func (w *walker) reach(i int, typ string, details, commit Hash, path string) {
 	k := &w.res.Keys[i]
 	if !k.Reached {
@@ -210,9 +184,6 @@ func (w *walker) reachKey(key Hash, typ string, details Hash) {
 	}
 }
 
-// pinnedRevisions reads the mount details and their pinned manifests, as the
-// pin reader of a cycle does, and returns each distinct revision once, with
-// the project path it was found at first.
 func (w *walker) pinnedRevisions(ctx context.Context, mounts []Hash) ([]walkRevision, error) {
 	var revs []walkRevision
 	seenDetails := make(map[Hash]bool, len(mounts))
@@ -299,8 +270,6 @@ func (rw *revisionWalk) hit(w *walker, key Hash, typ, path string) {
 	}
 }
 
-// failed records an object of the walk that could not be read. It returns
-// the context's error once the walk is cancelled.
 func (rw *revisionWalk) failed(ctx context.Context, what string, h Hash, path string, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -314,8 +283,7 @@ func (w *walker) walkCommit(ctx context.Context, rw *revisionWalk) error {
 	if !rev.dirHash.IsZero() {
 		return w.walkTree(ctx, rw, rev.dirHash, rev.path, make(map[Hash]bool))
 	}
-	// A pinned revision can be an annotated tag; the checkout holds the
-	// commit the tag names.
+	// A pinned revision can be an annotated tag; the checkout holds its commit.
 	h, what := rev.commit, WalkRevision
 	for range maxTagChain + 1 {
 		_, obj, err := remote.DecodeObject(ctx, w.objs, h)
@@ -326,8 +294,7 @@ func (w *walker) walkCommit(ctx context.Context, rw *revisionWalk) error {
 		switch o := obj.(type) {
 		case *gitobjects.Commit:
 			rw.hit(w, h, WalkCommit, rev.path)
-			// The first link of a commit is its tree; the parents are
-			// history, which a checkout does not hold.
+			// The parents are history, which a checkout does not hold.
 			return w.walkTree(ctx, rw, o.Links()[0], rev.path, make(map[Hash]bool))
 		case *gitobjects.Tag:
 			rw.hit(w, h, WalkTag, rev.path)

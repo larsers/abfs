@@ -69,8 +69,6 @@ func (c *gcpGCCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return clierr.NoSubcommandErr(fl)
 }
 
-// gcServer holds the flags with which a GC command reaches the store, and
-// opens the server of the command.
 type gcServer struct {
 	opts gcp.NewServerOpts
 }
@@ -89,15 +87,12 @@ func (s *gcServer) setOpts() {
 	s.opts.SmallPools = true
 }
 
-// check fails when a required flag is missing.
 func (s *gcServer) check() error {
 	return requireStoreFlags(s.opts.ProjectID, s.opts.InstanceID, s.opts.BucketName)
 }
 
-// open creates the server of the command. It is read-only: its reads must
-// not rescue condemned objects or count as a use, or a command would keep
-// what it reads. A command reads each object it needs once and runs for a
-// short time, so its caches hold one entry and its clients open small pools.
+// open creates a read-only server: a command's reads must not rescue or count
+// as a use, or a command would keep what it reads.
 func (s *gcServer) open(ctx context.Context) (*gcp.GCPServer, error) {
 	s.setOpts()
 	server, err := gcp.New(ctx, &s.opts)
@@ -258,12 +253,10 @@ func (c *gcpGCRunCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringSliceVar(&c.explain, "explain", nil, "Object keys, separated by commas, whose gc row, reachability, first root, times and condemn marker the report explains")
 }
 
-// deleteOnlyFlags are the flags that only delete mode reads.
 var deleteOnlyFlags = []string{
 	"delete-types", "accept-mounts-without-keepalive", "delete-start-delay",
 }
 
-// checkOpts checks the mode flags set in fl and fills the keys to explain.
 func (c *gcpGCRunCmd) checkOpts(fl *pflag.FlagSet) error {
 	modes := 0
 	for _, m := range []bool{c.dryRun, c.condemn, c.delete} {
@@ -308,8 +301,6 @@ func (c *gcpGCRunCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return m.endCycle(c.mode(), r, err)
 }
 
-// endCycle sets the gauges of a cycle in mode that reported r and returned
-// err, and returns the error that gives the exit code.
 func (m *cycleMetrics) endCycle(mode string, r *gc.Report, err error) error {
 	result, code := cycleExit(r, err)
 	m.record(mode, result, r, time.Now())
@@ -319,7 +310,6 @@ func (m *cycleMetrics) endCycle(mode string, r *gc.Report, err error) error {
 	return clierr.CLIErrWithExitCode(code, "%s", outcomeMessage(r, err))
 }
 
-// mode returns the mode of the cycle, empty when no mode flag is set.
 func (c *gcpGCRunCmd) mode() string {
 	switch {
 	case c.delete:
@@ -343,9 +333,7 @@ var outcomeExitCodes = map[string]int{
 	gc.OutcomeChunksSkipped:  6,
 }
 
-// cycleExit returns the result label and the exit code of a cycle that
-// reported r and returned err. A cycle without a report failed, whatever its
-// outcome.
+// A cycle without a report failed, whatever its outcome.
 func cycleExit(r *gc.Report, err error) (string, int) {
 	var refused *gc.ErrCondemnRefused
 	switch {
@@ -360,8 +348,6 @@ func cycleExit(r *gc.Report, err error) (string, int) {
 	return outcome, outcomeExitCodes[outcome]
 }
 
-// outcomeMessage returns the error line of a cycle that exits with an
-// outcome other than OutcomeOK.
 func outcomeMessage(r *gc.Report, err error) string {
 	if err != nil {
 		return err.Error()
@@ -388,9 +374,8 @@ func outcomeMessage(r *gc.Report, err error) string {
 	return fmt.Sprintf("the GC cycle %d ended with outcome %s", r.Cycle, outcome)
 }
 
-// cycleMetrics are the gauges of a cycle, set once at its end. Each run is a
-// new series, so they are gauges: a counter would have one point, in which a
-// rate sees no increase.
+// Each run is a new series, so these are gauges: a counter would have one
+// point, in which a rate sees no increase.
 type cycleMetrics struct {
 	end    metrics.Gauge
 	keys   metrics.Gauge
@@ -405,9 +390,7 @@ func newCycleMetrics(p metrics.Provider) *cycleMetrics {
 	}
 }
 
-// record sets the gauges of a cycle that ended at end with result and
-// reported r, which may be nil. The counts are those of the steps the mode
-// runs, zero for a step that did not run.
+// record sets zero counts for the steps the mode does not run; r may be nil.
 func (m *cycleMetrics) record(mode, result string, r *gc.Report, end time.Time) {
 	m.end.Set(float64(end.Unix()), mode, result)
 	if r == nil || mode == gc.PhaseDryRun {
@@ -435,8 +418,7 @@ func (m *cycleMetrics) record(mode, result string, r *gc.Report, end time.Time) 
 	m.chunks.Set(float64(objects), "bucket")
 }
 
-// run runs the cycle, writes its report and returns it, nil when the cycle
-// stopped before it had one or the report could not be written.
+// run returns nil when the cycle stopped before its report was written.
 func (c *gcpGCRunCmd) run(ctx context.Context, fl *pflag.FlagSet) (*gc.Report, error) {
 	if err := c.checkOpts(fl); err != nil {
 		return nil, err
@@ -651,8 +633,6 @@ func printWalk(res *gc.WalkResult) {
 	}
 }
 
-// checkAppProfile reads the Bigtable app profile of a GC command and warns
-// about each setting the collector needs that it lacks.
 func checkAppProfile(ctx context.Context, o *gcp.NewServerOpts) *gc.ProfileReport {
 	rep := gc.ReadAppProfile(ctx, o.ProjectID, o.BtInstance, o.BtAppProfile)
 	for _, p := range rep.Problems {

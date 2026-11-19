@@ -31,85 +31,54 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// A delete record is the object abfsgc/deleted/<state>/<cycle>/<level>-<range>-<batch>
-// in the server bucket, written by the delete step before it deletes the rows
-// of one batch, so that the chunks of every deleted object can be found after
-// its row is gone, and an undo can write the rows back. It holds a header,
-// then a key section with the kind and the 20-byte key of each entry, and
-// for a map row the key of its other end, then a row section with, per
-// object in the order of the key section, the newest cell of each column of
-// the families meta and data of its objects row, and the newest value of
-// each column of the family e of its gc row, none when it had no gc row.
-// Readers that need only the keys stop after the key section. Integers are
-// big-endian.
+// A delete record is written before the deletes of its batch, so the chunks can
+// be found and an undo can write the rows back. Integers are big-endian.
 const (
 	recordPrefix        = "abfsgc/deleted/"
 	recordMagic         = "ABFSGCD\n"
 	recordFormatVersion = 2
 	recordObject        = 1
 	recordMapRow        = 2
-	// inlineDepot is the depot of the server that keeps content in the
-	// descriptor itself, which needs no delete.
+	// inlineDepot keeps content in the descriptor, which needs no delete.
 	inlineDepot = "inline"
-	// prunedMarker is the object <cycle>/pruned among the delete records,
-	// written before the records of the cycle are pruned, so that an undo of
-	// the cycle fails instead of finding nothing to restore. It carries the
-	// flag of a done record, so that the chunk step skips it.
+	// prunedMarker carries the flag of a done record, so the chunk step skips it.
 	prunedMarker = "pruned"
-	// undoWindow is how long after its record the chunk step deletes the
-	// chunks of a deleted object, so the time in which an undo restores every
-	// object it deleted. Later an undo restores the objects whose content is
-	// inline, and the map rows, while the records exist.
+	// undoWindow is how long after its record the chunk step deletes chunks.
 	undoWindow = 7 * 24 * time.Hour
-	// recordRetention is how long ref records are kept after they were
-	// written, and delete records after they were flagged, so that an undo
-	// finds them.
+	// recordRetention keeps the records an undo needs.
 	recordRetention = undoWindow
 )
 
-// maxRecordBytes is the most bytes of entries in one delete record; the
-// delete step writes a larger batch as several records. Tests change it.
+// maxRecordBytes is the most bytes of entries in one delete record. Tests change it.
 var maxRecordBytes = 16 << 20
 
-// recordPrefixOf returns the prefix of the delete records of the garbage
-// collector state.
 func recordPrefixOf(state string) string {
 	return recordPrefix + state + "/"
 }
 
-// recordObjectName returns the name of the delete record of one batch of a
-// range and level of the delete step of cycle.
 func recordObjectName(state string, cycle int64, level, rng, batch int) string {
 	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + strconv.Itoa(level) + "-" + strconv.Itoa(rng) + "-" + strconv.Itoa(batch)
 }
 
-// prunedMarkerName returns the name of the marker of the pruned records of
-// cycle.
 func prunedMarkerName(state string, cycle int64) string {
 	return recordPrefixOf(state) + strconv.FormatInt(cycle, 10) + "/" + prunedMarker
 }
 
-// recordHeader is the header of a delete record.
 type recordHeader struct {
 	cycle int64
 	runID string
-	// gcRowsAfter is the grace start of the cycle: a gc row whose newest
-	// e:links cell is newer belongs to an object written again after the
-	// mark, and stays.
+	// gcRowsAfter is the grace start; a gc row with a newer e:links cell stays.
 	gcRowsAfter time.Time
 	count       int64
 }
 
-// recordCell is a cell of a row kept in a delete record.
 type recordCell struct {
 	family, column string
 	ts             bigtable.Timestamp
 	value          []byte
 }
 
-// recordEntry is an entry of a delete record: an object with the cells of
-// its objects row and the values of the edges family of its gc row, or a map
-// row from key to mapTo. An object without edges had no gc row.
+// An object entry without edges had no gc row.
 type recordEntry struct {
 	kind  uint8
 	key   Hash
@@ -118,8 +87,6 @@ type recordEntry struct {
 	edges []recordCell
 }
 
-// objectEntry returns the record entry of the object key whose objects row
-// and gc row were read as object and gc.
 func objectEntry(key Hash, object, gc bigtable.Row) recordEntry {
 	e := recordEntry{kind: recordObject, key: key}
 	for _, family := range []string{objectsMetaFamily, objectsDataFamily} {
@@ -133,7 +100,6 @@ func objectEntry(key Hash, object, gc bigtable.Row) recordEntry {
 	return e
 }
 
-// content returns the data:content descriptor of the object e.
 func (e *recordEntry) content() []byte {
 	for _, c := range e.cells {
 		if c.family == objectsDataFamily && c.column == objectsContentColumn {
@@ -143,7 +109,6 @@ func (e *recordEntry) content() []byte {
 	return nil
 }
 
-// edge returns the value of the column of the edges of the object e.
 func (e *recordEntry) edge(column string) ([]byte, bool) {
 	for _, c := range e.edges {
 		if c.column == column {
@@ -153,7 +118,6 @@ func (e *recordEntry) edge(column string) ([]byte, bool) {
 	return nil, false
 }
 
-// size returns the number of bytes of e in a record.
 func (e *recordEntry) size() int {
 	n := 1 + entities.HashSize
 	if e.kind == recordMapRow {
@@ -179,9 +143,7 @@ func (h *recordHeader) write(w io.Writer) (int, error) {
 	return w.Write(b)
 }
 
-// writeRecord writes the delete record name with the header h and entries,
-// only if no object of that name exists or this run wrote it, and returns
-// its size.
+// writeRecord writes only if no object of that name exists or this run wrote it.
 func writeRecord(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *recordHeader, entries []recordEntry) (int64, error) {
 	var size int64
 	err := createObject(ctx, b, bucket, name, h.runID, "application/octet-stream", func(w io.Writer) error {
@@ -192,8 +154,6 @@ func writeRecord(ctx context.Context, b writeBudget, bucket *storage.BucketHandl
 	return size, err
 }
 
-// encodeRecord writes a delete record with the header h and entries to w,
-// and returns its size.
 func encodeRecord(w io.Writer, h *recordHeader, entries []recordEntry) (int64, error) {
 	h.count = int64(len(entries))
 	n, err := h.write(w)
@@ -250,13 +210,10 @@ func appendBytes(b, v []byte) []byte {
 	return append(binary.BigEndian.AppendUint32(b, uint32(len(v))), v...)
 }
 
-// readRecord reads the delete record name.
 func readRecord(ctx context.Context, bucket *storage.BucketHandle, name string) (*recordHeader, []recordEntry, error) {
 	return readRecordSections(ctx, bucket, name, true)
 }
 
-// readRecordKeys reads the header and the key section of the delete record
-// name, so its entries hold no cells.
 func readRecordKeys(ctx context.Context, bucket *storage.BucketHandle, name string) (*recordHeader, []recordEntry, error) {
 	return readRecordSections(ctx, bucket, name, false)
 }
@@ -279,8 +236,6 @@ func readRecordSections(ctx context.Context, bucket *storage.BucketHandle, name 
 	return h, entries, nil
 }
 
-// decodeRecord decodes a delete record of size bytes from r, with the row
-// section when rows is set.
 func decodeRecord(r io.Reader, size int64, rows bool) (*recordHeader, []recordEntry, error) {
 	br := bufio.NewReader(r)
 	sr := &sizedReader{r: br, left: size}

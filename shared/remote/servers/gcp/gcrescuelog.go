@@ -32,18 +32,12 @@ import (
 )
 
 const (
-	// rescueKeyLines is the number of rescued objects logged per
-	// rescueLogWindow; a call that rescues a whole mount logs only its call
-	// line once the limit is reached. rescueCallLines limits the call lines
-	// the same way, as GetObject logs one call per object.
 	rescueKeyLines  = 100
 	rescueCallLines = 100
 	rescueLogWindow = time.Minute
 	otherType       = "other"
 )
 
-// rescueTypes are the object types of the rescue metric: the types the
-// collector knows and otherType for any other.
 var rescueTypes, rescueTypeIndex = func() ([]string, map[string]int) {
 	types := append(gc.TypeNames(), otherType)
 	index := make(map[string]int, len(types))
@@ -60,10 +54,6 @@ func rescueType(typ string) int {
 	return rescueTypeIndex[otherType]
 }
 
-// rescueLog logs the rescues of a server: one line per call that rescued or
-// failed to rescue an object, with the client, at most rescueCallLines per
-// rescueLogWindow, and one line per rescued object, at most rescueKeyLines.
-// A line then counts the lines the limits left out.
 type rescueLog struct {
 	now          func() time.Time
 	mu           sync.Mutex
@@ -78,8 +68,6 @@ func newRescueLog() *rescueLog {
 	return &rescueLog{now: time.Now}
 }
 
-// call logs a call with the request id req that read the rows of read
-// objects and rescued or failed to rescue some of them.
 func (l *rescueLog) call(ctx context.Context, path rescuePath, req string, read, rescued, failed int) {
 	if rescued == 0 && failed == 0 {
 		return
@@ -97,17 +85,13 @@ func (l *rescueLog) call(ctx context.Context, path rescuePath, req string, read,
 		rescued, read, rescuePathNames[path], failed, req, addr, forwarded, version)
 }
 
-// lost logs that the collector deleted the object of hdr before the call
-// with the request id req could rescue it. The lines are not limited: each is
-// an object a client may have needed.
+// lost is not rate limited: each line is an object a client may have needed.
 func (l *rescueLog) lost(ctx context.Context, path rescuePath, req string, hdr *ObjectHeader) {
 	addr, forwarded, version := rescueClient(ctx)
 	log.Printf("Condemned object %s was deleted before it could be rescued in %s: request %s, peer %s, x-forwarded-for %q, client-version %q",
 		hdr.Id, rescuePathNames[path], req, addr, forwarded, version)
 }
 
-// object logs the rescue of hdr, whose marker was condemned, by the call with
-// the request id req.
 func (l *rescueLog) object(path rescuePath, req string, hdr *ObjectHeader, condemned []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -120,7 +104,6 @@ func (l *rescueLog) object(path rescuePath, req string, hdr *ObjectHeader, conde
 	log.Printf("Rescued %s %s in %s, condemned by GC cycle %s: request %s", hdr.Type, hdr.Id, rescuePathNames[path], markerCycle(condemned), req)
 }
 
-// windowLocked starts a new window once rescueLogWindow has passed.
 func (l *rescueLog) windowLocked() {
 	if now := l.now(); now.Sub(l.start) >= rescueLogWindow {
 		l.flushLocked()
@@ -129,7 +112,6 @@ func (l *rescueLog) windowLocked() {
 	}
 }
 
-// flush logs the count of lines left out so far.
 func (l *rescueLog) flush() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -147,8 +129,6 @@ func (l *rescueLog) flushLocked() {
 	}
 }
 
-// markerCycle returns the cycle number of a condemn marker, 8 bytes big-endian
-// as gc run --condemn writes it, or the marker in hexadecimal.
 func markerCycle(condemned []byte) string {
 	if len(condemned) == 8 {
 		return fmt.Sprint(binary.BigEndian.Uint64(condemned))
@@ -156,10 +136,8 @@ func markerCycle(condemned []byte) string {
 	return fmt.Sprintf("%x", condemned)
 }
 
-// newRequestID returns the id that the rescue log lines of one call share, a
-// random one, followed by the trace ID of the call when it is traced. The
-// calls of one client operation can share a trace, so the trace ID alone does
-// not name the call.
+// The calls of one client operation can share a trace, so the trace ID alone
+// does not name the call.
 func newRequestID(ctx context.Context) string {
 	id := fmt.Sprintf("%016x", rand.Uint64())
 	if sc := trace.SpanContextFromContext(ctx); sc.HasTraceID() {
@@ -168,9 +146,6 @@ func newRequestID(ctx context.Context) string {
 	return id
 }
 
-// rescueClient returns what identifies the client of ctx: the peer address,
-// which behind a load balancer is the proxy, and the x-forwarded-for and
-// client-version metadata.
 func rescueClient(ctx context.Context) (addr, forwarded, version string) {
 	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
 		addr = p.Addr.String()

@@ -158,8 +158,6 @@ func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return nil
 }
 
-// registerStoreFlags registers the flags that name the databases and the
-// bucket of a GCP server.
 func registerStoreFlags(fl *pflag.FlagSet, project, instance, database, btInstance, bucket *string) {
 	fl.StringVar(project, "project", "", "The GCP Project which contains the databases (required)")
 	fl.StringVar(instance, "instance", "", "The GCP Spanner Database Instance (required)")
@@ -168,13 +166,10 @@ func registerStoreFlags(fl *pflag.FlagSet, project, instance, database, btInstan
 	fl.StringVar(bucket, "bucket", "", "The GCS Bucket Name (required)")
 }
 
-// requireStoreFlags fails when a required flag of registerStoreFlags is
-// empty.
 func requireStoreFlags(project, instance, bucket string) error {
 	return requireFlags(map[string]string{"--project": project, "--instance": instance, "--bucket": bucket})
 }
 
-// closeServer closes the server that a command created.
 func closeServer(server *gcp.GCPServer) {
 	if err := server.Close(); err != nil {
 		log.Printf("Warning: error closing ABFS server: %v", err)

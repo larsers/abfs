@@ -25,30 +25,21 @@ import (
 
 const profileReadTimeout = 30 * time.Second
 
-// ProfileReport describes the Bigtable app profile of a GC command. The scans
-// and writes of the collector are batch work: they need single-cluster
-// routing with single-row transactions for the conditional writes, and low
-// priority so that they do not slow down the servers.
+// ProfileReport describes the Bigtable app profile of a GC command. The collector
+// needs single-cluster routing, single-row transactions and low priority.
 type ProfileReport struct {
-	ID string `json:"id"`
-	// Routing is single-cluster or multi-cluster, Cluster the cluster of
-	// single-cluster routing.
+	ID           string `json:"id"`
 	Routing      string `json:"routing,omitempty"`
 	Cluster      string `json:"cluster,omitempty"`
 	Transactions bool   `json:"transactional_writes"`
-	// Priority is low, medium or high, or data-boost for a Data Boost
-	// profile.
+	// Priority is low, medium, high or data-boost.
 	Priority string `json:"priority,omitempty"`
-	// Problems lists what breaks the settings the collector needs, or why the
-	// profile could not be read, and Fix how to create a profile that has
-	// them.
+	// Problems lists the settings that break the rules; Fix tells how to make a good profile.
 	Problems []string `json:"problems,omitempty"`
 	Fix      string   `json:"fix,omitempty"`
 }
 
-// ReadAppProfile reads the app profile id of the Bigtable instance and checks
-// its settings; an empty id is the instance's default profile. A profile that
-// cannot be read is reported as a problem.
+// ReadAppProfile reads and checks app profile id; empty is the default profile.
 func ReadAppProfile(ctx context.Context, project, instance, id string) *ProfileReport {
 	get := func(ctx context.Context, id string) (*adminpb.AppProfile, error) {
 		// The admin client retries transient errors until its context ends.
@@ -92,7 +83,6 @@ func checkAppProfile(id, instance string, ap *adminpb.AppProfile) *ProfileReport
 		rep.Priority = "data-boost"
 		rep.Problems = append(rep.Problems, "it uses Data Boost, which allows no writes")
 	} else {
-		// Older profiles hold the priority in the deprecated field.
 		p := ap.GetPriority() //nolint:staticcheck // read when the isolation holds the old field
 		if si := ap.GetStandardIsolation(); si != nil {
 			p = si.GetPriority()

@@ -21,9 +21,8 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// WalkGC walks the pinned revisions of mount details by content; see gc.Walk.
-// It fails on a server that rescues or touches what it reads, so that the
-// walk does not keep the objects it is asked about.
+// WalkGC runs gc.Walk. It fails on a server that rescues or touches what it
+// reads, so that the walk does not keep the objects it is asked about.
 func (s *GCPServer) WalkGC(ctx context.Context, opts *gc.WalkOpts) (*gc.WalkResult, error) {
 	if s.gcHooks.rescue != nil || s.gcHooks.toucher != nil {
 		return nil, errors.New("the GC walk needs a server that neither rescues nor touches the objects it reads")

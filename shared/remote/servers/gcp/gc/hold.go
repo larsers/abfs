@@ -23,38 +23,22 @@ import (
 	"time"
 )
 
-// condemnHoldMargin is how much longer than the grace a condemn marker holds
-// at least before its key may be deleted. It covers the outputs of a map
-// result that a mount without the keep-alive applies, which only the touch of
-// the server's answer keeps, for a cache TTL of up to 6 hours 39 minutes;
-// tests change it.
+// condemnHoldMargin covers map outputs on mounts without keep-alive. Tests change it.
 var condemnHoldMargin = 16 * time.Hour
 
-// holdOf returns how long after the completion of a list a cycle may delete
-// the keys that hold its marker, for a list whose servers had the largest
-// cache TTL ttl and a cycle whose live mounts touch at most every keepAlive:
-// the grace plus condemnHoldMargin, or, when longer, ttl, the write bound,
-// the longest time a client relies on a present answer, and the clock skew
-// margin. A server answers present for a key read before its marker landed
-// until ttl and the write bound after that, and a client relies on the answer
-// for the longest push, or, on a keep-alive mount, for the time clients
-// reuse map results, the touch interval a tenth late, and the time a
-// keep-alive pass may take.
+// holdOf returns how long after a list completed a cycle may delete its keys, so
+// that no client still relies on a present answer read before the marker.
 func holdOf(ttl, keepAlive time.Duration, o *DryRunOpts) time.Duration {
 	reliance := max(o.LongestPush, clientMapReuse+keepAlive+keepAlive/10+keepAlivePassAllowance)
 	return max(o.Grace+condemnHoldMargin, ttl+ValidationWriteBound+reliance+clockSkewMargin)
 }
 
-// listHolds holds the records of the condemned lists of a garbage collector,
-// read once after the lease was taken, and why they could not be read.
 type listHolds struct {
 	records map[int64]*ListRecord
 	err     error
 }
 
-// readListHolds reads the list records of the lease. A failed read is kept,
-// so that the cycle deletes nothing and rewrites no marker; it fails only
-// when ctx ends.
+// A failed read is kept, so the cycle deletes nothing and rewrites no marker.
 func readListHolds(ctx context.Context, lease *Lease) (*listHolds, error) {
 	records, err := lease.ReadListRecords(ctx)
 	if err != nil {
@@ -66,8 +50,6 @@ func readListHolds(ctx context.Context, lease *Lease) (*listHolds, error) {
 	return &listHolds{records: records, err: err}, nil
 }
 
-// record returns the complete record of the list whose marker is value, or
-// nil.
 func (h *listHolds) record(value []byte) *ListRecord {
 	if h.err != nil {
 		return nil
@@ -79,9 +61,7 @@ func (h *listHolds) record(value []byte) *ListRecord {
 	return r
 }
 
-// recorded reports whether the marker value has a complete record, so that a
-// condemn must not write the key again; with an unread record every marker
-// counts as recorded.
+// With unread records every marker counts as recorded, so a condemn rewrites none.
 func (h *listHolds) recorded(value []byte) bool {
 	return h.err != nil || h.record(value) != nil
 }
@@ -90,10 +70,7 @@ func (h *listHolds) recorded(value []byte) bool {
 type ListHoldReport struct {
 	Cycle        int64     `json:"cycle"`
 	CompleteTime time.Time `json:"complete_time"`
-	// CacheTTLHours is the largest cache TTL of the servers recorded with
-	// the list, HoldHours the hold of its markers for this cycle and
-	// EligibleTime when it ends; the cycle may delete its keys when
-	// Eligible.
+	// The cycle may delete the keys of the list when Eligible.
 	CacheTTLHours float64   `json:"cache_ttl_hours"`
 	HoldHours     float64   `json:"hold_hours"`
 	EligibleTime  time.Time `json:"eligible_time"`
@@ -102,10 +79,6 @@ type ListHoldReport struct {
 	Unreachable int64 `json:"unreachable"`
 }
 
-// eligible returns for each marker value of a scan, by its number, whether a
-// cycle whose snapshot is snapshot and whose live mounts touch at most every
-// keepAlive may delete the keys that hold it, and the holds of the lists
-// that unreachable objects hold the markers of, by cycle.
 func (h *listHolds) eligible(values [][]byte, unreachable []sizedNode, snapshot time.Time, keepAlive time.Duration, o *DryRunOpts) ([]bool, []ListHoldReport) {
 	ok := make([]bool, len(values)+1)
 	reports := make(map[int64]*ListHoldReport)
@@ -133,9 +106,7 @@ func (h *listHolds) eligible(values [][]byte, unreachable []sizedNode, snapshot 
 	return ok, list
 }
 
-// prunable returns the cycles of the records older than the cycle before
-// cycle whose marker no objects row of the scan holds. A later marker of such
-// a cycle has no record and is written again.
+// A later marker of a pruned cycle has no record and is written again.
 func (h *listHolds) prunable(cycle int64, values [][]byte) []int64 {
 	if h.err != nil {
 		return nil
@@ -154,7 +125,6 @@ func (h *listHolds) prunable(cycle int64, values [][]byte) []int64 {
 	return cycles
 }
 
-// describe says why the list records could not be read.
 func (h *listHolds) describe() string {
 	return fmt.Sprintf("the GC list records could not be read: %v", h.err)
 }

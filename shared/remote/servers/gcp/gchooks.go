@@ -38,9 +38,6 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// The server side of the garbage collector, on with NewServerOpts.GC: reads
-// rescue condemned objects, hits touch objects and map rows, cache entries
-// expire, and each server writes a heartbeat, without which it does not serve.
 const (
 	DefaultCacheTTL            = 6 * time.Hour
 	DefaultGCTouchInterval     = 36 * time.Hour
@@ -51,10 +48,9 @@ const (
 	metricsScope               = "github.com/google/abfs/shared/remote/servers/gcp"
 )
 
-// maxTouchedMapRows is how many map row touches a server remembers, about 225 bytes each.
+// maxTouchedMapRows costs about 225 bytes per row.
 const maxTouchedMapRows = 4 * 1000 * 1000
 
-// rescuePath is the server call that found an object, condemned or not.
 type rescuePath int
 
 const (
@@ -68,15 +64,12 @@ const (
 
 var rescuePathNames = [numRescuePaths]string{"headers", "validation", "put_object", "get_object", "map_results"}
 
-// firstHeartbeatTimeout is how long a server tries to write its first
-// heartbeat before it fails to start, and writeServer writes a heartbeat;
-// tests change both.
+// Tests change these.
 var (
 	firstHeartbeatTimeout = time.Minute
 	writeServer           = gc.WriteServer
 )
 
-// contentEntry is an entry of the s.content LRU cache.
 type contentEntry struct {
 	content *ObjectContent
 	loaded  uint32
@@ -86,7 +79,6 @@ type mapRowKey struct {
 	from, to entities.Hash
 }
 
-// toucher is the part of gc.Toucher that the hooks use.
 type toucher interface {
 	TouchObject(key gc.Hash) bool
 	TryTouchObject(key gc.Hash) bool
@@ -97,42 +89,32 @@ type toucher interface {
 }
 
 type gcHooks struct {
-	// on is NewServerOpts.GC. Off, none of the hooks below run.
 	on bool
 	// Zero disables the TTL and the touches.
 	cacheTTL      uint32
 	touchInterval uint32
 	rescue        func(ctx context.Context, key entities.Hash, condemned []byte) (bool, error)
 	toucher       toucher
-	// touchedMapRows holds the last touch of map rows, sharded by the first
-	// byte of from.
+	// touchedMapRows is sharded by the first byte of from.
 	touchedMapRows []*lru.Cache[mapRowKey, uint32]
 	stopHeartbeat  func()
-	// server is this process's heartbeat row in AbfsGcServers, which exists once
-	// hasRow is set. reportedLosses and reportedMapRowLosses count the
-	// object and map row touches lost when the last heartbeat was written.
+	// server is this process's heartbeat row, which exists once hasRow is set.
 	server               gc.Server
 	hasRow               bool
 	reportedLosses       int64
 	reportedMapRowLosses int64
-	// heartbeatStale is the age in seconds of the last successful heartbeat,
-	// at lastHeartbeat on the cacheNow clock, beyond which the server stops
-	// serving; zero without a heartbeat.
+	// heartbeatStale is the heartbeat age in seconds at which serving stops.
 	heartbeatStale uint32
 	lastHeartbeat  atomic.Uint32
-	// pause and pausePending record a pause of the process that the next
-	// heartbeat records as a touch loss.
+	// pausePending is a pause the next heartbeat records as a touch loss.
 	pause        pauseDetector
 	pausePending bool
-	// lastAttempt is the start of the last heartbeat attempt on the cacheNow
-	// clock.
+	// lastAttempt is on the cacheNow clock.
 	lastAttempt uint32
 	metrics     metric.Registration
 	rescueLog   *rescueLog
 	stopped     bool
-	// answerBound bounds the time from the start of a call to a present
-	// answer, and answerSeconds records that time per call. A read-only
-	// server answers no client and bounds nothing.
+	// answerBound is off on a read-only server, which answers no client.
 	answerBound   bool
 	answerSeconds metric.Float64Histogram
 
@@ -153,8 +135,6 @@ func seconds(d time.Duration) uint32 {
 	return uint32(max(1, (d+time.Second-1)/time.Second))
 }
 
-// startGCHooks starts the garbage collector hooks configured in opts. It does
-// nothing unless opts.GC is set.
 func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error {
 	if !opts.GC {
 		return nil
@@ -175,11 +155,8 @@ func (s *GCPServer) startGCHooks(ctx context.Context, opts *NewServerOpts) error
 	return s.enableGCHooks(ctx, &o)
 }
 
-// gcHookOpts checks the GC options of opts and returns them with the default
-// heartbeat interval when it is zero. A server that rescues and touches needs
-// a cache TTL, a touch interval and a heartbeat: without them the collector
-// refuses every condemn and delete, and it sees a server only through its
-// heartbeat.
+// gcHookOpts requires a cache TTL, touch interval and heartbeat: without them
+// the collector refuses every condemn and delete.
 func gcHookOpts(opts *NewServerOpts) (NewServerOpts, error) {
 	o := *opts
 	if o.CacheTTL < 0 || o.GCTouchInterval < 0 || o.GCHeartbeatInterval < 0 {
@@ -202,8 +179,6 @@ func gcHookOpts(opts *NewServerOpts) (NewServerOpts, error) {
 	return o, nil
 }
 
-// enableGCHooks turns the hooks on and starts the toucher and the heartbeat.
-// It fails when it cannot write the first heartbeat before ctx ends.
 func (s *GCPServer) enableGCHooks(ctx context.Context, opts *NewServerOpts) error {
 	s.casdb.EnableGC()
 	s.gcEdges = gc.NewEdgeWriter(s.casdb.BTClient())
@@ -260,11 +235,8 @@ func (s *GCPServer) enableGCHooks(ctx context.Context, opts *NewServerOpts) erro
 	return nil
 }
 
-// stopGCHooks stops the heartbeat, writes the buffered touches and records in
-// the heartbeat row of this server that it stopped, and whether it lost
-// touches or was paused since its last heartbeat. The row stays, so that the
-// collector sees the process in the window of every cycle it may have served
-// in; the losses are reported, not checked.
+// stopGCHooks marks the heartbeat row stopped but keeps it, so the collector
+// sees the process in every cycle window it may have served in.
 func (s *GCPServer) stopGCHooks() {
 	g := &s.gcHooks
 	if g.stopped {
@@ -295,8 +267,7 @@ func (s *GCPServer) stopGCHooks() {
 		return
 	}
 	g.hasRow = false
-	// A pause after the last heartbeat, or one whose heartbeat failed, is
-	// recorded by the stop.
+	// The stop records a pause that no heartbeat recorded.
 	if g.pausedSince() {
 		g.pausePending = true
 	}
@@ -315,8 +286,6 @@ func (s *GCPServer) stopGCHooks() {
 	}
 }
 
-// losses counts the object touches this process lost so far: every one that
-// was dropped or failed.
 func (g *gcHooks) losses() int64 {
 	if g.toucher == nil {
 		return 0
@@ -325,9 +294,7 @@ func (g *gcHooks) losses() int64 {
 	return st.Dropped + st.Failed
 }
 
-// mapRowLosses counts the map row touches this process lost so far. They are
-// recorded apart from the object touches: a lost one only shortens the
-// retention of an eval map row.
+// A lost map row touch only shortens the retention of an eval map row.
 func (g *gcHooks) mapRowLosses() int64 {
 	if g.toucher == nil {
 		return 0
@@ -336,17 +303,12 @@ func (g *gcHooks) mapRowLosses() int64 {
 	return st.MapRowsDropped + st.MapRowsFailed
 }
 
-// touchesLate reports whether the toucher holds touches past the time at
-// which they count as lost, whose loss it has not counted yet.
 func (g *gcHooks) touchesLate() bool {
 	return g.toucher != nil && g.toucher.Late()
 }
 
-// checkHeartbeat fails with Unavailable once the last successful heartbeat
-// of this server is older than two heartbeat intervals plus the write
-// timeout, until the next one succeeds. The collector counts a process for
-// the window of a cycle only while its last heartbeat is recent enough, so a
-// server must not serve without one.
+// checkHeartbeat fails once the heartbeat is stale: the collector counts a
+// process in a cycle window only while its heartbeat is recent.
 func (g *gcHooks) checkHeartbeat() error {
 	if g.heartbeatStale == 0 {
 		return nil
@@ -358,8 +320,7 @@ func (g *gcHooks) checkHeartbeat() error {
 	return nil
 }
 
-// CheckGCHeartbeat fails while the server does not serve because its GC
-// heartbeat is stale, for a health probe. It does no I/O.
+// CheckGCHeartbeat fails while the GC heartbeat is stale. It does no I/O.
 func (s *GCPServer) CheckGCHeartbeat(context.Context) error {
 	return s.gcHooks.checkHeartbeat()
 }
@@ -368,7 +329,6 @@ func (g *gcHooks) expired(loaded uint32) bool {
 	return g.cacheTTL > 0 && loaded != 0 && cacheNow()-loaded >= g.cacheTTL
 }
 
-// lookupHeader returns the cached header of key unless it has expired.
 func (s *GCPServer) lookupHeader(key entities.Hash) (CachedHeader, bool) {
 	h, ok := s.headers[key[0]].Get(key)
 	if ok && s.gcHooks.expired(h.Loaded) {
@@ -378,13 +338,9 @@ func (s *GCPServer) lookupHeader(key entities.Hash) (CachedHeader, bool) {
 	return h, ok
 }
 
-// storeHeader caches hdr, read from Bigtable by a read that started at
-// loaded on the cacheNow clock, so that the entry ages from the start of the
-// read. With GC it replaces an expired entry and keeps the touch mark of the
-// entry it replaces when that touch is of the current period; without GC it
-// keeps an existing entry. touched tells that the object got a touch of its
-// own after loaded, the edges of a new object or the touch of a rescue, so
-// that a hit in the period of loaded queues none.
+// storeHeader ages the entry from loaded, the start of the read. touched means
+// the object got its own touch after loaded, by new edges or a rescue, so a
+// hit in that period queues none.
 func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32, touched bool) CachedHeader {
 	h := newCachedHeader(hdr)
 	h.Loaded = loaded
@@ -404,7 +360,6 @@ func (s *GCPServer) storeHeader(hdr *ObjectHeader, loaded uint32, touched bool) 
 	return h
 }
 
-// lookupContent returns the cached content of key unless it has expired.
 func (s *GCPServer) lookupContent(key entities.Hash) (*ObjectContent, bool) {
 	c, ok := s.content[key[0]].Get(key)
 	if ok && s.gcHooks.expired(c.loaded) {
@@ -414,7 +369,6 @@ func (s *GCPServer) lookupContent(key entities.Hash) (*ObjectContent, bool) {
 	return c.content, ok
 }
 
-// storeContent caches content; see storeHeader.
 func (s *GCPServer) storeContent(key entities.Hash, content *ObjectContent, loaded uint32) {
 	entry := contentEntry{content: content, loaded: loaded}
 	if !s.gcHooks.on {
@@ -424,22 +378,18 @@ func (s *GCPServer) storeContent(key entities.Hash, content *ObjectContent, load
 	s.content[key[0]].Add(key, entry)
 }
 
-// forget removes key from the caches.
 func (s *GCPServer) forget(key entities.Hash) {
 	s.headers[key[0]].Remove(key)
 	s.content[key[0]].Remove(key)
 }
 
-// forgetMissing removes key, which a read found missing, from the caches, so
-// that an expired entry is not kept. Without GC entries do not expire.
+// forgetMissing drops an expired entry; without GC entries do not expire.
 func (s *GCPServer) forgetMissing(key entities.Hash) {
 	if s.gcHooks.on {
 		s.forget(key)
 	}
 }
 
-// getObjectDataGC is getObjectData with GC on. A read touches the object, from
-// the cache or not, as any other call that finds it.
 func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (CachedHeader, *ObjectContent, error) {
 	cachedHdr, hdrOk := s.lookupHeader(key)
 	content, contentOk := s.lookupContent(key)
@@ -469,9 +419,7 @@ func (s *GCPServer) getObjectDataGC(ctx context.Context, key entities.Hash) (Cac
 	return cachedHdr, content, nil
 }
 
-// rescueCondemned rescues hdr if the collector condemned it and reports
-// whether it did. It returns casdb.ErrNotFound when the collector deleted the
-// object first.
+// rescueCondemned returns casdb.ErrNotFound when the collector deleted hdr.
 func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *ObjectHeader) (bool, error) {
 	if hdr.Condemned == nil || s.gcHooks.rescue == nil {
 		return false, nil
@@ -486,8 +434,6 @@ func (s *GCPServer) rescueCondemned(ctx context.Context, path rescuePath, hdr *O
 	return err == nil, err
 }
 
-// rescueOne rescues hdr, which the collector condemned, and counts the result.
-// The log lines name the request req of the call.
 func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, req string, hdr *ObjectHeader) error {
 	g := &s.gcHooks
 	condemned := hdr.Condemned
@@ -507,13 +453,8 @@ func (s *GCPServer) rescueOne(ctx context.Context, path rescuePath, req string, 
 	return nil
 }
 
-// rescueHeaders rescues the condemned objects of hdrs and returns hdrs without
-// the ones the collector deleted first, and the keys it rescued. A batch can
-// hold many condemned objects, for example a keep-alive touch right after a
-// cycle condemned what the mount holds, so the rescues run in parallel. A
-// failed rescue does not stop the others: the call fails with the first error
-// once all have run, so a retry finds only the objects whose rescue failed
-// still condemned.
+// rescueHeaders runs every rescue even after a failure, so that a retry finds
+// only the failed ones still condemned.
 func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*ObjectHeader) ([]*ObjectHeader, map[entities.Hash]bool, error) {
 	if s.gcHooks.rescue == nil {
 		return hdrs, nil, nil
@@ -567,35 +508,25 @@ func (s *GCPServer) rescueHeaders(ctx context.Context, path rescuePath, hdrs []*
 	return live, keys, nil
 }
 
-// touchMark returns the CachedHeader.Touched value of a touch period. The
-// value repeats every 255 periods, never zero.
+// touchMark repeats every 255 periods and is never zero.
 func touchMark(period uint64) uint8 {
 	return uint8(period%255) + 1
 }
 
-// touchPeriod returns the touch period of the object key at now. Periods are
-// --gc-touch-interval long and counted from the process start, shifted by an
-// offset taken from the key, so that the periods of different objects end at
-// different times and their next touches do not all queue at once.
+// touchPeriod shifts the periods by an offset from the key, so that the next
+// touches of different objects do not all queue at once.
 func (g *gcHooks) touchPeriod(key entities.Hash, now uint32) uint64 {
 	interval := uint64(g.touchInterval)
 	offset := uint64(binary.BigEndian.Uint32(key[len(key)-4:])) % interval
 	return (uint64(now) + offset) / interval
 }
 
-// touchedThisPeriod reports whether this server touched the object key, whose
-// entry is h, in the current touch period. A touch is never older than the
-// load of its entry, so for entries loaded less than 255 periods ago the mark
-// cannot have wrapped.
+// The mark cannot have wrapped for entries loaded less than 255 periods ago.
 func (g *gcHooks) touchedThisPeriod(key entities.Hash, h CachedHeader, now uint32) bool {
 	period := g.touchPeriod(key, now)
 	return h.Touched != 0 && period-g.touchPeriod(key, h.Loaded) < 255 && h.Touched == touchMark(period)
 }
 
-// touchHit touches the object key, which the call path found, unless this
-// server touched it in the current touch period. So an object that is used
-// keeps a touch younger than the touch interval, and each server writes at
-// most one touch per object and period.
 func (s *GCPServer) touchHit(path rescuePath, key entities.Hash, h CachedHeader) {
 	g := &s.gcHooks
 	if g.toucher == nil {
@@ -608,8 +539,7 @@ func (s *GCPServer) touchHit(path rescuePath, key entities.Hash, h CachedHeader)
 	if !g.touch(path, key) {
 		return
 	}
-	// A concurrent forget can be undone here; the entry keeps its load time,
-	// so the TTL still bounds it.
+	// A concurrent forget can be undone here; the TTL still bounds the entry.
 	shard := s.headers[key[0]]
 	if cur, ok := shard.Peek(key); ok && cur.Loaded == h.Loaded {
 		cur.Touched = touchMark(g.touchPeriod(key, now))
@@ -622,10 +552,8 @@ func (s *GCPServer) touchHit(path rescuePath, key entities.Hash, h CachedHeader)
 	}
 }
 
-// touch queues a touch of key. Headers and MapResults, the calls of the client
-// keep-alive and of builds, wait for room in a full buffer, so that a burst of
-// them slows down instead of losing touches. The other calls do not wait, so
-// that reads and uploads do not slow down when the abfsgc table does.
+// The keep-alive and build calls wait for buffer room, so a burst slows down
+// instead of losing touches; other calls do not wait.
 func (g *gcHooks) touch(path rescuePath, key entities.Hash) bool {
 	if path == pathHeaders || path == pathMapResults {
 		return g.toucher.TouchObject(key)
@@ -633,9 +561,6 @@ func (g *gcHooks) touch(path rescuePath, key entities.Hash) bool {
 	return g.toucher.TryTouchObject(key)
 }
 
-// touchMapRow rewrites the cell of the map row from#to, so that its timestamp
-// is the last use, unless this replica did so within the touch interval. A
-// touch the toucher dropped is tried again on the next use.
 func (s *GCPServer) touchMapRow(from, to entities.Hash) {
 	g := &s.gcHooks
 	if g.toucher == nil {
@@ -652,9 +577,7 @@ func (s *GCPServer) touchMapRow(from, to entities.Hash) {
 	}
 }
 
-// liveMapResults returns the results of from whose objects exist, and touches
-// their map rows. The collector removes results nobody used for a while, and a
-// client cannot use a result whose object is gone.
+// liveMapResults drops results whose object is gone; a client cannot use them.
 func (s *GCPServer) liveMapResults(ctx context.Context, from entities.Hash, results []entities.Hash) ([]entities.Hash, error) {
 	if len(results) == 0 {
 		return results, nil
@@ -675,8 +598,6 @@ func (s *GCPServer) liveMapResults(ctx context.Context, from entities.Hash, resu
 	return live, nil
 }
 
-// missingChunkReader reads the content of the object key and handles a chunk
-// that is missing when it is read.
 type missingChunkReader struct {
 	io.ReadCloser
 	ctx     context.Context
@@ -694,10 +615,8 @@ func (r *missingChunkReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// chunkMissing handles a chunk of the object key that was missing while its
-// content, described by content, was read. When the collector deleted the
-// object during the read, the object no longer exists. When the row still
-// lists the chunk, the chunk is lost, which is not a missing object.
+// chunkMissing reports a missing object only when the row is gone; a chunk the
+// row still lists is lost, not missing.
 func (s *GCPServer) chunkMissing(ctx context.Context, key entities.Hash, content string, chunkErr error) error {
 	s.forget(key)
 	_, current, err := s.casdb.GetObjectData(ctx, key)
@@ -714,9 +633,7 @@ func (s *GCPServer) chunkMissing(ctx context.Context, key entities.Hash, content
 	}
 }
 
-// startHeartbeat writes the first heartbeat of this server, retrying for up
-// to firstHeartbeatTimeout while ctx lives, so that the server has a row
-// before it serves, and then one every interval until stopGCHooks.
+// startHeartbeat writes the first heartbeat before the server serves.
 func (s *GCPServer) startHeartbeat(ctx context.Context, interval time.Duration) error {
 	g := &s.gcHooks
 	log.Printf("GC server ID %s, heartbeat every %s", g.server.ID, interval)
@@ -738,8 +655,7 @@ func (s *GCPServer) startHeartbeat(ctx context.Context, interval time.Duration) 
 		}
 	}
 	g.heartbeatStale = seconds(2*interval + heartbeatTimeout)
-	// The later heartbeats run until stopGCHooks, not until ctx ends, so that
-	// a server that drains its calls after a stop signal keeps its row fresh.
+	// Not tied to ctx, so that a server draining its calls keeps its row fresh.
 	loop, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -762,7 +678,6 @@ func (s *GCPServer) startHeartbeat(ctx context.Context, interval time.Duration) 
 	return nil
 }
 
-// heartbeat writes one heartbeat of this server.
 func (s *GCPServer) heartbeat(ctx context.Context) error {
 	g := &s.gcHooks
 	start := cacheNow()
@@ -776,8 +691,7 @@ func (s *GCPServer) heartbeat(ctx context.Context) error {
 		log.Printf("Warning: the wall clock advanced more than the monotonic clock by over %s since the last GC heartbeat; recording the pause as a touch loss", maxPause)
 		g.pausePending = true
 	}
-	// A late touch leaves the toucher's slots only after its loss is
-	// counted, so the slots are read first.
+	// Read the slots first: a late touch leaves them after its loss is counted.
 	late := g.touchesLate()
 	losses, mapRowLosses := g.losses(), g.mapRowLosses()
 	err := writeServer(hctx, s.casdb.SpannerClient(), &g.server, g.pausePending || late || losses > g.reportedLosses, mapRowLosses > g.reportedMapRowLosses)

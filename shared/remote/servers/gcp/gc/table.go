@@ -30,10 +30,8 @@ import (
 	"github.com/google/abfs/shared/objects"
 )
 
-// The table abfsgc has one row per object, keyed like the objects table. The
-// family e holds the edges, the family t the last touch. The family abfsgc of the
-// objects table holds the condemn marker. Package casdb keeps its own copy of
-// the names of the objects table, since it cannot import this package.
+// Package casdb cannot import this package and keeps its own copy of the
+// names of the objects table.
 const (
 	TableName         = "abfsgc"
 	EdgesFamily       = "e"
@@ -56,9 +54,6 @@ type EdgeWriter struct {
 	budget    writeBudget
 }
 
-// NewEdgeWriter returns an EdgeWriter for the table abfsgc of client's instance.
-// Its writes run under the caller's context; a server bounds them from the
-// link validation of the call.
 func NewEdgeWriter(client *bigtable.Client) *EdgeWriter {
 	table := client.Open(TableName)
 	return &EdgeWriter{
@@ -69,8 +64,6 @@ func NewEdgeWriter(client *bigtable.Client) *EdgeWriter {
 	}
 }
 
-// Put writes the gc row of the object key of type typ, decoded as obj (nil for
-// a blob).
 func (w *EdgeWriter) Put(ctx context.Context, key Hash, typ string, obj objects.Object) error {
 	edges, malformed, err := Edges(typ, obj)
 	if err != nil {
@@ -84,15 +77,12 @@ func (w *EdgeWriter) Put(ctx context.Context, key Hash, typ string, obj objects.
 
 // Write writes the gc row of the object key of type typ with the given edges.
 func (w *EdgeWriter) Write(ctx context.Context, key Hash, typ string, edges []Hash) error {
-	// The server sets the timestamps, so that the cell timestamp of e:links is
-	// the first write time on one clock for all replicas.
+	// Server timestamps put the first write times of all replicas on one clock.
 	return w.write(ctx, key, typ, edges, bigtable.ServerTime, false)
 }
 
-// WriteAt writes the gc row of an object that already exists with the time of
-// its object row, so that the row records when the object was written, not
-// when its edges were. It replaces the edges of an older row, whose cells can
-// be newer than that time.
+// WriteAt writes the gc row of an existing object with the time of its object
+// row, replacing older edges, whose cells can be newer than that time.
 func (w *EdgeWriter) WriteAt(ctx context.Context, key Hash, typ string, edges []Hash, written bigtable.Timestamp) error {
 	return w.write(ctx, key, typ, edges, written, true)
 }
@@ -105,12 +95,8 @@ func (w *EdgeWriter) write(ctx context.Context, key Hash, typ string, edges []Ha
 	mut.Set(EdgesFamily, LinksColumn, ts, PackEdges(edges))
 	mut.Set(EdgesFamily, TypeColumn, ts, []byte(typ))
 	mut.Set(EdgesFamily, VersionColumn, ts, versionBytes(ExtractorVersion))
-	// The write is retried here: the client library does not retry mutations
-	// with server timestamps, because a retry after a lost response writes the
-	// cells again with a later timestamp. For a gc row that is harmless: the
-	// newest cell wins and the first write time moves later, which only keeps
-	// the object longer. A row written with a given time is the same after a
-	// retry.
+	// The library does not retry server-timestamp mutations. A retry here only
+	// moves the first write time later, which keeps the object longer.
 	row := key.String()
 	if err := retryWith(ctx, w.retryWait, w.budget, func(actx context.Context) error { return w.apply(actx, row, mut) }); err != nil {
 		return fmt.Errorf("failed to write the gc row of %s: %v", key, err) //nolint:errorlint // a missing table must not reach the client as a missing object
@@ -118,12 +104,7 @@ func (w *EdgeWriter) write(ctx context.Context, key Hash, typ string, edges []Ha
 	return nil
 }
 
-// retryable reports whether err of a call made under ctx, or under an attempt
-// context derived from it, is transient. Bigtable and Cloud Storage over gRPC
-// answer a throttled call with ResourceExhausted. An attempt that reached its
-// deadline is, while ctx lives: the library returns either a DeadlineExceeded
-// status or the plain context error, depending on where the attempt was when
-// it ended.
+// retryable reports whether err is transient; an attempt deadline is while ctx lives.
 func retryable(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
@@ -148,13 +129,11 @@ type Row struct {
 	Type    string
 	Version int64
 	Edges   []Hash
-	// Written is the time the edges were written, the first write time of the
-	// object.
+	// Written is the first write time of the object.
 	Written time.Time
 }
 
-// ParseRow parses a row of the table abfsgc read with the newest cell of each
-// column. A column that is missing keeps its zero value.
+// ParseRow parses a gc row read with the newest cell of each column.
 func ParseRow(row bigtable.Row) (*Row, error) {
 	if !entities.IsHash(row.Key()) {
 		return nil, fmt.Errorf("invalid gc row key %q", row.Key())

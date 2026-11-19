@@ -39,83 +39,49 @@ import (
 
 const (
 	DefaultChunkRate = 500
-	// chunkRecordWorkers is the number of delete records the chunk step works
-	// on at once. The records are independent; the calls in flight of all of
-	// them are bounded by the delete workers.
+	// chunkRecordWorkers bounds the records; DeleteWorkers bounds the calls.
 	chunkRecordWorkers = 16
-	// chunksDoneMetadata flags a delete record whose chunks are deleted,
-	// and gcRowsDoneMetadata one whose gc rows of objects without a row are
-	// deleted, with the cycle that deleted them.
 	chunksDoneMetadata = "chunks-done"
 	gcRowsDoneMetadata = "gc-rows-done"
 	// gcRowPassDelay is how long after its record the step repeats the gc
-	// row deletes of its objects without a row, which a delete step that
-	// stopped between the objects row and the gc row leaves. The chunks wait
-	// for the undo window.
-	gcRowPassDelay = 15 * time.Minute
-	// The depots of the server: the chunks table keeps a row per chunk,
-	// named by the chunk ID, and the bucket an object.
+	// row deletes that a stopped delete step left.
+	gcRowPassDelay  = 15 * time.Minute
 	chunksTableName = "chunks"
 	bigtableDepot   = "bigtable"
 	bucketDepot     = "bucket"
 )
 
-// ChunkStepReport reports the chunk step of a delete cycle, which deletes the
-// chunks of the objects that the delete records of earlier cycles name.
+// ChunkStepReport reports the chunk step of a delete cycle.
 type ChunkStepReport struct {
-	// Skipped lists the reasons why the step deleted no chunks, and
-	// RecordsSkipped counts the records past the undo window it skipped for
-	// them. ListFailed reports that the step could not list the records.
-	Skipped        []string `json:"skipped,omitempty"`
-	RecordsSkipped int64    `json:"records_skipped"`
-	ListFailed     bool     `json:"list_failed,omitempty"`
-	// Records counts the records the step read for their chunks and
-	// RecordsDone those it flagged. RecordsWaiting counts the records younger
-	// than the undo window, RecordsGCRowsDone those whose gc rows the step
-	// finished before that, and RecordErrors those that could not be read.
-	Records           int64 `json:"records"`
-	RecordsDone       int64 `json:"records_done"`
-	RecordsWaiting    int64 `json:"records_waiting"`
-	RecordsGCRowsDone int64 `json:"records_gc_rows_done"`
-	RecordErrors      int64 `json:"record_errors,omitempty"`
-	// Unflagged counts the records older than the undo window and a day left
-	// without the flag after the step, which are never pruned, and
-	// OldestUnflaggedSeconds the age of the oldest.
+	Skipped           []string `json:"skipped,omitempty"`
+	RecordsSkipped    int64    `json:"records_skipped"`
+	ListFailed        bool     `json:"list_failed,omitempty"`
+	Records           int64    `json:"records"`
+	RecordsDone       int64    `json:"records_done"`
+	RecordsWaiting    int64    `json:"records_waiting"`
+	RecordsGCRowsDone int64    `json:"records_gc_rows_done"`
+	RecordErrors      int64    `json:"record_errors,omitempty"`
+	// Unflagged counts records past the undo window and a day still without
+	// the flag; they are never pruned.
 	Unflagged              int64   `json:"unflagged"`
 	OldestUnflaggedSeconds float64 `json:"oldest_unflagged_seconds,omitempty"`
-	// Keys counts the objects of the records read. KeptRowPresent still have
-	// their row with the recorded chunks, which stay; RePutAfterDelete have a
-	// row written again with other chunks, and RowAbsent no row, and lose
-	// the recorded chunks.
-	Keys             int64 `json:"keys"`
-	KeptRowPresent   int64 `json:"kept_row_present"`
-	RePutAfterDelete int64 `json:"reput_after_delete"`
-	RowAbsent        int64 `json:"row_absent"`
-	// ChunkRowsDeleted and BucketObjectsDeleted count the chunks deleted and
-	// ChunksGone those already gone. RestoredAfterRecord counts the chunks
-	// written or changed after their record, as by an undo, which stay.
-	// DeleteRefused counts the bucket deletes the bucket refused, as for an
-	// object hold, and UnknownDepot the chunks of a depot the step does not
-	// know; both leave their record without the flag.
-	ChunkRowsDeleted     int64 `json:"chunk_rows_deleted"`
-	BucketObjectsDeleted int64 `json:"bucket_objects_deleted"`
-	ChunksGone           int64 `json:"chunks_gone"`
-	RestoredAfterRecord  int64 `json:"restored_after_record"`
-	DeleteRefused        int64 `json:"delete_refused"`
-	UnknownDepot         int64 `json:"unknown_depot,omitempty"`
-	// GCRowsDeleted counts the gc rows of objects without a row that the
-	// delete step left, deleted now, and GCRowsKept those of objects
-	// written again since the grace start of the record.
-	GCRowsDeleted int64 `json:"gc_rows_deleted"`
-	GCRowsKept    int64 `json:"gc_rows_kept"`
-	// Errors counts the reads and deletes that failed, the first in
-	// ErrorSample; each leaves its record without the flag.
-	Errors      int64   `json:"errors"`
-	ErrorSample string  `json:"error_sample,omitempty"`
-	Seconds     float64 `json:"seconds"`
+	Keys                   int64   `json:"keys"`
+	KeptRowPresent         int64   `json:"kept_row_present"`
+	RePutAfterDelete       int64   `json:"reput_after_delete"`
+	RowAbsent              int64   `json:"row_absent"`
+	ChunkRowsDeleted       int64   `json:"chunk_rows_deleted"`
+	BucketObjectsDeleted   int64   `json:"bucket_objects_deleted"`
+	ChunksGone             int64   `json:"chunks_gone"`
+	RestoredAfterRecord    int64   `json:"restored_after_record"`
+	DeleteRefused          int64   `json:"delete_refused"`
+	UnknownDepot           int64   `json:"unknown_depot,omitempty"`
+	GCRowsDeleted          int64   `json:"gc_rows_deleted"`
+	GCRowsKept             int64   `json:"gc_rows_kept"`
+	Errors                 int64   `json:"errors"`
+	ErrorSample            string  `json:"error_sample,omitempty"`
+	Seconds                float64 `json:"seconds"`
 }
 
-// chunkStep is one chunk step.
 type chunkStep struct {
 	d       *deleter
 	cycle   int64
@@ -125,20 +91,14 @@ type chunkStep struct {
 	objects *bigtable.Table
 	chunks  *bigtable.Table
 	gcTable *bigtable.Table
-	// calls bounds the keys worked on at once over all records.
-	calls chan struct{}
+	calls   chan struct{}
 	// mu guards the counts of rep.
 	mu sync.Mutex
 }
 
-// deleteChunks is the chunk step: it deletes the chunks of the objects that
-// the delete records of earlier cycles name, from the records created at
-// least the undo window ago that carry no flag yet, and flags each record
-// whose keys are all done. A key whose row is present keeps its chunks.
-// Before that, from gcRowPassDelay on, it repeats the gc row deletes of the
-// objects without a row, also while the bucket settings stop the chunk
-// deletes. The step fails only when the lease or the run ends; any other
-// failure leaves a record without the flag, to try again in the next cycle.
+// deleteChunks deletes the chunks named by delete records past the undo
+// window and flags each finished record. It fails only when the lease or the
+// run ends; any other failure leaves the record for the next cycle.
 func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 	start := time.Now()
 	s := &chunkStep{
@@ -202,7 +162,6 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 		log.Printf("Warning: GC cycle %d deletes no chunks: %s", cycle, reason)
 	}
 	for _, attrs := range unflagged {
-		// Every record waits the undo window for its flag.
 		age := wallNow().Sub(attrs.Created)
 		if done[attrs.Name] || age < undoWindow+24*time.Hour {
 			continue
@@ -215,9 +174,6 @@ func (d *deleter) deleteChunks(ctx context.Context, cycle int64) error {
 	return nil
 }
 
-// preconditions returns why the step must not delete chunks: settings of the
-// bucket that would keep a deleted chunk or refuse its delete. It fails only
-// when the run ends.
 func (s *chunkStep) preconditions(ctx context.Context) ([]string, error) {
 	var attrs *storage.BucketAttrs
 	err := retryWith(ctx, firstRetryWait, s.reads, func(actx context.Context) error {
@@ -234,8 +190,6 @@ func (s *chunkStep) preconditions(ctx context.Context) ([]string, error) {
 	return bucketProblems(attrs), nil
 }
 
-// bucketProblems returns the settings of a bucket with attrs under which the
-// chunk step must not delete bucket chunks.
 func bucketProblems(attrs *storage.BucketAttrs) []string {
 	var reasons []string
 	if attrs.VersioningEnabled {
@@ -247,13 +201,10 @@ func bucketProblems(attrs *storage.BucketAttrs) []string {
 	if attrs.DefaultEventBasedHold {
 		reasons = append(reasons, "the bucket puts an event-based hold on each new object, which refuses its delete")
 	}
-	// The gRPC API does not report object retention; a delete that an
-	// object's retention refuses counts in DeleteRefused.
 	return reasons
 }
 
-// listRecords returns the delete records of the state without the flag,
-// oldest first, and counts them.
+// listRecords returns the unflagged delete records, oldest first.
 func (s *chunkStep) listRecords(ctx context.Context) ([]*storage.ObjectAttrs, error) {
 	prefix := recordPrefixOf(s.d.opts.StateName)
 	var records []*storage.ObjectAttrs
@@ -274,8 +225,6 @@ func (s *chunkStep) listRecords(ctx context.Context) ([]*storage.ObjectAttrs, er
 	return records, nil
 }
 
-// gcRows repeats the gc row deletes of the objects of one record whose row is
-// absent, and flags the record when every one is done.
 func (s *chunkStep) gcRows(ctx context.Context, attrs *storage.ObjectAttrs) error {
 	h, entries, err := readRecordKeys(ctx, s.d.bucket, attrs.Name)
 	if err != nil {
@@ -330,9 +279,7 @@ func (s *chunkStep) gcRows(ctx context.Context, attrs *storage.ObjectAttrs) erro
 	return nil
 }
 
-// record deletes the chunks of the objects of one record, and repeats the gc
-// row deletes unless an earlier step finished them, and flags it when every
-// key is done. It reports whether it flagged the record.
+// record reports whether it flagged the record.
 func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (bool, error) {
 	h, entries, err := readRecord(ctx, s.d.bucket, attrs.Name)
 	if err != nil {
@@ -398,7 +345,6 @@ func (s *chunkStep) record(ctx context.Context, attrs *storage.ObjectAttrs) (boo
 	return true, nil
 }
 
-// acquire takes one of the calls in flight, unless ctx ends first.
 func (s *chunkStep) acquire(ctx context.Context) bool {
 	select {
 	case s.calls <- struct{}{}:
@@ -408,7 +354,6 @@ func (s *chunkStep) acquire(ctx context.Context) bool {
 	}
 }
 
-// flag sets the metadata key of the record to the cycle.
 func (s *chunkStep) flag(ctx context.Context, attrs *storage.ObjectAttrs, key string) error {
 	metadata := maps.Clone(attrs.Metadata)
 	if metadata == nil {
@@ -421,16 +366,13 @@ func (s *chunkStep) flag(ctx context.Context, attrs *storage.ObjectAttrs, key st
 	})
 }
 
-// recordedChunk is a chunk of a content descriptor.
 type recordedChunk struct {
 	Depot string `json:"depot"`
 	ID    string `json:"id"`
 }
 
-// key deletes the recorded chunks of the object e, whose row the step read
-// as st, unless the row still holds them, and, with gcRowDelete, repeats the
-// gc row delete of an object without a row. It reports whether the key is
-// done, and fails only when the step must stop.
+// key deletes the recorded chunks of e unless its row still holds them. It
+// reports whether the key is done.
 func (s *chunkStep) key(ctx context.Context, e *recordEntry, st rowState, recordCreated time.Time, chunkRowDelete, gcRowDelete *bigtable.Mutation) (bool, error) {
 	var recorded, current []recordedChunk
 	content := e.content()
@@ -441,9 +383,8 @@ func (s *chunkStep) key(ctx context.Context, e *recordEntry, st rowState, record
 		}
 	}
 	if st.present {
-		// A descriptor that does not parse or is empty keeps the chunks: only
-		// a row written again with other chunks proves that the delete
-		// happened.
+		// Only a row written again with other chunks proves the delete
+		// happened; anything else keeps the chunks.
 		if len(recorded) == 0 || len(st.content) == 0 || bytes.Equal(st.content, content) || json.Unmarshal(st.content, &current) != nil {
 			s.count(&s.rep.KeptRowPresent)
 			return true, nil
@@ -470,10 +411,8 @@ func (s *chunkStep) key(ctx context.Context, e *recordEntry, st rowState, record
 	return done && ok, err
 }
 
-// gcRow deletes the gc row of an object without a row with gcRowDelete: the
-// delete step may have stopped between the objects row and the gc row. A
-// key written again since has a newer e:links cell and keeps it. It reports
-// whether the row is done, and fails only when the step must stop.
+// gcRow deletes the gc row of an object without a row; a key written again
+// since has a newer e:links cell and keeps it.
 func (s *chunkStep) gcRow(ctx context.Context, row string, gcRowDelete *bigtable.Mutation) (bool, error) {
 	kept, _, err := condApply(ctx, s.d.budget, s.gcTable, row, gcRowDelete)
 	switch {
@@ -491,9 +430,6 @@ func (s *chunkStep) gcRow(ctx context.Context, row string, gcRowDelete *bigtable
 	return true, nil
 }
 
-// chunk deletes the chunk c of a record created at recordCreated unless it
-// was written after it. It reports whether the chunk is done, and fails only
-// when the step must stop.
 func (s *chunkStep) chunk(ctx context.Context, c recordedChunk, recordCreated time.Time, chunkRowDelete *bigtable.Mutation) (bool, error) {
 	switch c.Depot {
 	case inlineDepot:
@@ -523,7 +459,6 @@ func (s *chunkStep) chunk(ctx context.Context, c recordedChunk, recordCreated ti
 	return false, nil
 }
 
-// bucketOutcome is the outcome of a conditional delete of a bucket chunk.
 type bucketOutcome int
 
 const (
@@ -534,10 +469,8 @@ const (
 	bucketFailed
 )
 
-// bucketChunk deletes the bucket object id unless it was written, restored
-// or kept by an undo at or after recordCreated, or is held, under the
-// generation and metageneration it read, so that an object restored or
-// changed in between stays.
+// bucketChunk deletes the bucket object id under the generation and
+// metageneration it read, so an object restored or changed in between stays.
 func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated time.Time) (bool, error) {
 	obj := s.d.bucket.Object(id)
 	attrs, err := s.chunkAttrs(ctx, obj)
@@ -573,11 +506,8 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 	case bucketGone:
 		s.count(&s.rep.ChunksGone)
 	case bucketPreconditionFailed:
-		// Only a new generation, as of a restore from soft delete, or the
-		// mark of an undo keeps the chunk for good. Any other change, such
-		// as a hold placed in between, or the same generation and
-		// metageneration, as an object hold may answer, is a refusal, and a
-		// later step reads the chunk again.
+		// Only a new generation or an undo mark keeps the chunk for good;
+		// anything else, such as a hold, is a refusal retried later.
 		now, err := s.chunkAttrs(ctx, obj)
 		switch {
 		case errors.Is(err, storage.ErrObjectNotExist):
@@ -604,7 +534,6 @@ func (s *chunkStep) bucketChunk(ctx context.Context, id string, recordCreated ti
 	return true, nil
 }
 
-// chunkAttrs reads the attributes of the bucket chunk obj.
 func (s *chunkStep) chunkAttrs(ctx context.Context, obj *storage.ObjectHandle) (*storage.ObjectAttrs, error) {
 	var attrs *storage.ObjectAttrs
 	err := retryWith(ctx, firstRetryWait, s.reads, func(actx context.Context) error {
@@ -615,11 +544,8 @@ func (s *chunkStep) chunkAttrs(ctx context.Context, obj *storage.ObjectHandle) (
 	return attrs, err
 }
 
-// restoredSince reports whether the bucket chunk with attrs was written or
-// restored from soft delete, which gives it a new creation time, or kept by
-// an undo, at or after recordCreated. An undo marks each chunk it keeps,
-// after the record. A change of the metadata alone, as when a hold is placed
-// or released, is no restore.
+// restoredSince reports whether the chunk was written, restored or kept by an
+// undo at or after recordCreated. A metadata change alone is no restore.
 func restoredSince(attrs *storage.ObjectAttrs, recordCreated time.Time) bool {
 	if !attrs.Created.Before(recordCreated) {
 		return true
@@ -628,19 +554,12 @@ func restoredSince(attrs *storage.ObjectAttrs, recordCreated time.Time) bool {
 	return undone && !attrs.Updated.Before(recordCreated)
 }
 
-// held reports whether the object with attrs refuses a delete at now: it has
-// a hold, or a retention that has not expired.
 func held(attrs *storage.ObjectAttrs, now time.Time) bool {
 	return attrs.EventBasedHold || attrs.TemporaryHold ||
 		(attrs.Retention != nil && attrs.Retention.RetainUntil.After(now)) ||
 		attrs.RetentionExpirationTime.After(now)
 }
 
-// bucketDeleteOutcome classifies the error of a conditional delete of a
-// bucket chunk. A failed precondition means the object got a new generation
-// or metageneration since it was read, as by a restore from soft delete, or
-// may be the answer to an object hold; a refusal comes from an object hold
-// or a retention policy.
 func bucketDeleteOutcome(err error) bucketOutcome {
 	var gerr *googleapi.Error
 	switch {
@@ -656,7 +575,6 @@ func bucketDeleteOutcome(err error) bucketOutcome {
 	return bucketFailed
 }
 
-// stops reports whether err of a write under ctx must stop the step.
 func stops(ctx context.Context, err error) bool {
 	return errors.Is(err, errLeaseExpiring) || (err != nil && ctx.Err() != nil)
 }

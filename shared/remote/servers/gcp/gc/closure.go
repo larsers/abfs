@@ -18,67 +18,41 @@ import (
 	"slices"
 )
 
-// keyOutcome is what the delete step did with a candidate, or why it did not
-// try it.
+// keyOutcome is what the delete step did with a candidate.
 type keyOutcome uint8
 
 const (
-	// outcomePending is a candidate the step tries.
 	outcomePending keyOutcome = iota
 	outcomeDeleted
-	// outcomeNotMatched is a key whose marker was no longer the one the
-	// scan read: a server rescued it.
 	outcomeNotMatched
-	// outcomeGone is a key whose row was gone before its delete.
 	outcomeGone
-	// outcomeUnknown is a key whose delete or read failed; the step reads it
-	// again at its end.
 	outcomeUnknown
 	outcomeTypeNotAllowed
-	// outcomeBlocked is a key with a parent that was not deleted.
 	outcomeBlocked
-	// outcomeUnplaced is a key on a cycle of edges, which content hashes
-	// cannot form.
 	outcomeUnplaced
-	// outcomeNotSent is a key of a level the step did not reach because a
-	// worker failed.
 	outcomeNotSent
 )
 
-// deletePlan is the plan of the delete step of a cycle. Its candidates are
-// the nodes that the mark found unreachable and whose objects row the
-// consistency scan read with a marker of a list whose hold has ended. A
-// candidate is deleted only after every parent of it in the graph that has
-// an objects row was deleted earlier in the step, so that no object that is
-// still read links a deleted one. A parent that is not live and not a
-// candidate, such as one written or rescued after the marker of its child,
-// blocks the child until its own marker is eligible. The levels order the
-// candidates so that each comes after all its candidate parents, and the map
-// rows that name a candidate come before all of them, since a map lookup
+// deletePlan is the plan of the delete step of a cycle. A candidate goes only
+// after all its parents with an objects row, so no object still read links a
+// deleted one; map rows naming a candidate go first, since a map lookup
 // returns the result without reading the request.
 type deletePlan struct {
 	g *graph
-	// cands are the candidate nodes in key order, with the sizes of their
-	// objects and the numbers of their markers in values; isCand holds them
-	// by node.
+	// cands are in key order.
 	cands   []uint32
 	sizes   []int64
 	markers []uint32
 	values  [][]byte
 	isCand  bitmap
-	// levels[l] lists the candidates of level l, in key order; level 0 is
-	// the map rows, so levels[0] is empty.
-	levels [][]int32
-	// outcome is the state of each candidate. The plan sets the keys the
-	// step must not try; the step records the others.
+	// levels[0] is the map rows, so it is empty.
+	levels  [][]int32
 	outcome []keyOutcome
 	mapRows []plannedMapRow
 	report  *DeletePlanReport
 }
 
-// plannedMapRow is a row of the table maps that the delete step removes
-// before the objects: a row that names a candidate, or an eval row past the
-// map retention whose ends stay or whose result has no gc row.
+// plannedMapRow is a maps row the delete step removes before the objects.
 type plannedMapRow struct {
 	key      string
 	from, to uint32
@@ -88,39 +62,23 @@ type plannedMapRow struct {
 // DeletePlanReport reports what a delete cycle would remove, if every map
 // row delete and every conditional object delete matched.
 type DeletePlanReport struct {
-	// Lists reports the hold of each list whose marker an unreachable object
-	// holds.
 	Lists []ListHoldReport `json:"lists,omitempty"`
-	// Held counts the unreachable objects whose marker has a complete record
-	// whose hold has not ended, and Unrecorded those whose marker has none,
-	// which a condemn writes again.
-	Held       int64 `json:"held"`
-	Unrecorded int64 `json:"unrecorded"`
-	// Candidates counts the unreachable objects whose marker is eligible;
-	// WouldDelete those the step would try, with their size.
-	Candidates       int64                     `json:"candidates"`
-	WouldDelete      int64                     `json:"would_delete"`
-	WouldDeleteBytes int64                     `json:"would_delete_bytes"`
-	Types            map[string]*PlanTypeCount `json:"types,omitempty"`
-	// Levels is the number of object levels.
-	Levels int `json:"levels"`
-	// MapRows counts the map rows that name a candidate and go first,
-	// ExpiredEvalMapRows the eval rows past the map retention whose ends
-	// stay, and MapRowsKeptForTypes the rows naming a candidate with an end
-	// of a type the cycle may not delete, which keep their candidate ends.
-	MapRows             int64 `json:"map_rows"`
-	ExpiredEvalMapRows  int64 `json:"expired_eval_map_rows"`
-	MapRowsKeptForTypes int64 `json:"map_rows_kept_for_types,omitempty"`
-	// TypeNotAllowed counts candidates of types the cycle may not delete.
-	TypeNotAllowed int64 `json:"type_not_allowed,omitempty"`
-	// BlockedByNoncandidateParent counts candidates with a parent that is
-	// unreachable, has an objects row and is not a candidate, each once: a
-	// parent marked after the child, which holds it until its own marker is
-	// eligible. BlockedSamples lists such edges as "parent>child".
+	// Unrecorded counts unreachable objects whose marker has no record.
+	Held                int64                     `json:"held"`
+	Unrecorded          int64                     `json:"unrecorded"`
+	Candidates          int64                     `json:"candidates"`
+	WouldDelete         int64                     `json:"would_delete"`
+	WouldDeleteBytes    int64                     `json:"would_delete_bytes"`
+	Types               map[string]*PlanTypeCount `json:"types,omitempty"`
+	Levels              int                       `json:"levels"`
+	MapRows             int64                     `json:"map_rows"`
+	ExpiredEvalMapRows  int64                     `json:"expired_eval_map_rows"`
+	MapRowsKeptForTypes int64                     `json:"map_rows_kept_for_types,omitempty"`
+	TypeNotAllowed      int64                     `json:"type_not_allowed,omitempty"`
+	// BlockedSamples lists edges as "parent>child".
 	BlockedByNoncandidateParent int64    `json:"blocked_by_noncandidate_parent"`
 	BlockedSamples              []string `json:"blocked_samples,omitempty"`
-	// Blocked counts candidates below a key the step would not try.
-	Blocked int64 `json:"blocked"`
+	Blocked                     int64    `json:"blocked"`
 	// Unplaced counts candidates on a cycle of edges, which are kept.
 	Unplaced int64 `json:"unplaced,omitempty"`
 }
@@ -132,11 +90,8 @@ type PlanTypeCount struct {
 	WouldDeleteBytes int64 `json:"would_delete_bytes"`
 }
 
-// planDeletes plans the delete step in the mark of res, for the types allows
-// accepts: its candidates are the unreachable nodes whose marker eligible
-// holds by its number, and holds reports the lists. Eval map rows whose
-// newest cell is older than evalAfter, in microseconds, are past the map
-// retention.
+// planDeletes plans the delete step for the types allows accepts. evalAfter
+// is in microseconds.
 func planDeletes(res *Result, eligible []bool, holds []ListHoldReport, evalAfter int64, allows func(string) bool) *deletePlan {
 	g := res.graph
 	p := &deletePlan{g: g, isCand: newBitmap(g.size()), values: res.markers, report: &DeletePlanReport{Lists: holds, Types: make(map[string]*PlanTypeCount)}}
@@ -202,7 +157,6 @@ func planDeletes(res *Result, eligible []bool, holds []ListHoldReport, evalAfter
 	return p
 }
 
-// index returns the candidate index of node id, or -1.
 func (p *deletePlan) index(id uint32) int {
 	if id == noNode || !p.isCand.has(id) {
 		return -1
@@ -211,8 +165,6 @@ func (p *deletePlan) index(id uint32) int {
 	return i
 }
 
-// children calls f for the candidate index of each edge of candidate i to a
-// candidate.
 func (p *deletePlan) children(i int, f func(j int)) {
 	for _, e := range p.g.edges(p.cands[i]) {
 		if j := p.index(e); j >= 0 {
@@ -221,9 +173,8 @@ func (p *deletePlan) children(i int, f func(j int)) {
 	}
 }
 
-// fail marks every candidate child of the candidate i blocked, so that no
-// key is tried whose parent was not deleted. A blocked key is itself failed
-// when its level ends.
+// fail blocks every candidate child of i, so no key is tried whose parent was
+// not deleted.
 func (p *deletePlan) fail(i int) {
 	p.children(i, func(j int) {
 		if p.outcome[j] == outcomePending {
@@ -232,9 +183,7 @@ func (p *deletePlan) fail(i int) {
 	})
 }
 
-// layer puts each candidate one level below its deepest candidate parent, by
-// Kahn's layering over the edges between candidates; a candidate without one
-// is on level 1. A candidate on a cycle is never placed and is kept.
+// layer puts each candidate one level below its deepest candidate parent.
 func (p *deletePlan) layer() {
 	indeg := make([]int32, len(p.cands))
 	for i := range p.cands {
@@ -269,8 +218,7 @@ func (p *deletePlan) layer() {
 }
 
 // blockNoncandidateParents blocks every candidate with a parent that is not
-// live, not a candidate and has an objects row: the proof that every such
-// parent is a candidate failed for it, so it stays.
+// live, not a candidate and has an objects row.
 func (p *deletePlan) blockNoncandidateParents(res *Result) {
 	rep := p.report
 	counted := newBitmap(p.g.size())
@@ -296,13 +244,9 @@ func (p *deletePlan) blockNoncandidateParents(res *Result) {
 	}
 }
 
-// planMapRows selects the map rows that name a candidate and the eval rows
-// past the map retention whose request is live and whose result is live or
-// has no gc row. A row goes only when the
-// cycle may delete the types of both its ends; an end without a node has no
-// type and allows it. So a cycle limited to some types drops no cached result
-// of the others. A row that names a candidate and stays for its types keeps
-// its candidate ends, as a kept row does in the step.
+// planMapRows selects the map rows that name a candidate and the expired eval
+// rows. A row goes only when the cycle may delete the types of both its ends,
+// and a kept row that names a candidate keeps its candidate ends.
 func (p *deletePlan) planMapRows(res *Result, evalAfter int64, allows func(string) bool) {
 	g, rep := p.g, p.report
 	allowed := func(id uint32) bool {
@@ -337,8 +281,6 @@ func (p *deletePlan) planMapRows(res *Result, evalAfter int64, allows func(strin
 	}
 }
 
-// blockAllowed blocks node id if it is a candidate the step would try and of
-// a type allows accepts; a candidate of another type is never tried.
 func (p *deletePlan) blockAllowed(id uint32, allows func(string) bool) {
 	if j := p.index(id); j >= 0 && p.outcome[j] == outcomePending && allows(typeNames[p.g.types[id]]) {
 		p.outcome[j] = outcomeBlocked

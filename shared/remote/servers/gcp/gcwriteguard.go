@@ -30,17 +30,14 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// writeGuard bounds the writes that record a reference after its links were
-// validated by gc.ValidationWriteBound from the start of the validation. A
-// condemn marker that lands after a validation read the object can be
-// followed by a delete only once the collector can count on every such write
-// having landed. Without GC it does nothing.
+// writeGuard bounds the writes that record a reference to
+// gc.ValidationWriteBound from the start of its link validation, so the
+// collector can count on them having landed before it deletes.
 type writeGuard struct {
 	on    bool
 	start uint32
 }
 
-// validationGuard returns the guard of a validation that starts now.
 func (s *GCPServer) validationGuard() writeGuard {
 	if !s.gcHooks.on {
 		return writeGuard{}
@@ -48,18 +45,13 @@ func (s *GCPServer) validationGuard() writeGuard {
 	return writeGuard{on: true, start: cacheNow()}
 }
 
-// boundPassed reports whether gc.ValidationWriteBound has passed since start
-// at now, both on the cacheNow clock. That clock counts whole seconds, so one
-// second is kept back.
+// The cacheNow clock counts whole seconds, so one second is kept back.
 func boundPassed(start, now uint32) bool {
 	return now >= start && now-start >= uint32(gc.ValidationWriteBound/time.Second)-1
 }
 
-// writeBound is the bound of a guarded write that the interceptors of the
-// server's Bigtable and Spanner connections check before each attempt, the
-// retries of the client libraries included. A suspend of the machine stops the
-// context deadline of the write, not the cacheNow clock. passed records that
-// an interceptor refused an attempt.
+// writeBound is checked by the client interceptors before each attempt,
+// retries included: a suspend stops the context deadline, not cacheNow.
 type writeBound struct {
 	start  uint32
 	passed atomic.Bool
@@ -67,10 +59,8 @@ type writeBound struct {
 
 type writeBoundKey struct{}
 
-// do runs the write f under a context that ends with the bound and carries it
-// for the interceptors. It fails with Unavailable, without calling f, once the
-// bound has passed, and when an interceptor refused an attempt of f: the
-// client sends the call again, which validates again.
+// do fails with Unavailable once the bound has passed, so that the client
+// sends the call again, which validates again.
 func (w writeGuard) do(ctx context.Context, f func(ctx context.Context) error) error {
 	if !w.on {
 		return f(ctx)
@@ -93,9 +83,8 @@ func (w writeGuard) do(ctx context.Context, f func(ctx context.Context) error) e
 	return err
 }
 
-// checkWriteBound fails when ctx carries a write bound that has passed. It
-// runs in the interceptors of the client libraries, which read the gRPC code:
-// it is one they do not retry, so the write ends at once.
+// checkWriteBound returns a code the client libraries do not retry, so the
+// write ends at once.
 func checkWriteBound(ctx context.Context) error {
 	b, ok := ctx.Value(writeBoundKey{}).(*writeBound)
 	if !ok || !boundPassed(b.start, cacheNow()) {
@@ -105,8 +94,6 @@ func checkWriteBound(ctx context.Context) error {
 	return status.Error(codes.FailedPrecondition, "the GC write bound of the call has passed")
 }
 
-// writeBoundUnary and writeBoundStream are the interceptors of the write
-// bound on the connections of the server's clients.
 func writeBoundUnary(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 	if err := checkWriteBound(ctx); err != nil {
 		return err
@@ -121,15 +108,11 @@ func writeBoundStream(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.Clien
 	return streamer(ctx, desc, cc, method, opts...)
 }
 
-// answerTimer is the start of a call that may answer that objects are
-// present, on the cacheNow clock and on the wall clock.
 type answerTimer struct {
 	start uint32
 	wall  time.Time
 }
 
-// startAnswer returns the start of a call that may answer present; zero
-// unless the server bounds its answers.
 func (g *gcHooks) startAnswer() answerTimer {
 	if !g.answerBound {
 		return answerTimer{}
@@ -137,11 +120,8 @@ func (g *gcHooks) startAnswer() answerTimer {
 	return answerTimer{start: cacheNow(), wall: time.Now()}
 }
 
-// checkAnswer records the time the call of path took and fails with
-// Unavailable when gc.ValidationWriteBound or more has passed since its start:
-// a present answer rests on information whose use the collector bounds from
-// the start of the call, and a suspend of the machine can stall a call for
-// longer.
+// checkAnswer fails once gc.ValidationWriteBound has passed since the start:
+// the collector bounds the use of a present answer from the start of the call.
 func (g *gcHooks) checkAnswer(ctx context.Context, path rescuePath, a answerTimer) error {
 	if a.start == 0 {
 		return nil

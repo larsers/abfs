@@ -23,28 +23,18 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// maxPause is the largest gap between the growth of the wall clock and of the
-// monotonic clock between two heartbeats that is not taken for a pause of the
-// process. Shorter pauses are within the clock skew margin of the collector.
+// maxPause is within the clock skew margin of the collector.
 const maxPause = 10 * time.Second
 
-// stopFreeClock counts the seconds since its epoch on a clock that does not
-// stop while the process is suspended: the monotonic time since the epoch plus
-// the largest lead of the wall clock over it seen so far. The monotonic clock
-// stops in a suspend on some systems, the wall clock does not. A backward step
-// of the wall clock neither moves the count back nor stops it, and a forward
-// step that is undone later leaves the count ahead, which only makes cache
-// entries expire early. Where the system has a boot clock, which counts
-// suspends and is never stepped, the wall clock counts as at least the boot
-// clock, so a suspend shows even when a step of the wall clock undid it
-// before any read.
+// stopFreeClock counts seconds on a clock that keeps running while the process
+// is suspended: monotonic time plus the largest lead of the wall (or boot)
+// clock seen. Wall clock steps only move it ahead, expiring cache entries early.
 type stopFreeClock struct {
 	epoch time.Time
 	// boot is the boot clock at the epoch, when hasBoot.
 	boot    time.Duration
 	hasBoot bool
-	// lead is the largest lead of the wall clock over the monotonic clock,
-	// in nanoseconds.
+	// lead is the largest lead of wall over monotonic time, in nanoseconds.
 	lead atomic.Int64
 	last atomic.Uint32
 }
@@ -55,8 +45,6 @@ func newStopFreeClock() *stopFreeClock {
 	return c
 }
 
-// elapsed returns the monotonic and the wall-clock time since the epoch, the
-// latter at least the boot clock time since the epoch.
 func (c *stopFreeClock) elapsed() (mono, wall time.Duration) {
 	now := time.Now()
 	mono, wall = now.Sub(c.epoch), now.Round(0).Sub(c.epoch.Round(0))
@@ -68,8 +56,6 @@ func (c *stopFreeClock) elapsed() (mono, wall time.Duration) {
 	return mono, wall
 }
 
-// maxLead records the lead of wall over mono and returns the largest lead
-// seen so far.
 func (c *stopFreeClock) maxLead(mono, wall time.Duration) time.Duration {
 	v := int64(wall - mono)
 	for {
@@ -80,8 +66,7 @@ func (c *stopFreeClock) maxLead(mono, wall time.Duration) time.Duration {
 	}
 }
 
-// seconds returns the count for the given times since the epoch, plus one so
-// that zero means unset, and never less than a count it returned before.
+// seconds is one-based, so that zero means unset, and never goes back.
 func (c *stopFreeClock) seconds(mono, wall time.Duration) uint32 {
 	v := uint32(max(mono+c.maxLead(mono, wall), 0)/time.Second) + 1
 	for {
@@ -95,52 +80,41 @@ func (c *stopFreeClock) seconds(mono, wall time.Duration) uint32 {
 	}
 }
 
-// cacheClock gives cache entries their load and touch times, and the
-// heartbeat its pause check. Tests replace cacheClock, cacheNow and
-// clockElapsed.
+// Tests replace these.
 var (
 	cacheClock   = newStopFreeClock()
 	clockElapsed = cacheClock.elapsed
 	cacheNow     = func() uint32 { return cacheClock.seconds(clockElapsed()) }
 )
 
-// pausedSince reports whether the process was paused since the last call of
-// pausedSince.
 func (g *gcHooks) pausedSince() bool {
 	mono, wall := clockElapsed()
 	return g.pause.check(cacheClock.maxLead(mono, wall))
 }
 
-// pauseDetector tells from the growth of the largest lead of the wall clock
-// over the monotonic clock between two calls of check whether the process was
-// paused in between, for example while its VM was suspended. The largest lead
-// keeps a pause that a backward step of the wall clock undid before the check.
+// pauseDetector detects a pause, such as a VM suspend, from the growth of the
+// largest wall-clock lead between calls of check.
 type pauseDetector struct {
 	started bool
 	lead    time.Duration
 }
 
-// check records the largest lead and reports a pause since the last call.
 func (p *pauseDetector) check(lead time.Duration) bool {
 	paused := p.started && lead-p.lead > maxPause
 	p.started, p.lead = true, lead
 	return paused
 }
 
-// heartbeatLate records start, the start of a heartbeat attempt, and reports
-// whether the last attempt started more than the heartbeat interval plus the
-// touch drain bound before it. The process was then frozen or starved for
-// longer than the drain bound, with the monotonic clock running, and touches
-// may land later than the collector allows.
+// heartbeatLate reports a gap since the last attempt longer than the interval
+// plus the drain bound: touches may then land later than the collector allows.
 func (g *gcHooks) heartbeatLate(start uint32) bool {
 	last := g.lastAttempt
 	g.lastAttempt = start
 	return last != 0 && start > last && time.Duration(start-last)*time.Second > g.server.HeartbeatInterval+gc.TouchDrainBound
 }
 
-// checkReadAge fails with Unavailable when a read that started at start on
-// the cacheNow clock took the cache TTL or longer, because what it read may
-// be older than the collector allows a server to use.
+// checkReadAge fails a read that took the cache TTL or longer: what it read
+// may be older than the collector allows a server to use.
 func (g *gcHooks) checkReadAge(start uint32) error {
 	if g.on && g.cacheTTL > 0 {
 		if now := cacheNow(); now >= start && now-start >= g.cacheTTL {

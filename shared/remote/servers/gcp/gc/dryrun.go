@@ -40,12 +40,9 @@ const (
 	DefaultLongestPush    = 3 * time.Hour
 	DefaultScanShards     = 16
 
-	// DefaultSnapshotRetention keeps a workspace snapshot as long as a build.
 	DefaultSnapshotRetention = 720 * time.Hour
 
-	// minMountIdle is the shortest mount idle time: four times the interval
-	// at which clients with the GC keep-alive rewrite their mount ref, so
-	// that a live mount does not lose its ref between two rewrites.
+	// minMountIdle keeps the ref of a live mount between two rewrites.
 	minMountIdle = 4 * instance.GCKeepAliveRefInterval
 )
 
@@ -54,39 +51,22 @@ type DryRunOpts struct {
 	// Grace keeps every object written or touched within it before the
 	// snapshot, and everything such an object reaches.
 	Grace time.Duration
-	// MountIdle is how long a mount ref stays a root after its last write.
-	// An ended mount ref, one with an unmount ref, keeps only its mount
-	// details and goes earlier when its unmount ref passes BuildRetention.
-	MountIdle time.Duration
-	// BuildRetention is how long build, build-start and unmount refs stay
-	// roots after their last write. An ended mount ref goes with its unmount
-	// ref.
-	BuildRetention time.Duration
-	// SnapshotRetention is how long a snapshot ref stays a root after its
-	// last write.
+	// MountIdle, BuildRetention, SnapshotRetention and MapRetention are how
+	// long the refs and map rows stay roots after their last write or use.
+	MountIdle         time.Duration
+	BuildRetention    time.Duration
 	SnapshotRetention time.Duration
-	// MapRetention is how long an eval map row stays a root after its last
-	// write or use.
-	MapRetention time.Duration
-	// LongestPush is the longest push or build upload. Grace must cover it
-	// and the largest cache TTL of the servers (see graceProblem).
-	LongestPush time.Duration
-	// Consistency checks that every object has a gc row, which reads the
-	// meta family of every object row. The command always sets it; tests
-	// turn it off.
-	Consistency bool
-	// Shards is the number of key ranges scanned in parallel.
-	Shards int
-	// LeaseDuration is the lease the run holds and renews.
+	MapRetention      time.Duration
+	LongestPush       time.Duration
+	// Consistency reads the meta family of every object row; tests turn it off.
+	Consistency   bool
+	Shards        int
 	LeaseDuration time.Duration
-	// WriteDeadline is the deadline of one attempt of a Bigtable write call
-	// of the run; a streamed Cloud Storage object gets it plus its size at
-	// 8 MiB/s. Two attempts must fit into a quarter of the lease, the margin
-	// at which the run stops.
+	// WriteDeadline bounds one attempt of a Bigtable write. Two attempts must
+	// fit into a quarter of the lease, the margin at which the run stops.
 	WriteDeadline time.Duration
-	// Holder names this process in the lease; empty uses DefaultHolder.
-	Holder string
-	// StateName is the AbfsGcState row; empty uses DefaultStateName.
+	// Holder and StateName default to DefaultHolder and DefaultStateName.
+	Holder    string
 	StateName string
 	// Explain lists keys whose state and first root the report explains.
 	Explain []Hash
@@ -108,9 +88,7 @@ func DefaultDryRunOpts() DryRunOpts {
 	}
 }
 
-// Validate checks the options. The grace must be longer than the longest
-// push; the cycle checks it against the cache TTL of the servers too (see
-// graceProblem).
+// Validate checks the options.
 func (o *DryRunOpts) Validate() error {
 	for _, d := range []struct {
 		name  string
@@ -145,45 +123,34 @@ func (o *DryRunOpts) Validate() error {
 
 // Report is the result of a dry run.
 type Report struct {
-	Cycle        int64     `json:"cycle"`
-	Phase        string    `json:"phase"`
-	Holder       string    `json:"holder"`
-	StartTime    time.Time `json:"start_time"`
-	SnapshotTime time.Time `json:"snapshot_time"`
-	Settings     Settings  `json:"settings"`
-	// Refs counts the refs per class at the snapshot.
-	Refs map[RefClass]*RefCounts `json:"refs"`
-	// RefsToTombstone counts the refs past their retention.
-	RefsToTombstone int64       `json:"refs_to_tombstone"`
-	LiveMounts      MountCounts `json:"live_mounts"`
-	// Workspaces reports the pinned manifests of the mounts that the
-	// workspace snapshots were taken from, and Snapshots those of the
-	// snapshots that snapshot refs name.
-	Workspaces MountCounts `json:"workspaces"`
-	Snapshots  MountCounts `json:"snapshots"`
-	// Replicas reports the server replicas and their settings.
-	Replicas ReplicaReport `json:"replicas"`
-	// AppProfile reports the Bigtable app profile of the command, which the
-	// command checks before the cycle.
-	AppProfile *ProfileReport `json:"app_profile,omitempty"`
+	Cycle           int64                   `json:"cycle"`
+	Phase           string                  `json:"phase"`
+	Holder          string                  `json:"holder"`
+	StartTime       time.Time               `json:"start_time"`
+	SnapshotTime    time.Time               `json:"snapshot_time"`
+	Settings        Settings                `json:"settings"`
+	Refs            map[RefClass]*RefCounts `json:"refs"`
+	RefsToTombstone int64                   `json:"refs_to_tombstone"`
+	LiveMounts      MountCounts             `json:"live_mounts"`
+	Workspaces      MountCounts             `json:"workspaces"`
+	Snapshots       MountCounts             `json:"snapshots"`
+	Replicas        ReplicaReport           `json:"replicas"`
+	AppProfile      *ProfileReport          `json:"app_profile,omitempty"`
 	// Roots counts the roots per class; a root without a gc row is dangling.
-	Roots       map[string]*RootCounts  `json:"roots"`
-	Objects     ObjectCounts            `json:"objects"`
-	Types       map[string]*TypeReport  `json:"types"`
-	Edges       EdgeCounts              `json:"edges"`
-	Maps        map[MapClass]*MapCounts `json:"maps"`
-	Consistency ConsistencyReport       `json:"consistency"`
-	// Condemn reports the condemn step of a condemn cycle, and PreviousList
-	// what it found of the keys of the list before.
-	Condemn      *CondemnReport      `json:"condemn,omitempty"`
-	PreviousList *PreviousListReport `json:"previous_list,omitempty"`
-	// Delete reports the delete step of a delete cycle, and in the other
-	// modes what one would delete.
-	Delete *DeleteReport `json:"delete,omitempty"`
-	// Explain explains the keys of DryRunOpts.Explain.
-	Explain []KeyReport  `json:"explain,omitempty"`
-	Memory  MemoryReport `json:"memory"`
-	Seconds Timings      `json:"seconds"`
+	Roots        map[string]*RootCounts  `json:"roots"`
+	Objects      ObjectCounts            `json:"objects"`
+	Types        map[string]*TypeReport  `json:"types"`
+	Edges        EdgeCounts              `json:"edges"`
+	Maps         map[MapClass]*MapCounts `json:"maps"`
+	Consistency  ConsistencyReport       `json:"consistency"`
+	Condemn      *CondemnReport          `json:"condemn,omitempty"`
+	PreviousList *PreviousListReport     `json:"previous_list,omitempty"`
+	// Delete reports the delete step, and in the other modes what one would
+	// delete.
+	Delete  *DeleteReport `json:"delete,omitempty"`
+	Explain []KeyReport   `json:"explain,omitempty"`
+	Memory  MemoryReport  `json:"memory"`
+	Seconds Timings       `json:"seconds"`
 }
 
 // Settings records the options of the run.
@@ -194,8 +161,7 @@ type Settings struct {
 	SnapshotRetentionHours float64 `json:"snapshot_retention_hours"`
 	MapRetentionHours      float64 `json:"map_retention_hours"`
 	// CacheTTLHours is the largest cache TTL of the servers that may have
-	// run within the grace, which the grace check used; zero when no server
-	// recorded one.
+	// run within the grace.
 	CacheTTLHours    float64 `json:"cache_ttl_hours"`
 	LongestPushHours float64 `json:"longest_push_hours"`
 	Shards           int     `json:"shards"`
@@ -212,43 +178,35 @@ const (
 	RootPinnedRevisions = "pinned-revisions"
 	RootRecent          = "recent"
 	rootMapPrefix       = "map-"
-	// RootPermanent holds the empty file and the empty directory. Every server
-	// writes them at start and link validation needs them, but clients do not
-	// push them, so nothing may remove them.
+	// RootPermanent holds the empty file and directory, which link
+	// validation needs and clients do not push.
 	RootPermanent = "permanent"
 )
 
 // ObjectCounts counts the objects of the table abfsgc.
 type ObjectCounts struct {
-	// Rows counts the gc rows, one per object.
 	Rows        int64 `json:"rows"`
 	Reachable   int64 `json:"reachable"`
 	Unreachable int64 `json:"unreachable"`
-	// Recent counts objects written or touched within the grace.
-	Recent int64 `json:"recent"`
-	// TouchOnly counts rows with a touch and no edges, for objects that have
-	// no gc row yet.
+	Recent      int64 `json:"recent"`
+	// TouchOnly counts rows with a touch and no edges.
 	TouchOnly int64 `json:"touch_only"`
-	// OutdatedRows counts rows written by an older edge extractor than their
-	// type requires, which a backfill rewrites; NewerRows counts rows of a
-	// newer one.
+	// OutdatedRows counts rows of an older edge extractor, which a backfill
+	// rewrites; NewerRows counts rows of a newer one.
 	OutdatedRows int64 `json:"outdated_rows"`
 	NewerRows    int64 `json:"newer_rows"`
-	// ReachableBytes and UnreachableBytes sum the object sizes (meta:size),
-	// read by the consistency pass; without it they are not known.
+	// ReachableBytes and UnreachableBytes are nil without the consistency pass.
 	ReachableBytes   *int64 `json:"reachable_bytes,omitempty"`
 	UnreachableBytes *int64 `json:"unreachable_bytes,omitempty"`
 }
 
 // MemoryReport reports the memory of the run.
 type MemoryReport struct {
-	// PeakHeapBytes is the largest heap seen between the steps.
 	PeakHeapBytes uint64 `json:"peak_heap_bytes"`
-	// PeakSysBytes is the largest memory obtained from the system.
-	PeakSysBytes uint64 `json:"peak_sys_bytes"`
-	KeysBytes    int64  `json:"keys_bytes"`
-	EdgesBytes   int64  `json:"edges_bytes"`
-	MapRowsBytes int64  `json:"map_rows_bytes"`
+	PeakSysBytes  uint64 `json:"peak_sys_bytes"`
+	KeysBytes     int64  `json:"keys_bytes"`
+	EdgesBytes    int64  `json:"edges_bytes"`
+	MapRowsBytes  int64  `json:"map_rows_bytes"`
 }
 
 // Timings records the seconds each step took.
@@ -267,40 +225,24 @@ type Result struct {
 	Report *Report
 	graph  *graph
 	live   bitmap
-	// first holds the first root of each tracked node, resolved by roots.
-	first map[uint32]rootRef
-	roots *rootTable
+	first  map[uint32]rootRef
+	roots  *rootTable
 	// unreachable lists, in key order, the unreachable nodes that the
-	// consistency scan found an objects row for, with their markers, and
-	// marked the live nodes it found a marker for; markers are the values
-	// they number. tooNew is the check, in a delete cycle, of the objects
-	// that scan found without a gc row because they were written during it,
-	// and tooNewErr why it failed.
+	// consistency scan found an objects row for.
 	unreachable []sizedNode
 	marked      []sizedNode
 	markers     [][]byte
 	tooNew      *TooNewReport
 	tooNewErr   error
-	// seen holds the nodes that the consistency scan found an objects row
-	// for.
-	seen bitmap
-	// servers is the server evidence read at the start of the cycle, and
-	// holds the records of the condemned lists read after the lease was
-	// taken.
-	servers *serverEvidence
-	holds   *listHolds
-	// bounds are the key ranges of the scans, and maps the rows of the table
-	// maps.
-	bounds []string
-	maps   *mapScan
-	// plan is the plan of a delete, nil when there is none.
-	plan *deletePlan
-	// expiredRefs are the refs past their retention at the snapshot.
+	seen        bitmap
+	servers     *serverEvidence
+	holds       *listHolds
+	bounds      []string
+	maps        *mapScan
+	plan        *deletePlan
 	expiredRefs []expiredRef
 }
 
-// firstRoot returns the root whose walk first reached the tracked node id, or
-// nil when id is not tracked or not reachable.
 func (r *Result) firstRoot(id uint32) *Root {
 	ref, ok := r.first[id]
 	if !ok {
@@ -319,14 +261,8 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 	return r.live.has(id), true
 }
 
-// DryRun runs one garbage collection cycle that only reports: it takes the
-// lease, reads the roots at one snapshot, marks the objects of the table abfsgc
-// and counts what a collection would remove. It writes nothing but the
-// AbfsGcState row and deletes old AbfsGcServers rows. objs reads the workspace
-// snapshots, mount details and pinned manifests of live mounts and
-// workspaces. With the consistency check the report also counts what a
-// delete cycle would remove now, from the markers it read and the records of
-// the lists, or says in Report.Delete why it could not read the records.
+// DryRun runs one garbage collection cycle that only reports. It writes
+// nothing but the AbfsGcState row and deletes old AbfsGcServers rows.
 func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
@@ -335,9 +271,7 @@ func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs r
 	return runCycle(ctx, sp, bt, objs, &o, nil)
 }
 
-// runCycle runs one cycle: a dry run when c is nil, else a condemn cycle
-// whose steps c runs on the mark, under the same lease, and a delete cycle
-// when c has a deleter.
+// runCycle runs a dry run when c is nil, else a condemn or delete cycle.
 func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, o *DryRunOpts, c *condemner) (*Result, error) {
 	if o.Holder == "" {
 		o.Holder = DefaultHolder()
@@ -367,14 +301,12 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs
 	var res *Result
 	holds, err := readListHolds(runCtx, lease)
 	if err == nil && c != nil && spanner.ErrCode(holds.err) == codes.NotFound {
-		// The table is missing; its error names the init that creates it.
 		err = holds.err
 	}
 	if err == nil && c != nil {
 		err = c.readPrevious(runCtx, lease, d)
 	}
 	if err == nil {
-		// Only a plan needs the unreachable nodes of a dry run.
 		d.keepUnreachable = c != nil || holds.err == nil
 		res, err = d.run(runCtx)
 	}
@@ -400,23 +332,17 @@ func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs
 }
 
 type dryRun struct {
-	opts   *DryRunOpts
-	lease  *Lease
-	sp     *spanner.Client
-	bt     *bigtable.Client
-	objs   remote.RemoteProvider
-	start  time.Time
-	report *Report
-	// perType counts the edges per type index.
-	perType []int64
-	// outdated counts the outdated rows per type index.
-	outdated []int64
-	// tracked lists keys whose first root the mark records, besides those of
-	// the Explain option.
-	tracked []Hash
-	phase   string
-	// keepUnreachable keeps the unreachable objects that have an objects row,
-	// for a condemn.
+	opts            *DryRunOpts
+	lease           *Lease
+	sp              *spanner.Client
+	bt              *bigtable.Client
+	objs            remote.RemoteProvider
+	start           time.Time
+	report          *Report
+	perType         []int64
+	outdated        []int64
+	tracked         []Hash
+	phase           string
 	keepUnreachable bool
 }
 
@@ -464,9 +390,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	for _, w := range r.Replicas.Warnings {
 		log.Printf("Warning: %s", w)
 	}
-	// A row of AbfsGcServers is evidence for every delete whose window holds it,
-	// so it stays for the largest grace of any condemn or delete cycle, and
-	// for the time before the window in which a map row loss is reported.
+	// A row of AbfsGcServers is evidence for every delete whose window holds it.
 	keep := max(staleReplicaAge, max(d.lease.MaxGrace, o.Grace)+time.Hour+clientMapReuse+keepAlivePassAllowance)
 	if r.Replicas.ServersRemoved, err = pruneServers(ctx, d.sp, snapshot.Add(-keep)); err != nil {
 		return nil, err
@@ -524,9 +448,6 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	d.sampleMemory()
 
 	step = time.Now()
-	// The roots are walked one at a time in a fixed order of classes, so that
-	// a tracked node is attributed to the first root, in that order, that
-	// reaches it.
 	m := newMarker(g, g.size())
 	for _, keys := range [][]Hash{d.tracked, o.Explain} {
 		ids := make([]uint32, len(keys))
@@ -631,8 +552,7 @@ func (d *dryRun) root(class string) *RootCounts {
 	return c
 }
 
-// addRoot walks the root h of class, which ref names, and reports whether h
-// has a gc row.
+// addRoot reports whether h has a gc row.
 func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash, ref rootRef) bool {
 	c := d.root(class)
 	id := g.find(h)
@@ -647,13 +567,11 @@ func (d *dryRun) addRoot(m *marker, g *graph, class string, h Hash, ref rootRef)
 
 // TypeReport counts the objects and edges of one type.
 type TypeReport struct {
-	Objects     int64 `json:"objects"`
-	Reachable   int64 `json:"reachable"`
-	Unreachable int64 `json:"unreachable"`
-	Edges       int64 `json:"edges"`
-	// OutdatedRows counts the rows that a backfill rewrites.
-	OutdatedRows int64 `json:"outdated_rows"`
-	// UnreachableSample lists the first unreachable keys of the type.
+	Objects           int64    `json:"objects"`
+	Reachable         int64    `json:"reachable"`
+	Unreachable       int64    `json:"unreachable"`
+	Edges             int64    `json:"edges"`
+	OutdatedRows      int64    `json:"outdated_rows"`
 	UnreachableSample []string `json:"unreachable_sample,omitempty"`
 }
 

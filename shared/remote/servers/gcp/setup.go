@@ -28,8 +28,6 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 )
 
-// bigtableTables lists the Bigtable tables of the server and their column
-// families.
 var bigtableTables = []struct {
 	name     string
 	families []string
@@ -49,10 +47,8 @@ type SetupOpts struct {
 	GC bool
 }
 
-// Setup prepares existing Spanner and Bigtable instances and a bucket for the
-// server: it creates the database, the schema, the tables and the column
-// families that are missing, and checks that the bucket exists. It never deletes
-// data, so it can run again after an upgrade.
+// Setup creates what the server lacks in existing instances and checks the
+// bucket. It never deletes data, so it can run again after an upgrade.
 func Setup(ctx context.Context, opts *SetupOpts) error {
 	spannerDB := fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID)
 	if err := casdb.SetupSchema(ctx, spannerDB, opts.GC); err != nil {
@@ -103,7 +99,6 @@ func setupBigtable(ctx context.Context, project, instance string, gc bool) error
 	return nil
 }
 
-// checkBucket checks that the bucket exists and its objects can be listed.
 func checkBucket(ctx context.Context, bucketName string) error {
 	client, err := storage.NewGRPCClient(ctx, storage.WithDisabledClientMetrics())
 	if err != nil {
@@ -121,8 +116,6 @@ func checkBucketWith(ctx context.Context, client *storage.Client, bucketName str
 	return nil
 }
 
-// checkResources checks that the Spanner tables, the Bigtable tables and the
-// bucket the server needs exist and can be read.
 func (s *GCPServer) checkResources(ctx context.Context, bucketName string) error {
 	if err := s.casdb.CheckSchema(ctx); err != nil {
 		return err

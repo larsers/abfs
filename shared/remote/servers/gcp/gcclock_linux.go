@@ -20,8 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// bootClock returns CLOCK_BOOTTIME, which counts the time the system was
-// suspended and is never stepped. Tests replace it.
+// bootClock returns CLOCK_BOOTTIME. Tests replace it.
 var bootClock = func() (time.Duration, bool) {
 	var ts unix.Timespec
 	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {

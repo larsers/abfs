@@ -32,30 +32,22 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// A ref record is the JSON object abfsgc/refs/<state>/<cycle> in the server
-// bucket, written by a delete cycle before it removes the refs past their
-// retention, so that an operator can put a ref back while its target exists.
+// A ref record lists the refs a delete cycle removes, so they can be put back.
 const (
 	refRecordPrefix = "abfsgc/refs/"
 	refsTable       = "Refs"
-	// refRemovalBatch is the number of refs one transaction removes. It keeps
-	// each transaction short, because the refs it locks may be written by a
-	// server at the same time.
+	// refRemovalBatch keeps transactions short: servers may write the same refs.
 	refRemovalBatch = 500
 )
 
-// refRecordPrefixOf returns the prefix of the ref records of the garbage
-// collector state.
 func refRecordPrefixOf(state string) string {
 	return refRecordPrefix + state + "/"
 }
 
-// refRecordName returns the name of the ref record of cycle.
 func refRecordName(state string, cycle int64) string {
 	return refRecordPrefixOf(state) + strconv.FormatInt(cycle, 10)
 }
 
-// expiredRef is a ref past its retention at the snapshot, as read then.
 type expiredRef struct {
 	class              RefClass
 	projectID          int64
@@ -64,7 +56,6 @@ type expiredRef struct {
 	target             string
 }
 
-// refRecord is the content of a ref record.
 type refRecord struct {
 	Cycle    int64            `json:"cycle"`
 	Snapshot time.Time        `json:"snapshot"`
@@ -85,21 +76,16 @@ type refRecordEntry struct {
 // RefRemovalReport reports the removal of the refs past their retention.
 type RefRemovalReport struct {
 	// Record is the ref record of the cycle, written before any removal.
-	Record string `json:"record,omitempty"`
-	// Classes counts the refs of each class.
+	Record  string                         `json:"record,omitempty"`
 	Classes map[RefClass]*RefRemovalCounts `json:"classes,omitempty"`
 	// Error is why the removal stopped; the cycle then does not delete.
-	Error string `json:"error,omitempty"`
-	// RecordsRemoved counts the ref records of older cycles deleted.
-	RecordsRemoved int64 `json:"records_removed"`
+	Error          string `json:"error,omitempty"`
+	RecordsRemoved int64  `json:"records_removed"`
 }
 
 // RefRemovalCounts counts the removal of the refs of one class.
 type RefRemovalCounts struct {
-	// Recorded counts the refs of the record and Removed those removed.
-	// Changed counts the refs written again since the snapshot, which stay
-	// roots for the next cycle, and Gone those whose row was gone, removed by
-	// another writer or by an attempt whose answer was lost.
+	// Changed refs were written since the snapshot and stay; Gone refs had no row.
 	Recorded int64 `json:"recorded"`
 	Removed  int64 `json:"removed"`
 	Changed  int64 `json:"changed"`
@@ -118,21 +104,14 @@ func (r *RefRemovalReport) class(c RefClass) *RefRemovalCounts {
 	return n
 }
 
-// The outcomes of the removal of one ref.
 const (
 	refRemoved = iota + 1
 	refChanged
 	refGone
 )
 
-// removeExpiredRefs removes the refs that were past their retention at the
-// snapshot of the cycle: it records them first, then removes each one whose
-// update time and target are still the ones of the snapshot, in transactions
-// of refRemovalBatch refs. A ref written since the snapshot validated its
-// target and stays. The mark of the cycle did not count these refs as roots,
-// so the cycle condemns what only they reached, and the delete of that comes
-// one cycle later. It returns the first error; a ref removed before it stays
-// removed, and the next cycle tries the others again.
+// removeExpiredRefs records the expired refs, then removes each whose update
+// time and target are still those of the snapshot; a newer write keeps it.
 func (d *deleter) removeExpiredRefs(ctx context.Context, lease *Lease, res *Result) (*RefRemovalReport, error) {
 	r := res.Report
 	rep := &RefRemovalReport{}
@@ -187,10 +166,7 @@ func (d *deleter) removeExpiredRefs(ctx context.Context, lease *Lease, res *Resu
 	return rep, nil
 }
 
-// removeRefBatch removes the refs of batch whose update time and target are
-// the ones read at the snapshot, in one read-write transaction, each attempt
-// within the budget b. A retry is safe, because the transaction reads the
-// refs again. It returns the outcome of each ref.
+// removeRefBatch removes the unchanged refs of batch; a retry reads them again.
 func removeRefBatch(ctx context.Context, sp *spanner.Client, b writeBudget, batch []expiredRef) ([]int, error) {
 	type refKey struct {
 		projectID int64
@@ -243,9 +219,7 @@ func removeRefBatch(ctx context.Context, sp *spanner.Client, b writeBudget, batc
 	return outcomes, nil
 }
 
-// pruneRefRecords deletes the ref records of the state beyond the newest keep
-// cycles that are older than the record retention, and returns how many it
-// deleted, each delete within the budget b.
+// pruneRefRecords keeps the newest keep records and those within the retention.
 func pruneRefRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
 	prefix := refRecordPrefixOf(state)
 	byCycle := make(map[int64]*storage.ObjectAttrs)

@@ -28,61 +28,45 @@ import (
 	"cloud.google.com/go/storage"
 )
 
-// PreviousListReport reports the keys of the last published condemned list
-// in the mark of this cycle.
+// PreviousListReport reports how this mark found the keys of the last list.
 type PreviousListReport struct {
 	Location     string    `json:"location"`
 	Cycle        int64     `json:"cycle"`
 	SnapshotTime time.Time `json:"snapshot_time"`
-	// Complete tells that the cycle that wrote the list wrote all its
-	// markers.
-	Complete bool `json:"complete"`
-	// Error tells why the list could not be read.
-	Error string                       `json:"error,omitempty"`
-	Keys  int64                        `json:"keys"`
-	Types map[string]*PreviousListType `json:"types,omitempty"`
+	// Complete tells that the cycle that wrote the list wrote all its markers.
+	Complete bool                         `json:"complete"`
+	Error    string                       `json:"error,omitempty"`
+	Keys     int64                        `json:"keys"`
+	Types    map[string]*PreviousListType `json:"types,omitempty"`
 }
 
 // PreviousListType counts the keys of one type of the previous list.
 type PreviousListType struct {
-	Keys int64 `json:"keys"`
-	// StillUnreachable counts the keys this mark found unreachable.
+	Keys             int64 `json:"keys"`
 	StillUnreachable int64 `json:"still_unreachable"`
-	// Gone counts keys without a gc row now.
-	Gone int64 `json:"gone,omitempty"`
-	// Live counts the keys the mark found live, by the class of the root that
-	// reached them first, with up to maxSamples keys per class in Samples.
+	Gone             int64 `json:"gone,omitempty"`
+	// Live counts live keys by the class of their first root.
 	Live    map[string]int64    `json:"live,omitempty"`
 	Samples map[string][]string `json:"samples,omitempty"`
-	// Rescued counts live keys without a marker: a server cleared it on a
-	// read.
+	// Rescued counts live keys whose marker a server cleared on a read.
 	Rescued int64 `json:"rescued"`
 }
 
-// liveKey is a line of the live list: a key that this cycle found live with a
-// condemn marker, which it cleared.
+// liveKey is a line of the live list: a live key whose marker this cycle cleared.
 type liveKey struct {
-	Key  string `json:"key"`
-	Type string `json:"type"`
-	// Root is the root that reached the key first, known for the keys of the
-	// previous list.
-	Root *Root `json:"root,omitempty"`
-	// Marker is the cycle number of the marker this cycle cleared.
-	Marker int64 `json:"marker"`
+	Key    string `json:"key"`
+	Type   string `json:"type"`
+	Root   *Root  `json:"root,omitempty"`
+	Marker int64  `json:"marker"`
 }
 
-// previousList is the condemned list that AbfsGcState names at the start of a
-// cycle, for the report: its state, its keys, nil when it could not be read,
-// and why.
 type previousList struct {
 	state ListState
 	list  *condemnedList
 	err   string
 }
 
-// readPreviousList reads the condemned list that the state of the lease
-// names from bucket. A list that is gone or cannot be read is reported, not
-// an error: no rule reads it.
+// readPreviousList only reports a list it cannot read: no rule reads the list.
 func readPreviousList(ctx context.Context, lease *Lease, bucket *storage.BucketHandle) (previousList, error) {
 	state, err := lease.ReadList(ctx)
 	if err != nil || state.Location == "" {
@@ -105,8 +89,6 @@ func readPreviousList(ctx context.Context, lease *Lease, bucket *storage.BucketH
 	return prev, nil
 }
 
-// readPrevious reads the condemned list that AbfsGcState names, so that the mark
-// tracks the first roots of its keys. The list serves only the report.
 func (c *condemner) readPrevious(ctx context.Context, lease *Lease, d *dryRun) error {
 	var err error
 	if c.prev, err = readPreviousList(ctx, lease, c.bucket); err != nil {
@@ -118,8 +100,6 @@ func (c *condemner) readPrevious(ctx context.Context, lease *Lease, d *dryRun) e
 	return nil
 }
 
-// reportPrevious reports the keys of the previous list in the mark of res,
-// whose live keys with a marker are cleared.
 func (c *condemner) reportPrevious(res *Result, cleared bitmap) *PreviousListReport {
 	state := c.prev.state
 	if state.Location == "" {
@@ -157,8 +137,7 @@ func (c *condemner) reportPrevious(res *Result, cleared bitmap) *PreviousListRep
 		if len(t.Samples[class]) < maxSamples {
 			t.Samples[class] = append(t.Samples[class], k.String())
 		}
-		// Only a rescue clears a marker between two cycles. Markers of an
-		// incomplete list may never have been written.
+		// Only a rescue clears a marker between cycles; an incomplete list may lack markers.
 		if !cleared.has(id) && state.Complete {
 			t.Rescued++
 		}
@@ -166,11 +145,8 @@ func (c *condemner) reportPrevious(res *Result, cleared bitmap) *PreviousListRep
 	return rep
 }
 
-// clearMarked deletes the markers of the live keys that the consistency scan
-// read with one and writes every such key, with the root that keeps it when
-// known, to the live list of this cycle. It returns the nodes it cleared. A
-// delete never creates a row, and a live key is never a candidate, so the
-// clear races no delete.
+// clearMarked deletes the markers of live keys and writes them to the live list.
+// It races no delete: a delete never creates a row, a live key is no candidate.
 func (c *condemner) clearMarked(ctx context.Context, lease *Lease, res *Result, rep *CondemnReport) (bitmap, error) {
 	cleared := newBitmap(res.graph.size())
 	rows := make([]string, len(res.marked))
@@ -205,7 +181,6 @@ func (c *condemner) clearMarked(ctx context.Context, lease *Lease, res *Result, 
 	return cleared, nil
 }
 
-// clearMarkers deletes the condemn markers of rows, in batches.
 func (c *condemner) clearMarkers(ctx context.Context, rows []string) error {
 	table := c.bt.Open(objectsTable)
 	lim := newLimiter(c.opts.Rate)

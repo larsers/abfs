@@ -30,20 +30,12 @@ import (
 
 type Hash = entities.Hash
 
-// ExtractorVersion is the version of the GC rules a server follows. It is
-// stored with the edges of every object and in the heartbeat row of every
-// server, and the collector refuses to delete while a server of an older
-// version may have run. Bump it whenever the rules of Edges change, and raise
-// requiredVersion to it for the types whose edges changed, so that a backfill
-// rewrites only the rows of those types; bump it too when a server change
-// that the delete rule depends on changes, without raising requiredVersion.
-// Version 3 bounds the time from the start of a call to a present answer and
-// checks the write bound before each attempt.
+// ExtractorVersion is the version of the GC rules a server follows; the collector
+// refuses to delete while an older server may have run. Bump it when Edges or a
+// server rule the delete depends on changes, and raise requiredVersion for the
+// types whose edges changed.
 const ExtractorVersion = 3
 
-// requiredVersion returns the oldest extractor version whose edges of type typ
-// are still correct. Version 1 gave deep trees no edges to their nested deep
-// tree chunks.
 func requiredVersion(typ string) int64 {
 	if typ == string(gitobjects.ObjectTypeDeepTree) {
 		return 2
@@ -53,12 +45,9 @@ func requiredVersion(typ string) int64 {
 
 var errUnsupportedType = errors.New("unsupported object type")
 
-// Edges returns the GC edges of an object of type typ that objects.Factory
-// decoded as obj; obj is nil for a blob. The edges are the object's links with
-// the changes the collector needs, sorted, without zero or duplicate hashes.
-// Hash strings that are set but do not parse are skipped and counted in
-// malformed. An object type Edges does not know is an error, so that a new type
-// cannot lose its edges unnoticed.
+// Edges returns the sorted, unique GC edges of an object of type typ decoded as
+// obj (nil for a blob), and the count of hash strings that do not parse. An
+// unknown type is an error, so that a new type cannot lose its edges unnoticed.
 func Edges(typ string, obj objects.Object) (edges []Hash, malformed int, err error) {
 	if typ == string(entities.ObjectTypeBlob) {
 		return nil, 0, nil
@@ -70,23 +59,19 @@ func Edges(typ string, obj objects.Object) (edges []Hash, malformed int, err err
 	case *binding.BuildInfo:
 		edges, malformed = buildInfoEdges(o)
 	case *binding.BuildStart:
-		// PreviousBuild would chain every build to the one before it, and
-		// clients read it from a local file, never from the server.
+		// PreviousBuild is left out: clients read it locally, and it chains all builds.
 		edges, malformed = stringHashes(nil, o.MountDetails, o.RootBegin)
 	case *binding.EvalResponse:
 		edges = evalResponseEdges(o)
 	case *gitobjects.DeepTreeObject:
-		// Its other entries are trees and blobs of the source tree it was made
-		// from. A nested deep tree, usually the chunk of a large directory, may
-		// be named by no map row, so it can be reachable only from here.
+		// A nested deep tree may be named by no map row, so only this edge keeps it.
 		for _, ent := range o.Entries {
 			if ent.Mode == entities.FileModeDeepTree {
 				edges = append(edges, ent.Hash)
 			}
 		}
 	case *binding.DigestMap:
-		// The digests are blobs of the source tree; the sub-maps are reachable
-		// only from here.
+		// The sub-maps are reachable only from here.
 		edges = slices.Clone(o.DigestMaps)
 	case *gitobjects.Tree, *gitobjects.Commit, *gitobjects.Tag, *gitobjects.SymRefObject,
 		*objects.DeepTreeRequest, *binding.DigestMapRequest,
@@ -122,8 +107,7 @@ func buildInfoEdges(o *binding.BuildInfo) ([]Hash, int) {
 	return edges, malformed
 }
 
-// evalResponseEdges keeps the request and the outputs. ninjago compares the
-// hashes of the inputs in ReadPatch with local ones and never fetches them.
+// evalResponseEdges leaves out the ReadPatch inputs, which ninjago never fetches.
 func evalResponseEdges(o *binding.EvalResponse) []Hash {
 	edges := make([]Hash, 0, 1+len(o.WritePatch))
 	edges = append(edges, o.EvalRequest)
@@ -133,9 +117,6 @@ func evalResponseEdges(o *binding.EvalResponse) []Hash {
 	return edges
 }
 
-// stringHashes appends the hashes written as hexadecimal strings to edges. An
-// empty string or the zero hash means none; anything else that is not a hash
-// is counted in malformed.
 func stringHashes(edges []Hash, hashes ...string) (_ []Hash, malformed int) {
 	for _, s := range hashes {
 		if s == "" {
@@ -165,7 +146,6 @@ func PackEdges(edges []Hash) []byte {
 	return b
 }
 
-// UnpackEdges is the inverse of PackEdges.
 func UnpackEdges(b []byte) ([]Hash, error) {
 	if len(b)%entities.HashSize != 0 {
 		return nil, fmt.Errorf("invalid packed edges of %d bytes", len(b))

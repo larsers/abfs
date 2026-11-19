@@ -21,10 +21,7 @@ import (
 )
 
 const (
-	// liveReplicaAge bounds the time from the last heartbeat of a process to
-	// the end of its service: a server stops serving two heartbeat intervals
-	// and HeartbeatTimeout after its last successful heartbeat, at most
-	// 20.5 minutes. A process counts for the window of a cycle until then.
+	// liveReplicaAge caps serveLimit; the longest real limit is 20.5 minutes.
 	liveReplicaAge = 30 * time.Minute
 	// staleReplicaAge is the shortest time a row of AbfsGcServers is kept.
 	staleReplicaAge = 24 * time.Hour
@@ -32,35 +29,20 @@ const (
 
 // ReplicaReport reports the server processes seen in AbfsGcServers.
 type ReplicaReport struct {
-	// Live counts the rows of processes that did not record a stop and may
-	// still serve: their last heartbeat is within their serve limit (see
-	// serveLimit).
-	Live int64 `json:"live"`
-	// Stale counts the other rows that did not record a stop.
-	Stale int64 `json:"stale"`
-	// Stopped counts the rows of processes that recorded a stop. They are
-	// not checked here and stay.
+	// Live counts rows without a stop within their serve limit, Stale the others.
+	Live    int64 `json:"live"`
+	Stale   int64 `json:"stale"`
 	Stopped int64 `json:"stopped"`
-	// Hosts counts the distinct host names among the live rows, and
-	// RowsPerHost the live rows of each host. A host has more than one live
-	// row for a short time after a server restarted without recording its
-	// stop.
+	// Hosts counts the distinct hosts of the live rows.
 	Hosts       int64            `json:"hosts"`
 	RowsPerHost map[string]int64 `json:"rows_per_host,omitempty"`
-	// Warnings lists the live rows whose settings break the timing rules of
-	// the collector. A condemn mode would refuse to run with any of them.
-	Warnings []string `json:"warnings,omitempty"`
-	// ServersRemoved counts the rows of AbfsGcServers that the run deleted, those
-	// older than any grace a delete could still need them for.
-	ServersRemoved int64 `json:"servers_removed"`
-	// MapRowLossTime is the latest time a server recorded lost map row
-	// touches, from the time clients reuse map results and a keep-alive pass
-	// may take before the window start; nil when none did. It is reported,
-	// not checked.
+	// Warnings lists live rows that break the timing rules; condemn refuses them.
+	Warnings       []string `json:"warnings,omitempty"`
+	ServersRemoved int64    `json:"servers_removed"`
+	// MapRowLossTime is the latest time a server recorded lost map row touches.
 	MapRowLossTime *time.Time `json:"map_row_loss_time,omitempty"`
 }
 
-// replicaHost returns the host name of a replica ID made by NewReplicaID.
 func replicaHost(id string) string {
 	if i := strings.LastIndexByte(id, '-'); i > 0 {
 		return id[:i]
@@ -68,8 +50,6 @@ func replicaHost(id string) string {
 	return id
 }
 
-// serverReplicas returns the rows of AbfsGcServers that checkReplicas checks,
-// all but those of processes that recorded a stop, and how many it left out.
 func serverReplicas(servers []Server) ([]Server, int64) {
 	var replicas []Server
 	var stopped int64
@@ -83,9 +63,7 @@ func serverReplicas(servers []Server) ([]Server, int64) {
 	return replicas, stopped
 }
 
-// serveLimit returns how long after its last heartbeat the process of r may
-// still serve: two heartbeat intervals, HeartbeatTimeout and the clock skew
-// margin. A row with an interval out of range counts with the largest one.
+// serveLimit is how long after its last heartbeat the process of r may serve.
 func serveLimit(r *Server) time.Duration {
 	interval := r.HeartbeatInterval
 	if interval <= 0 || interval > MaxHeartbeatInterval {
@@ -94,10 +72,6 @@ func serveLimit(r *Server) time.Duration {
 	return min(2*interval+HeartbeatTimeout+clockSkewMargin, liveReplicaAge)
 }
 
-// checkReplicas checks the settings of the replicas that may still serve at
-// now, within their serve limit, against the timing rules of replicaProblems,
-// and counts their hosts. A process that stopped serving without recording
-// its stop, such as a crashed one, then no longer counts as a host.
 func checkReplicas(replicas []Server, now time.Time, o *DryRunOpts) ReplicaReport {
 	var rep ReplicaReport
 	for i := range replicas {
@@ -122,10 +96,6 @@ func checkReplicas(replicas []Server, now time.Time, o *DryRunOpts) ReplicaRepor
 	return rep
 }
 
-// replicaProblems returns how the settings of r break the timing rules: a
-// used object must be touched at least once per half grace, and a replica
-// must read a cached entry again after a TTL. graceProblem checks the TTL
-// against the grace.
 func replicaProblems(r *Server, o *DryRunOpts) []string {
 	if !r.GC {
 		return []string{"runs without the garbage collector hooks"}

@@ -23,18 +23,14 @@ import (
 type rootKind uint8
 
 const (
-	// rootOfRef: i is the index of the ref root.
 	rootOfRef rootKind = iota + 1
-	// rootPinned: i is the index of the pinned revision.
 	rootPinned
-	// rootPermanentObject and rootRecentObject: i is the node.
 	rootPermanentObject
 	rootRecentObject
-	// rootMap: row is the map row.
 	rootMap
 )
 
-// rootRef names one root of a mark.
+// rootRef names one root: i indexes the ref roots, pinned revisions or nodes.
 type rootRef struct {
 	kind     rootKind
 	i        int
@@ -42,21 +38,18 @@ type rootRef struct {
 	mapClass MapClass
 }
 
-// refClassOrder is the order in which the mark walks the ref roots. Pinned
-// revisions come after the unmount refs, before the builds.
+// refClassOrder is the order in which the mark walks the ref roots.
 var refClassOrder = []RefClass{
 	RefSource, RefProjectStatus, RefPushedPacks, RefConfig, RefACL, RefWorkspace, RefSnapshot, RefMount, RefUnmount,
 	RefBuild, RefBuildStart, RefOtherMeta,
 }
 
-// pinnedAfter is the last ref class walked before the pinned revisions.
 const pinnedAfter = RefUnmount
 
 func refClassRank(c RefClass) int {
 	return slices.Index(refClassOrder, c)
 }
 
-// sortRefRoots sorts the ref roots into the order of the mark.
 func sortRefRoots(roots []refRoot) {
 	slices.SortStableFunc(roots, func(a, b refRoot) int {
 		return refClassRank(a.class) - refClassRank(b.class)
@@ -65,23 +58,17 @@ func sortRefRoots(roots []refRoot) {
 
 // Root describes the root that first reached an object in the mark.
 type Root struct {
-	// Class is the root class, as in Report.Roots.
 	Class string `json:"class"`
-	// Key is the root object: the ref target, the pinned revision, the recent
-	// or permanent object, or the request of a map row.
-	Key string `json:"key,omitempty"`
-	// Project, Ref and UpdateTime name a ref root.
+	// Key is the root object: ref target, pinned revision, object or map request.
+	Key        string     `json:"key,omitempty"`
 	Project    string     `json:"project,omitempty"`
 	Ref        string     `json:"ref,omitempty"`
 	UpdateTime *time.Time `json:"update_time,omitempty"`
-	// Pin names the mount details, and the workspace snapshot, of a pinned
-	// revision.
-	Pin *MountSample `json:"pin,omitempty"`
-	// Result is the result of a map row.
-	Result string `json:"result,omitempty"`
+	// Pin names the mount details and workspace snapshot of a pinned revision.
+	Pin    *MountSample `json:"pin,omitempty"`
+	Result string       `json:"result,omitempty"`
 }
 
-// rootTable resolves the rootRefs of one mark.
 type rootTable struct {
 	g         *graph
 	refs      []refRoot

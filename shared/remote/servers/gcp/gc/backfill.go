@@ -40,9 +40,7 @@ const (
 
 // BackfillOpts sets the scan of Backfill.
 type BackfillOpts struct {
-	// Start and End limit the scan to the object keys in [Start, End), given as
-	// lowercase hexadecimal prefixes. Empty means the start or the end of the
-	// table.
+	// Start and End are lowercase hexadecimal key prefixes; empty is unbounded.
 	Start, End string
 	// Shards is the number of key ranges scanned in parallel.
 	Shards int
@@ -52,8 +50,7 @@ type BackfillOpts struct {
 	Rate float64
 	// DryRun counts the gc rows to write and writes none.
 	DryRun bool
-	// WriteDeadline is the deadline of one attempt of a gc row write; zero
-	// uses DefaultWriteDeadline.
+	// WriteDeadline of zero uses DefaultWriteDeadline.
 	WriteDeadline time.Duration
 }
 
@@ -70,13 +67,11 @@ type TypeCounts struct {
 // BackfillStats reports a backfill.
 type BackfillStats struct {
 	Scanned int64
-	// Current counts the objects whose gc row has the extractor version their
-	// type requires or a newer one.
+	// Current counts gc rows at or above the extractor version of their type.
 	Current   int64
 	Malformed int64
 	Types     map[string]*TypeCounts
-	// Done reports that the scan reached End. Otherwise ResumeKey is the Start
-	// of a run that continues this one: every key before it is done.
+	// Done reports that the scan reached End; otherwise ResumeKey continues it.
 	Done      bool
 	ResumeKey string
 }
@@ -90,14 +85,9 @@ func (s *BackfillStats) Failed() int64 {
 	return n
 }
 
-// Backfill writes the gc row of every object that has none or one of an older
-// extractor version than its type requires, for objects added before the
-// server wrote gc rows or while --gc was off. Each row gets the time of the
-// object row, so the grace counts from the upload of the object, not from the
-// backfill. Blobs are not read; other objects are read through objects and
-// decoded. An object that cannot be read or decoded is logged and counted, the
-// scan goes on, and the error says how many failed; the object keeps no gc
-// row, so the next run tries it again.
+// Backfill writes the gc row of every object that has none or an outdated one.
+// Each row gets the time of the object row, so the grace counts from the upload.
+// An object that cannot be read keeps no gc row, so the next run tries it again.
 func Backfill(ctx context.Context, client *bigtable.Client, objects remote.RemoteProvider, opts *BackfillOpts) (*BackfillStats, error) {
 	o := *opts
 	if o.Shards <= 0 {
@@ -173,7 +163,6 @@ type backfill struct {
 	done   []bool
 }
 
-// scanShard handles the keys in [start, end) in batches.
 func (b *backfill) scanShard(ctx context.Context, shard int, start, end string) error {
 	filter := bigtable.RowFilter(bigtable.ChainFilters(bigtable.FamilyFilter(objectsMetaFamily), bigtable.ColumnFilter("type"), bigtable.LatestNFilter(1)))
 	from := start
@@ -214,8 +203,6 @@ func (b *backfill) scanShard(ctx context.Context, shard int, start, end string) 
 	}
 }
 
-// handleBatch writes the gc rows of the objects keys, of the given types and
-// object row times.
 func (b *backfill) handleBatch(ctx context.Context, keys, types []string, times []bigtable.Timestamp) error {
 	versions := make(map[string]int64, len(keys))
 	err := b.gcTable.ReadRows(ctx, bigtable.RowList(keys), func(row bigtable.Row) bool {
@@ -284,8 +271,6 @@ func (b *backfill) edges(ctx context.Context, key, typ string) (Hash, []Hash, in
 	return hash, edges, malformed, err
 }
 
-// snapshot returns a copy of the stats so far, with the resume key of the
-// first shard that is not done.
 func (b *backfill) snapshot() BackfillStats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -318,9 +303,7 @@ func (s *BackfillStats) add(o *BackfillStats) {
 	}
 }
 
-// splitRange returns n+1 boundaries that split [start, end) into n key ranges
-// of about the same number of keys, for keys that are hexadecimal hashes. It
-// returns fewer when the range is too small to split.
+// splitRange returns fewer than n ranges when [start, end) is too small to split.
 func splitRange(start, end string, n int) ([]string, error) {
 	lo, err := keyPrefix(start, 0)
 	if err != nil {
@@ -343,8 +326,6 @@ func splitRange(start, end string, n int) ([]string, error) {
 	return append(bounds, end), nil
 }
 
-// keyPrefix returns the first 32 bits of a hexadecimal key, or empty for an
-// empty key.
 func keyPrefix(key string, empty uint64) (uint64, error) {
 	if key == "" {
 		return empty, nil
@@ -360,14 +341,12 @@ func keyPrefix(key string, empty uint64) (uint64, error) {
 	return v, nil
 }
 
-// limiter spaces out work to a rate of units per second.
 type limiter struct {
 	mu       sync.Mutex
 	interval time.Duration
 	next     time.Time
 }
 
-// newLimiter returns a limiter for rate units per second, or nil for no limit.
 func newLimiter(rate float64) *limiter {
 	if rate <= 0 {
 		return nil
@@ -375,7 +354,6 @@ func newLimiter(rate float64) *limiter {
 	return &limiter{interval: time.Duration(float64(time.Second) / rate)}
 }
 
-// wait reserves n units and waits until their turn.
 func (l *limiter) wait(ctx context.Context, n int) error {
 	if l == nil {
 		return nil

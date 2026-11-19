@@ -37,28 +37,21 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// A condemned list is the object abfsgc/condemned/<state>/<cycle> in the server
-// bucket: a header, then one record per condemned object in key order, of
-// the 20-byte key, the type as an index into the header's type names, and
-// the size, big-endian. Format version 1 has no chunk descriptors.
+// Condemned list integers are big-endian. Format version 1 has no chunk descriptors.
 const (
 	listPrefix        = "abfsgc/condemned/"
 	liveSuffix        = ".live"
 	listMagic         = "ABFSGCL\n"
 	listFormatVersion = 1
 	listRecordSize    = entities.HashSize + 1 + 8
-	// runIDMetadata holds the run that wrote a list object, so that a retried
-	// create can tell its own earlier attempt from another run.
+	// runIDMetadata lets a retried create tell its earlier attempt from another run.
 	runIDMetadata = "abfs-gc-run"
 )
 
-// listObjectName returns the name of the condemned list of a cycle of the
-// garbage collector state.
 func listObjectName(state string, cycle int64) string {
 	return listPrefix + state + "/" + strconv.FormatInt(cycle, 10)
 }
 
-// listHeader is the header of a condemned list.
 type listHeader struct {
 	cycle    int64
 	snapshot time.Time
@@ -73,7 +66,6 @@ func (h *listHeader) runID() string {
 	return runID(h.holder, h.epoch)
 }
 
-// runID names the run of a lease holder and epoch.
 func runID(holder string, epoch int64) string {
 	return holder + "#" + strconv.FormatInt(epoch, 10)
 }
@@ -153,9 +145,7 @@ func readString(r io.Reader) (string, error) {
 	return string(b), nil
 }
 
-// sizedReader reads an object of a known size and counts the bytes left, so
-// that a count or a length read from the object can be checked against what
-// is left before anything is allocated for it.
+// sizedReader lets a count read from an object be checked before allocating.
 type sizedReader struct {
 	r    io.Reader
 	left int64
@@ -167,8 +157,6 @@ func (s *sizedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// checkCount fails unless count items of at least size bytes each fit in
-// what is left of r.
 func (s *sizedReader) checkCount(count, size int64) error {
 	if count < 0 || count > s.left/size {
 		return fmt.Errorf("it counts %d entries, but %d bytes are left", count, s.left)
@@ -176,7 +164,6 @@ func (s *sizedReader) checkCount(count, size int64) error {
 	return nil
 }
 
-// checkEnd fails unless r is at its end.
 func checkEnd(r io.ByteReader, count int64) error {
 	_, err := r.ReadByte()
 	switch {
@@ -188,24 +175,18 @@ func checkEnd(r io.ByteReader, count int64) error {
 	return nil
 }
 
-// listRecord is one record of a condemned list.
 type listRecord struct {
 	key  Hash
 	typ  uint8
 	size int64
 }
 
-// writeList writes the condemned list name with the header h and the
-// records that next returns, until it returns false. The object is created
-// only if it does not exist.
 func writeList(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name string, h *listHeader, next func() (listRecord, bool)) error {
 	return createObject(ctx, b, bucket, name, h.runID(), "application/octet-stream", func(w io.Writer) error {
 		return encodeList(w, h, next)
 	})
 }
 
-// encodeList writes a condemned list with the header h and the records that
-// next returns to w.
 func encodeList(w io.Writer, h *listHeader, next func() (listRecord, bool)) error {
 	if err := h.write(w); err != nil {
 		return err
@@ -227,10 +208,8 @@ func encodeList(w io.Writer, h *listHeader, next func() (listRecord, bool)) erro
 	return nil
 }
 
-// createObject writes the object name with write, only if no object of that
-// name exists, within the streaming deadline of the budget b. If one exists,
-// written by the same run, an earlier attempt of this call wrote it and the
-// call succeeds.
+// createObject writes name only if it does not exist. An existing object of the
+// same run is an earlier attempt of this call, and the call succeeds.
 func createObject(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, name, runID, contentType string, write func(io.Writer) error) error {
 	obj := bucket.Object(name)
 	sctx, wrap, stop, err := b.stream(ctx)
@@ -279,7 +258,6 @@ func preconditionFailed(err error) bool {
 	return status.Code(err) == codes.FailedPrecondition
 }
 
-// condemnedList holds the keys of a condemned list and their types.
 type condemnedList struct {
 	header *listHeader
 	keys   []Hash
@@ -287,7 +265,6 @@ type condemnedList struct {
 	types []uint8
 }
 
-// typeName returns the type name of the key i.
 func (l *condemnedList) typeName(i int) string {
 	if t := int(l.types[i]); t < len(l.header.types) {
 		return l.header.types[t]
@@ -295,7 +272,6 @@ func (l *condemnedList) typeName(i int) string {
 	return "unknown"
 }
 
-// readList reads the condemned list name.
 func readList(ctx context.Context, bucket *storage.BucketHandle, name string) (_ *condemnedList, retErr error) {
 	r, err := bucket.Object(name).NewReader(ctx)
 	if err != nil {
@@ -309,7 +285,6 @@ func readList(ctx context.Context, bucket *storage.BucketHandle, name string) (_
 	return l, nil
 }
 
-// decodeList decodes a condemned list of size bytes from r.
 func decodeList(r io.Reader, size int64) (*condemnedList, error) {
 	br := bufio.NewReaderSize(r, 1<<20)
 	sr := &sizedReader{r: br, left: size}
@@ -335,9 +310,6 @@ func decodeList(r io.Reader, size int64) (*condemnedList, error) {
 	return l, nil
 }
 
-// pruneLists deletes the list objects of the state beyond the newest keep
-// cycles, with their companions, and returns how many it deleted, each delete
-// within the budget b. It leaves other names under the prefix alone.
 func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
 	prefix := listPrefix + state + "/"
 	byCycle := make(map[int64][]string)
@@ -369,13 +341,8 @@ func pruneLists(ctx context.Context, b writeBudget, bucket *storage.BucketHandle
 	return n, nil
 }
 
-// pruneRecords deletes the delete records of the cycles of the state beyond
-// the newest keep cycles whose records were all flagged longer than the
-// record retention ago, and returns how many it deleted, each delete within
-// the budget b. Before it deletes the records of a cycle, it writes the pruned
-// marker of the cycle. A record without the flag stays whatever its age,
-// because the chunks it names may still be to delete, and so do the other
-// records of its cycle, so that an undo of the cycle finds all of them.
+// pruneRecords writes the pruned marker of a cycle before it deletes the records.
+// An unflagged record keeps its whole cycle, so an undo finds all of them.
 func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, keep int) (int64, error) {
 	prefix := recordPrefixOf(state)
 	records := make(map[int64][]string)
@@ -419,15 +386,11 @@ func pruneRecords(ctx context.Context, b writeBudget, bucket *storage.BucketHand
 	return n, nil
 }
 
-// flaggedBefore reports whether the delete record with attrs was flagged
-// before oldest. The step flags it when it deleted the chunks it names, which
-// can be long after the record was written, and the flag write updates the
-// record.
+// The flag write updates the record, so Updated is the time it was flagged.
 func flaggedBefore(attrs *storage.ObjectAttrs, oldest time.Time) bool {
 	return attrs.Metadata[chunksDoneMetadata] != "" && attrs.Updated.Before(oldest)
 }
 
-// writePrunedMarker writes the pruned marker of cycle, unless it exists.
 func writePrunedMarker(ctx context.Context, b writeBudget, bucket *storage.BucketHandle, state string, cycle int64) error {
 	name := prunedMarkerName(state, cycle)
 	err := retryWith(ctx, firstRetryWait, b, func(actx context.Context) error {
@@ -441,9 +404,7 @@ func writePrunedMarker(ctx context.Context, b writeBudget, bucket *storage.Bucke
 	return nil
 }
 
-// deleteObject deletes obj with the retries of the collector, each attempt
-// within the budget b, so that a listing that ran long cannot delete after
-// the lease is lost. An object already gone counts as deleted.
+// deleteObject keeps each attempt within b, so it cannot delete after a lost lease.
 func deleteObject(ctx context.Context, b writeBudget, obj *storage.ObjectHandle) error {
 	err := retryWith(ctx, firstRetryWait, b, obj.Delete)
 	if errors.Is(err, storage.ErrObjectNotExist) {

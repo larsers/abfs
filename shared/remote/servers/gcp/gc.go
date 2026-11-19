@@ -21,19 +21,17 @@ import (
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
-// BackfillGC writes the missing and outdated rows of the table abfsgc; see
-// gc.Backfill.
+// BackfillGC runs gc.Backfill.
 func (s *GCPServer) BackfillGC(ctx context.Context, opts *gc.BackfillOpts) (*gc.BackfillStats, error) {
 	return gc.Backfill(ctx, s.casdb.BTClient(), s, opts)
 }
 
-// DryRunGC runs a garbage collection cycle that only reports; see gc.DryRun.
+// DryRunGC runs gc.DryRun.
 func (s *GCPServer) DryRunGC(ctx context.Context, opts *gc.DryRunOpts) (*gc.Result, error) {
 	return gc.DryRun(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s, opts)
 }
 
-// CondemnGC runs a garbage collection cycle that condemns, with its lists in
-// bucket; see gc.Condemn.
+// CondemnGC runs gc.Condemn with its lists in bucket.
 func (s *GCPServer) CondemnGC(ctx context.Context, bucket string, opts *gc.CondemnOpts) (*gc.Result, error) {
 	if s.storage == nil {
 		return nil, errors.New("the server has no Cloud Storage client for the condemned lists")
@@ -41,9 +39,7 @@ func (s *GCPServer) CondemnGC(ctx context.Context, bucket string, opts *gc.Conde
 	return gc.Condemn(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s.storage.Bucket(bucket), s, opts)
 }
 
-// DeleteGC runs a garbage collection cycle that deletes, with its lists and
-// records in bucket and the checks of the Bigtable instance in checks; see
-// gc.Delete.
+// DeleteGC runs gc.Delete with its lists and records in bucket.
 func (s *GCPServer) DeleteGC(ctx context.Context, bucket string, checks gc.InstanceChecks, opts *gc.DeleteOpts) (*gc.Result, error) {
 	if s.storage == nil {
 		return nil, errors.New("the server has no Cloud Storage client for the condemned lists")
@@ -51,8 +47,7 @@ func (s *GCPServer) DeleteGC(ctx context.Context, bucket string, checks gc.Insta
 	return gc.Delete(ctx, s.casdb.SpannerClient(), s.casdb.BTClient(), s.storage.Bucket(bucket), s, checks, opts)
 }
 
-// GCInstanceChecks returns the checks of the Bigtable instance of project
-// that the server's client writes to, with its app profile.
+// GCInstanceChecks returns the checks of the server's Bigtable instance.
 func (s *GCPServer) GCInstanceChecks(project, instance string) gc.InstanceChecks {
 	return gc.NewInstanceChecks(project, instance, s.casdb.BTClient())
 }

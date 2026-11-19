@@ -25,26 +25,17 @@ import (
 )
 
 const (
-	// clientMapReuse is how long cacheman answers map lookups from its copy
-	// of the results a server returned, without asking a server again
-	// (DefaultTTLHours in shared/cacheman/server).
+	// clientMapReuse is DefaultTTLHours in shared/cacheman/server.
 	clientMapReuse = 8 * time.Hour
-	// keepAlivePassAllowance is the time a keep-alive pass may take to reach
-	// an object of its mount, from the time the pass was due: a pass sends at
-	// most 10,000 hashes a second, so a mount of 10 million hashes takes
-	// about 17 minutes, and a failed pass is retried after 5 minutes.
+	// keepAlivePassAllowance covers a 10M-hash pass at 10,000 hashes/s and a retry.
 	keepAlivePassAllowance = time.Hour
 )
 
-// serverEvidence is what the collector knows of the server processes: their
-// heartbeat rows in AbfsGcServers.
 type serverEvidence struct {
-	// servers are the rows of AbfsGcServers, read at readTime.
 	servers  []Server
 	readTime time.Time
 }
 
-// readServerEvidence reads AbfsGcServers.
 func readServerEvidence(ctx context.Context, client *spanner.Client) (*serverEvidence, error) {
 	servers, read, err := readServers(ctx, client)
 	if err != nil {
@@ -53,16 +44,11 @@ func readServerEvidence(ctx context.Context, client *spanner.Client) (*serverEvi
 	return &serverEvidence{servers: servers, readTime: read}, nil
 }
 
-// windowStart returns the start of the window of a delete cycle whose
-// snapshot is snapshot: a use before it cannot keep an object recent at the
-// mark of that cycle, so only the processes that may have run since count.
+// A use before the window start cannot keep an object recent at the mark.
 func windowStart(snapshot time.Time, grace time.Duration) time.Time {
 	return snapshot.Add(-grace - clockSkewMargin)
 }
 
-// mayHaveRun reports whether the process of s may have run at or after
-// start: it stopped then or later, or it did not stop and its last heartbeat
-// is not older than a live row may be.
 func (s *Server) mayHaveRun(start time.Time) bool {
 	if !s.StoppedAt.IsZero() {
 		return !s.StoppedAt.Before(start)
@@ -70,8 +56,6 @@ func (s *Server) mayHaveRun(start time.Time) bool {
 	return !s.LastSeen.Add(liveReplicaAge).Before(start)
 }
 
-// inWindow returns the rows of AbfsGcServers whose process may have run since
-// start.
 func (e *serverEvidence) inWindow(start time.Time) []Server {
 	var in []Server
 	for _, s := range e.servers {
@@ -82,9 +66,6 @@ func (e *serverEvidence) inWindow(start time.Time) []Server {
 	return in
 }
 
-// longestTouchInterval returns the largest touch interval of the processes
-// that may have run since start: an object a client touches is recent for
-// the grace less that interval at the next mark.
 func (e *serverEvidence) longestTouchInterval(start time.Time) time.Duration {
 	var d time.Duration
 	for _, s := range e.inWindow(start) {
@@ -93,8 +74,6 @@ func (e *serverEvidence) longestTouchInterval(start time.Time) time.Duration {
 	return d
 }
 
-// longestCacheTTL returns the largest cache TTL of the processes that may
-// have run since start.
 func (e *serverEvidence) longestCacheTTL(start time.Time) time.Duration {
 	var d time.Duration
 	for _, s := range e.inWindow(start) {
@@ -103,8 +82,6 @@ func (e *serverEvidence) longestCacheTTL(start time.Time) time.Duration {
 	return d
 }
 
-// graceTTL returns the server with the largest cache TTL among those that
-// may have run since start, and false when no such row exists.
 func (e *serverEvidence) graceTTL(start time.Time) (Server, bool) {
 	var longest Server
 	found := false
@@ -116,9 +93,6 @@ func (e *serverEvidence) graceTTL(start time.Time) (Server, bool) {
 	return longest, found
 }
 
-// graceProblem returns why the grace of o does not cover the largest cache
-// TTL of the servers that may have run since start and the longest push, or
-// "" when it does. Without such a server the grace cannot be checked.
 func (e *serverEvidence) graceProblem(start time.Time, o *DryRunOpts) string {
 	r, found := e.graceTTL(start)
 	switch {
@@ -130,24 +104,14 @@ func (e *serverEvidence) graceProblem(start time.Time, o *DryRunOpts) string {
 	return ""
 }
 
-// keepAliveTouchLimit returns how soon after a server answered that a mount's
-// object is present the keep-alive must touch it again, so that the object is
-// recent at the mark of every cycle until then, for a cycle whose snapshot is
-// snapshot: the grace less the longest touch interval and the longest cache
-// TTL of the processes that may have run in its window, and the clock skew
-// margin. An answer from the header cache rests on a touch made when the
-// entry was looked up, up to the TTL before the answer. A mount that keeps
-// to it needs no rescue of what it holds; the hold of the condemn markers
-// does not rest on it.
+// keepAliveTouchLimit subtracts the cache TTL because a cached presence answer
+// rests on a touch made up to the TTL before it.
 func (e *serverEvidence) keepAliveTouchLimit(snapshot time.Time, grace time.Duration) time.Duration {
 	start := windowStart(snapshot, grace)
 	return grace - e.longestTouchInterval(start) - e.longestCacheTTL(start) - clockSkewMargin
 }
 
-// mapRowLoss returns the latest time a server that may have run since the
-// window start of a cycle whose snapshot is snapshot recorded lost map row
-// touches, or any time from clientMapReuse and keepAlivePassAllowance before
-// that start, and whether there is one. It is reported, not checked.
+// mapRowLoss is reported, not checked.
 func (e *serverEvidence) mapRowLoss(snapshot time.Time, grace time.Duration) (time.Time, bool) {
 	start := windowStart(snapshot, grace).Add(-clientMapReuse - keepAlivePassAllowance)
 	var latest time.Time
@@ -159,12 +123,8 @@ func (e *serverEvidence) mapRowLoss(snapshot time.Time, grace time.Duration) (ti
 	return latest, !latest.IsZero()
 }
 
-// windowBlockers returns the reasons in e why a cycle whose snapshot is
-// snapshot must not delete: a process that may have run in the window ran
-// without link validation, with an older version of the GC rules or with
-// settings that break the timing rules, or the grace does not cover the
-// largest cache TTL. A process that crashed or lost touches does not count:
-// the delete rule rests on no touch that a server buffers.
+// windowBlockers ignores crashes and lost touches: the delete rule rests on no
+// touch that a server buffers.
 func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []string {
 	var reasons []string
 	add := func(format string, args ...any) {
@@ -188,12 +148,8 @@ func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []stri
 	return reasons
 }
 
-// listCacheTTL returns the largest cache TTL of the processes that may have
-// run since the window start of a cycle whose snapshot is snapshot, which a
-// condemn records with its list, and the reasons why it must not complete the
-// list: a server that has no row there may have used information read before
-// the markers, and one without the GC hooks, without a cache TTL or of an
-// older version of the GC rules does not bound its answers.
+// listCacheTTL returns the largest cache TTL in the window and why the list must
+// not complete: a server with no row may answer from reads before the markers.
 func (e *serverEvidence) listCacheTTL(snapshot time.Time, grace time.Duration) (time.Duration, []string) {
 	var reasons []string
 	in := e.inWindow(windowStart(snapshot, grace))
@@ -218,9 +174,6 @@ func (e *serverEvidence) listCacheTTL(snapshot time.Time, grace time.Duration) (
 	return ttl, reasons
 }
 
-// liveBlockers returns the reasons in e why a cycle must not condemn or
-// delete that the live heartbeat rows show, as condemnBlockers does for the
-// first read.
 func liveBlockers(e *serverEvidence, o *CondemnOpts) []string {
 	replicas, _ := serverReplicas(e.servers)
 	rep := checkReplicas(replicas, e.readTime, &o.DryRunOpts)
