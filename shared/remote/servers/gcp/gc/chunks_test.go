@@ -395,7 +395,6 @@ func TestChunkStep_BucketSettings(t *testing.T) {
 		{"versioning", storage.BucketAttrs{VersioningEnabled: true}, "Object Versioning on"},
 		{"retention policy", storage.BucketAttrs{RetentionPolicy: &storage.RetentionPolicy{RetentionPeriod: time.Hour}}, "retention policy of 1h0m0s"},
 		{"default event-based hold", storage.BucketAttrs{DefaultEventBasedHold: true}, "event-based hold on each new object"},
-		{"object retention", storage.BucketAttrs{ObjectRetentionMode: "Enabled"}, "object retention Enabled"},
 	}
 	for _, tt := range tests {
 		got := bucketProblems(&tt.attrs)

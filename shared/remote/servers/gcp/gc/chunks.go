@@ -247,10 +247,8 @@ func bucketProblems(attrs *storage.BucketAttrs) []string {
 	if attrs.DefaultEventBasedHold {
 		reasons = append(reasons, "the bucket puts an event-based hold on each new object, which refuses its delete")
 	}
-	if attrs.ObjectRetentionMode != "" {
-		// The JSON API reports it as "Enabled"; the gRPC API does not report it.
-		reasons = append(reasons, fmt.Sprintf("the bucket has object retention %s, under which an object can refuse its delete", attrs.ObjectRetentionMode))
-	}
+	// The gRPC API does not report object retention; a delete that an
+	// object's retention refuses counts in DeleteRefused.
 	return reasons
 }
 

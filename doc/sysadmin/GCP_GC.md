@@ -513,7 +513,9 @@ A chunk row goes only when it has no cell newer than the record, such as the cel
 The step deletes no chunks, and lists why in `delete.chunks.skipped`, when the bucket settings cannot be read or the bucket has any of the settings below. The `abfsgc` row deletes run either way. `records_skipped` counts the records past the undo window whose chunks it skipped. When the records cannot be listed, the step does nothing and reports `list_failed`. Either makes the cycle exit with status 6, as does a record that `unflagged` counts.
 
 * Object Versioning on: a delete would keep a noncurrent version;
-* a retention policy, a default event-based hold or object retention: each can refuse a delete.
+* a retention policy or a default event-based hold: each can refuse a delete.
+
+The gRPC API the servers use does not report object retention, so the step cannot check it; a delete that the retention of an object refuses counts in `delete_refused`.
 
 Bucket soft delete plays no part: a bucket with it on works as one without it.
 
