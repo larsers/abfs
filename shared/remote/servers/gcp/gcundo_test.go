@@ -66,6 +66,51 @@ func (f *deleteFixture) undo(first, last int64) (*gc.UndoReport, []string) {
 	return rep, rows
 }
 
+// The undo lists the delete records under the lease, so that no collector
+// prunes them in between: while another holder's lease is valid, it fails on
+// the lease.
+func TestUndoGC_ListsUnderTheLease(t *testing.T) {
+	require := require.New(t)
+	f := newDeleteFixture(t)
+	w := f.s.storage.Bucket(f.bucket).Object("abfsgc/deleted/" + gc.DefaultStateName + "/1/0-0-0").NewWriter(context.Background())
+	require.NoError(w.Close())
+	other, err := gc.AcquireLease(context.Background(), f.s.casdb.SpannerClient(), gc.DefaultStateName, "running-collector", gc.PhaseUndo, time.Hour, 0)
+	require.NoError(err)
+	t.Cleanup(other.Release)
+	o := gc.DefaultUndoOpts()
+	o.Cycle = 1
+	_, err = gc.Undo(context.Background(), f.s.casdb.SpannerClient(), f.s.casdb.BTClient(), f.s.storage.Bucket(f.bucket), &o)
+	var held *gc.ErrLeaseHeld
+	require.ErrorAs(err, &held)
+}
+
+// An undo of cycles without delete records fails before it takes the lease,
+// so the state keeps its cycle.
+func TestUndoGC_RefusedUndoKeepsTheState(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	f := newDeleteFixture(t)
+	sp := f.s.casdb.SpannerClient()
+	lease, err := gc.AcquireLease(ctx, sp, gc.DefaultStateName, "collector", gc.PhaseUndo, time.Hour, 0)
+	require.NoError(err)
+	lease.Release()
+	state := func() []any {
+		row, err := sp.Single().ReadRow(ctx, "AbfsGcState", spanner.Key{gc.DefaultStateName}, []string{"Cycle", "LeaseHolder", "CycleStartTime", "UpdateTime"})
+		require.NoError(err)
+		var cycle spanner.NullInt64
+		var holder spanner.NullString
+		var start, update spanner.NullTime
+		require.NoError(row.Columns(&cycle, &holder, &start, &update))
+		return []any{cycle, holder, start, update}
+	}
+	before := state()
+	o := gc.DefaultUndoOpts()
+	o.Cycle = 1
+	_, err = gc.Undo(ctx, sp, f.s.casdb.BTClient(), f.s.storage.Bucket(f.bucket), &o)
+	require.ErrorContains(err, "found no delete records")
+	require.Equal(before, state())
+}
+
 // Objects that delete cycles removed come back from their delete records
 // alone: children before parents across the cycles of the range, each with
 // the chunks that the chunk step keeps for the undo window. Each is readable

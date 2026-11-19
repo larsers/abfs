@@ -640,6 +640,32 @@ func TestUndo_BlocksAParentOfAGoneChild(t *testing.T) {
 	require.True(f.rowExists(objectsTableName, parentAfter.String()))
 }
 
+// A map row whose end a cycle outside the run deleted is not restored, so
+// that it names no absent object; an undo that covers that cycle restores
+// both.
+func TestUndo_MapRowOfAnEndDeletedLater(t *testing.T) {
+	require := require.New(t)
+	f := newUndoFixture(t)
+	h := testHashes(2)
+	from, to := h[0], h[1]
+	f.object(from, "blob", nil)
+	f.deleted(to)
+	f.recordOf(5, 0, nil, [2]Hash{from, to})
+	f.recordOf(6, 1, []Hash{to})
+	row := from.String() + "#" + to.String()
+
+	rep := f.undo(undoLease(), 5, 5)
+	require.Equal(int64(1), rep.MapRowsBlocked)
+	require.Zero(rep.MapRowsRestored)
+	require.False(f.rowExists(mapsTableName, row))
+
+	rep = f.undo(undoLease(), 5, 6)
+	require.Zero(rep.NotRestored())
+	require.Equal(int64(1), rep.MapRowsRestored)
+	require.True(f.rowExists(mapsTableName, row))
+	require.True(f.rowExists(objectsTableName, to.String()))
+}
+
 // When the records of a cycle outside the run were pruned, a child that is
 // absent, not restored by the run and named by no record may have been
 // deleted by that cycle, so its parent is not restored.

@@ -606,11 +606,11 @@ A batch writes its record before its deletes, so a record can name a key that it
 What the undo does:
 
 * It fails when a cycle in the range has pruned records, or a record of the range is of format version 1. When a restored object links an absent object, it reads the keys of the records of every cycle, and then any record of format version 1 under `abfsgc/deleted/<state>/` fails it. Delete those records first (see [Upgrades](#upgrades)).
-* It takes the lease in the phase `undo`, which does not raise the largest grace. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two write attempts of 30 seconds each and a minute.
+* It takes the lease in the phase `undo`, which does not raise the largest grace, and lists the records again then, so that no collector removes them meanwhile. A range it refuses fails before the lease and leaves the GC state as it was. Before its first write it waits until a collector that lost the lease has stopped writing: the expiry of that lease, or the time of its own lease when that lease was released, plus two write attempts of 30 seconds each and a minute.
 * It restores the newest cycle first and in each cycle the deepest level first, so children come back before their parents.
 * For each object whose row is absent: its chunks must exist; its bucket chunks get the custom metadata `abfs-undo=<cycle>` and its chunk rows a cell `data:undo` with a new time, so that a chunk step that read them earlier cannot delete them; its `abfsgc` row is written from the record with a new time and a touch, so it is recent for `--grace`; its `objects` row comes last, with the cells and times of the record, without the marker.
 * An object is not restored, nor anything that links it, when a chunk is gone (`missing_chunks`; the log names the chunk), it had no `abfsgc` row when it was deleted (`without_gc_row`), or it links an absent object that this run did not restore and that a delete record of another cycle names, or, when the records of a cycle were pruned, any absent object (`blocked_by_child`).
-* Map rows come back with a new time. What is present stays as it is.
+* Map rows come back with a new time. A map row is not restored when an end was not restored, or is absent under the same rules as a linked object (`map_rows_blocked`; the log names the end). What is present stays as it is.
 
 ## Operator rules
 

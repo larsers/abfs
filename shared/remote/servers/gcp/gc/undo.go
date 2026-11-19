@@ -139,7 +139,8 @@ type UndoReport struct {
 	ChunkRowsWritten     int64 `json:"chunk_rows_written"`
 	BucketObjectsStamped int64 `json:"bucket_objects_stamped"`
 	// MapRows counts the map rows of the records: restored, present, or
-	// blocked by an end that was not restored.
+	// blocked by an end that was not restored or that a delete the run did
+	// not undo removed.
 	MapRows         int64   `json:"map_rows"`
 	MapRowsRestored int64   `json:"map_rows_restored"`
 	MapRowsPresent  int64   `json:"map_rows_present"`
@@ -155,10 +156,10 @@ func (r *UndoReport) NotRestored() int64 {
 
 // Undo writes back the objects and map rows that the delete cycles from
 // opts.Cycle to opts.Through deleted, from their delete records in bucket,
-// which hold the rows they deleted. It fails before any write when a cycle of
-// the range has records no more. It takes the lease in the phase undo and
-// waits before its first write until a collector that had lost the lease
-// stopped writing. It restores the newest cycle first and in a cycle the
+// which hold the rows they deleted. It takes the lease in the phase undo, so
+// that no collector prunes the records it lists, and fails before any write
+// when a cycle of the range has records no more. It waits before its first
+// write until a collector that had lost the lease stopped writing. It restores the newest cycle first and in a cycle the
 // deepest level first, so that the children of an object are back before it.
 // Per object whose row is absent: the bucket chunks of its descriptor, which
 // must exist, get a metadata key; its chunk rows, which must exist, get a
@@ -170,7 +171,8 @@ func (r *UndoReport) NotRestored() int64 {
 // that is present stays as it is. An object that lacks a chunk, that had no
 // gc row, or that links an object that was not restored or that a delete
 // cycle outside the range may have deleted is not restored, nor is anything
-// that links it; running Undo with more cycles restores the latter.
+// that links it or a map row that names it; running Undo with more cycles
+// restores the latter.
 func Undo(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, opts *UndoOpts) (*UndoReport, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
@@ -186,7 +188,8 @@ func Undo(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *
 		o.StateName = DefaultStateName
 	}
 	u := newUndoer(bt, bucket, &o)
-	if err := u.prepare(ctx); err != nil {
+	// A check before the lease refuses a bad range without using up a cycle.
+	if err := u.listCycles(ctx); err != nil {
 		return nil, err
 	}
 	lease, err := AcquireLease(ctx, sp, o.StateName, o.Holder, PhaseUndo, o.LeaseDuration, 0)
@@ -196,6 +199,9 @@ func Undo(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *
 	defer lease.Release()
 	runCtx, stop := lease.Keep(ctx)
 	defer stop()
+	if err := u.prepare(runCtx); err != nil {
+		return nil, err
+	}
 	rep, err := u.run(runCtx, lease)
 	if err != nil && runCtx.Err() != nil && ctx.Err() == nil {
 		err = fmt.Errorf("the GC undo stopped: %w", context.Cause(runCtx))
@@ -244,9 +250,22 @@ func newUndoer(bt *bigtable.Client, bucket *storage.BucketHandle, o *UndoOpts) *
 	}
 }
 
-// prepare lists the delete records of the cycles. It fails when no cycle has
-// a record, or a cycle has records no more.
+// prepare lists the delete records of the cycles and the ref records.
 func (u *undoer) prepare(ctx context.Context) error {
+	if err := u.listCycles(ctx); err != nil {
+		return err
+	}
+	for cycle := u.opts.Cycle; cycle <= u.opts.Through; cycle++ {
+		if len(u.records[cycle]) == 0 {
+			log.Printf("GC cycle %d has no delete records: it deleted nothing", cycle)
+		}
+	}
+	return u.listRefRecords(ctx)
+}
+
+// listCycles lists the delete records of the cycles. It fails when no cycle
+// has a record, or a cycle has records no more.
+func (u *undoer) listCycles(ctx context.Context) error {
 	u.records = make(map[int64][]recordName)
 	found := false
 	for cycle := u.opts.Cycle; cycle <= u.opts.Through; cycle++ {
@@ -254,16 +273,13 @@ func (u *undoer) prepare(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if len(names) == 0 {
-			log.Printf("GC cycle %d has no delete records: it deleted nothing", cycle)
-		}
 		found = found || len(names) > 0
 		u.records[cycle] = names
 	}
 	if !found {
 		return fmt.Errorf("found no delete records of the cycles %d to %d under gs://%s/%s: they deleted nothing, or the bucket or the GC state is not the one of the deletes", u.opts.Cycle, u.opts.Through, u.bucket.BucketName(), recordPrefixOf(u.opts.StateName))
 	}
-	return u.listRefRecords(ctx)
+	return nil
 }
 
 // listRefRecords names in the report the ref records of the cycle before
@@ -762,7 +778,8 @@ func hashRows(keys []Hash) []string {
 
 // mapRow restores the map row from#to with a new timestamp, so that it is
 // not expired again by the next cycle, unless it is present or an end was
-// not restored.
+// not restored or is absent after a delete that the run did not undo, as
+// by a later cycle outside the range.
 func (u *undoer) mapRow(ctx context.Context, from, to Hash) error {
 	row := from.String() + "#" + to.String()
 	u.count(&u.rep.MapRows)
@@ -770,6 +787,15 @@ func (u *undoer) mapRow(ctx context.Context, from, to Hash) error {
 	blocked := u.notRestored[from] || u.notRestored[to]
 	u.mu.Unlock()
 	if blocked {
+		u.count(&u.rep.MapRowsBlocked)
+		return nil
+	}
+	reason, err := u.goneChild(ctx, []Hash{from, to})
+	if err != nil {
+		return err
+	}
+	if reason != "" {
+		log.Printf("GC undo does not restore the map row %s: it %s", row, reason)
 		u.count(&u.rep.MapRowsBlocked)
 		return nil
 	}
