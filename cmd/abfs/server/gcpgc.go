@@ -461,7 +461,7 @@ func (c *gcpGCRunCmd) run(ctx context.Context, fl *pflag.FlagSet) (*gc.Report, e
 	case c.condemn:
 		res, err = server.CondemnGC(ctx, o.BucketName, &c.opts.CondemnOpts)
 	default:
-		res, err = server.DryRunGC(ctx, o.BucketName, &c.opts.DryRunOpts)
+		res, err = server.DryRunGC(ctx, &c.opts.DryRunOpts)
 	}
 	if res == nil {
 		return nil, err

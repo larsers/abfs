@@ -1023,7 +1023,7 @@ func TestDeleteGC_ChecksObjectsWrittenDuringTheScan(t *testing.T) {
 	require.Empty(readsOf())
 
 	o := f.deleteOpts().DryRunOpts
-	res, err = gc.DryRun(ctx, f.s.casdb.SpannerClient(), bt, f.s.storage.Bucket(f.bucket), f.s, &o)
+	res, err = gc.DryRun(ctx, f.s.casdb.SpannerClient(), bt, f.s, &o)
 	require.NoError(err)
 	require.Equal(int64(n), res.Report.Consistency.TooNew)
 	require.Nil(res.Report.Delete.TooNew)

@@ -181,8 +181,7 @@ func windowBlockers(e *serverEvidence, snapshot time.Time, o *DryRunOpts) []stri
 		if s.GC && !s.LinkValidation {
 			add("server %s runs without link validation, so it can accept an object or ref that links a condemned object without reading it", s.ID)
 		}
-		r := s.replica()
-		for _, p := range replicaProblems(&r, o) {
+		for _, p := range replicaProblems(s, o) {
 			add("server %s: %s", s.ID, p)
 		}
 	}

@@ -68,7 +68,7 @@ func Delete(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket
 	}
 	c := &condemner{opts: &o.CondemnOpts, bt: bt, bucket: bucket}
 	c.del = &deleter{opts: &o, sp: sp, bt: bt, bucket: bucket, checks: checks}
-	return runCycle(ctx, sp, bt, bucket, objs, &o.DryRunOpts, c)
+	return runCycle(ctx, sp, bt, objs, &o.DryRunOpts, c)
 }
 
 // DeleteStepReport reports the delete step of a cycle.

@@ -18,7 +18,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
-	"time"
 )
 
 // NewReplicaID returns an ID for the heartbeat of this server process: the
@@ -32,23 +31,4 @@ func NewReplicaID() string {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)
 	return host + "-" + hex.EncodeToString(b)
-}
-
-// Replica is what checkReplicas checks of the heartbeat row of a server
-// process in AbfsGcServers.
-type Replica struct {
-	ID string
-	// Version is the version of the GC rules the process follows, which it
-	// also writes into the table abfsgc, 0 when it writes none.
-	Version int64
-	// GC reports whether the process runs the garbage collector hooks.
-	GC bool
-	// TouchInterval and CacheTTL are the process's touch period and cache
-	// TTL; zero means it writes no touches or keeps cache entries without a
-	// TTL. HeartbeatInterval is the time between two of its heartbeats.
-	TouchInterval     time.Duration
-	CacheTTL          time.Duration
-	HeartbeatInterval time.Duration
-	// LastSeen is the commit time of its last heartbeat.
-	LastSeen time.Time
 }

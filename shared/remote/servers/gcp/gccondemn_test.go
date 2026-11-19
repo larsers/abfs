@@ -368,7 +368,7 @@ func TestDryRunGC_PlansFromMarkers(t *testing.T) {
 	require.NoError(err)
 	o := gc.DefaultDryRunOpts()
 	o.Shards = 3
-	res, err := f.s.DryRunGC(ctx, f.bucket, &o)
+	res, err := f.s.DryRunGC(ctx, &o)
 	require.NoError(err)
 	plan := res.Report.Delete.Plan
 	require.Zero(plan.Candidates)
@@ -379,7 +379,7 @@ func TestDryRunGC_PlansFromMarkers(t *testing.T) {
 	require.False(plan.Lists[0].Eligible)
 
 	ageList(t, f.s, 1, 89*time.Hour)
-	res, err = f.s.DryRunGC(ctx, f.bucket, &o)
+	res, err = f.s.DryRunGC(ctx, &o)
 	require.NoError(err)
 	require.Equal(int64(1), res.Report.Delete.Plan.Candidates)
 	require.Equal(int64(1), res.Report.Delete.Plan.WouldDelete)
@@ -748,7 +748,7 @@ func TestCondemnGC_MissingListTable(t *testing.T) {
 	require.NoError(op.Wait(ctx))
 
 	o := f.deleteOpts().DryRunOpts
-	res, err := gc.DryRun(ctx, f.s.casdb.SpannerClient(), f.s.casdb.BTClient(), f.s.storage.Bucket(f.bucket), f.s, &o)
+	res, err := gc.DryRun(ctx, f.s.casdb.SpannerClient(), f.s.casdb.BTClient(), f.s, &o)
 	require.NoError(err)
 	require.Contains(res.Report.Delete.PlanError, "init --gc")
 	_, err = f.condemn(nil)

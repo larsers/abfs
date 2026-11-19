@@ -60,30 +60,25 @@ type ReplicaReport struct {
 	MapRowLossTime *time.Time `json:"map_row_loss_time,omitempty"`
 }
 
-// ReplicaHost returns the host name of a replica ID made by NewReplicaID.
-func ReplicaHost(id string) string {
+// replicaHost returns the host name of a replica ID made by NewReplicaID.
+func replicaHost(id string) string {
 	if i := strings.LastIndexByte(id, '-'); i > 0 {
 		return id[:i]
 	}
 	return id
 }
 
-// replica returns what checkReplicas checks of s.
-func (s *Server) replica() Replica {
-	return Replica{ID: s.ID, Version: s.Version, GC: s.GC, TouchInterval: s.TouchInterval, CacheTTL: s.CacheTTL, HeartbeatInterval: s.HeartbeatInterval, LastSeen: s.LastSeen}
-}
-
 // serverReplicas returns the rows of AbfsGcServers that checkReplicas checks,
 // all but those of processes that recorded a stop, and how many it left out.
-func serverReplicas(servers []Server) ([]Replica, int64) {
-	var replicas []Replica
+func serverReplicas(servers []Server) ([]Server, int64) {
+	var replicas []Server
 	var stopped int64
 	for i := range servers {
 		if !servers[i].StoppedAt.IsZero() {
 			stopped++
 			continue
 		}
-		replicas = append(replicas, servers[i].replica())
+		replicas = append(replicas, servers[i])
 	}
 	return replicas, stopped
 }
@@ -91,7 +86,7 @@ func serverReplicas(servers []Server) ([]Replica, int64) {
 // serveLimit returns how long after its last heartbeat the process of r may
 // still serve: two heartbeat intervals, HeartbeatTimeout and the clock skew
 // margin. A row with an interval out of range counts with the largest one.
-func serveLimit(r *Replica) time.Duration {
+func serveLimit(r *Server) time.Duration {
 	interval := r.HeartbeatInterval
 	if interval <= 0 || interval > MaxHeartbeatInterval {
 		interval = MaxHeartbeatInterval
@@ -103,7 +98,7 @@ func serveLimit(r *Replica) time.Duration {
 // now, within their serve limit, against the timing rules of replicaProblems,
 // and counts their hosts. A process that stopped serving without recording
 // its stop, such as a crashed one, then no longer counts as a host.
-func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaReport {
+func checkReplicas(replicas []Server, now time.Time, o *DryRunOpts) ReplicaReport {
 	var rep ReplicaReport
 	for i := range replicas {
 		r := &replicas[i]
@@ -115,7 +110,7 @@ func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaRepo
 		if rep.RowsPerHost == nil {
 			rep.RowsPerHost = make(map[string]int64)
 		}
-		host := ReplicaHost(r.ID)
+		host := replicaHost(r.ID)
 		if rep.RowsPerHost[host] == 0 {
 			rep.Hosts++
 		}
@@ -131,7 +126,7 @@ func checkReplicas(replicas []Replica, now time.Time, o *DryRunOpts) ReplicaRepo
 // used object must be touched at least once per half grace, and a replica
 // must read a cached entry again after a TTL. graceProblem checks the TTL
 // against the grace.
-func replicaProblems(r *Replica, o *DryRunOpts) []string {
+func replicaProblems(r *Server, o *DryRunOpts) []string {
 	if !r.GC {
 		return []string{"runs without the garbage collector hooks"}
 	}

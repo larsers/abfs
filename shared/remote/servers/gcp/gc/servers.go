@@ -44,9 +44,14 @@ const (
 type Server struct {
 	// ID is made by NewReplicaID.
 	ID string
-	// Version, GC, TouchInterval and CacheTTL are as in Replica.
-	Version       int64
-	GC            bool
+	// Version is the version of the GC rules the process follows, which it
+	// also writes into the table abfsgc, 0 when it writes none.
+	Version int64
+	// GC reports whether the process runs the garbage collector hooks.
+	GC bool
+	// TouchInterval and CacheTTL are the process's touch period and cache
+	// TTL; zero means it writes no touches or keeps cache entries without a
+	// TTL.
 	TouchInterval time.Duration
 	CacheTTL      time.Duration
 	// HeartbeatInterval is the time between two heartbeats.
@@ -143,10 +148,10 @@ func readServers(ctx context.Context, client *spanner.Client) ([]Server, time.Ti
 	return servers, read, nil
 }
 
-// PruneServers deletes the rows of AbfsGcServers whose process neither wrote a
+// pruneServers deletes the rows of AbfsGcServers whose process neither wrote a
 // heartbeat nor stopped since before, crashed ones included, and returns how
 // many it deleted.
-func PruneServers(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {
+func pruneServers(ctx context.Context, client *spanner.Client, before time.Time) (int64, error) {
 	var n int64
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		var err error

@@ -24,7 +24,6 @@ import (
 
 	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/spanner"
-	"cloud.google.com/go/storage"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 
@@ -328,19 +327,18 @@ func (r *Result) Reachable(h Hash) (reachable, found bool) {
 // workspaces. With the consistency check the report also counts what a
 // delete cycle would remove now, from the markers it read and the records of
 // the lists, or says in Report.Delete why it could not read the records.
-// bucket is not read.
-func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
+func DryRun(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, opts *DryRunOpts) (*Result, error) {
 	o := *opts
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
-	return runCycle(ctx, sp, bt, bucket, objs, &o, nil)
+	return runCycle(ctx, sp, bt, objs, &o, nil)
 }
 
 // runCycle runs one cycle: a dry run when c is nil, else a condemn cycle
 // whose steps c runs on the mark, under the same lease, and a delete cycle
 // when c has a deleter.
-func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucket *storage.BucketHandle, objs remote.RemoteProvider, o *DryRunOpts, c *condemner) (*Result, error) {
+func runCycle(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, objs remote.RemoteProvider, o *DryRunOpts, c *condemner) (*Result, error) {
 	if o.Holder == "" {
 		o.Holder = DefaultHolder()
 	}
@@ -470,7 +468,7 @@ func (d *dryRun) run(ctx context.Context) (*Result, error) {
 	// so it stays for the largest grace of any condemn or delete cycle, and
 	// for the time before the window in which a map row loss is reported.
 	keep := max(staleReplicaAge, max(d.lease.MaxGrace, o.Grace)+time.Hour+clientMapReuse+keepAlivePassAllowance)
-	if r.Replicas.ServersRemoved, err = PruneServers(ctx, d.sp, snapshot.Add(-keep)); err != nil {
+	if r.Replicas.ServersRemoved, err = pruneServers(ctx, d.sp, snapshot.Add(-keep)); err != nil {
 		return nil, err
 	}
 

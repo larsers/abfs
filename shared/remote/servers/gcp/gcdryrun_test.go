@@ -147,7 +147,7 @@ func (f *gcFixture) run(opts *gc.DryRunOpts) *gc.Result {
 		o.Shards = 3
 		opts = &o
 	}
-	res, err := f.s.DryRunGC(context.Background(), f.bucket, opts)
+	res, err := f.s.DryRunGC(context.Background(), opts)
 	require.NoError(f.t, err)
 	return res
 }
@@ -505,7 +505,7 @@ func TestDryRunGC_UnknownTypeFailsClosed(t *testing.T) {
 	f.gcRow(objects.HashBlobBytes([]byte("from a newer server")), "future-type", nil, f.old)
 
 	o := gc.DefaultDryRunOpts()
-	_, err := f.s.DryRunGC(context.Background(), f.bucket, &o)
+	_, err := f.s.DryRunGC(context.Background(), &o)
 	require.ErrorContains(t, err, `unknown object type "future-type"`)
 }
 
@@ -547,13 +547,13 @@ func TestDryRunGC_LeaseRefusesSecondRun(t *testing.T) {
 
 	o := gc.DefaultDryRunOpts()
 	o.Holder = "second"
-	_, err = f.s.DryRunGC(ctx, f.bucket, &o)
+	_, err = f.s.DryRunGC(ctx, &o)
 	var held *gc.ErrLeaseHeld
 	require.ErrorAs(err, &held)
 	require.Equal("first", held.Holder)
 
 	lease.Release()
-	res, err := f.s.DryRunGC(ctx, f.bucket, &o)
+	res, err := f.s.DryRunGC(ctx, &o)
 	require.NoError(err)
 	require.Equal(int64(2), res.Report.Cycle)
 	require.Equal("second", res.Report.Holder)

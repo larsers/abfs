@@ -155,7 +155,7 @@ func Condemn(ctx context.Context, sp *spanner.Client, bt *bigtable.Client, bucke
 		o.BatchSize = DefaultCondemnBatch
 	}
 	c := &condemner{opts: &o, bt: bt, bucket: bucket}
-	return runCycle(ctx, sp, bt, bucket, objs, &o.DryRunOpts, c)
+	return runCycle(ctx, sp, bt, objs, &o.DryRunOpts, c)
 }
 
 // blockingRootClasses are the root classes in which a root without a gc row
