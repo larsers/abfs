@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/binding"
+	"github.com/google/abfs/repo"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/objects/gitobjects"
@@ -471,6 +472,31 @@ func TestDryRunGC_SnapshotRefKeepsPinnedBase(t *testing.T) {
 	requireReachable(t, res, true, ws, oldWS, oldDetails, oldPinned, oldBase, oldBaseTree)
 	require.Equal(&gc.RefCounts{Refs: 2, Roots: 2}, res.Report.Refs[gc.RefSnapshot])
 	require.Equal(int64(2), res.Report.Snapshots.Revisions)
+}
+
+// A mount whose workspace differs from its commit pins the workspace's tree
+// in a project annotation and mounts that tree, which is then a root as well.
+// An annotation that is not a hash is counted as ignored.
+func TestDryRunGC_MountKeepsAnnotatedTree(t *testing.T) {
+	require := require.New(t)
+	f := newGCFixture(t)
+	old := f.old
+	baseTree := f.tree(old, f.blob("base file", old))
+	base := f.commit(baseTree, "base", old)
+	edited := f.blob("edited in the parent workspace", old)
+	wsTree := f.tree(old, edited)
+	manifest := "<manifest>\n<remote name=\"origin\" fetch=\"https://example.com\"/>\n<default revision=\"main\" remote=\"origin\"/>\n" +
+		fmt.Sprintf("<project name=\"p0\" path=\"p0\" revision=\"%s\">\n<annotaion name=\"%s\" value=\"%s\"/>\n</project>\n", base, repo.ABFSDirHashTag, wsTree) +
+		fmt.Sprintf("<project name=\"p1\" path=\"p1\" revision=\"%s\">\n<annotaion name=\"%s\" value=\"main\"/>\n</project>\n</manifest>\n", base, repo.ABFSDirHashTag)
+	pinned := f.blob(manifest, old)
+	details := f.object(&binding.MountDetails{Version: binding.CurrentMountDetailsVersion, MetaRefPrefix: "user/u", PinnedManifestHash: pinned}, old)
+	f.ref(entities.ABFSMetaProject, "refs/abfs/mount/user/u/1", details, f.now.Add(-time.Hour))
+
+	res := f.run(nil)
+	requireReachable(t, res, true, details, pinned, base, baseTree, wsTree, edited)
+	m := res.Report.LiveMounts
+	require.Equal(int64(2), m.Revisions)
+	require.Equal(int64(1), m.IgnoredRevisions)
 }
 
 func TestDryRunGC_UnknownTypeFailsClosed(t *testing.T) {

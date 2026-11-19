@@ -26,6 +26,7 @@ import (
 
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/repo"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/remote"
@@ -387,7 +388,8 @@ func (c *pinCounts) counts(src *pinSource) *MountCounts {
 // behind each workspace snapshot that a workspace or snapshot ref names, and
 // the pinned manifests they name. It returns the project revisions that are
 // object keys: the commits the mounts and workspaces are based on, which
-// neither links. A mount with the keep-alive whose touch interval is not
+// neither links, and the workspace trees that mounts use in place of a
+// commit's tree. A mount with the keep-alive whose touch interval is not
 // safely below touchLimit is counted in TouchIntervalTooLong.
 func pinnedRevisions(ctx context.Context, objs remote.RemoteProvider, refs *refSnapshot, touchLimit time.Duration) ([]pinnedRevision, pinCounts, error) {
 	p := &pinReader{
@@ -584,16 +586,13 @@ func wsMountDetails(ctx context.Context, objs remote.RemoteProvider, h Hash) (Ha
 	return ws.MountDetails, nil
 }
 
-// manifestRevisions returns the revisions of a manifest that are hashes and
-// counts the others.
+// manifestRevisions returns the revisions of a manifest that are hashes, and
+// the trees that projects pin in place of their commit's tree, and counts the
+// others.
 func manifestRevisions(ctx context.Context, objs remote.RemoteProvider, h Hash) (revs []Hash, ignored int, err error) {
-	content, err := readBlob(ctx, objs, h)
+	projects, err := manifestProjects(ctx, objs, h)
 	if err != nil {
 		return nil, 0, err
-	}
-	m, err := manifest.Parse(content)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to parse the manifest: %w", err)
 	}
 	add := func(rev string) {
 		if entities.IsHash(rev) {
@@ -602,18 +601,55 @@ func manifestRevisions(ctx context.Context, objs remote.RemoteProvider, h Hash) 
 			ignored++
 		}
 	}
+	for _, p := range projects {
+		add(p.revision)
+		if p.dirHash != "" {
+			add(p.dirHash)
+		}
+	}
+	return revs, ignored, nil
+}
+
+type manifestProject struct {
+	path, revision, dirHash string
+}
+
+// manifestProjects returns the projects of a manifest with their revisions
+// and, for a mount whose workspace differs from its commit, the workspace's
+// tree, which the mount uses in place of the commit's tree.
+func manifestProjects(ctx context.Context, objs remote.RemoteProvider, h Hash) ([]manifestProject, error) {
+	content, err := readBlob(ctx, objs, h)
+	if err != nil {
+		return nil, err
+	}
+	m, err := manifest.Parse(content)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse the manifest: %w", err)
+	}
+	var projects []manifestProject
 	for _, p := range m.Project {
-		add(m.ProjectRevision(p))
+		mp := manifestProject{path: p.GetPath(), revision: m.ProjectRevision(p)}
+		for _, a := range p.Annotation {
+			if a.Name == repo.ABFSDirHashTag {
+				mp.dirHash = a.Value
+				break
+			}
+		}
+		projects = append(projects, mp)
 	}
 	for _, p := range m.ExtendProject {
 		if p.Revision != "" {
-			add(p.Revision)
+			path := p.Path
+			if path == "" {
+				path = p.Name
+			}
+			projects = append(projects, manifestProject{path: path, revision: p.Revision})
 		}
 	}
 	if m.SuperProject != nil {
-		add(m.ProjectRevision(&m.SuperProject.Project))
+		projects = append(projects, manifestProject{path: m.SuperProject.GetPath(), revision: m.ProjectRevision(&m.SuperProject.Project)})
 	}
-	return revs, ignored, nil
+	return projects, nil
 }
 
 func readBlob(ctx context.Context, objs remote.RemoteProvider, h Hash) (_ []byte, retErr error) {

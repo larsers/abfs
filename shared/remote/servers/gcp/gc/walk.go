@@ -22,7 +22,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/abfs/binding"
-	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/repo"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
@@ -52,10 +52,6 @@ const (
 	// WalkDirHash prefixes the type of what the walk found below the tree a
 	// pinned manifest names for a project in place of its commit's tree.
 	WalkDirHash = "dir-hash-"
-	// dirHashAnnotation is repo.ABFSDirHashTag: a pinned manifest of a mount
-	// whose workspace differs from its commit names the workspace's tree in
-	// this project annotation, and the mount uses that tree.
-	dirHashAnnotation = "abfs.dir.hash.tag"
 )
 
 // WalkOpts are the options of Walk.
@@ -279,7 +275,7 @@ func (w *walker) pinnedRevisions(ctx context.Context, mounts []Hash) ([]walkRevi
 				continue
 			}
 			if !entities.IsHash(p.dirHash) {
-				w.incomplete(fmt.Sprintf("pinned manifest %s: project %s has %s %q, which is not a hash", pinned, p.path, dirHashAnnotation, p.dirHash))
+				w.incomplete(fmt.Sprintf("pinned manifest %s: project %s has %s %q, which is not a hash", pinned, p.path, repo.ABFSDirHashTag, p.dirHash))
 				continue
 			}
 			if dh := entities.NewHash(p.dirHash); !seenDirHashes[dh] {
@@ -290,47 +286,6 @@ func (w *walker) pinnedRevisions(ctx context.Context, mounts []Hash) ([]walkRevi
 	}
 	w.res.Revisions = int64(len(revs))
 	return revs, nil
-}
-
-type manifestProject struct {
-	path, revision, dirHash string
-}
-
-// manifestProjects returns the projects of a manifest with their revisions,
-// in the order of manifestRevisions.
-func manifestProjects(ctx context.Context, objs remote.RemoteProvider, h Hash) ([]manifestProject, error) {
-	content, err := readBlob(ctx, objs, h)
-	if err != nil {
-		return nil, err
-	}
-	m, err := manifest.Parse(content)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse the manifest: %w", err)
-	}
-	var projects []manifestProject
-	for _, p := range m.Project {
-		mp := manifestProject{path: p.GetPath(), revision: m.ProjectRevision(p)}
-		for _, a := range p.Annotation {
-			if a.Name == dirHashAnnotation {
-				mp.dirHash = a.Value
-				break
-			}
-		}
-		projects = append(projects, mp)
-	}
-	for _, p := range m.ExtendProject {
-		if p.Revision != "" {
-			path := p.Path
-			if path == "" {
-				path = p.Name
-			}
-			projects = append(projects, manifestProject{path: path, revision: p.Revision})
-		}
-	}
-	if m.SuperProject != nil {
-		projects = append(projects, manifestProject{path: m.SuperProject.GetPath(), revision: m.ProjectRevision(&m.SuperProject.Project)})
-	}
-	return projects, nil
 }
 
 func (rw *revisionWalk) hit(w *walker, key Hash, typ, path string) {
