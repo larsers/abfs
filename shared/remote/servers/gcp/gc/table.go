@@ -136,9 +136,11 @@ func (w *EdgeWriter) applyWithRetry(ctx context.Context, row string, mut *bigtab
 }
 
 // retryable reports whether err of a call made under ctx, or under an attempt
-// context derived from it, is transient. An attempt that reached its deadline
-// is, while ctx lives: the library returns either a DeadlineExceeded status or
-// the plain context error, depending on where the attempt was when it ended.
+// context derived from it, is transient. Bigtable and Cloud Storage over gRPC
+// answer a throttled call with ResourceExhausted. An attempt that reached its
+// deadline is, while ctx lives: the library returns either a DeadlineExceeded
+// status or the plain context error, depending on where the attempt was when
+// it ended.
 func retryable(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
@@ -147,7 +149,7 @@ func retryable(ctx context.Context, err error) bool {
 		return true
 	}
 	switch status.Code(err) {
-	case codes.Unavailable, codes.Aborted, codes.DeadlineExceeded:
+	case codes.Unavailable, codes.Aborted, codes.DeadlineExceeded, codes.ResourceExhausted:
 		return true
 	}
 	return false

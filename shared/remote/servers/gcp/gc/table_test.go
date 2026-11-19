@@ -117,6 +117,7 @@ func TestEdgeWriter_RetriesTransientErrors(t *testing.T) {
 		{"success", nil, 1, false},
 		{"unavailable then success", []error{status.Error(codes.Unavailable, "down")}, 2, false},
 		{"aborted twice then success", []error{status.Error(codes.Aborted, "a"), status.Error(codes.Aborted, "a")}, 3, false},
+		{"quota then success", []error{status.Error(codes.ResourceExhausted, "quota")}, 2, false},
 		{"permanent", []error{status.Error(codes.NotFound, "no table")}, 1, true},
 		{"not a status", []error{errors.New("other")}, 1, true},
 		{"always unavailable", []error{
