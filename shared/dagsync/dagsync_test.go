@@ -15,6 +15,7 @@
 package dagsync_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -860,4 +861,161 @@ func TestWaitStopRace(t *testing.T) {
 			require.Equal(t, []entities.Hash{hash1, hash2}, refs, "iteration %d: Wait returned nil but the refs are not stored", i)
 		}
 	}
+}
+
+// bigContent is over the offline threshold of startOfflineSync.
+var (
+	bigContent = bytes.Repeat([]byte("big blob "), 64)
+	bigHash    = objects.HashBlobBytes(bigContent)
+)
+
+// startOfflineSync starts a dagsync that keeps objects over 256 bytes offline, with bigContent, the
+// small blobs and trees in the accessor.
+func startOfflineSync(t *testing.T, trees ...*gitobjects.Tree) (*dagsync.DAGSync, *inmemory.InMemoryServer) {
+	updater := inmemory.New()
+	accessor := newTestAccessor()
+	d := dagsync.New(&dagsync.DagSyncOpts{Updater: updater, Accessor: accessor, WorkersCount: 1, OfflineThreshold: 256})
+	d.FailCooldown = time.Microsecond
+
+	accessor.blobs[bigHash] = bigContent
+	accessor.blobs[hash1] = content1
+	accessor.blobs[hash2] = content2
+	for _, tree := range trees {
+		accessor.objects[tree.Hash] = tree.Encoded
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
+	go func() {
+		d.Start(ctx)
+		close(stopped)
+	}()
+	return d, updater
+}
+
+// waitForResult returns the first callback result that is not a link validation error, which dagsync
+// reports before it pushes the missing links.
+func waitForResult(t *testing.T, results <-chan error) error {
+	for {
+		select {
+		case err := <-results:
+			var linkErr *remote.ErrObjectLinkValidation
+			if !errors.As(err, &linkErr) {
+				return err
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for the callback")
+			return nil
+		}
+	}
+}
+
+func resultChan() (chan error, dagsync.Callback) {
+	results := make(chan error, 10)
+	return results, func(err error) { results <- err }
+}
+
+func TestDAGSyncOffline_DependentRefFails(t *testing.T) {
+	d, updater := startOfflineSync(t)
+
+	results, callback := resultChan()
+	d.PutRefs("server", "project", []entities.RefHash{{Ref: "refs/heads/big", Hash: bigHash}}, callback)
+	err := waitForResult(t, results)
+	require.ErrorIs(t, err, dagsync.ErrOfflineDependency)
+	require.ErrorContains(t, err, bigHash.String())
+
+	refs, err := updater.GetRefs(t.Context(), "server", "project", []string{"refs/heads/big"})
+	require.NoError(t, err)
+	require.True(t, refs[0].IsZero())
+}
+
+func TestDAGSyncOffline_RefAboveTreesFails(t *testing.T) {
+	inner := newObject(bigHash, hash1)
+	outer := newObject(inner, hash2)
+	d, updater := startOfflineSync(t, inner, outer)
+
+	results, callback := resultChan()
+	d.PutRefs("server", "project", []entities.RefHash{{Ref: "refs/heads/big", Hash: outer.Hash}}, callback)
+	err := waitForResult(t, results)
+	require.ErrorIs(t, err, dagsync.ErrOfflineDependency)
+	require.ErrorContains(t, err, bigHash.String())
+
+	refs, err := updater.GetRefs(t.Context(), "server", "project", []string{"refs/heads/big"})
+	require.NoError(t, err)
+	require.True(t, refs[0].IsZero())
+	headers, err := updater.Headers(t.Context(), []entities.Hash{inner.Hash, outer.Hash})
+	require.NoError(t, err)
+	require.True(t, headers[0].IsEmpty())
+	require.True(t, headers[1].IsEmpty())
+}
+
+func TestDAGSyncOffline_PhonySucceeds(t *testing.T) {
+	d, _ := startOfflineSync(t)
+
+	results, callback := resultChan()
+	d.Phony(0, []entities.Hash{bigHash}, callback)
+	require.NoError(t, waitForResult(t, results))
+	require.NoError(t, d.Wait(10*time.Second))
+}
+
+func TestDAGSyncOffline_UnrelatedRequestsRun(t *testing.T) {
+	d, updater := startOfflineSync(t)
+
+	results, callback := resultChan()
+	d.PutRefs("server", "project", []entities.RefHash{{Ref: "refs/heads/big", Hash: bigHash}}, callback)
+	waitForResult(t, results)
+
+	results, callback = resultChan()
+	d.PutRefs("server", "project", []entities.RefHash{{Ref: "refs/heads/small", Hash: hash1}}, callback)
+	require.NoError(t, waitForResult(t, results))
+	refs, err := updater.GetRefs(t.Context(), "server", "project", []string{"refs/heads/small"})
+	require.NoError(t, err)
+	require.Equal(t, hash1, refs[0])
+
+	results, callback = resultChan()
+	d.Phony(0, []entities.Hash{hash2}, callback)
+	require.NoError(t, waitForResult(t, results))
+	headers, err := updater.Headers(t.Context(), []entities.Hash{hash2})
+	require.NoError(t, err)
+	require.False(t, headers[0].IsEmpty())
+
+	require.NoError(t, d.Wait(10*time.Second))
+	assertSyncIsGood(t, d)
+}
+
+func TestDAGSyncOffline_SkippedMapKeepsKey(t *testing.T) {
+	d, updater := startOfflineSync(t)
+
+	d.AddMapResult(hash1, bigHash)
+	require.NoError(t, d.Wait(10*time.Second))
+	d.AddMapResult(hash1, hash2)
+	require.NoError(t, d.Wait(10*time.Second))
+
+	results, err := updater.MapResults(t.Context(), hash1)
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{hash2}, results)
+}
+
+func TestDAGSyncOffline_XchgRefs(t *testing.T) {
+	d, updater := startOfflineSync(t)
+
+	results, callback := resultChan()
+	d.XchgRef("server", "project", "refs/heads/big", bigHash, entities.ZeroHash, callback)
+	err := waitForResult(t, results)
+	require.ErrorIs(t, err, dagsync.ErrOfflineDependency)
+	require.ErrorContains(t, err, bigHash.String())
+
+	results, callback = resultChan()
+	d.XchgRef("server", "project", "refs/heads/small", hash1, entities.ZeroHash, callback)
+	require.NoError(t, waitForResult(t, results))
+
+	refs, err := updater.GetRefs(t.Context(), "server", "project", []string{"refs/heads/big", "refs/heads/small"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{entities.ZeroHash, hash1}, refs)
+	require.NoError(t, d.Wait(10*time.Second))
+	assertSyncIsGood(t, d)
 }

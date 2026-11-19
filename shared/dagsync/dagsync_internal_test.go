@@ -287,3 +287,31 @@ func TestDropCallsCallbackOnce(t *testing.T) {
 	}
 	requireNoNodeCounted(t, d)
 }
+
+// A ref push skipped for an object kept offline does not skip the next push of the same ref,
+// which waits for it only to keep the order.
+func TestSkippedRefPushKeepsNextPush(t *testing.T) {
+	d := New(&DagSyncOpts{WorkersCount: 0})
+	offline := entities.Hash{1}
+	first := &PutRefsRequest{server: "s", project: "p", refs: []entities.RefHash{{Ref: "refs/heads/main", Hash: offline}}}
+	second := &PutRefsRequest{server: "s", project: "p", refs: []entities.RefHash{{Ref: "refs/heads/main", Hash: entities.Hash{2}}}}
+	errs := make(chan error, 1)
+
+	d.handle(&newRequest{request: first, callbacks: []Callback{func(err error) { errs <- err }}})
+	d.handle(&newRequest{request: second})
+	d.lock.Lock()
+	f := d.nodes[first.String()]
+	s := d.nodes[second.String()]
+	require.Equal(t, 1, s.deps[f])
+	require.Equal(t, BlockedState, s.state)
+	d.transit(f, RunningState)
+	f.offlineDep = offline
+	d.lock.Unlock()
+	d.handle(&executed{node: f, skipped: true})
+
+	require.ErrorIs(t, <-errs, ErrOfflineDependency)
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	require.True(t, s.offlineDep.IsZero())
+	require.Equal(t, QueuedState, s.state)
+}

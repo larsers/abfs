@@ -853,8 +853,10 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 		require.Zero(t, c.Stats().RemoteChecks.PhonyConfirmed)
 	})
 
-	// With an offline threshold, dagsync skips a phony request whose link it skipped, and
-	// every later one, and calls back without an error and without asking the server.
+	// With an offline threshold, dagsync skips a phony request whose link it skipped and calls
+	// back without an error and without asking the server, so the phony request confirms
+	// nothing. A later phony request for a small object runs and uploads it, and the upload
+	// marks it remote.
 	t.Run("phony with an offline threshold", func(t *testing.T) {
 		r := newCheckRemote()
 		c := newCheckCacheman(t, r, checkOpts{gcKeepAlive: true, period: time.Hour, offlineThreshold: 4})
@@ -876,6 +878,11 @@ func TestCacheman_LocalWriteOfRemoteContent(t *testing.T) {
 			case <-done:
 			case <-time.After(5 * time.Second):
 				t.Fatalf("no successful callback for the phony request of %s", h)
+			}
+			if h == small {
+				require.True(t, r.has(t, h))
+				require.True(t, confirmed(c, h))
+				continue
 			}
 			require.False(t, r.has(t, h))
 			requireUnconfirmed(t, c, h)
