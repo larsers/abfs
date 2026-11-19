@@ -38,6 +38,9 @@ const (
 	// went back to the LRU. Until the entry is used again, Park does not park it but moves it
 	// to the young end of the LRU and records the move here. A use deletes the key.
 	releasedPrefix = "released::"
+
+	// restoreBatchSize is the number of keys restoreParked deletes per transaction.
+	restoreBatchSize = 10000
 )
 
 // parkedEntry is the park state of an entry in memory.
@@ -278,54 +281,71 @@ func (b *BadgerIndexStore) Unpark(hash entities.Hash, timestamp int64) (bool, er
 // release time other than 0 is recorded for Park.
 // Caller should be holding the timestamps lock for the hash.
 func (b *BadgerIndexStore) unparkLocked(hash entities.Hash, p parkedEntry, timestamp, released int64) (bool, error) {
-	var lruSize int64
-	var inLRU, stale bool
+	var u unparkWrite
 	err := b.retryUpdateOnConflict(func(txn *badger.Txn) error {
-		inLRU, stale, lruSize = false, false, 0
-		key := parkKey(p.time, hash)
-		if _, err := txn.Get(key); errors.Is(err, badger.ErrKeyNotFound) {
-			stale = true
-			return nil
-		} else if err != nil {
-			return err
-		}
-		if err := txn.Delete(key); err != nil {
-			return err
-		}
-		if released != 0 {
-			if err := txn.Set(releasedKey(hash), []byte(strconv.FormatInt(released, 10))); err != nil {
-				return err
-			}
-		}
-		entry, _ := b.get(txn, hash)
-		if entry == nil || !entry.Local || !entry.Remote || !b.isLRUCandidate(hash) || b.readTimestampLocked(hash) != 0 {
-			return nil
-		}
-		if err := txn.Set(lruKey(timestamp, hash), nil); err != nil {
-			return err
-		}
-		inLRU = true
-		lruSize = int64(entry.LocalSize())
-		return nil
+		var err error
+		u, err = b.writeUnparkLocked(txn, hash, p, timestamp, released)
+		return err
 	}, defaultNumTries)
 	if err != nil {
 		return false, fmt.Errorf("Unpark(%v) failed: %w", hash.String(), err)
 	}
+	return b.unparkedLocked(hash, p, timestamp, released, u), nil
+}
 
+// unparkWrite is what writeUnparkLocked wrote, for unparkedLocked.
+type unparkWrite struct {
+	stale   bool
+	inLRU   bool
+	lruSize int64
+}
+
+// writeUnparkLocked writes the unpark of hash for unparkLocked.
+// Caller should be holding the timestamps lock for the hash.
+// Should only be called from the context of an open transaction.
+func (b *BadgerIndexStore) writeUnparkLocked(txn *badger.Txn, hash entities.Hash, p parkedEntry, timestamp, released int64) (unparkWrite, error) {
+	key := parkKey(p.time, hash)
+	if _, err := txn.Get(key); errors.Is(err, badger.ErrKeyNotFound) {
+		return unparkWrite{stale: true}, nil
+	} else if err != nil {
+		return unparkWrite{}, err
+	}
+	if err := txn.Delete(key); err != nil {
+		return unparkWrite{}, err
+	}
+	if released != 0 {
+		if err := txn.Set(releasedKey(hash), []byte(strconv.FormatInt(released, 10))); err != nil {
+			return unparkWrite{}, err
+		}
+	}
+	entry, _ := b.get(txn, hash)
+	if entry == nil || !entry.Local || !entry.Remote || !b.isLRUCandidate(hash) || b.readTimestampLocked(hash) != 0 {
+		return unparkWrite{}, nil
+	}
+	if err := txn.Set(lruKey(timestamp, hash), nil); err != nil {
+		return unparkWrite{}, err
+	}
+	return unparkWrite{inLRU: true, lruSize: int64(entry.LocalSize())}, nil
+}
+
+// unparkedLocked records in memory an unpark that writeUnparkLocked wrote and reports whether
+// the park key was there.
+// Caller should be holding the timestamps lock for the hash.
+func (b *BadgerIndexStore) unparkedLocked(hash entities.Hash, p parkedEntry, timestamp, released int64, u unparkWrite) bool {
 	shard := shardForHash(hash)
 	b.parkedSize.Add(-p.size)
 	delete(b.parked[shard], hash)
-	if stale {
-		return false, nil
+	if u.stale {
+		return false
 	}
 	if released != 0 {
 		b.released[shard][hash] = released
 	}
-	if inLRU {
+	if u.inLRU {
 		b.writeTimestampLocked(hash, timestamp)
-		b.lruSize.Add(lruSize)
+		b.lruSize.Add(u.lruSize)
 	}
-	return true, nil
+	return true
 }
 
 // IsParked implements IndexStore.
@@ -342,47 +362,67 @@ func (b *BadgerIndexStore) ParkedSize() int64 {
 
 // ReleaseParked implements IndexStore.
 func (b *BadgerIndexStore) ReleaseParked(before int64, limit int) (int, bool, error) {
-	var batch []KeyTimestamp
+	var candidates []KeyTimestamp
 	err := b.db.View(func(txn *badger.Txn) error {
 		var err error
-		batch, err = oldestParked(txn, before, limit)
+		candidates, err = oldestParked(txn, before, limit)
 		return err
 	})
 	if err != nil {
 		return 0, false, fmt.Errorf("ReleaseParked() failed: %w", err)
 	}
+	if len(candidates) == 0 {
+		return 0, true, nil
+	}
+	hashes := make([]entities.Hash, len(candidates))
+	for i, kt := range candidates {
+		hashes[i] = kt.Key
+	}
+	shards := shardsForHashes(hashes)
+	b.lockTimestampShards(shards)
+	defer b.unlockTimestampShards(shards)
+
+	type release struct {
+		hash      entities.Hash
+		p         parkedEntry
+		timestamp int64
+		u         unparkWrite
+	}
 	now := time.Now().Unix()
-	var released int
-	for _, kt := range batch {
-		ok, err := b.release(kt, now)
-		if err != nil {
-			return released, false, err
+	var releases []release
+	err = b.retryUpdateOnConflict(func(txn *badger.Txn) error {
+		releases = releases[:0]
+		for _, kt := range candidates {
+			p, ok := b.parked[shardForHash(kt.Key)][kt.Key]
+			if !ok || p.time != kt.Timestamp {
+				if err := txn.Delete(parkKey(kt.Timestamp, kt.Key)); err != nil {
+					return err
+				}
+				continue
+			}
+			// An entry without an LRU time before the park goes back at its park time.
+			timestamp := p.lruTime
+			if timestamp == 0 {
+				timestamp = p.time
+			}
+			u, err := b.writeUnparkLocked(txn, kt.Key, p, timestamp, now)
+			if err != nil {
+				return err
+			}
+			releases = append(releases, release{hash: kt.Key, p: p, timestamp: timestamp, u: u})
 		}
-		if ok {
+		return nil
+	}, defaultNumTries)
+	if err != nil {
+		return 0, false, fmt.Errorf("ReleaseParked() failed: %w", err)
+	}
+	var released int
+	for _, r := range releases {
+		if b.unparkedLocked(r.hash, r.p, r.timestamp, now, r.u) {
 			released++
 		}
 	}
-	return released, len(batch) < limit, nil
-}
-
-// release returns the entry of the park key kt to the LRU at its timestamp before the park,
-// or at its park time if it had none. It deletes a park key that names no parked entry.
-func (b *BadgerIndexStore) release(kt KeyTimestamp, now int64) (bool, error) {
-	b.lockTimestamps(kt.Key)
-	defer b.unlockTimestamps(kt.Key)
-
-	p, ok := b.parked[shardForHash(kt.Key)][kt.Key]
-	if !ok || p.time != kt.Timestamp {
-		err := b.db.Update(func(txn *badger.Txn) error {
-			return txn.Delete(parkKey(kt.Timestamp, kt.Key))
-		})
-		return false, err
-	}
-	timestamp := p.lruTime
-	if timestamp == 0 {
-		timestamp = p.time
-	}
-	return b.unparkLocked(kt.Key, p, timestamp, now)
+	return released, len(candidates) < limit, nil
 }
 
 // oldestParked returns up to limit park keys, oldest first, parked at or before maxTimestamp.
@@ -472,8 +512,12 @@ func (b *BadgerIndexStore) EvictParked() ([]*IndexKeyEntry, int64, int64, error)
 // restoreParked re-populates the park state in memory and parkedSize from the store. It deletes
 // park keys whose entry is no longer Local and Remote, and release times of deleted entries.
 func (b *BadgerIndexStore) restoreParked() error {
+	parked := make(map[entities.Hash]parkedEntry)
+	released := make(map[entities.Hash]int64)
 	var size int64
-	err := b.db.Update(func(txn *badger.Txn) error {
+	w := batchDeleter{db: b.db}
+	defer w.discard()
+	err := b.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		prefix := []byte(parkPrefix)
@@ -490,15 +534,16 @@ func (b *BadgerIndexStore) restoreParked() error {
 				})
 				entry, _ = b.get(txn, kt.Key)
 			}
-			if err != nil || entry == nil || !entry.Local || !entry.Remote || b.isParkedLocked(kt.Key) {
-				if err := txn.Delete(key); err != nil {
+			_, dup := parked[kt.Key]
+			if err != nil || entry == nil || !entry.Local || !entry.Remote || dup {
+				if err := w.delete(key); err != nil {
 					return err
 				}
 				continue
 			}
 			p.time = kt.Timestamp
 			p.size = int64(entry.LocalSize())
-			b.parked[shardForHash(kt.Key)][kt.Key] = p
+			parked[kt.Key] = p
 			size += p.size
 		}
 
@@ -507,25 +552,68 @@ func (b *BadgerIndexStore) restoreParked() error {
 			item := it.Item()
 			key := item.KeyCopy(nil)
 			hash := stripPrefix(releasedPrefix, key)
-			var released int64
+			var t int64
 			err := item.Value(func(val []byte) error {
 				var err error
-				released, err = strconv.ParseInt(string(val), 10, 64)
+				t, err = strconv.ParseInt(string(val), 10, 64)
 				return err
 			})
 			if entry, _ := b.get(txn, hash); err != nil || entry == nil {
-				if err := txn.Delete(key); err != nil {
+				if err := w.delete(key); err != nil {
 					return err
 				}
 				continue
 			}
-			b.released[shardForHash(hash)][hash] = released
+			released[hash] = t
 		}
-		return nil
+		return w.commit()
 	})
 	if err != nil {
 		return fmt.Errorf("restoreParked() failed: %w", err)
 	}
+	for h, p := range parked {
+		b.parked[shardForHash(h)][h] = p
+	}
+	for h, t := range released {
+		b.released[shardForHash(h)][h] = t
+	}
 	b.parkedSize.Store(size)
 	return nil
+}
+
+// batchDeleter deletes keys in write transactions of at most restoreBatchSize keys, since one
+// transaction cannot hold the deletes of a large index.
+type batchDeleter struct {
+	db    *badger.DB
+	txn   *badger.Txn
+	count int
+}
+
+func (w *batchDeleter) delete(key []byte) error {
+	if w.txn == nil {
+		w.txn = w.db.NewTransaction(true)
+	}
+	if err := w.txn.Delete(key); err != nil {
+		return err
+	}
+	if w.count++; w.count >= restoreBatchSize {
+		return w.commit()
+	}
+	return nil
+}
+
+func (w *batchDeleter) commit() error {
+	if w.txn == nil {
+		return nil
+	}
+	err := w.txn.Commit()
+	w.txn, w.count = nil, 0
+	return err
+}
+
+func (w *batchDeleter) discard() {
+	if w.txn != nil {
+		w.txn.Discard()
+		w.txn = nil
+	}
 }

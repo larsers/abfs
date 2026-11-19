@@ -25,6 +25,9 @@ import (
 const (
 	clearRetryWait    = 100 * time.Millisecond
 	maxClearRetryWait = 5 * time.Second
+	// releaseParkedBatchSize is the number of parked entries released per transaction, which
+	// holds their timestamp shards and eviction off for its length.
+	releaseParkedBatchSize = 1000
 )
 
 var errEvictionHeld = errors.New("eviction is held until the server confirms the cache")
@@ -149,7 +152,7 @@ func (i *badgerIndex) releaseParked(before int64) (int, error) {
 	var released int
 	for {
 		i.evictRWLock.RLock()
-		n, done, err := i.indexStore.ReleaseParked(before, MaxEvictBatchSize)
+		n, done, err := i.indexStore.ReleaseParked(before, releaseParkedBatchSize)
 		i.evictRWLock.RUnlock()
 		released += n
 		if err != nil || done {
