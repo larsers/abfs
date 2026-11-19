@@ -36,18 +36,19 @@ func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 	if !c.ReadJSON(w, r, &keys) {
 		return
 	}
-	if c.abfsClient == nil {
+	abfsClient := c.remoteClient()
+	if abfsClient == nil {
 		c.ErrorJSON(w, r, errors.New("remote client not initialized"), http.StatusServiceUnavailable)
 		return
 	}
-	if _, ok := c.abfsClient.(*localOnlyClient); ok {
+	if _, ok := abfsClient.(*localOnlyClient); ok {
 		c.ErrorJSON(w, r, errors.New("cacheman is running in local-only mode"), http.StatusServiceUnavailable)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), remoteHeadersTimeout)
 	defer cancel()
-	hdrs, err := c.abfsClient.Headers(ctx, keys)
+	hdrs, err := abfsClient.Headers(ctx, keys)
 	if err != nil {
 		c.ErrorJSON(w, r, err, http.StatusInternalServerError)
 		return
@@ -60,4 +61,18 @@ func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 		c.checkRemoteHeaders(ctx, keys, found)
 	}
 	c.WriteJSON(w, r, found)
+}
+
+// remoteClient returns the ABFS client, which a config reload can replace while the keep-alive
+// and the local write check use it.
+func (c *CacheMan) remoteClient() ABFSClient {
+	c.abfsClientLock.RLock()
+	defer c.abfsClientLock.RUnlock()
+	return c.abfsClient
+}
+
+func (c *CacheMan) setABFSClient(abfsClient ABFSClient) {
+	c.abfsClientLock.Lock()
+	defer c.abfsClientLock.Unlock()
+	c.abfsClient = abfsClient
 }

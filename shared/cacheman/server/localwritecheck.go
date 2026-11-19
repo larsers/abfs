@@ -78,8 +78,10 @@ type localWriteCheck struct {
 	ctx    context.Context
 	index  localWriteIndex
 	worker bool
-	queue  map[entities.Hash]EntryType
-	full   chan struct{}
+	// cancelPass stops the start pass of index.
+	cancelPass context.CancelFunc
+	queue      map[entities.Hash]EntryType
+	full       chan struct{}
 
 	// phonySync is the dagsync whose phony callbacks report an answer of the server. A
 	// dagsync with an offline threshold skips requests and then calls back without an
@@ -163,11 +165,9 @@ func (c *CacheMan) applyLocalWriteCheck(config *instance.Config) {
 	if config.GCKeepAlive && config.EnableIndex && !config.LocalOnly {
 		c.localWrites.on.Store(true)
 	}
-	idx, ok := c.checkedIndex()
-	if !ok {
-		return
+	if idx, ok := c.checkedIndex(); ok {
+		idx.enableLocalWriteCheck()
 	}
-	idx.enableLocalWriteCheck()
 
 	c.localWrites.mu.Lock()
 	defer c.localWrites.mu.Unlock()
@@ -186,10 +186,18 @@ func (c *CacheMan) startLocalWriteCheck(ctx context.Context) {
 func (c *CacheMan) startLocalWriteCheckLocked() {
 	lw := &c.localWrites
 	idx, ok := c.checkedIndex()
-	if !ok || lw.ctx == nil || idx == lw.index {
+	if lw.ctx == nil || (ok && idx == lw.index) {
 		return
 	}
+	// A config reload closed the index of the running pass.
+	if lw.cancelPass != nil {
+		lw.cancelPass()
+		lw.cancelPass = nil
+	}
 	lw.index = idx
+	if !ok {
+		return
+	}
 
 	// An entry cleared before a restart is not Remote, so nothing else would check it.
 	markers, err := idx.checkMarkers()
@@ -230,8 +238,10 @@ func (c *CacheMan) startLocalWriteCheckLocked() {
 	if err != nil {
 		c.printer.Printf("Failed to read the LRU, eviction waits for the cache to fill: %v\n", err)
 	} else {
+		var passCtx context.Context
+		passCtx, lw.cancelPass = context.WithCancel(lw.ctx)
 		c.activeWorkers.Add(1)
-		go c.localWriteStartPass(lw.ctx, idx, slices.Collect(slices.Chunk(lru, localWriteStartPassBatch)))
+		go c.localWriteStartPass(passCtx, idx, slices.Collect(slices.Chunk(lru, localWriteStartPassBatch)))
 	}
 
 	if !lw.worker {
@@ -260,7 +270,7 @@ func (c *CacheMan) stopContext(ctx context.Context) (context.Context, context.Ca
 func (c *CacheMan) localWriteHeaders(ctx context.Context, keys []entities.Hash) ([]bool, error) {
 	wait := localWriteRetryWait
 	for {
-		hdrs, err := c.abfsClient.Headers(ctx, keys)
+		hdrs, err := c.remoteClient().Headers(ctx, keys)
 		if err == nil && len(hdrs) != len(keys) {
 			err = fmt.Errorf("server answered %d headers for %d keys", len(hdrs), len(keys))
 		}
@@ -534,12 +544,12 @@ func (c *CacheMan) localWriteStartPass(ctx context.Context, idx localWriteIndex,
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.SetLimit(localWriteStartPassCalls)
 	for i, batch := range batches {
-		if err := pacer.wait(ctx, len(batch)); err != nil {
+		keys := c.startPassKeys(ctx, batch)
+		if err := pacer.wait(ctx, len(keys)); err != nil {
 			stopped = true
 			break
 		}
 		eg.Go(func() error {
-			keys := c.startPassKeys(ctx, batch)
 			var found []bool
 			if len(keys) > 0 {
 				var err error

@@ -180,6 +180,7 @@ type CacheMan struct {
 	initDeeptreeGroup    singleflight.Group // see (*CacheMan).resolveDeeptree
 	healthCheckTrigger   chan struct{}
 	abfsClient           ABFSClient
+	abfsClientLock       sync.RWMutex
 	ariClient            ari.BlobClient
 	aresClient           ARESClient
 	cancelOverridesWatch func()
@@ -870,7 +871,7 @@ func (c *CacheMan) setupRBE(config *instance.Config, force bool) error {
 
 	// Wrap the original abfsClient with RBEClient.
 	// TODO: Rename abfsClient to something more generic.
-	c.abfsClient = rbe.NewRBEClient(&rexec.Client{GrpcClient: rbeClient}, idStore)
+	c.setABFSClient(rbe.NewRBEClient(&rexec.Client{GrpcClient: rbeClient}, idStore))
 	c.ariClient = ari.NewClient(&rexec.Client{GrpcClient: rbeClient})
 	return nil
 }
@@ -1042,7 +1043,7 @@ func (c *CacheMan) setupABFSClient(config *instance.Config, force bool) error {
 			c.printer.Printf("Error closing abfs client: %v\n", err)
 		}
 	}
-	c.abfsClient = &localOnlyClient{}
+	c.setABFSClient(&localOnlyClient{})
 	if c.ariClient != nil {
 		if err := c.ariClient.Close(); err != nil {
 			c.printer.Printf("Error closing ari client: %v\n", err)
@@ -1051,14 +1052,14 @@ func (c *CacheMan) setupABFSClient(config *instance.Config, force bool) error {
 	}
 
 	if config.LocalOnly || config.RBEAsCAS {
-		c.abfsClient = &localOnlyClient{}
+		c.setABFSClient(&localOnlyClient{})
 		return nil
 	}
 
 	abfsServers := config.EffectiveRemoteServers()
 	if len(abfsServers) <= 0 {
 		c.printer.Println("No remote servers configured, running with local-only fallback")
-		c.abfsClient = &localOnlyClient{}
+		c.setABFSClient(&localOnlyClient{})
 		return nil
 	}
 
@@ -1071,7 +1072,7 @@ func (c *CacheMan) setupABFSClient(config *instance.Config, force bool) error {
 		return err
 	}
 
-	c.abfsClient = abfsClient
+	c.setABFSClient(abfsClient)
 
 	return nil
 }
