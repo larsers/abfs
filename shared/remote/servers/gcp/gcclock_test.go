@@ -133,7 +133,7 @@ func TestCacheAge_FromReadStart(t *testing.T) {
 				err := tt.call()
 				clock.armed.Store(false)
 				if delay == 60 {
-					require.Equal(codes.Unavailable, status.Code(err), err)
+					require.Equal(codes.Unavailable, clientCode(err), err)
 					continue
 				}
 				require.NoError(err)

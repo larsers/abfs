@@ -55,6 +55,7 @@ import (
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
+	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 	"github.com/google/abfs/shared/remote/servers/gcp/depot"
 )
@@ -898,4 +899,9 @@ func TestAddMapResult_RejectsZeroHashes(t *testing.T) {
 	require.ErrorAs(t, s.AddMapResult(ctx, entities.ZeroHash, h), &linkErr)
 	require.ErrorAs(t, s.AddMapResult(ctx, h, entities.ZeroHash), &linkErr)
 	require.NoError(t, s.AddMapResult(ctx, h, h))
+}
+
+// clientCode returns the gRPC code with which a client sees err of the server.
+func clientCode(err error) codes.Code {
+	return status.Code(abfsgrpc.WrapErrorInStatus(err))
 }

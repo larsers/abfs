@@ -30,10 +30,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/gcp/casdb"
 	"github.com/google/abfs/shared/remote/servers/gcp/depot"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
@@ -354,7 +353,7 @@ func (g *gcHooks) checkHeartbeat() error {
 	}
 	now, last := cacheNow(), g.lastHeartbeat.Load()
 	if now > last && now-last > g.heartbeatStale {
-		return status.Errorf(codes.Unavailable, "GC heartbeat stale: none written for %d s", now-last)
+		return &remote.ErrUnavailable{Reason: fmt.Sprintf("GC heartbeat stale: none written for %d s", now-last)}
 	}
 	return nil
 }

@@ -31,7 +31,6 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -544,7 +543,7 @@ func (c *CASDB) XchgRefs(ctx context.Context, projectID int64, refs []remote.Ref
 		return nil
 	}
 	if len(refs) > maxRefsBatch {
-		return status.Errorf(codes.InvalidArgument, "cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)
+		return &remote.ErrInvalidArgument{Reason: fmt.Sprintf("cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)}
 	}
 
 	cols := []string{"ProjectId", "Ref", "UpdateTime", "Target"}

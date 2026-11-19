@@ -15,12 +15,11 @@
 package gcp
 
 import (
+	"fmt"
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
+	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
@@ -145,7 +144,7 @@ func (g *gcHooks) heartbeatLate(start uint32) bool {
 func (g *gcHooks) checkReadAge(start uint32) error {
 	if g.on && g.cacheTTL > 0 {
 		if now := cacheNow(); now >= start && now-start >= g.cacheTTL {
-			return status.Errorf(codes.Unavailable, "a Bigtable read took %d s, not shorter than the cache TTL", now-start)
+			return &remote.ErrUnavailable{Reason: fmt.Sprintf("a Bigtable read took %d s, not shorter than the cache TTL", now-start)}
 		}
 	}
 	return nil

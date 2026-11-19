@@ -24,7 +24,7 @@ import (
 	pb "github.com/google/abfs/shared/remote/grpc/proto"
 )
 
-// WrapErrorInStatus looks for specific typed errors (like ErrObjectLinkValidation or ErrPermissionDenied) and wraps them in a grpc Status error if found.
+// WrapErrorInStatus looks for specific typed errors (like ErrObjectLinkValidation, ErrPermissionDenied or ErrUnavailable) and wraps them in a grpc Status error if found.
 func WrapErrorInStatus(err error) error {
 	var linkErr *remote.ErrObjectLinkValidation
 	if errors.As(err, &linkErr) {
@@ -52,6 +52,16 @@ func WrapErrorInStatus(err error) error {
 			return detailErr
 		}
 		return stWithDetails.Err()
+	}
+
+	var unavailableErr *remote.ErrUnavailable
+	if errors.As(err, &unavailableErr) {
+		return status.Error(codes.Unavailable, err.Error())
+	}
+
+	var invalidErr *remote.ErrInvalidArgument
+	if errors.As(err, &invalidErr) {
+		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	return err

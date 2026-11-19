@@ -130,7 +130,7 @@ func TestValidationDeadline_FailsLateWrite(t *testing.T) {
 				err := tt.call(i)
 				clock.armed.Store(false)
 				if delay == bound {
-					require.Equal(codes.Unavailable, status.Code(err), err)
+					require.Equal(codes.Unavailable, clientCode(err), err)
 					require.False(tt.written(t, i))
 					continue
 				}
@@ -169,7 +169,7 @@ func TestValidationDeadline_ObjectRowAfterSlowGCRow(t *testing.T) {
 	armed.Store(true)
 	err := putRaw(s, key, data)
 	armed.Store(false)
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	require.NotNil(readGCRow(t, s, key), "the gc row was written")
 	_, err = s.casdb.GetHeader(ctx, key)
 	require.ErrorIs(err, casdb.ErrNotFound)
@@ -239,7 +239,7 @@ func TestWriteBound_Interceptors(t *testing.T) {
 		require.Equal(codes.FailedPrecondition, status.Code(serr))
 		return err
 	})
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	require.Equal(2, sent)
 }
 
@@ -269,7 +269,7 @@ func TestWriteBound_LibraryRetry(t *testing.T) {
 	err := writeGuard{on: true, start: 100}.do(ctx, func(ctx context.Context) error {
 		return bt.Open(gc.TableName).Apply(ctx, "row", mut)
 	})
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	require.Equal(int32(1), attempts.Load())
 	row, err := bt.Open(gc.TableName).ReadRow(ctx, "row")
 	require.NoError(err)
@@ -307,7 +307,7 @@ func TestWriteBound_SpannerCommit(t *testing.T) {
 		now += uint32(gc.ValidationWriteBound / time.Second)
 		return cas.AddRefs(ctx, id, []remote.RefHash{{Ref: "refs/heads/late", Hash: blob}})
 	})
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	hashes, err := s.GetRefs(ctx, "example.com", "p", []string{"refs/heads/late"})
 	require.NoError(err)
 	require.True(hashes[0].IsZero())
@@ -372,7 +372,7 @@ func TestAnswerBound(t *testing.T) {
 				err := tt.call()
 				clock.armed.Store(false)
 				if delay == bound {
-					require.Equal(codes.Unavailable, status.Code(err), err)
+					require.Equal(codes.Unavailable, clientCode(err), err)
 					continue
 				}
 				require.NoError(err)

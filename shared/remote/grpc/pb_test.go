@@ -24,6 +24,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 
@@ -730,4 +731,87 @@ func TestXchgRefs(t *testing.T) {
 	require.Equal(t, MaxMessageSize, tooLargeErr.MaxSize)
 	require.Greater(t, tooLargeErr.Size, MaxMessageSize)
 	require.Equal(t, 1, calls)
+}
+
+// A backend error saying that the server cannot answer now reaches the client
+// of every call as Unavailable, and one that refuses the call as
+// InvalidArgument, wrapped or not.
+func TestTypedErrorsReachClientAsCodes(t *testing.T) {
+	key := entities.NewHash("a0423896973644771497bdc03eb99d5281615b51")
+	tests := []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{"unavailable", fmt.Errorf("failed to read: %w", &remote.ErrUnavailable{Reason: "heartbeat stale"}), codes.Unavailable},
+		{"invalid argument", &remote.ErrInvalidArgument{Reason: "too many refs"}, codes.InvalidArgument},
+	}
+	for _, tt := range tests {
+		server := &ServerImpl{
+			HeadersImpl:      func(context.Context, []remote.Hash) ([]entities.ObjectHeader, error) { return nil, tt.err },
+			SHA256Impl:       func(context.Context, []remote.Hash) ([]entities.SHA256, error) { return nil, tt.err },
+			PutObjectImpl:    func(context.Context, remote.Hash, remote.ContentReadCloser) error { return tt.err },
+			MapResultsImpl:   func(context.Context, remote.Hash) ([]remote.Hash, error) { return nil, tt.err },
+			AddMapResultImpl: func(context.Context, remote.Hash, remote.Hash) error { return tt.err },
+			GetRefsImpl:      func(context.Context, string, string, []string) ([]remote.Hash, error) { return nil, tt.err },
+			SearchRefsImpl: func(context.Context, string, string, string, int) ([]remote.ProjectRefHash, error) {
+				return nil, tt.err
+			},
+			PutRefsImpl:  func(context.Context, string, string, []remote.RefHash) error { return tt.err },
+			XchgRefImpl:  func(context.Context, string, string, string, remote.Hash, remote.Hash) error { return tt.err },
+			XchgRefsImpl: func(context.Context, string, string, []remote.RefXchg) error { return tt.err },
+			VersionImpl:  func(context.Context) (string, error) { return "", tt.err },
+		}
+		client, stop := grpcPipe(t, server)
+		ctx := context.Background()
+		calls := map[string]func() error{
+			"Headers":      func() error { _, err := client.Headers(ctx, []remote.Hash{key}); return err },
+			"SHA256":       func() error { _, err := client.SHA256(ctx, []remote.Hash{key}); return err },
+			"PutObject":    func() error { return client.PutObject(ctx, key, remote.NewBlobReaderFromBytes([]byte("x"))) },
+			"MapResults":   func() error { _, err := client.MapResults(ctx, key); return err },
+			"AddMapResult": func() error { return client.AddMapResult(ctx, key, key) },
+			"GetRefs":      func() error { _, err := client.GetRefs(ctx, "s", "p", []string{"refs/heads/main"}); return err },
+			"SearchRefs":   func() error { _, err := client.SearchRefs(ctx, "s", "p", "refs/", 0); return err },
+			"PutRefs": func() error {
+				return client.PutRefs(ctx, "s", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: key}})
+			},
+			"XchgRef": func() error { return client.XchgRef(ctx, "s", "p", "refs/heads/main", key, key) },
+			"XchgRefs": func() error {
+				return client.XchgRefs(ctx, "s", "p", []remote.RefXchg{{Ref: "refs/heads/main", Desired: key}})
+			},
+			"Version": func() error { _, err := client.Version(ctx); return err },
+		}
+		for name, call := range calls {
+			err := call()
+			require.Equal(t, tt.code, status.Code(err), "%s %s: %v", tt.name, name, err)
+			require.ErrorContains(t, err, tt.err.Error(), "%s %s", tt.name, name)
+		}
+		stop()
+	}
+}
+
+// GetObject sends a read that the server could not answer again, as it does
+// for a transport failure.
+func TestGetObjectRetriesUnavailable(t *testing.T) {
+	key := entities.NewHash("a0423896973644771497bdc03eb99d5281615b51")
+	content := "hello world!\n"
+	var calls atomic.Int32
+	server := &ServerImpl{
+		GetObjectImpl: func(context.Context, remote.Hash) (remote.ContentReadCloser, error) {
+			if calls.Add(1) == 1 {
+				return nil, &remote.ErrUnavailable{Reason: "heartbeat stale"}
+			}
+			reader := objects.PrependHeaderReader(strings.NewReader(content), "blob", int64(len(content)))
+			return remote.NewContentReader(io.NopCloser(reader), remote.EncodingRaw), nil
+		},
+	}
+	client, stop := grpcPipe(t, server)
+	defer stop()
+
+	reader, err := client.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	got, err := objects.ReadBlob(reader)
+	require.NoError(t, err)
+	require.Equal(t, content, string(got))
+	require.Equal(t, int32(2), calls.Load())
 }

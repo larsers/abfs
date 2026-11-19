@@ -324,9 +324,9 @@ func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
 		herr := calls[0].call()
 		for _, c := range calls[1:] {
 			err := c.call()
-			require.Equal(status.Code(herr), status.Code(err), "%s: %v", c.name, err)
+			require.Equal(clientCode(herr), clientCode(err), "%s: %v", c.name, err)
 		}
-		require.Equal(status.Code(herr), status.Code(s.CheckGCHeartbeat(ctx)))
+		require.Equal(clientCode(herr), clientCode(s.CheckGCHeartbeat(ctx)))
 		return herr
 	}
 	require.NoError(serving())
@@ -340,7 +340,7 @@ func TestGCHooks_StopsServingWithStaleHeartbeat(t *testing.T) {
 	require.NoError(serving())
 	now++
 	err := serving()
-	require.Equal(codes.Unavailable, status.Code(err), err)
+	require.Equal(codes.Unavailable, clientCode(err), err)
 	require.ErrorContains(err, "GC heartbeat stale")
 
 	failing.Store(false)

@@ -16,6 +16,7 @@ package gcp
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/gcp/gc"
 )
 
@@ -79,20 +81,21 @@ func (w writeGuard) do(ctx context.Context, f func(ctx context.Context) error) e
 		elapsed = time.Duration(now-w.start) * time.Second
 	}
 	if boundPassed(w.start, now) {
-		return status.Errorf(codes.Unavailable, "the link validation of this call started %s ago, more than the GC allows before its writes; send it again", elapsed)
+		return &remote.ErrUnavailable{Reason: fmt.Sprintf("the link validation of this call started %s ago, more than the GC allows before its writes; send it again", elapsed)}
 	}
 	ctx, cancel := context.WithTimeout(ctx, gc.ValidationWriteBound-elapsed-time.Second)
 	defer cancel()
 	b := &writeBound{start: w.start}
 	err := f(context.WithValue(ctx, writeBoundKey{}, b))
 	if err != nil && b.passed.Load() {
-		return status.Errorf(codes.Unavailable, "the link validation of this call started %s or more ago before a write attempt, more than the GC allows; send it again", gc.ValidationWriteBound)
+		return &remote.ErrUnavailable{Reason: fmt.Sprintf("the link validation of this call started %s or more ago before a write attempt, more than the GC allows; send it again", gc.ValidationWriteBound)}
 	}
 	return err
 }
 
-// checkWriteBound fails when ctx carries a write bound that has passed. The
-// code is one the client libraries do not retry, so the write ends at once.
+// checkWriteBound fails when ctx carries a write bound that has passed. It
+// runs in the interceptors of the client libraries, which read the gRPC code:
+// it is one they do not retry, so the write ends at once.
 func checkWriteBound(ctx context.Context) error {
 	b, ok := ctx.Value(writeBoundKey{}).(*writeBound)
 	if !ok || !boundPassed(b.start, cacheNow()) {
@@ -147,7 +150,7 @@ func (g *gcHooks) checkAnswer(ctx context.Context, path rescuePath, a answerTime
 		g.answerSeconds.Record(ctx, time.Since(a.wall).Seconds(), metric.WithAttributes(attribute.String("call", rescuePathNames[path])))
 	}
 	if now := cacheNow(); boundPassed(a.start, now) {
-		return status.Errorf(codes.Unavailable, "the call took %d s, more than the GC allows before a present answer; send it again", now-a.start)
+		return &remote.ErrUnavailable{Reason: fmt.Sprintf("the call took %d s, more than the GC allows before a present answer; send it again", now-a.start)}
 	}
 	return nil
 }
