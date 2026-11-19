@@ -152,10 +152,10 @@ func TestGCPGCFlags_ClientMetrics(t *testing.T) {
 		register func(*pflag.FlagSet)
 		got      *bool
 	}{
-		{run.RegisterFlags, &run.server.ClientMetrics},
-		{backfill.RegisterFlags, &backfill.server.ClientMetrics},
-		{undo.RegisterFlags, &undo.server.ClientMetrics},
-		{walk.RegisterFlags, &walk.server.ClientMetrics},
+		{run.RegisterFlags, &run.server.opts.ClientMetrics},
+		{backfill.RegisterFlags, &backfill.server.opts.ClientMetrics},
+		{undo.RegisterFlags, &undo.server.opts.ClientMetrics},
+		{walk.RegisterFlags, &walk.server.opts.ClientMetrics},
 		{server.RegisterFlags, &server.gcpCmd.clientMetrics},
 	} {
 		fl := pflag.NewFlagSet("gc", pflag.ContinueOnError)
