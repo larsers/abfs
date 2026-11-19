@@ -30,16 +30,12 @@ import (
 const (
 	// parked entries are stored with key = park::<padded park time>::<hash> value = the LRU
 	// timestamp of the entry before the park, 0 if it had none.
-	// A parked entry is Local and Remote, but out of the LRU: the server lacked it, and it
-	// waits for a mount to name it or for its release.
 	parkPrefix = "park::"
 
 	// release times are stored with key = released::<hash> value = the time a parked entry
-	// went back to the LRU. Until the entry is used again, Park does not park it but moves it
-	// to the young end of the LRU and records the move here. A use deletes the key.
+	// went back to the LRU. Park moves such an entry to the young end of the LRU until it is used.
 	releasedPrefix = "released::"
 
-	// restoreBatchSize is the number of keys restoreParked deletes per transaction.
 	restoreBatchSize = 10000
 )
 
@@ -48,8 +44,7 @@ type parkedEntry struct {
 	// time is the park time and lruTime the LRU timestamp before the park, 0 if none.
 	time    int64
 	lruTime int64
-	// size is the local size the entry adds to parkedSize.
-	size int64
+	size    int64
 }
 
 func parkKey(timestamp int64, hash entities.Hash) []byte {
@@ -171,9 +166,8 @@ func (b *BadgerIndexStore) Park(hash entities.Hash) (bool, error) {
 	return true, nil
 }
 
-// renewReleasedLocked moves a released entry that was not used since its release to the young
-// end of the LRU, as a push does, so that a mount can name it before eviction takes it. The
-// move counts as its release time, so the entry stays unparked until it is used.
+// renewReleasedLocked moves a released entry not used since its release to the young end of
+// the LRU and records the move as its release time.
 // Caller should be holding the timestamps lock for the hash.
 func (b *BadgerIndexStore) renewReleasedLocked(hash entities.Hash, lruTime int64) error {
 	now := time.Now().Unix()
@@ -293,7 +287,6 @@ func (b *BadgerIndexStore) unparkLocked(hash entities.Hash, p parkedEntry, times
 	return b.unparkedLocked(hash, p, timestamp, released, u), nil
 }
 
-// unparkWrite is what writeUnparkLocked wrote, for unparkedLocked.
 type unparkWrite struct {
 	stale   bool
 	inLRU   bool
@@ -328,8 +321,7 @@ func (b *BadgerIndexStore) writeUnparkLocked(txn *badger.Txn, hash entities.Hash
 	return unparkWrite{inLRU: true, lruSize: int64(entry.LocalSize())}, nil
 }
 
-// unparkedLocked records in memory an unpark that writeUnparkLocked wrote and reports whether
-// the park key was there.
+// unparkedLocked records an unpark in memory and reports whether the park key was there.
 // Caller should be holding the timestamps lock for the hash.
 func (b *BadgerIndexStore) unparkedLocked(hash entities.Hash, p parkedEntry, timestamp, released int64, u unparkWrite) bool {
 	shard := shardForHash(hash)

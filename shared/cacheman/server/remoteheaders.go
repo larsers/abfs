@@ -23,14 +23,12 @@ import (
 	"github.com/google/abfs/shared/entities"
 )
 
-// remoteHeadersTimeout bounds one request. A batch of condemned objects takes
-// the server a while to rescue, so it is generous; it only keeps a server that
-// does not answer from holding the keep-alive forever.
+// remoteHeadersTimeout is generous, since the server can take a while to rescue
+// a batch of condemned objects.
 var remoteHeadersTimeout = 10 * time.Minute
 
-// handleRemoteHeaders asks the remote server for the headers of the given keys
-// and returns for each key whether the server has it. Mounts use it to touch
-// the objects they hold, so the server GC sees them as in use.
+// handleRemoteHeaders returns for each key whether the remote server has it.
+// Mounts use it to touch the objects they hold for the server GC.
 func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 	var keys []entities.Hash
 	if !c.ReadJSON(w, r, &keys) {
@@ -63,8 +61,7 @@ func (c *CacheMan) handleRemoteHeaders(w http.ResponseWriter, r *http.Request) {
 	c.WriteJSON(w, r, found)
 }
 
-// remoteClient returns the ABFS client, which a config reload can replace while the keep-alive
-// and the local write check use it.
+// remoteClient returns the ABFS client, which a config reload can replace.
 func (c *CacheMan) remoteClient() ABFSClient {
 	c.abfsClientLock.RLock()
 	defer c.abfsClientLock.RUnlock()

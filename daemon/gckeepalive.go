@@ -39,37 +39,29 @@ const (
 	gcKeepAliveMaxTick = 15 * time.Minute
 	// Fraction of the interval by which each later wait varies.
 	gcKeepAliveSpread = 0.1
-	// Same as the per-call key limit of the gRPC client, so each request is one server call.
+	// The per-call key limit of the gRPC client.
 	gcTouchBatchSize = 50000
-	// Keys a touch sends per second at most, so that the server's touch
-	// writers keep up with the touch of a large mount.
+	// Keys per second, so that the server's touch writers keep up.
 	gcTouchRate = 10000
-	// The wait before the first retry of a failed touch. It doubles with each
-	// failure in a row, up to half the touch interval.
+	// Doubles with each failure in a row, up to half the touch interval.
 	gcTouchRetryWait = 5 * time.Minute
 )
 
 // GCKeepAliveRemote is the part of the cacheman client that GCKeepAlive uses.
 type GCKeepAliveRemote interface {
 	PutRefs(server string, project string, refs []entities.RefHash, blocking bool) error
-	// RemoteHeaders returns for each key whether the server has it.
 	RemoteHeaders(keys []entities.Hash) ([]bool, error)
 }
 
-// MountScan is what a scan of a mount found.
 type MountScan struct {
 	// Hashes are those of loaded files and of unloaded entries.
 	Hashes []entities.Hash
-	// Dirs maps the hash of each clean loaded directory to its paths. The
-	// hash covers what the directory holds, except excluded entries, which
-	// the scan lists on their own.
+	// Dirs maps the hash of each clean loaded directory to its paths.
 	Dirs map[entities.Hash][]string
 }
 
-// GCKeepAlive keeps a live mount visible to the server GC. It re-writes the
-// mount ref with the same target, which moves the ref's update time, and sends
-// the hashes the mount holds to the server in batched Headers calls, which the
-// server counts as a use of each object it has.
+// GCKeepAlive keeps a live mount visible to the server GC: it re-writes the
+// mount ref and sends the hashes the mount holds to the server.
 type GCKeepAlive struct {
 	Remote        GCKeepAliveRemote
 	Server        string
@@ -79,20 +71,16 @@ type GCKeepAlive struct {
 	TouchInterval time.Duration
 	// TouchRate is the most keys a touch sends per second; zero means no limit.
 	TouchRate float64
-	// Scan scans the mount below each of roots, or the whole mount when roots
-	// is empty. The roots themselves are not reported as clean directories.
+	// Scan scans the mount below each of roots, or all of it when roots is empty.
 	Scan func(ctx context.Context, roots []string) (MountScan, error)
-	// Rand returns a number in [0, 1) that spreads the waits, so that mounts
-	// started at the same time do not refresh and touch at the same time. Nil
-	// means every wait is exactly the interval.
+	// Rand returns a number in [0, 1) that spreads the waits; nil means none.
 	Rand func() float64
 
 	lastRef   time.Time
 	lastTouch time.Time
 	// Zero means the interval.
-	refWait   time.Duration
-	touchWait time.Duration
-	// The touches that failed in a row.
+	refWait       time.Duration
+	touchWait     time.Duration
 	touchFailures int
 
 	localWrites *localWriteWatch
@@ -104,8 +92,7 @@ func MountRef(d *binding.MountDetails) string {
 }
 
 // NewGCKeepAlive returns the GC keep-alive of the mount at mountPoint, or nil
-// if gc-keepalive is off, the mount does not use a server or both intervals
-// are zero. Call it after the mount details and the mount ref are written.
+// if it needs none.
 func NewGCKeepAlive(info filesystem.MountInfo, details *binding.MountDetails, server string, remote GCKeepAliveRemote, mountPoint string) *GCKeepAlive {
 	if info.LocalOnly || details == nil || details.Config == nil || !details.Config.GCKeepAlive {
 		return nil
@@ -153,8 +140,7 @@ func (k *GCKeepAlive) refInterval() time.Duration {
 }
 
 // Run refreshes the ref and touches the objects until ctx is done. The refresh
-// runs on its own, so that a long touch does not delay it. Errors are logged
-// and never stop it.
+// runs on its own, so that a long touch does not delay it.
 func (k *GCKeepAlive) Run(ctx context.Context) {
 	if k.tick() <= 0 {
 		return
@@ -184,9 +170,8 @@ func runSteps(ctx context.Context, until func(time.Time) time.Duration, step fun
 	}
 }
 
-// start sets the first waits to a random part of each interval, so that the
-// first refreshes and touches of mounts started together are spread over a
-// whole interval.
+// start spreads the first waits over a whole interval, so that mounts started
+// together do not refresh and touch together.
 func (k *GCKeepAlive) start(now time.Time) {
 	k.lastRef, k.lastTouch = now, now
 	k.refWait = k.firstWait(k.refInterval())
@@ -201,7 +186,6 @@ func (k *GCKeepAlive) firstWait(d time.Duration) time.Duration {
 	return max(time.Duration((1-k.Rand())*float64(d)), 1)
 }
 
-// nextWait returns d plus or minus gcKeepAliveSpread of d.
 func (k *GCKeepAlive) nextWait(d time.Duration) time.Duration {
 	if k.Rand == nil || d <= 0 {
 		return d
@@ -216,8 +200,6 @@ func waitOr(wait, d time.Duration) time.Duration {
 	return d
 }
 
-// untilRef returns the time from now to the next refresh, at most
-// gcKeepAliveMaxTick.
 func (k *GCKeepAlive) untilRef(now time.Time) time.Duration {
 	wait := gcKeepAliveMaxTick
 	if d := k.refInterval(); d > 0 {
@@ -226,8 +208,6 @@ func (k *GCKeepAlive) untilRef(now time.Time) time.Duration {
 	return max(wait, 0)
 }
 
-// untilTouch returns the time from now to the next touch, at most
-// gcKeepAliveMaxTick.
 func (k *GCKeepAlive) untilTouch(now time.Time) time.Duration {
 	wait := gcKeepAliveMaxTick
 	if k.TouchInterval > 0 {
@@ -263,11 +243,9 @@ func (k *GCKeepAlive) touchStep(ctx context.Context, now time.Time) {
 	}
 }
 
-// retryWait returns the wait before the next attempt after k.touchFailures
-// failed touches in a row. A failed touch is retried long before the next
-// interval, since the objects it did not reach may be condemned, and the wait
-// grows, so that a server or cacheman that cannot answer does not cause a
-// mount scan on every tick.
+// retryWait returns the wait after k.touchFailures failed touches in a row. It
+// is short, since the objects a failed touch missed may be condemned, and it
+// grows, so that a server that cannot answer does not cause a scan per tick.
 func (k *GCKeepAlive) retryWait() time.Duration {
 	limit := k.TouchInterval / 2
 	wait := gcTouchRetryWait
@@ -283,14 +261,11 @@ func (k *GCKeepAlive) refreshRef() error {
 }
 
 // touch sends the hashes of the mount to the server and returns how many the
-// server has and how many were sent. For a clean loaded directory it sends the
-// directory's hash, and scans the directory only when the server lacks it,
-// which happens when the directory was changed and hashed locally. A scan
-// error does not stop the hashes found so far.
+// server has and how many were sent. It scans a clean loaded directory only
+// when the server lacks its hash. A scan error does not stop the hashes found.
 func (k *GCKeepAlive) touch(ctx context.Context) (int, int, error) {
 	p := &touchPacer{rate: k.TouchRate}
 	sent := make(map[entities.Hash]struct{})
-	// The directory hashes asked so far, and whether the server has them.
 	dirPresent := make(map[entities.Hash]bool)
 	found := 0
 	var roots []string
@@ -340,7 +315,6 @@ func (k *GCKeepAlive) touch(ctx context.Context) (int, int, error) {
 	return found, len(sent), nil
 }
 
-// newHashes returns the hashes not in sent and adds them to it.
 func newHashes(sent map[entities.Hash]struct{}, hashes []entities.Hash) []entities.Hash {
 	var out []entities.Hash
 	for _, h := range hashes {
@@ -362,8 +336,6 @@ func count(present []bool) int {
 	return n
 }
 
-// remoteHeaders asks the server for keys in batches, paced by p, and returns
-// for each key whether the server has it.
 func (k *GCKeepAlive) remoteHeaders(ctx context.Context, p *touchPacer, keys []entities.Hash) ([]bool, error) {
 	present := make([]bool, 0, len(keys))
 	for batch := range slices.Chunk(keys, gcTouchBatchSize) {
@@ -379,9 +351,8 @@ func (k *GCKeepAlive) remoteHeaders(ctx context.Context, p *touchPacer, keys []e
 	return present, nil
 }
 
-// touchPacer spaces the batches of a touch so that the batch after one of n
-// keys starts at least n/rate seconds after it. Time spent elsewhere, such as
-// in a scan, earns no credit beyond one batch.
+// touchPacer spaces batches so that the batch after one of n keys starts at
+// least n/rate seconds later, with no credit for time spent elsewhere.
 type touchPacer struct {
 	rate float64
 	next time.Time
@@ -421,24 +392,17 @@ func (bindcasAttrs) Dirty(path string) (bool, error)         { return bindcas.Di
 func (bindcasAttrs) Excluded(path string) (bool, error)      { return bindcas.Excluded(path) }
 func (bindcasAttrs) Hash(path string) (entities.Hash, error) { return bindcas.Hash(path) }
 
-// scanMountHashes scans the mount below each of roots for what the server
-// must keep: the hashes of loaded files and of unloaded files and
-// directories, which the mount fetches from the server when they are read,
-// and the hashes of clean loaded directories. casfs keeps the hash of a clean
-// directory, so reading it costs nothing, while a dirty directory would be
-// hashed; dirty directories are scanned entry by entry. The entries below a
-// clean directory are covered by its hash, except excluded ones, which casfs
-// leaves out of the hash of their parent, such as projects and the files of
-// linkfile; the scan still walks loaded directories below a clean one to find
-// them, but reads no hash there.
+// scanMountHashes scans the mount below each of roots for the hashes of loaded
+// files, of unloaded entries and of clean loaded directories, whose hash casfs
+// keeps. That hash covers the entries below except excluded ones, such as
+// projects and linkfile files, which the scan walks below it to find.
 func scanMountHashes(ctx context.Context, roots []string, attrs mountAttrs) (MountScan, error) {
 	var mu sync.Mutex
 	seen := make(map[entities.Hash]struct{})
 	dirs := make(map[entities.Hash][]string)
 	var errs []error
 	for _, root := range roots {
-		// The relative paths of the directories whose entries a clean
-		// directory's hash covers.
+		// Directories whose entries a clean directory's hash covers.
 		var covered sync.Map
 		err := cwalk.Walk(root, func(rel string, info fs.FileInfo, err error) error {
 			if err != nil {

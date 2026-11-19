@@ -35,11 +35,9 @@ type manifestHashesSetter interface {
 }
 
 // setPinnedManifest gives the mount the hash of its pinned manifest, so the
-// mount details link it, when gc-keepalive is on and a server keeps the mount. A manifest file is stored
-// first, because the mount details are pushed before the file is written into
-// the mount. A branch is pinned as the mount resolves it, and a workspace
-// snapshot passes on the pin of the mount it was taken from. Neither of these
-// two fails the mount: without a pin the mount is kept only by its branch.
+// mount details link it, when gc-keepalive is on and the mount uses a server.
+// A manifest file is stored first, because the mount details are pushed before
+// the file is written into the mount. A failed pin does not fail the mount.
 func (c *mountRepoCmd) setPinnedManifest(ctx context.Context, m manifestHashesSetter) error {
 	if c.Store == nil || c.ConfigProvider == nil || c.Config == nil || !c.Config.GCKeepAlive || c.Config.LocalOnly {
 		return nil
@@ -74,9 +72,8 @@ func (c *mountRepoCmd) setPinnedManifest(ctx context.Context, m manifestHashesSe
 	return nil
 }
 
-// pinBranch pins the manifest of the branch to the commits it names now and
-// stores the pinned manifest, so the mount keeps them after the branch moves.
-// Every project has to resolve, whatever the groups.
+// pinBranch pins the manifest of the branch to the commits it names now, so the
+// mount keeps them after the branch moves.
 func (c *mountRepoCmd) pinBranch(ctx context.Context, m manifestHashesSetter) error {
 	start := time.Now()
 	r := repo.New(c.Store, casgit.New(c.Store), c.Config.ManifestServer, c.Config.ManifestProjectName, c.Config.ManifestScheme, "", false)
@@ -98,8 +95,7 @@ func (c *mountRepoCmd) pinBranch(ctx context.Context, m manifestHashesSetter) er
 }
 
 // setSnapshotPin passes the pin of the workspace's last snapshot on to the
-// mount, when gc-keepalive is on and a server keeps the mount. It never fails
-// the mount.
+// mount. It never fails the mount.
 func (c *mountCmd) setSnapshotPin(ctx context.Context, m manifestHashesSetter) {
 	if c.workspaces == nil || c.ConfigProvider == nil || c.Config == nil || !c.Config.GCKeepAlive || c.Config.LocalOnly {
 		return
