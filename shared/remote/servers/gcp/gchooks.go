@@ -660,7 +660,7 @@ func (s *GCPServer) liveMapResults(ctx context.Context, from entities.Hash, resu
 	if len(results) == 0 {
 		return results, nil
 	}
-	hdrs, err := s.getHeaders(ctx, pathMapResults, results)
+	hdrs, err := s.getHeaders(ctx, pathMapResults, results, false)
 	if err != nil {
 		return nil, err
 	}

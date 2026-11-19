@@ -60,6 +60,9 @@ var _ pb.ABFSServer = (*PBServer)(nil)
 // Headers implements ABFSServer.
 func (s *PBServer) Headers(ctx context.Context, req *pb.HeadersRequest) (*pb.HeadersReply, error) {
 	keys := HashesFromInputBytes(req.Keys)
+	if req.NoTouch {
+		ctx = remote.WithNoTouch(ctx)
+	}
 	headers, err := s.server.Headers(ctx, keys)
 	if err != nil {
 		return nil, err

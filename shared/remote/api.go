@@ -35,7 +35,11 @@ type RemoteProvider interface {
 	// Headers returns a slice of headers corresponding to the provided keys.
 	// The returned slice is ordered to match the input keys. If a header for a
 	// given key is not found, the header at the corresponding index will be empty
-	// (i.e., its IsEmpty() method will return true).
+	// (i.e., its IsEmpty() method will return true). With a context from
+	// WithNoTouch, a server that records the use of objects for its garbage
+	// collector records none and answers an object the collector condemned that
+	// it reads as missing; a header it cached before the condemn answers present
+	// until its cache TTL ends.
 	Headers(ctx context.Context, keys []Hash) ([]entities.ObjectHeader, error)
 	SHA256(ctx context.Context, keys []Hash) ([]entities.SHA256, error)
 
@@ -55,6 +59,19 @@ type RemoteProvider interface {
 
 	Version(ctx context.Context) (string, error)
 	WhoAmI(ctx context.Context) (string, error)
+}
+
+type noTouchKey struct{}
+
+// WithNoTouch returns a context whose Headers calls record no use of the objects they find.
+func WithNoTouch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noTouchKey{}, true)
+}
+
+// NoTouch reports whether ctx comes from WithNoTouch.
+func NoTouch(ctx context.Context) bool {
+	noTouch, _ := ctx.Value(noTouchKey{}).(bool)
+	return noTouch
 }
 
 type RemoteCloser interface {

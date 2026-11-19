@@ -494,6 +494,53 @@ func TestGCHooks_OnlyKeepAliveCallsWaitForTouches(t *testing.T) {
 	require.Equal([]string{casdb.MapRowKey(from, result)}, fake.mapRows)
 }
 
+// A Headers call with a no-touch context records no use, from the cache or
+// after a read, and rescues nothing: a condemned object is answered as missing
+// and not cached, so that the next plain call rescues it.
+func TestGCHooks_HeadersNoTouch(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	now := uint32(1)
+	setCacheNow(t, &now)
+	s := newGCHooksServer(t, &NewServerOpts{CacheTTL: 2 * time.Hour, GCTouchInterval: time.Hour})
+	cached := putBlob(t, s, "cached")
+	uncached := putBlob(t, s, "uncached")
+	s.forget(uncached)
+	condemned := putBlob(t, s, "condemned")
+	condemnObject(t, s, condemned, 3)
+	s.gcHooks.toucher.Close()
+	fake := &fakeToucher{}
+	s.gcHooks.toucher = fake
+	// A new touch period, so that a plain call touches every object again.
+	now += 3600
+	keys := []entities.Hash{cached, uncached, condemned}
+
+	for range 2 {
+		hdrs, err := s.Headers(remote.WithNoTouch(ctx), keys)
+		require.NoError(err)
+		require.False(hdrs[0].IsEmpty())
+		require.False(hdrs[1].IsEmpty())
+		require.True(hdrs[2].IsEmpty())
+	}
+	require.Empty(fake.waited)
+	require.Empty(fake.tried)
+	require.True(isCondemned(t, s, condemned))
+	require.False(objectTouched(t, s, condemned))
+	require.Zero(rescuesOf(s, pathHeaders))
+	_, ok := s.headers[condemned[0]].Peek(condemned)
+	require.False(ok, "a condemned object was cached")
+
+	hdrs, err := s.Headers(ctx, keys)
+	require.NoError(err)
+	for _, h := range hdrs {
+		require.False(h.IsEmpty())
+	}
+	require.False(isCondemned(t, s, condemned))
+	require.True(objectTouched(t, s, condemned), "the rescue wrote no touch")
+	require.Equal(int64(1), rescuesOf(s, pathHeaders))
+	require.ElementsMatch([]entities.Hash{cached, uncached}, fake.waited)
+}
+
 // The collector's own server reads condemned objects as live and leaves the
 // marker and the touches as they are.
 func TestGCHooks_ReadOnly(t *testing.T) {

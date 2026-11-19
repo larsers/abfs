@@ -74,7 +74,7 @@ func (c *PBClient) Headers(ctx context.Context, keys []remote.Hash) ([]entities.
 	headers := make([]entities.ObjectHeader, 0, len(keys))
 
 	for subKeys := range slices.Chunk(keys, maxHeaderLen) {
-		resp, err := c.pb.Headers(ctx, &pb.HeadersRequest{Keys: HashesToHashBytes(subKeys)})
+		resp, err := c.pb.Headers(ctx, &pb.HeadersRequest{Keys: HashesToHashBytes(subKeys), NoTouch: remote.NoTouch(ctx)})
 		if err != nil {
 			return nil, err
 		}

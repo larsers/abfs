@@ -63,6 +63,11 @@ message ObjectHeader {
 
 message HeadersRequest {
   repeated bytes keys = 1;
+  // Asks a server with garbage collection to record no use of the objects it
+  // finds and to rescue none, and to answer a condemned object it reads as
+  // missing. A header it cached before the condemn answers present until its
+  // cache TTL ends.
+  bool no_touch = 2;
 }
 
 message HeadersReply {

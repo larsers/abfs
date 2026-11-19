@@ -235,8 +235,13 @@ func (x *ObjectHeader) GetSize() int64 {
 }
 
 type HeadersRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Keys          [][]byte               `protobuf:"bytes,1,rep,name=keys,proto3" json:"keys,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Keys  [][]byte               `protobuf:"bytes,1,rep,name=keys,proto3" json:"keys,omitempty"`
+	// Asks a server with garbage collection to record no use of the objects it
+	// finds and to rescue none, and to answer a condemned object it reads as
+	// missing. A header it cached before the condemn answers present until its
+	// cache TTL ends.
+	NoTouch       bool `protobuf:"varint,2,opt,name=no_touch,json=noTouch,proto3" json:"no_touch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -276,6 +281,13 @@ func (x *HeadersRequest) GetKeys() [][]byte {
 		return x.Keys
 	}
 	return nil
+}
+
+func (x *HeadersRequest) GetNoTouch() bool {
+	if x != nil {
+		return x.NoTouch
+	}
+	return false
 }
 
 type HeadersReply struct {
@@ -1711,9 +1723,10 @@ const file_abfs_proto_rawDesc = "" +
 	"\x0eemail_verified\x18\x03 \x01(\bR\remailVerified\"6\n" +
 	"\fObjectHeader\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x12\n" +
-	"\x04size\x18\x02 \x01(\x03R\x04size\"$\n" +
+	"\x04size\x18\x02 \x01(\x03R\x04size\"?\n" +
 	"\x0eHeadersRequest\x12\x12\n" +
-	"\x04keys\x18\x01 \x03(\fR\x04keys\"<\n" +
+	"\x04keys\x18\x01 \x03(\fR\x04keys\x12\x19\n" +
+	"\bno_touch\x18\x02 \x01(\bR\anoTouch\"<\n" +
 	"\fHeadersReply\x12,\n" +
 	"\aheaders\x18\x01 \x03(\v2\x12.abfs.ObjectHeaderR\aheaders\"#\n" +
 	"\rSHA256Request\x12\x12\n" +
