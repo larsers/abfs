@@ -23,6 +23,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/google/abfs/casgit"
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/shared/bindcas"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/objects/gitobjects"
@@ -408,4 +410,81 @@ func TestCreateManifestProject_NoBranchUsesHead(t *testing.T) {
 		require.NotPanics(t, func() { _, _, err = testMountSetup(t, c, ABFSInfo{ManifestBytes: manifestBytes}) })
 		require.ErrorContains(t, err, "no branches")
 	})
+}
+
+// submoduleFS holds directories by path. A submodule entry is a directory that does not take a
+// deeptree, as in casfs.
+type submoduleFS struct {
+	bindcas.CASFS
+	submodules map[string]bool
+	notEmpty   map[string]bool
+	deepTrees  map[string]entities.Hash
+	removed    []string
+}
+
+func (f *submoduleFS) Remove(p string) error {
+	if f.notEmpty[p] {
+		return syscall.ENOTEMPTY
+	}
+	f.removed = append(f.removed, p)
+	delete(f.submodules, p)
+	return nil
+}
+
+type submoduleDir struct {
+	bindcas.Dir
+	fs   *submoduleFS
+	path string
+}
+
+func (d *submoduleDir) Path() string { return d.path }
+
+func (d *submoduleDir) MkdirAll(ctx context.Context, name string) (bindcas.Dir, error) {
+	return &submoduleDir{fs: d.fs, path: name}, nil
+}
+
+func (d *submoduleDir) DeepUpdate(ctx context.Context, h entities.Hash) error {
+	if d.fs.submodules[d.path] {
+		return syscall.EOPNOTSUPP
+	}
+	d.fs.deepTrees[d.path] = h
+	return nil
+}
+
+func TestSetProjectDeepTree(t *testing.T) {
+	h := entities.NewHash("0123456789abcdef0123456789abcdef01234567")
+	tests := []struct {
+		name        string
+		submodule   bool
+		notEmpty    bool
+		wantRemoved []string
+		wantErr     error
+	}{
+		{name: "directory"},
+		{name: "submodule entry", submodule: true, wantRemoved: []string{"outer/inner"}},
+		{name: "submodule entry with files", submodule: true, notEmpty: true, wantErr: syscall.EOPNOTSUPP},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := &submoduleFS{
+				submodules: map[string]bool{"outer/inner": tt.submodule},
+				notEmpty:   map[string]bool{"outer/inner": tt.notEmpty},
+				deepTrees:  map[string]entities.Hash{},
+			}
+			root := &submoduleDir{fs: fs, path: "."}
+			prjDir, err := root.MkdirAll(context.Background(), "outer/inner")
+			require.NoError(t, err)
+
+			got, err := setProjectDeepTree(context.Background(), fs, root, "outer/inner", prjDir, h)
+			assert.Equal(t, tt.wantRemoved, fs.removed)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.Empty(t, fs.deepTrees)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "outer/inner", got.Path())
+			assert.Equal(t, map[string]entities.Hash{"outer/inner": h}, fs.deepTrees)
+		})
+	}
 }
