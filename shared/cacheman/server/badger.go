@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand/v2"
 	"runtime"
 	"sort"
 	"strconv"
@@ -68,6 +69,10 @@ const (
 	numDeletesPerTxn  = 50000
 	defaultRetryDelay = 100 * time.Millisecond
 	defaultNumTries   = 2
+
+	// Maps expire at a random point in the last 1/mapTTLSpread of the TTL, so maps written
+	// in one wave do not all expire, and go back to the server, in one wave.
+	mapTTLSpread = 4
 )
 
 var _ IndexStore = (*BadgerIndexStore)(nil)
@@ -1581,13 +1586,15 @@ func (b *BadgerIndexStore) deleteMany(hashes []entities.Hash) (int64, int64, err
 // It does not require any GC because the value space is all nil.
 type BadgerMapsStore struct {
 	BaseBadgerStore
-	ttlHours time.Duration
+	ttlHours   time.Duration
+	randInt64N func(n int64) int64
 }
 
 func NewBadgerMapStore(path string, printer Printer, ttlHours time.Duration) *BadgerMapsStore {
 	return &BadgerMapsStore{
 		BaseBadgerStore: BaseBadgerStore{path: path, printer: PrinterOrDefault(printer)},
 		ttlHours:        ttlHours,
+		randInt64N:      rand.Int64N,
 	}
 }
 
@@ -1631,11 +1638,17 @@ func (b *BadgerMapsStore) Get(from entities.Hash) ([]entities.Hash, error) {
 	return hashes, nil
 }
 
+// entryTTL returns a TTL in [ttl-ttl/mapTTLSpread, ttl].
+func (b *BadgerMapsStore) entryTTL() time.Duration {
+	ttl := b.ttlHours * time.Hour
+	return ttl - time.Duration(b.randInt64N(int64(ttl/mapTTLSpread)+1))
+}
+
 // Put implements MapsStore.
 func (b *BadgerMapsStore) Put(from, to entities.Hash) error {
 	key := fmt.Sprintf("%s::%s", from.String(), to.String())
 	return b.db.Update(func(txn *badger.Txn) error {
-		e := badger.NewEntry([]byte(key), nil).WithTTL(b.ttlHours * time.Hour)
+		e := badger.NewEntry([]byte(key), nil).WithTTL(b.entryTTL())
 		if err := txn.SetEntry(e); err != nil {
 			return fmt.Errorf("Put(%v, %v) failed: %w", from.String(), to.String(), err)
 		}
