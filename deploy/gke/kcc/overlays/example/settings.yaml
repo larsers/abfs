@@ -32,7 +32,9 @@ data:
   network: example-network
   # The cluster's subnetwork, for the Gateway address.
   subnetwork: example-subnet
-  # Used only by the network components.
+  # Used only by the network components. A /23 serves a small install; at
+  # thousands of CI nodes plan a /22, shared by every Envoy-based load balancer
+  # of the network in the region (docs/sizing.md).
   proxySubnetRange: 172.16.0.0/23
   # The Google service account of Config Connector for the namespace abfs.
   kccServiceAccount: kcc-abfs@example-project.iam.gserviceaccount.com
@@ -43,5 +45,14 @@ data:
   # Bigtable instance ids have 6 to 33 characters, cluster ids 6 to 30.
   bigtableInstance: abfs-objects
   bigtableCluster: abfs-objects-c1
+  # backend-new only. Bigtable autoscaling: maxNodes at most 10 x minNodes,
+  # cpuTarget 10 to 80; make check refuses other values. maxNodes counts
+  # toward the project's Bigtable node quota of the zone (docs/sizing.md).
+  bigtableMinNodes: "1"
+  bigtableMaxNodes: "3"
+  bigtableCpuTarget: "60"
+  # backend-new only. Spanner compute capacity: 100 to 1000 in steps of 100,
+  # then steps of 1000. Spanner holds refs only; raise it by hand on CPU.
+  spannerProcessingUnits: "100"
   # Bucket names are global; pick one you own.
   bucket: example-project-abfs-blobs

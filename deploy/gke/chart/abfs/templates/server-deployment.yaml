@@ -98,6 +98,10 @@ spec:
             {{- if $s.gc.enabled }}
             - --gc
             {{- end }}
+            {{- if $s.linksContent.enabled }}
+            - --links-content
+            - --links-content-threshold={{ int64 $s.linksContent.thresholdBytes }}
+            {{- end }}
             {{- range $s.extraArgs }}
             - {{ . | quote }}
             {{- end }}

@@ -155,6 +155,28 @@ template:
 	  want "$$c" "$$w" "the CI ComputeClass with ci.casfs.provider daemonset"; \
 	done; \
 	echo "OK: the CI class runs Ubuntu with secure boot off and integrity monitoring on for ci.casfs.provider daemonset"; \
+	tiers() { awk -v n="  name: abfs-$$1" '$$0 == n { c = 1 } /^---$$/ { c = 0 } \
+	  c && /^    - nodepools:/ { print "nodepools" } c && /^      spot:/ { s = $$2 } c && /^        zones:/ { print s " " $$2 }' | uniq | tr '\n' ';'; } ; \
+	cc=$$(show computeclasses.yaml -f $(CI)/zone-fallback-overlay.yaml); \
+	t=$$(tiers ci <<<"$$cc"); \
+	[[ $$t == 'nodepools;true ["europe-west4-b"];false ["europe-west4-b"];true ["europe-west4-a","europe-west4-c"];false ["europe-west4-a","europe-west4-c"];' ]] || \
+	  { echo "FAIL: the CI class rules are not nodepools, primary Spot, primary on-demand, fallback Spot, fallback on-demand: $$t" >&2; exit 1; }; \
+	t=$$(tiers server <<<"$$cc"); \
+	[[ $$t == 'false ["europe-west4-b"];false ["europe-west4-a","europe-west4-c"];' ]] || \
+	  { echo "FAIL: the server class rules are not the primary zone, then the fallback zones: $$t" >&2; exit 1; }; \
+	[[ $$(grep -c '^        locationPolicy: ANY$$' <<<"$$cc") == $$(grep -cF '        zones: ["europe-west4-a","europe-west4-c"]' <<<"$$cc") ]] || \
+	  { echo "FAIL: a fallback rule lacks locationPolicy ANY" >&2; exit 1; }; \
+	t=$$(tiers ci <<<"$$(show computeclasses.yaml)"); \
+	[[ $$t == 'false ["europe-west4-b"];' ]] || { echo "FAIL: without fallback zones the CI class is not on the primary zone only: $$t" >&2; exit 1; }; \
+	echo "OK: the CI and server classes try nodepools, then the primary zone (Spot first), then the fallback zones with locationPolicy ANY; without fallback zones the primary zone only"; \
+	for t in cacheman-daemonset.yaml casfs-loader-daemonset.yaml; do \
+	  if show $$t | grep -qF 'buffer.gke.io/standby-capacity-node-suspended'; then \
+	    echo "FAIL: templates/$$t tolerates suspended standby nodes without ci.capacityBuffer" >&2; exit 1; \
+	  fi; \
+	  [[ $$(show $$t -f $(CI)/capacity-buffer-overlay.yaml | grep -A1 -xF '        - key: buffer.gke.io/standby-capacity-node-suspended' | tail -n 1) == '          operator: Exists' ]] || \
+	    { echo "FAIL: templates/$$t lacks the toleration of suspended standby nodes with ci.capacityBuffer" >&2; exit 1; }; \
+	done; \
+	echo "OK: cacheman and the casfs loader tolerate suspended standby nodes only with ci.capacityBuffer"; \
 	j=$$(show ci-example-job.yaml --set ci.exampleJob.enabled=true --set ci.exampleJob.image=example.com/android-build:1); \
 	want "$$j" '              set -euo pipefail' "the example Job"; \
 	[[ $$(grep -A2 -xF '              cd "$$WORK/src"' <<<"$$j" | tail -n 2 | tr '\n' '|') == \
@@ -279,6 +301,39 @@ kustomize:
 	  done; \
 	done; \
 	echo "OK: both backend modes grant the server roles/storage.legacyBucketReader on the bucket"
+	@sizes() { awk 'BEGIN { RS = "\n---\n" } /\nkind: (BigtableInstance|SpannerInstance)\n/' "$$1" | \
+	  awk '/^ *minNodes:/ { mn = $$2 } /^ *maxNodes:/ { mx = $$2 } /^ *cpuTarget:/ { ct = $$2 } /^  processingUnits:/ { pu = $$2 } \
+	  END { e = ""; \
+	    if (mn != "" || mx != "" || ct != "") { \
+	      if (mn !~ /^[0-9]+$$/ || mx !~ /^[0-9]+$$/ || ct !~ /^[0-9]+$$/) e = e "Bigtable minNodes, maxNodes and cpuTarget must be integers; "; \
+	      else { if (mn < 1 || mx < mn) e = e "Bigtable needs 1 <= minNodes <= maxNodes; "; \
+	        if (mx > 10 * mn) e = e "Bigtable maxNodes " mx " is above 10 x minNodes " mn "; "; \
+	        if (ct < 10 || ct > 80) e = e "Bigtable cpuTarget " ct " is outside 10 to 80; " } } \
+	    if (pu != "" && (pu !~ /^[0-9]+$$/ || pu < 100 || (pu <= 1000 && pu % 100) || (pu > 1000 && pu % 1000))) \
+	      e = e "Spanner processingUnits " pu " is not 100 to 1000 in steps of 100 or a multiple of 1000; "; \
+	    printf "%s", e }'; } ; \
+	for f in $(OUT)/kustomize/*.yaml; do \
+	  e=$$(sizes $$f); [[ -z $$e ]] || { echo "FAIL: $$f: $$e" >&2; exit 1; }; \
+	done; \
+	echo "OK: every build keeps Bigtable maxNodes at most 10 x minNodes, cpuTarget in 10 to 80, and valid Spanner processing units"; \
+	t=$$(mktemp -d); trap 'rm -rf "$$t"' EXIT; \
+	k=$$(realpath --relative-to="$$t" $(KCC)); \
+	printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s/base\n  - settings.yaml\ncomponents:\n  - %s/components/backend-new\n  - %s/components/settings\n' "$$k" "$$k" "$$k" >"$$t/kustomization.yaml"; \
+	for bad in 'bigtableMaxNodes: "11"' 'bigtableCpuTarget: "85"' 'spannerProcessingUnits: "1500"'; do \
+	  sed "s/^  $${bad%%:*}: .*/  $$bad/" $(KCC)/overlays/example/settings.yaml >"$$t/settings.yaml"; \
+	  e=$$(sizes <(kubectl kustomize "$$t")); \
+	  [[ -n $$e ]] || { echo "FAIL: settings $$bad passed the size check" >&2; exit 1; }; \
+	  echo "OK: settings $$bad fails as expected: $$e"; \
+	done; \
+	cp $(KCC)/overlays/example/settings.yaml "$$t/settings.yaml"; \
+	for mode in backend-new backend-existing; do \
+	  printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s/base\n  - settings.yaml\ncomponents:\n  - %s/components/%s\n  - %s/components/links-content\n  - %s/components/settings\n' "$$k" "$$k" "$$mode" "$$k" "$$k" >"$$t/kustomization.yaml"; \
+	  m=$$(kubectl kustomize "$$t" | awk 'BEGIN { RS = "\n---\n" } /\n  name: abfs-server-token-creator-self\n/'); \
+	  for want in '  role: roles/iam.serviceAccountTokenCreator' '    kind: IAMServiceAccount' '      name: abfs-server' '    name: abfs-server'; do \
+	    grep -qxF -- "$$want" <<<"$$m" || { echo "FAIL: links-content with $$mode lacks '$$want'" >&2; exit 1; }; \
+	  done; \
+	done; \
+	echo "OK: links-content grants the server roles/iam.serviceAccountTokenCreator on itself, with either backend mode"
 
 # The schema source of ddl and ddl-check: an ABFS source tree, or a commit of
 # DDL_REPO that has the GCP server, for example

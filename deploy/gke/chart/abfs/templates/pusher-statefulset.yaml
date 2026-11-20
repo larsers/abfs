@@ -66,7 +66,7 @@ spec:
             - /bin/sh
             - -c
             - |
-              until abfs --no-local-cache {{ include "abfs.clientFlags" $vip }} cat config:git-pusher/default >/dev/null 2>&1; do
+              until abfs --no-local-cache {{ include "abfs.gatewayClientFlags" . }} cat config:git-pusher/default >/dev/null 2>&1; do
                 echo "waiting for config:git-pusher/default on {{ $vip }}"
                 sleep 10
               done
@@ -92,7 +92,7 @@ spec:
           command:
             - /bin/sh
             - -c
-            - exec abfs {{ include "abfs.clientFlags" $vip }} {{ include "abfs.otelKv" . }} git-pusher --storage-path /data --instance "$POD_NAME"
+            - exec abfs {{ include "abfs.gatewayClientFlags" . }} {{ include "abfs.otelKv" . }} git-pusher --storage-path /data --instance "$POD_NAME"
           env:
             - name: POD_NAME
               valueFrom:

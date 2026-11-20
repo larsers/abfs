@@ -42,13 +42,14 @@ Ask for each; say which defaults they may keep.
 - Project, region, zone of the Bigtable cluster and servers.
 - VPC network, subnet, network project (`NET_P`) and its owner; in a Shared VPC the Pods and Services secondary ranges.
 - What the network has (step 4.0): private zones for `googleapis.com`, `pkg.dev`, `gcr.io`, endpoints for Google APIs, a Cloud NAT gateway; whether other subnets may get NAT egress.
-- An existing proxy-only subnet, or a free `/23` (outside `10.0.0.0/8` in a plain VPC; outside the cluster's Pod and Service ranges in a Shared VPC).
+- An existing proxy-only subnet, or a free `/23` (`/22` for thousands of CI nodes) outside the node subnet, the Pod range, `PSC_IP` and peered ranges; in a Shared VPC also outside the Pod and Service secondary ranges.
 - A free IP for the Private Service Connect endpoint; whether admin hosts need the `gke.goog` zone.
 - Cluster name, GKE version and channel (default `1.37.2-gke.1325000`, Rapid), maintenance window.
 - The admin account, and who gets cluster access with which role.
 - The CI system, where it runs, and its Google service account (attached or through Workload Identity Federation, never a key).
 - Backend mode: `backend-new`, or `backend-existing` with the existing resource names.
-- Bigtable node cap (default 3); Artifact Registry repository (default `abfs`) and its project.
+- The farm size (concurrent builds, builds per node) for `docs/sizing.md`: Pod range (`POD_RANGE`), node subnet and proxy-only subnet sizes, system pool maximum, fallback zones (`computeClasses.zones.fallback`), Bigtable and Spanner settings (defaults 1 to 3 nodes, 100 processing units) and the quota requests.
+- Artifact Registry repository (default `abfs`) and its project.
 - Gerrit: manifest URL, branches, files, `.netrc` or `.gitcookies`; or upstream AOSP only.
 - `pusher.count` (default 3; fixed after the first full seed).
 - The CI build image and its registry.
@@ -66,5 +67,6 @@ Ask for each; say which defaults they may keep.
 | Backend modes, garbage collection, seed and steady phase, upgrades, cache reset, teardown, security, building images | `docs/runbook.md` |
 | Chart values, defaults, names shared with the KCC tree | `docs/configuration.md` |
 | What a CI build pod needs, the example Job, Airflow, node disk | `docs/ci-job.md` |
+| Sizing a large farm: ranges, proxies, backend, zones, standby buffer, telemetry cost | `docs/sizing.md` |
 | A known error message | `docs/troubleshooting.md` |
 | The ABFS server, client and pusher | `doc/sysadmin/` and `doc/android-dev/` in the ABFS source tree (`source/` in a bundle) |

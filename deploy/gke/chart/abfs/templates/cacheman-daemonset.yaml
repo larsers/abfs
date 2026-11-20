@@ -103,7 +103,7 @@ spec:
             - -c
             - |
               set -euo pipefail
-              abfs -i ci {{ include "abfs.clientFlags" $vip }} \
+              abfs -i ci {{ include "abfs.gatewayClientFlags" . }} \
                 --evict-threshold {{ include "abfs.cachemanEvictThreshold" . }} \
                 --fsync-objects={{ $ci.cacheman.fsyncObjects }} \
                 {{- range $k, $v := fromYaml (include "abfs.clientManifest" .) }}

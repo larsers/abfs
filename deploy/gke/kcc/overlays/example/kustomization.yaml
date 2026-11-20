@@ -21,6 +21,8 @@
 #     region.
 #   - gc, after backend-new, only when garbage collection is turned on
 #     (docs/runbook.md, Garbage collection). Off by default.
+#   - links-content with the chart value server.linksContent.enabled: the
+#     server may sign Cloud Storage URLs as itself. Either backend mode.
 #   - settings, always.
 # Render with `kubectl kustomize`, apply with `kubectl apply -k`.
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -33,12 +35,6 @@ components:
   # - ../../components/backend-existing
   # - ../../components/network/proxy-subnet
   # - ../../components/gc
+  # - ../../components/links-content
   - ../../components/settings
-# Numbers cannot come from settings.yaml (its values are strings), so set them
-# with a patch. Example for backend-new, the Bigtable cost cap:
-# patches:
-#   - target: {kind: BigtableInstance, name: abfs-objects}
-#     patch: |-
-#       - op: replace
-#         path: /spec/cluster/0/autoscalingConfig/maxNodes
-#         value: 5
+# The Bigtable bounds and the Spanner size are settings in settings.yaml.

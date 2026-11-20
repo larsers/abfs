@@ -14,6 +14,7 @@
 
 {{- if .Values.computeClasses.enabled }}
 {{- $cc := .Values.computeClasses }}
+{{- $tiers := include "abfs.zoneTiers" . | fromJsonArray }}
 {{- if not $cc.nodeServiceAccount }}
 {{- fail "computeClasses.nodeServiceAccount is required: the node service account of the KCC base" }}
 {{- end }}
@@ -24,7 +25,8 @@
 # nodes GKE creates; a change applies to new node pools only. Every class turns secure boot
 # and integrity monitoring on, except the CI class with ci.casfs.provider daemonset; the
 # org policy constraints/compute.requireShieldedVm requires both and the vTPM of Shielded
-# GKE Nodes.
+# GKE Nodes. The CI and server classes try the rules of the primary zone first, then those
+# of the fallback zones (computeClasses.zones).
 {{- if .Values.ci.enabled }}
 ---
 # CI build nodes: COS with secure boot on and the casfs module of the node image, or Ubuntu
@@ -46,7 +48,24 @@ spec:
     {{- $spots := list }}
     {{- if $cc.ci.spot }}{{ $spots = append $spots true }}{{ end }}
     {{- $spots = append $spots false }}
+    {{- range $loc := $tiers }}
     {{- range $spot := $spots }}
+    {{- if $cc.ci.machineTypes }}
+    {{- range $t := $cc.ci.machineTypes }}
+    - machineType: {{ $t }}
+      spot: {{ $spot }}
+      storage:
+        bootDiskType: hyperdisk-balanced
+        bootDiskSize: {{ $cc.ci.bootDiskGb }}
+      {{- with $loc }}
+      location:
+        zones: {{ toJson .zones }}
+        {{- with .locationPolicy }}
+        locationPolicy: {{ . }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- else }}
     {{- range $f := $cc.ci.families }}
     - machineFamily: {{ $f }}
       minCores: {{ $cc.ci.minCores }}
@@ -55,6 +74,15 @@ spec:
       storage:
         bootDiskType: hyperdisk-balanced
         bootDiskSize: {{ $cc.ci.bootDiskGb }}
+      {{- with $loc }}
+      location:
+        zones: {{ toJson .zones }}
+        {{- with .locationPolicy }}
+        locationPolicy: {{ . }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
     {{- end }}
     {{- end }}
   nodePoolConfig:
@@ -105,7 +133,8 @@ spec:
 {{- end }}
 {{- if .Values.server.enabled }}
 ---
-# Servers: the zone of the Bigtable cluster, never Spot.
+# Servers: the primary zone (default the Bigtable zone), then the fallback zones; never Spot.
+# Active migration moves them back to the primary zone when it has capacity again.
 apiVersion: cloud.google.com/v1
 kind: ComputeClass
 metadata:
@@ -114,14 +143,20 @@ metadata:
     {{- include "abfs.labels" . | nindent 4 }}
 spec:
   priorities:
-    {{- $zone := $cc.server.zone | default .Values.backend.zone }}
+    {{- range $loc := $tiers }}
     {{- range $f := $cc.server.families }}
     - machineFamily: {{ $f }}
       spot: false
       storage:
         bootDiskType: hyperdisk-balanced
+      {{- with $loc }}
       location:
-        zones: [{{ $zone | quote }}]
+        zones: {{ toJson .zones }}
+        {{- with .locationPolicy }}
+        locationPolicy: {{ . }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
     {{- end }}
   nodePoolConfig:
     imageType: cos_containerd

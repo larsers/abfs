@@ -64,6 +64,17 @@ app.kubernetes.io/component: {{ . }}
 {{- end -}}
 
 {{/*
+Plaintext client flags for the Gateway VIP, listed gateway.connections times. The client
+opens one connection per entry and spreads object keys over them; each connection lands on
+one Gateway proxy. One tunnel port per entry, 0 for none.
+*/}}
+{{- define "abfs.gatewayClientFlags" -}}
+{{- $vip := include "abfs.vip" . -}}
+{{- $n := int .Values.gateway.connections -}}
+--remote-servers {{ join "," (repeat $n (printf "%s " $vip) | trim | splitList " ") }} --tunnel-ports {{ join "," (repeat $n "0 " | trim | splitList " ") }} --disable-tls --auth-type none
+{{- end -}}
+
+{{/*
 Image reference by digest. With image.allowTag an empty digest falls back to the tag.
 Arg: dict "root" . "image" "<server|pusher|client|casfsLoader>".
 */}}
@@ -263,7 +274,10 @@ resources set one. Arg: dict "res" <resources> "what" <values path> "value" <the
 {{- end -}}
 {{- end -}}
 
-{{/* Toleration of the abfs-ci class taint, for DaemonSets. */}}
+{{/*
+Toleration of the abfs-ci class taint, for DaemonSets. With ci.capacityBuffer also the
+taint of suspended standby nodes, so the DaemonSet pods stay on them.
+*/}}
 {{- define "abfs.ci.scheduling" -}}
 nodeSelector:
   cloud.google.com/compute-class: abfs-ci
@@ -272,6 +286,42 @@ tolerations:
     operator: Equal
     value: abfs-ci
     effect: NoSchedule
+{{- if .Values.ci.capacityBuffer.enabled }}
+  - key: buffer.gke.io/standby-capacity-node-suspended
+    operator: Exists
+{{- end }}
+{{- end -}}
+
+{{/*
+Zone tiers of the CI and server classes, as a JSON list of ComputeClass location fields:
+the primary zone, then the fallback zones with locationPolicy ANY. Without a primary zone
+one empty entry: the rules carry no location and follow the cluster's node locations.
+*/}}
+{{- define "abfs.zoneTiers" -}}
+{{- $z := .Values.computeClasses.zones -}}
+{{- $primary := $z.primary | default .Values.backend.zone -}}
+{{- $fallback := $z.fallback | default list -}}
+{{- if not $primary -}}
+{{- if $fallback -}}
+{{- fail "computeClasses.zones.fallback needs a primary zone: set computeClasses.zones.primary or backend.zone" -}}
+{{- end -}}
+{{- list (dict) | toJson -}}
+{{- else -}}
+{{- $region := regexReplaceAll "-[a-z]$" $primary "" -}}
+{{- range $fallback -}}
+{{- if eq . $primary -}}
+{{- fail (printf "computeClasses.zones.fallback holds the primary zone %s; list only the other zones" $primary) -}}
+{{- end -}}
+{{- if ne (regexReplaceAll "-[a-z]$" . "") $region -}}
+{{- fail (printf "computeClasses.zones.fallback zone %s is not in the region %s of the primary zone %s; node pools are created in the cluster's region only" . $region $primary) -}}
+{{- end -}}
+{{- end -}}
+{{- $tiers := list (dict "zones" (list $primary)) -}}
+{{- if $fallback -}}
+{{- $tiers = append $tiers (dict "zones" $fallback "locationPolicy" "ANY") -}}
+{{- end -}}
+{{- $tiers | toJson -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -382,6 +432,27 @@ the CI node disk.
 {{- end -}}
 {{- if .Values.ci.localSsd.enabled -}}
 {{- fail "ci.localSsd.enabled is not implemented in this chart version" -}}
+{{- end -}}
+{{- with .Values.server.linksContent -}}
+{{- if and .enabled (lt (int64 .thresholdBytes) 1) -}}
+{{- fail (printf "server.linksContent.thresholdBytes %v is below 1; with links on, the server would sign a URL for every object" .thresholdBytes) -}}
+{{- end -}}
+{{- end -}}
+{{- with .Values.ci.capacityBuffer -}}
+{{- if .enabled -}}
+{{- if not (and $.Values.ci.enabled $.Values.computeClasses.enabled) -}}
+{{- fail "ci.capacityBuffer needs ci.enabled and computeClasses.enabled: the buffer holds nodes of the class abfs-ci" -}}
+{{- end -}}
+{{- if lt (int .replicas) 1 -}}
+{{- fail "ci.capacityBuffer.replicas must be at least 1 with ci.capacityBuffer.enabled" -}}
+{{- end -}}
+{{- if not $.Values.computeClasses.ci.machineTypes -}}
+{{- fail "ci.capacityBuffer needs computeClasses.ci.machineTypes: standby nodes over 208 GB of memory are not supported, and a machineFamily rule sets no upper memory bound; list machine types of at most 208 GB (docs/sizing.md, \"Standby buffer\")" -}}
+{{- end -}}
+{{- if gt (int (include "abfs.seconds" .refresh)) 432000 -}}
+{{- fail (printf "ci.capacityBuffer.refresh %s is above 120h, the longest GKE allows" .refresh) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- /* A null value, as --set ci.cacheman.evictThreshold=null leaves it, counts as removed. */ -}}
 {{- if and (hasKey .Values.ci.cacheman "evictThreshold") (not (kindIs "invalid" .Values.ci.cacheman.evictThreshold)) -}}

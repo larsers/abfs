@@ -22,6 +22,8 @@ GKE_VERSION=1.37.2-gke.1325000  # see step 3
 AR=abfs                         # the Artifact Registry repository
 REG=$REGION-docker.pkg.dev/$P/$AR
 PSC_IP=10.100.0.5               # a free address for the Private Service Connect endpoint
+POD_RANGE=10.4.0.0/14           # the cluster's Pod range: a free range, sized in step 6
+SYSTEM_MAX=6                    # most system pool nodes: kube-dns max 64 and Config Connector (step 6)
 ```
 
 The other pages use the literal names `example-project`, `europe-west4` and cluster `abfs`; replace them there too. The namespace `abfs` and the release name `abfs` are fixed.
@@ -112,7 +114,7 @@ If it fails: pick a newer version, or use `ci.casfs.provider: daemonset` with Ub
 
 **Creates:** a Cloud Router and Cloud NAT gateway (hourly, plus per GiB), a Private Service Connect endpoint (hourly), three Cloud DNS private zones (daily, plus queries). Turns on Private Google Access on the subnet. In a Shared VPC, all in `$NET_P`.
 
-Nodes are private ([Private nodes and egress](prerequisites.md#private-nodes-and-egress)). For public nodes, skip 4.1 and 4.2 and leave out `--enable-private-nodes` in step 6. These resources affect the whole network: run 4.0 first and agree on the result with the network owner before creating anything.
+Nodes are private ([Private nodes and egress](prerequisites.md#private-nodes-and-egress)); public nodes are not supported. These resources affect the whole network: run 4.0 first and agree on the result with the network owner before creating anything.
 
 ### 4.0 Check what the network has
 
@@ -133,7 +135,7 @@ When all four list nothing, continue with 4.1 (`WARNING: The following filter ke
 
 - **Zones:** a private zone for `googleapis.com`, `pkg.dev` or `gcr.io` bound to `$NET` stays; do not create it in 4.2. Agree with the network owner that it covers the APIs of [Private nodes and egress](prerequisites.md#private-nodes-and-egress).
 - **Forwarding rules:** an endpoint with target `all-apis` or `vpc-sc` is reused: set `PSC_IP` to its `IPAddress` and skip the address and forwarding rule of 4.2. With `vpc-sc`, the network owner confirms it serves the APIs ABFS uses.
-- **Routers:** a gateway with `ALL_SUBNETWORKS_ALL_IP_RANGES` already serves `$SUBNET`: skip the router and gateway of 4.1 and check that gateway in step 4's check. With `LIST_OF_SUBNETWORKS` or `ALL_SUBNETWORKS_ALL_PRIMARY_IP_RANGES`, run `gcloud compute routers nats describe <gateway> --router <router> --region $REGION --project $NET_P`: if it serves `$SUBNET` with `ALL_IP_RANGES`, skip as above; if it serves part of it, agree the change with the network owner; if not at all, create the 4.1 gateway with `--nat-custom-subnet-ip-ranges $SUBNET:ALL` in place of `--nat-all-subnet-ip-ranges`. With no gateway, `--nat-all-subnet-ip-ranges` gives every subnet in the region egress; if `gcloud compute networks subnets list --project $NET_P --network $NET --filter "region:$REGION"` shows other subnets, agree it with the network owner or use `--nat-custom-subnet-ip-ranges $SUBNET:ALL`.
+- **Routers:** a gateway with `ALL_SUBNETWORKS_ALL_IP_RANGES` already serves `$SUBNET`: skip the router and gateway of 4.1 and check that gateway in step 4's check. With `LIST_OF_SUBNETWORKS` or `ALL_SUBNETWORKS_ALL_PRIMARY_IP_RANGES`, run `gcloud compute routers nats describe <gateway> --router <router> --region $REGION --project $NET_P`: if it serves `$SUBNET` with `ALL_IP_RANGES`, skip as above; if it serves part of it, agree the change with the network owner; if not at all, create the 4.1 gateway. It serves `$SUBNET` only, with all its ranges, which the Pods need with `--disable-default-snat` (step 6).
 - **Subnets:** note the range of an existing proxy-only subnet for 4.3.
 
 Zones bound from other projects and endpoints in service projects do not show here; ask the network owner.
@@ -147,8 +149,12 @@ gcloud compute routers create abfs-nat-router --project $NET_P \
   --region $REGION --network $NET
 gcloud compute routers nats create abfs-nat --project $NET_P \
   --region $REGION --router abfs-nat-router \
-  --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges
+  --auto-allocate-nat-external-ips --nat-custom-subnet-ip-ranges $SUBNET:ALL \
+  --enable-dynamic-port-allocation --min-ports-per-vm 64 --max-ports-per-vm 2048 \
+  --enable-logging --log-filter ERRORS_ONLY
 ```
+
+`:ALL` covers the subnet's secondary ranges, so a Pod range added there later is served too. A reused gateway must serve `$SUBNET` with `ALL_IP_RANGES`.
 
 ### 4.2 Private Service Connect endpoint for Google APIs
 
@@ -181,7 +187,7 @@ gcloud compute networks subnets list --project $NET_P --network $NET \
   --filter "purpose=REGIONAL_MANAGED_PROXY AND region:$REGION"
 ```
 
-If one exists, note its range for `networkPolicy.proxyOnlySubnetCidr`. If not, step 10 creates it with `network/proxy-subnet`; pick a free `/23` for `proxySubnetRange` ([Proxy-only subnet](prerequisites.md#proxy-only-subnet)). In a plain VPC, pick it outside `10.0.0.0/8`, such as `172.16.0.0/23`: step 6 lets GKE pick the cluster's Pod range from `10.0.0.0/8`. In a Shared VPC, pick it outside the Pod and Service ranges that `gcloud container subnets list-usable` shows in step 6.
+If one exists, note its range for `networkPolicy.proxyOnlySubnetCidr`; at thousands of CI nodes it should be a `/22` or larger ([sizing](sizing.md#gateway)). If not, step 10 creates it with `network/proxy-subnet`; pick a free `/23` (`/22` at that scale) for `proxySubnetRange`, such as `172.16.0.0/23`, outside `$SUBNET`, `$POD_RANGE`, `$PSC_IP` and peered ranges ([Proxy-only subnet](prerequisites.md#proxy-only-subnet)). In a Shared VPC, pick it outside the Pod and Service ranges that `gcloud container subnets list-usable` shows in step 6.
 
 ### Check the network
 
@@ -196,7 +202,7 @@ gcloud compute forwarding-rules describe abfsapis --project $NET_P --global \
 gcloud dns managed-zones list --project $NET_P --filter 'visibility=private' --format 'value(dnsName)'
 ```
 
-Expected: `True`; `AUTO_ONLY` and `ALL_SUBNETWORKS_ALL_IP_RANGES` (or `LIST_OF_SUBNETWORKS` with `$SUBNET` and `ALL_IP_RANGES`); `IPAddress` `$PSC_IP` with `target: all-apis` (or `target: vpc-sc` if reused); zones `googleapis.com.`, `pkg.dev.`, `gcr.io.` and the endpoint's own `p.googleapis.com.`. For resources reused from 4.0, describe those instead.
+Expected: `True`; `AUTO_ONLY` and `LIST_OF_SUBNETWORKS` with `$SUBNET` and `ALL_IP_RANGES` (or `ALL_SUBNETWORKS_ALL_IP_RANGES` for a reused gateway); `IPAddress` `$PSC_IP` with `target: all-apis` (or `target: vpc-sc` if reused); zones `googleapis.com.`, `pkg.dev.`, `gcr.io.` and the endpoint's own `p.googleapis.com.`. For resources reused from 4.0, describe those instead.
 
 If it fails: [Image pulls or Google API calls fail on private nodes](troubleshooting.md#image-pulls-or-google-api-calls-fail-on-private-nodes).
 
@@ -235,11 +241,13 @@ The first prints only the two roles above; the second `roles/iam.serviceAccountU
 
 ## 6. Create the cluster
 
-**Creates:** a GKE Standard cluster with a regional control plane (cluster management fee) and one `n4-standard-4` system node per zone of the region.
+**Creates:** a GKE Standard cluster with a regional control plane (cluster management fee) and one `n4-standard-4` system node per zone of the region, autoscaled up to `$SYSTEM_MAX`.
+
+`--default-max-pods-per-node`, the Pod range, Dataplane V2 and the regional control plane are fixed at creation. Size `$POD_RANGE` and the node subnet for the largest farm you plan ([Pod and node ranges](prerequisites.md#pod-and-node-ranges), [sizing](sizing.md)): a /14 holds 4,096 nodes at 32 pods per node, a /16 1,024. `$SYSTEM_MAX` holds the kube-dns replicas of that farm ([DNS at scale](prerequisites.md#dns-at-scale)).
 
 Set the maintenance window to the quiet hours of your CI, in UTC ([Node upgrades](prerequisites.md#node-upgrades)). Do not add `--addons`: it turns off every add-on it does not name ([Cluster](prerequisites.md#cluster)).
 
-In a Shared VPC, the host-project owner first attaches `$P` as a service project, grants the GKE service agent of `$P` its host-project roles, and creates Pod and Service secondary ranges in `$SUBNET` ([Set up clusters with Shared VPC](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-shared-vpc)). Add `--cluster-secondary-range-name <Pod range> --services-secondary-range-name <Service range>` to the create command. List the usable ranges:
+In a Shared VPC, the host-project owner first attaches `$P` as a service project, grants the GKE service agent of `$P` its host-project roles, and creates Pod and Service secondary ranges in `$SUBNET` ([Set up clusters with Shared VPC](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-shared-vpc)). Add `--cluster-secondary-range-name <Pod range> --services-secondary-range-name <Service range>` to the create command in place of `--cluster-ipv4-cidr $POD_RANGE`. List the usable ranges:
 
 ```sh
 gcloud container subnets list-usable --project $P --network-project $NET_P
@@ -253,7 +261,8 @@ gcloud container clusters create $CLUSTER \
   --release-channel rapid --cluster-version $GKE_VERSION \
   --network projects/$NET_P/global/networks/$NET \
   --subnetwork projects/$NET_P/regions/$REGION/subnetworks/$SUBNET --enable-ip-alias \
-  --enable-private-nodes \
+  --cluster-ipv4-cidr $POD_RANGE --default-max-pods-per-node 32 \
+  --enable-private-nodes --disable-default-snat \
   --enable-dns-access --no-enable-ip-access \
   --workload-pool $P.svc.id.goog \
   --gateway-api standard \
@@ -267,6 +276,7 @@ gcloud container clusters create $CLUSTER \
   --maintenance-window-start 2026-01-03T00:00:00Z --maintenance-window-duration 8H \
   --maintenance-window-recurrence 'FREQ=WEEKLY;BYDAY=SA,SU' \
   --machine-type n4-standard-4 --disk-type hyperdisk-balanced --num-nodes 1 \
+  --enable-autoscaling --total-min-nodes 3 --total-max-nodes $SYSTEM_MAX \
   --service-account abfs-system-nodes@$P.iam.gserviceaccount.com \
   --image-type COS_CONTAINERD --workload-metadata GKE_METADATA \
   --shielded-secure-boot --shielded-integrity-monitoring
@@ -291,7 +301,9 @@ gcloud container clusters describe $CLUSTER --project $P --region $REGION \
     addonsConfig.httpLoadBalancing, addonsConfig.horizontalPodAutoscaling,
     addonsConfig.gcePersistentDiskCsiDriverConfig, monitoringConfig.managedPrometheusConfig,
     maintenancePolicy.window, controlPlaneEndpointsConfig, privateClusterConfig,
-    nodePools[].config.shieldedInstanceConfig)'
+    nodePools[].config.shieldedInstanceConfig, nodePools[].autoscaling, locations,
+    ipAllocationPolicy.clusterIpv4CidrBlock, defaultMaxPodsConstraint, networkConfig.defaultSnatStatus,
+    addonsConfig.dnsCacheConfig)'
 kubectl get nodes -o wide
 kubectl get crd computeclasses.cloud.google.com gateways.gateway.networking.k8s.io \
   verticalpodautoscalers.autoscaling.k8s.io
@@ -310,6 +322,8 @@ Expected:
 - `dnsEndpointConfig`: `allowExternalTraffic: true` and an endpoint under `gke.goog`; `ipEndpointsConfig`: `enabled: false`.
 - `privateClusterConfig`: `enablePrivateNodes: true`, no `peeringName` ([Control plane to node traffic](prerequisites.md#control-plane-to-node-traffic)). A `publicEndpoint` address may show; it accepts no connections.
 - `shieldedInstanceConfig`: the system pool shows `enableSecureBoot: true`, `enableIntegrityMonitoring: true`.
+- `clusterIpv4CidrBlock` is `$POD_RANGE`; `maxPodsPerNode: '32'`; `defaultSnatStatus` `disabled: true`; the system pool's `autoscaling` shows `enabled: true` and `totalMaxNodeCount` `$SYSTEM_MAX`; `dnsCacheConfig` not `enabled: false`.
+- `locations` lists the zones of `computeClasses.zones` ([Zones](sizing.md#zones)); if a fallback zone is missing, check once that a class node starts there before you change the cluster's node locations.
 - Every node shows `<none>` under `EXTERNAL-IP`. The three CRDs exist; `gke-l7-rilb` appears within 10 minutes.
 
 If it fails: [kubectl cannot reach the control plane](troubleshooting.md#kubectl-cannot-reach-the-control-plane), [Gateway waits for its controller](troubleshooting.md#gateway-waits-for-its-controller).
@@ -446,8 +460,9 @@ cp -r kcc/overlays/example kcc/overlays/<name>
 - `kccServiceAccount`: `kcc-abfs@<project>.iam.gserviceaccount.com`.
 - `serverWorkloadIdentityMember`: always `serviceAccount:<project>.svc.id.goog[abfs/abfs-server]`.
 - `spannerInstance`, `spannerDatabase`, `bigtableInstance`, `bigtableCluster`, `bucket`: backend names (bucket names are global; with `backend-existing`, the existing names).
+- `bigtableMinNodes`, `bigtableMaxNodes`, `bigtableCpuTarget`, `spannerProcessingUnits`: the backend size, `backend-new` only (defaults 1, 3, 60, 100; [sizing](sizing.md#backend)).
 
-In `kustomization.yaml`, list exactly one of `backend-new` and `backend-existing` ([Backend modes](runbook.md#backend-modes)), `network/proxy-subnet` when 4.3 found none, and `settings`. Set the Bigtable node cap with the patch in the file. Leave `gc` out ([Garbage collection](runbook.md#garbage-collection)).
+In `kustomization.yaml`, list exactly one of `backend-new` and `backend-existing` ([Backend modes](runbook.md#backend-modes)), `network/proxy-subnet` when 4.3 found none, and `settings`; `links-content` only with `server.linksContent.enabled`. Leave `gc` out ([Garbage collection](runbook.md#garbage-collection)).
 
 ```sh
 kubectl kustomize kcc/overlays/<name> | less     # review
@@ -559,6 +574,18 @@ Set in `values.yaml` ([configuration](configuration.md)):
 - `pusher.count`: fixed after the first full seed ([The pusher count is fixed](runbook.md#the-pusher-count-is-fixed)); the default 3 suits a full Android tree.
 - `pusher.pool`: below.
 - `alerts.enabled: true` and `alerts.clusterName: <cluster name>` (optional).
+- `computeClasses.zones.fallback`: below.
+- For a large farm: `server.replicas.max`, `server.linksContent` and `ci.capacityBuffer` ([sizing](sizing.md)).
+
+**Fallback zones.** Without fallback zones, CI and server nodes start only in the primary zone (`backend.zone` unless `computeClasses.zones.primary` is set). A stockout there leaves build pods pending until the zone has capacity again. In a regional cluster, list the other zones of the region that are in the cluster's `locations` (step 6):
+
+```yaml
+computeClasses:
+  zones:
+    fallback: [europe-west4-a, europe-west4-c]
+```
+
+GKE uses them only when the primary zone lacks capacity ([Zones](sizing.md#zones)). The chart default is an empty list.
 
 Leave `image.*` to `values-images.yaml`.
 

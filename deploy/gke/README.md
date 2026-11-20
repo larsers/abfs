@@ -12,8 +12,8 @@ This folder deploys the open-source ABFS GCP server, the git-pushers and the CI 
   abfs-ci namespace (PSA privileged)       abfs namespace (PSA baseline)
   +-------------------------------+        +-------------------------------+
   | ComputeClass abfs-ci          |        | ComputeClass abfs-server      |
-  |  COS nodes, any zone          |  h2c   |  abfs-server Deployment, HPA  |---> Spanner (refs)
-  |  casfs-loader DaemonSet       | -----> |  zone of the Bigtable cluster |---> Bigtable (objects)
+  |  COS nodes, primary zone      |  h2c   |  abfs-server Deployment, HPA  |---> Spanner (refs)
+  |  casfs-loader DaemonSet       | -----> |  primary zone (Bigtable's)    |---> Bigtable (objects)
   |  cacheman DaemonSet (hostPath)|  VIP   |  behind Gateway gke-l7-rilb   |---> Cloud Storage (blobs)
   |  build pods                   |        +-------------------------------+
   +-------------------------------+        | abfs-pusher-seed / -steady    |
@@ -36,7 +36,7 @@ Details in [prerequisites.md](docs/prerequisites.md); the install order in [inst
 - GKE Standard with a regional control plane. Autopilot does not allow the privileged CI pods.
 - A GKE version whose COS image ships casfs 0.1.24 or later: COS 133 from build 44-193, first in GKE 1.37.2-gke.1325000 on the Rapid channel ([prerequisites](docs/prerequisites.md#gke-version-for-the-ci-nodes)). `ci.casfs.provider: daemonset` instead runs Ubuntu CI nodes that build casfs on each node; it does not build on kernel series 6.14 and 6.19, and cannot run under `constraints/compute.requireShieldedVm` ([prerequisites](docs/prerequisites.md#secure-boot-on-the-ci-nodes)).
 - Config Connector installed by hand from its operator bundle, 1.130.1 or later, not the GKE add-on.
-- A VPC with a proxy-only subnet. With private nodes: a Private Service Connect endpoint for Google APIs with its DNS zones, Private Google Access and Cloud NAT.
+- Private nodes only. A VPC with a proxy-only subnet, a Private Service Connect endpoint for Google APIs with its DNS zones, Private Google Access and Cloud NAT.
 - Control plane access through the DNS-based endpoint only.
 - Spanner, Bigtable and Cloud Storage, new or existing; an Artifact Registry repository for the four images.
 - Tools: `gcloud`, `kubectl` with kustomize, Helm 4, `skopeo`, `jq`, `make`; `docker` for the backend check and image builds.
@@ -64,4 +64,5 @@ From a source tree, build the images instead of loading them ([runbook](docs/run
 - [runbook.md](docs/runbook.md): backend modes, garbage collection, seed and steady phase, upgrades, cache reset, teardown, security, the bundle.
 - [configuration.md](docs/configuration.md): every chart value and the KCC to chart name table.
 - [ci-job.md](docs/ci-job.md): the build pod contract, the example Job, Airflow, node sizing.
+- [sizing.md](docs/sizing.md): address ranges, Gateway proxies, backend size, zones, standby buffer and telemetry cost for a large farm.
 - [troubleshooting.md](docs/troubleshooting.md): known failures and their causes.

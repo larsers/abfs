@@ -57,6 +57,24 @@ replacements:
     targets:
       - select: {kind: BigtableInstance, name: abfs-objects}
         fieldPaths: [spec.cluster.0.clusterId]
+  # The settings are strings; a replacement keeps the integer type of the
+  # target field.
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bigtableMinNodes}
+    targets:
+      - select: {kind: BigtableInstance, name: abfs-objects}
+        fieldPaths: [spec.cluster.0.autoscalingConfig.minNodes]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bigtableMaxNodes}
+    targets:
+      - select: {kind: BigtableInstance, name: abfs-objects}
+        fieldPaths: [spec.cluster.0.autoscalingConfig.maxNodes]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bigtableCpuTarget}
+    targets:
+      - select: {kind: BigtableInstance, name: abfs-objects}
+        fieldPaths: [spec.cluster.0.autoscalingConfig.cpuTarget]
+  - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.spannerProcessingUnits}
+    targets:
+      - select: {kind: SpannerInstance, name: abfs-refs}
+        fieldPaths: [spec.processingUnits]
   - source: {kind: ConfigMap, name: abfs-kcc-settings, fieldPath: data.bucket}
     targets:
       - select: {kind: StorageBucket, name: abfs-blobs}

@@ -89,7 +89,7 @@ The CI system decides how many builds run. Each build pod requests CPU, memory a
 
 Builds on one node share its node cache, so larger nodes with several builds fetch less but need more casfs kernel memory and a larger boot disk. Smaller nodes follow the load more finely. The `optimize-utilization` profile places new builds on busy nodes first.
 
-Nodes go away only when no build runs on them (build pods carry `safe-to-evict: "false"`), after 30 minutes (`computeClasses.ci.consolidationDelayMinutes`). A longer delay keeps more warm nodes at the price of idle nodes. To keep a fixed number of nodes warm, add a node pool of your own with a minimum size under `computeClasses.ci.nodepools`; the class tries it first.
+Nodes go away only when no build runs on them (build pods carry `safe-to-evict: "false"`), after 30 minutes (`computeClasses.ci.consolidationDelayMinutes`). A longer delay keeps more warm nodes at the price of idle nodes; a kept node keeps its object cache, but its map entries expire 6 to 8 hours after they were written ([sizing](sizing.md#consolidation-delay)). To keep a fixed number of nodes warm, add a node pool of your own with a minimum size under `computeClasses.ci.nodepools`; the class tries it first.
 
 Use Spot nodes (`computeClasses.ci.spot`) only when the CI system retries a build whose node was preempted.
 
@@ -97,9 +97,9 @@ Use Spot nodes (`computeClasses.ci.spot`) only when the CI system retries a buil
 
 As a planning figure, one 16-vCPU replica carries about 10 warm builds at once at the HPA's 60 % target, so 3 to 10 replicas cover about 30 to 100 concurrent warm builds.
 
-Bigtable reaches its limit first: plan on its default cap of 3 nodes (`backend-new`) being reached at about 16 concurrent warm builds. Raise the cap in the KCC overlay for a larger farm; each node is a fixed hourly cost. Spanner holds only refs and stays at 100 processing units.
+Bigtable reaches its limit first: plan on its default cap of 3 nodes (`backend-new`) being reached at about 16 concurrent warm builds. Raise `bigtableMaxNodes` in the overlay's `settings.yaml` for a larger farm; each node is a fixed hourly cost ([sizing](sizing.md#backend)). Spanner holds only refs and stays at 100 processing units.
 
-The servers run in the zone of the Bigtable cluster. CI nodes run in any zone of the region.
+CI and server nodes run in the primary zone, by default the zone of the Bigtable cluster. With `computeClasses.zones.fallback` set, GKE uses those zones when the primary zone lacks capacity; servers move back when it has capacity again ([zones](sizing.md#zones)). For a farm of hundreds or thousands of nodes, see [sizing](sizing.md).
 
 ### Pushers
 

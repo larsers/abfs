@@ -14,8 +14,10 @@ Set each pair together; the chart cannot read the KCC objects.
 | `settings.yaml` `bigtableInstance` | `abfs-objects` | `backend.bigtableInstance` |
 | `settings.yaml` `bigtableCluster` | `abfs-objects-c1` | none; the chart uses the instance's default app profile, or `backend.bigtableAppProfile` |
 | `settings.yaml` `bucket` | `example-project-abfs-blobs` | `backend.bucket` |
-| `settings.yaml` `zone` (the Bigtable cluster's) | `europe-west4-b` | `backend.zone`; the server class places its nodes there unless `computeClasses.server.zone` is set |
+| `settings.yaml` `zone` (the Bigtable cluster's) | `europe-west4-b` | `backend.zone`; the CI and server classes use it as the primary zone unless `computeClasses.zones.primary` is set |
 | `settings.yaml` `proxySubnetRange`, or the network's existing proxy-only subnet | `172.16.0.0/23` | `networkPolicy.proxyOnlySubnetCidr` |
+| `settings.yaml` `bigtableMinNodes`, `bigtableMaxNodes`, `bigtableCpuTarget`, `spannerProcessingUnits` | `1`, `3`, `60`, `100` | none; `make check` refuses maxNodes above 10 x minNodes, cpuTarget outside 10 to 80 and invalid processing units ([sizing](sizing.md#backend)) |
+| component `links-content` (`roles/iam.serviceAccountTokenCreator` of `abfs-server` on itself) | | `server.linksContent.enabled` |
 | IAMServiceAccount `abfs-server` (base) | `abfs-server@example-project.iam.gserviceaccount.com` | `server.gcpServiceAccount`; empty means this name |
 | IAMServiceAccount `abfs-nodes` (base) | `abfs-nodes@example-project.iam.gserviceaccount.com` | `computeClasses.nodeServiceAccount` |
 | ComputeAddress `abfs-gateway` (base) | `abfs-gateway` | `gateway.addressName` |
@@ -60,7 +62,7 @@ The chart never creates the release namespace: the KCC base creates `abfs` (leve
 | --- | --- | --- |
 | `server.enabled` | `true` | |
 | `server.gcpServiceAccount` | `""` | Google service account of the KSA `abfs-server`; empty means `abfs-server@<backend.project>.iam.gserviceaccount.com` |
-| `server.replicas.min`, `.max` | `3`, `10` | HPA range; without HPA the fixed count is `min` |
+| `server.replicas.min`, `.max` | `3`, `10` | HPA range; without HPA the fixed count is `min`. `max` is a sizing input: peak Gateway requests/s over what one replica serves, plus 30 % ([sizing](sizing.md)). |
 | `server.hpa.enabled`, `.cpuTarget` | `true`, `60` | HPA on CPU utilization of the request |
 | `server.hpa.scaleDownStabilizationSeconds` | `1800` | The HPA removes replicas only after the load has stayed low this long. Scale-up keeps the HPA default. |
 | `server.hpa.scaleDownPeriodSeconds` | `300` | After the window, at most one replica goes per period |
@@ -77,6 +79,8 @@ The chart never creates the release namespace: the KCC base creates `abfs` (leve
 | `server.shutdownTimeout` | `25s` | `--shutdown-timeout` |
 | `server.logSampleRate` | `0.01` | `--log-sample-rate` |
 | `server.gc.enabled` | `false` | `--gc`; needs the garbage collector resources, which neither backend mode creates by default: `components/gc` with `backend-new`, then `init --gc` ([runbook](runbook.md#garbage-collection)). Adds up to about 1 GiB of server memory, which the memory check counts. The collector is [`gcCollector`](#gccollector). |
+| `server.linksContent.enabled` | `false` | `--links-content`: objects above the threshold go to the clients as signed Cloud Storage URLs, outside the Gateway. Needs the KCC component `links-content` ([sizing](sizing.md#gateway)). |
+| `server.linksContent.thresholdBytes` | `1048576` | `--links-content-threshold`; the render fails below 1 with links on |
 | `server.extraArgs` | `[]` | More server flags |
 | `server.preStopSleepSeconds` | `120` | Time the pod keeps serving after its endpoint is removed, at least `gateway.drainingTimeoutSec` plus about 60 s |
 | `server.terminationGracePeriodSeconds` | `240` | preStop (120 s) + the longest stop after SIGTERM (105 s: `server.drainDelay`, `server.shutdownTimeout`, with `server.gc.enabled` up to 20 s of GC touches and 30 s of heartbeat delete, 15 s of telemetry flush) + 15 s margin. Raise it with any of these. |
@@ -111,6 +115,7 @@ The server listens on 50051 (gRPC, plaintext h2c) and serves HTTP debug endpoint
 | `gateway.className` | `gke-l7-rilb` | Regional internal Application Load Balancer |
 | `gateway.addressName` | `abfs-gateway` | Name of the KCC ComputeAddress, the one of the KCC base |
 | `gateway.vip` | `""` (required) | IP of that address. Pushers, cacheman and build pods use `<vip>:50051`. |
+| `gateway.connections` | `4` | cacheman and the pushers list `<vip>:50051` this many times in `--remote-servers` (with as many tunnel ports of 0) and spread object keys over the connections; refs and a few calls stay on the first. One Gateway proxy serves each connection, about 1,400 requests/s and 18 MB/s. N = max(ceil(node peak req/s / 1,400), ceil(node peak bytes/s / 18 MB/s)) plus a margin; a cold node needs 2 ([sizing](sizing.md#gateway)). The bootstrap Job and the Helm test use one connection. |
 | `gateway.timeoutSec` | `600` | Backend timeout, for the longest single `GetObject` or `PutObject` stream |
 | `gateway.drainingTimeoutSec` | `60` | Connection draining |
 | `gateway.logging.enabled`, `.sampleRate` | `true`, `1000` | Access log, `sampleRate` out of 1,000,000 |
@@ -193,6 +198,8 @@ With `pusher.enabled: false` (the pushers run in another release), set `pusher.p
 | `ci.casfs.source.path`, `.commit`, `.version` | `/usr/src/casfs`, `c946f8e`, `0.1.23` | Source in the loader image; with `daemonset`, the module version the loader builds and expects (prefix match; empty skips the check). `image` checks the interface only. |
 | `ci.casfs.resources` | 100m CPU, 256Mi request, 2Gi limit | Loader container |
 | `ci.localSsd.enabled` | `false` | Not implemented; `true` fails the render |
+| `ci.capacityBuffer.enabled`, `.replicas` | `false`, `0` | Standby `CapacityBuffer` `<release>-ci-standby` in `ci.namespace` with a `PodTemplate` of one build pod (`ci.exampleJob.resources` and `ci.buildDisk`): `replicas` suspended CI nodes that GKE resumes before it creates nodes. GKE 1.37.1-gke.3020000 or later. Needs `computeClasses.ci.machineTypes` and `replicas` >= 1; cacheman and the casfs loader then tolerate `buffer.gke.io/standby-capacity-node-suspended` ([Standby buffer](sizing.md#standby-buffer)). |
+| `ci.capacityBuffer.initTime`, `.refresh` | `5m`, `24h` | Annotations `buffer.gke.io/standby-capacity-init-time` and `-refresh-frequency`; `refresh` at most `120h` |
 | `ci.exampleJob.enabled` | `false` | Render the example build Job ([ci-job.md](ci-job.md)) |
 | `ci.exampleJob.image` | `""` | Build image of the CI system |
 | `ci.exampleJob.branch`, `.target`, `.command` | `main`, `aosp_cf_x86_64_phone-trunk_staging-userdebug`, envsetup, lunch and `m` | Runs in bash in the mounted tree after `set +u`, with `-e` and `pipefail` on ([Example Job](ci-job.md#example-job)) |
@@ -206,11 +213,14 @@ With `pusher.enabled: false` (the pushers run in another release), set `pusher.p
 | `computeClasses.enabled` | `true` | |
 | `computeClasses.nodeServiceAccount` | `""` (required) | `abfs-nodes@<project>.iam.gserviceaccount.com` |
 | `computeClasses.imageStreaming` | `true` | Image streaming on all four classes. Needs the Container File System API and `roles/serviceusage.serviceUsageConsumer` for the node account, both in the KCC base ([prerequisites](prerequisites.md#image-streaming)). New node pools only. |
+| `computeClasses.zones.primary` | `""` | Zone tried first by the CI and server classes; empty means `backend.zone`, the Bigtable zone ([Zones](sizing.md#zones)) |
+| `computeClasses.zones.fallback` | `[]` | Other zones of the region, tried with `locationPolicy: ANY` when the primary zone lacks capacity. Empty means the primary zone only: a stockout there leaves build pods pending. Set it for every regional cluster ([install step 13](install.md#13-chart-values-and-the-gerrit-secret)). The render fails when it holds the primary zone or a zone of another region. |
 | `computeClasses.ci.families` | `[n4, n4d, c4d, c4]` | Machine families in fallback order |
+| `computeClasses.ci.machineTypes` | `[]` | Exact machine types in place of `families` (then `minCores` and `minMemoryGb` do not apply). Required with `ci.capacityBuffer`: types of at most 208 GB. |
 | `computeClasses.ci.minCores`, `.minMemoryGb` | `32`, `120` | Node floor; 120 GB keeps highcpu shapes out |
 | `computeClasses.ci.bootDiskGb` | `1100` | Hyperdisk Balanced boot disk in GiB; also sets the disk IOPS and throughput. 1,100 fits the cache and one build; two builds need 1,600 ([node disk](ci-job.md#node-disk)). New CI node pools only ([runbook](runbook.md#upgrades)). |
 | `computeClasses.ci.spot` | `false` | Spot rules before the on-demand ones. Only if the CI system retries builds whose node was preempted. |
-| `computeClasses.ci.consolidationDelayMinutes` | `30` | |
+| `computeClasses.ci.consolidationDelayMinutes` | `30` | How long an empty CI node stays. It keeps the object cache; map entries expire 6 to 8 hours after they were written regardless ([Consolidation delay](sizing.md#consolidation-delay)). |
 | `computeClasses.ci.consolidationThreshold` | `""` | Empty keeps the GKE default |
 | `computeClasses.ci.activeMigration` | `false` | Moving a fallback node to the preferred family costs its warm cache |
 | `computeClasses.ci.nodepools` | `[]` | Hand-made pools tried first, for example the [IOPS fallback pool](prerequisites.md#iops-fallback-node-pool-for-ci). Boot disks of at least `bootDiskGb`; the render check does not see them. |
@@ -218,12 +228,13 @@ With `pusher.enabled: false` (the pushers run in another release), set `pusher.p
 | `computeClasses.ci.capacityQuota.nodes` | `0` | Most CI nodes; required with `enabled` |
 | `computeClasses.ci.capacityQuota.cpu` | `""` | Most vCPUs over all CI nodes; empty sets no CPU limit |
 | `computeClasses.server.families` | `[n4, n4d, c4d, c4]` | |
-| `computeClasses.server.zone` | `""` | Empty means `backend.zone` |
-| `computeClasses.server.activeMigration` | `true` | |
+| `computeClasses.server.activeMigration` | `true` | Moves servers back to the primary zone and the first family when capacity returns |
 | `computeClasses.pusherSeed.families`, `.minCores`, `.minMemoryGb` | `[n4, n4d, c4d, c4]`, `32`, `240` | Highmem shapes for the seed |
 | `computeClasses.pusherSteady.families` | `[n4, n4d, c4d, c4]` | No size floor |
 
 Every class sets `whenUnsatisfiable: DoNotScaleUp`, Hyperdisk Balanced boot disks, `nodePoolConfig.imageStreaming` from `computeClasses.imageStreaming`, and secure boot and integrity monitoring on (`nodePoolAutoCreation.shieldedInstanceConfig`, GKE 1.36.3-gke.1244000 or later). The CI class sets `maintenanceExclusion: UNTIL_END_OF_SUPPORT` and uses `cos_containerd` (`ci.casfs.provider: image`), or `ubuntu_containerd` with secure boot off (`daemonset`). A change applies to new node pools only ([Secure boot on the CI nodes](prerequisites.md#secure-boot-on-the-ci-nodes)). The other classes use `cos_containerd`. Servers and pushers never run on Spot.
+
+Rule order of the CI class: the `nodepools` rule, then the primary zone (Spot rules first with `ci.spot`, each family or machine type), then the fallback zones in the same order with `locationPolicy: ANY`. The server class: the primary zone, then the fallback zones, each over its families. `locationPolicy` needs GKE 1.34.1-gke.2541000 or later. The pusher classes set no zone; a pusher follows its disk.
 
 ## otel, pdb, networkPolicy, alerts, tests
 
@@ -255,8 +266,8 @@ Every class sets `whenUnsatisfiable: DoNotScaleUp`, Hyperdisk Balanced boot disk
 | Pushers | seed phase: class `abfs-pusher-seed`, fixed requests | steady phase: class `abfs-pusher-steady`, `steadyResources`, VPA on memory (`Initial` by default) |
 | cacheman memory | VPA `abfs-cacheman` in mode `Off` gives a recommendation; set `ci.cacheman.resources` from it | same |
 | CI nodes | node auto-creation for pending build pods (32 vCPU floor), four families; bounded by Compute Engine quota or a `CapacityQuota` | consolidation after 30 minutes under the threshold; build pods carry `safe-to-evict: "false"` |
-| Bigtable (`backend-new`) | autoscaling on 60 % CPU up to `maxNodes` (3 by default, the cost cap) | down to 1 node |
-| Spanner | fixed 100 processing units | 100 is the smallest regional size |
+| Bigtable (`backend-new`) | autoscaling on `bigtableCpuTarget` (60 %) up to `bigtableMaxNodes` (3 by default, the cost cap) | down to `bigtableMinNodes` (1) |
+| Spanner | fixed `spannerProcessingUnits` (100) | 100 is the smallest regional size |
 | Gateway | managed | managed |
 
 None of these moves a pod to a smaller node when its requests shrink. Rules:
