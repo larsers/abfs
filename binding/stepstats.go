@@ -28,6 +28,9 @@ const (
 	// CacheReasonApplyFailed means a cached response failed to apply with an error other
 	// than a mismatch.
 	CacheReasonApplyFailed = "apply_failed"
+	// CacheReasonPhonyOutput means the step declares phony_output, so it runs on every build
+	// and is never looked up in the cache.
+	CacheReasonPhonyOutput = "phony_output"
 )
 
 // StepStats counts the steps of a ninja run and sums their run times.

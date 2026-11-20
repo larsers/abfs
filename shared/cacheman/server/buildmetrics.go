@@ -41,6 +41,7 @@ var buildMissReasons = []string{
 	"skipped",
 	"mismatch",
 	"apply_failed",
+	"phony_output",
 }
 
 // buildRejectReasons are the reasons a cached response was not used that are reported by

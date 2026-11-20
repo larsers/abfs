@@ -83,6 +83,8 @@ func (s *stepCounter) snapshot() *binding.StepStats {
 // A mismatch outranks an apply failure, which outranks a skipped response.
 func missReason(cacheOff bool, eval *Eval) string {
 	switch {
+	case eval.step != nil && eval.step.IsPhonyOutput():
+		return binding.CacheReasonPhonyOutput
 	case cacheOff:
 		return binding.CacheReasonOff
 	case eval.mismatched > 0:

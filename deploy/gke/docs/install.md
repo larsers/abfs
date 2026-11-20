@@ -950,7 +950,7 @@ Check: `COMPLETIONS 1/1`.
 grep -h 'cache: hits:' cold-build.log warm-build.log
 ```
 
-Each line reads `Evaluation took <time>, fail: <n>, cache: hits: <n>, misses: <n>, ratio: <percent>, check errors: <n>`.
+Each line reads `Evaluation took <time>, fail: <n>, cache: hits: <n>, misses: <n>, ratio: <percent>, check errors: <n>, phony_output runs: <n>`. phony_output steps run on every build, so they count in `phony_output runs` and not in `misses`.
 
 Check: the warm rebuild takes minutes, and each of its ratios is above 99. A few misses (build number, build host) are normal. A low ratio points to another mount path, another lunch target, or a non-deterministic step ([usage](usage.md#steady-state)).
 
