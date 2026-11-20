@@ -95,6 +95,9 @@ type ABFSBackend struct {
 	pendingJobs     sync.WaitGroup
 	matchFiles      *matchFiles
 	cacheErrors     atomic.Int64
+	// phonyOutputRuns counts the phony_output steps that ran. They always run, so they are
+	// not cache misses.
+	phonyOutputRuns atomic.Int64
 	metadata        *binding.BuildMetadata
 }
 
@@ -902,7 +905,11 @@ func (c *ABFSBackend) postExec(eval *Eval, resp *binding.EvalResponse, runType n
 		if err := c.addToNinjaLog(eval, resp, runType); err != nil {
 			return err
 		}
-		c.steps.addStep(runType, missReason(c.config.EvalNoCache, eval), resp)
+		reason := missReason(c.config.EvalNoCache, eval)
+		if reason == binding.CacheReasonPhonyOutput {
+			c.phonyOutputRuns.Add(1)
+		}
+		c.steps.addStep(runType, reason, resp)
 	}
 
 	return err
@@ -1273,14 +1280,15 @@ func (c *ABFSBackend) FinalizeBuild(err error) error {
 
 	failed := states[build.StateFailed]
 	cached := states[build.StateCached]
-	done := states[build.StateDone]
+	phonyOutputRuns := c.phonyOutputRuns.Load()
+	misses := max(states[build.StateDone]-phonyOutputRuns, 0)
 	hitRate := 0.0
-	if cached+done != 0 {
-		hitRate = float64(cached) / float64(cached+done) * 100
+	if cached+misses != 0 {
+		hitRate = float64(cached) / float64(cached+misses) * 100
 	}
 	msg := fmt.Sprintf(
-		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f, check errors: %d",
-		time.Since(c.startTime), failed, cached, done, hitRate, c.cacheErrors.Load(),
+		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f, check errors: %d, phony_output runs: %d",
+		time.Since(c.startTime), failed, cached, misses, hitRate, c.cacheErrors.Load(), phonyOutputRuns,
 	)
 	c.log.Warnf("%s", msg)
 

@@ -47,6 +47,18 @@ func TestMissReason(t *testing.T) {
 	}
 }
 
+func TestMissReason_PhonyOutput(t *testing.T) {
+	g := loadTestGraph(t, testNinjaFile(
+		phonyOutputBuild("qssi_violators", "src/rules.txt"),
+		resultBuild([]string{"qssi_violators"}, nil)), "out/result")
+
+	for _, cacheOff := range []bool{false, true} {
+		eval := &Eval{step: loadedStep(g, "qssi_violators")}
+		require.Equal(t, binding.CacheReasonPhonyOutput, missReason(cacheOff, eval))
+	}
+	require.Equal(t, binding.CacheReasonNoResult, missReason(false, &Eval{step: loadedStep(g, "out/result")}))
+}
+
 func evalResponse(runSecs, userSecs, sysSecs float64) *binding.EvalResponse {
 	resp := new(binding.EvalResponse)
 	resp.RunInfo.RunDuration = runSecs
