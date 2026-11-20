@@ -307,6 +307,14 @@ The bootstrap Job rewrites the two configs when they changed.
 
 `ci.cacheman.evictThreshold` was removed; the threshold is now 90 % of `ci.cacheman.cacheDisk`, so remove it from your values files. With `alerts.enabled`, `alerts.clusterName` is required.
 
+`computeClasses.server.zone` was removed; set `computeClasses.zones.primary` instead (empty means `backend.zone`). The CI class now creates nodes in the primary zone only, unless `computeClasses.zones.fallback` lists more zones; CI nodes in other zones stay until consolidation removes them.
+
+Scale settings ([sizing](sizing.md)):
+
+- `gateway.connections` reaches a CI node with its next cacheman pod (`OnDelete`, as above) and the pushers with their rolling update.
+- `computeClasses.zones`, `.ci.families` and `.ci.machineTypes` change the class rules; GKE uses them for the next nodes it creates. Running nodes stay.
+- `bigtableMinNodes`, `bigtableMaxNodes`, `bigtableCpuTarget` and `spannerProcessingUnits` (`backend-new`): run `make check`, then `kubectl apply -k kcc/overlays/<name>`; Config Connector changes the instances in place. Request Bigtable node quota before a larger `bigtableMaxNodes`.
+
 ### Spanner schema changes
 
 The `ddl` list of `kcc/components/backend-new/spanner-database-ddl.yaml` is append-only: Config Connector refuses a changed entry, and the `SpannerDatabase` reports an update error until it is restored. Never edit or remove an entry. Append a schema change by hand at the end, as a new `ALTER` or `CREATE ... IF NOT EXISTS` entry in the same `- |-` form. Check the list before applying:

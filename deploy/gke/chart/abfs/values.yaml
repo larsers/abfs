@@ -51,7 +51,8 @@ backend:
   # Empty uses the instance default profile, which must use single-cluster routing.
   bigtableAppProfile: ""
   bucket: ""
-  # Zone of the Bigtable cluster. The server class places its nodes there.
+  # Zone of the Bigtable cluster. It is the default primary zone of the CI and server
+  # classes (computeClasses.zones.primary).
   zone: ""
 
 # Namespaces. The release namespace (abfs) holds the server, pushers and the bootstrap Job;
@@ -67,6 +68,8 @@ server:
   # GSA bound to the abfs-server KSA through Workload Identity. Empty means
   # abfs-server@<backend.project>.iam.gserviceaccount.com.
   gcpServiceAccount: ""
+  # max is a sizing input: the Gateway request rate of the peak over what one replica
+  # serves, plus a margin (docs/sizing.md).
   replicas:
     min: 3
     max: 10
@@ -106,6 +109,12 @@ server:
   logSampleRate: 0.01
   gc:
     enabled: false
+  # --links-content: objects above thresholdBytes go to the client as signed Cloud Storage
+  # URLs, so their bytes skip the Gateway. Needs the KCC component links-content, which
+  # lets the server's service account sign as itself (docs/sizing.md, "Gateway").
+  linksContent:
+    enabled: false
+    thresholdBytes: 1048576
   extraArgs: []
   preStopSleepSeconds: 120
   # preStop, then the server's longest stop after SIGTERM, then a margin: 120 s +
@@ -166,6 +175,9 @@ gateway:
   addressName: abfs-gateway
   # IP of that address. Pushers, cacheman and build pods use <vip>:50051.
   vip: ""
+  # Connections of each cacheman and pusher to <vip>:50051. The client spreads object keys
+  # over them, and each connection is served by one Gateway proxy (docs/sizing.md).
+  connections: 4
   timeoutSec: 600
   drainingTimeoutSec: 60
   logging:
@@ -330,6 +342,17 @@ ci:
   # Not implemented in this chart version.
   localSsd:
     enabled: false
+  # Standby CapacityBuffer, GKE 1.37.1-gke.3020000 or later: replicas suspended CI nodes,
+  # each shaped for one build pod (ci.exampleJob.resources and ci.buildDisk), that GKE
+  # resumes before it creates new nodes. Needs computeClasses.ci.machineTypes, shapes of at
+  # most 208 GB memory; the render fails without them (docs/sizing.md, "Standby buffer").
+  capacityBuffer:
+    enabled: false
+    replicas: 0
+    # Time GKE gives a new buffer node to start its DaemonSets before it suspends it.
+    initTime: 5m
+    # Age at which GKE replaces a suspended node, at most 120h.
+    refresh: 24h
   exampleJob:
     enabled: false
     # Build image of the customer's CI; it needs bash and the Android build host tools.
@@ -358,8 +381,18 @@ computeClasses:
   # roles/serviceusage.serviceUsageConsumer for the node account (KCC base). A change
   # applies to new node pools only.
   imageStreaming: true
+  # Zones of the CI and server nodes. GKE tries the primary zone first and the fallback
+  # zones only when the primary zone lacks capacity (any of them, locationPolicy ANY).
+  # primary empty means backend.zone, the Bigtable zone; fallback empty means the primary
+  # zone only. Zones of the cluster's region; fallback must not hold primary.
+  zones:
+    primary: ""
+    fallback: []
   ci:
     families: [n4, n4d, c4d, c4]
+    # Exact machine types in place of families, in fallback order. Required with
+    # ci.capacityBuffer, which supports no node over 208 GB of memory.
+    machineTypes: []
     minCores: 32
     minMemoryGb: 120
     # GiB. Holds the node cache and the build outputs; it also sets the default Hyperdisk
@@ -368,6 +401,8 @@ computeClasses:
     bootDiskGb: 1100
     # Spot rules before the on-demand ones. Only if the CI retries preempted builds.
     spot: false
+    # How long an empty CI node stays. A node that stays keeps its object cache; its map
+    # entries expire 6 to 8 hours after they were written, whatever the delay (docs/sizing.md).
     consolidationDelayMinutes: 30
     # Empty keeps the GKE default.
     consolidationThreshold: ""
@@ -385,8 +420,7 @@ computeClasses:
       cpu: ""
   server:
     families: [n4, n4d, c4d, c4]
-    # Empty means backend.zone.
-    zone: ""
+    # Moves servers back to the primary zone and the first family when capacity returns.
     activeMigration: true
   pusherSeed:
     families: [n4, n4d, c4d, c4]

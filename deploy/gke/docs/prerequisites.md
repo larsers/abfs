@@ -10,7 +10,7 @@ On the admin workstation: `gcloud`, `kubectl` (with kustomize), `helm` (checked 
 
 ## Cluster
 
-GKE Standard with a regional control plane. Autopilot does not allow the privileged CI pods.
+GKE Standard with a regional control plane. Autopilot does not allow the privileged CI pods. For node counts, address ranges, quotas and the backend size of a large farm, see [sizing](sizing.md).
 
 | Item | Setting |
 | --- | --- |
@@ -21,19 +21,20 @@ GKE Standard with a regional control plane. Autopilot does not allow the privile
 | Managed Service for Prometheus | on |
 | Vertical Pod Autoscaling | on (the chart creates VerticalPodAutoscaler objects) |
 | Image streaming | on, set at creation (`--enable-image-streaming`) ([Image streaming](#image-streaming)) |
-| Dataplane V2 | on (the chart's NetworkPolicy is inert without it) |
+| Dataplane V2 | on (the chart's NetworkPolicy is inert without it). Clusters of 1,000 to 5,000 nodes must be regional Standard with Dataplane V2 and Private Service Connect, which this install has; all three are set at creation. |
+| Pod addresses | `--default-max-pods-per-node 32` (a /26 per node) and an explicit Pod range ([Pod and node ranges](#pod-and-node-ranges)); both fixed at creation |
 | Autoscaling profile | `optimize-utilization` |
-| Add-ons | the defaults on: HTTP load balancing (for the Gateway class `gke-l7-rilb`), horizontal pod autoscaling (the server HPA), the Compute Engine Persistent Disk CSI driver (the pusher data disks). NodeLocal DNSCache is on by default from 1.34.1-gke.3720000 and optional. |
+| Add-ons | the defaults on: HTTP load balancing (for the Gateway class `gke-l7-rilb`), horizontal pod autoscaling (the server HPA), the Compute Engine Persistent Disk CSI driver (the pusher data disks). NodeLocal DNSCache is on by default for new clusters from 1.34.1-gke.3720000; keep it ([DNS at scale](#dns-at-scale)). |
 | Config Connector | manual operator install, pinned version 1.130.1 or later, namespaced mode, not the GKE add-on ([Config Connector](#config-connector)) |
 | Node pool auto-creation | through the ComputeClasses, from 1.33.3-gke.1136000. Leave cluster-level node auto-provisioning off ([Cluster-level node auto-provisioning](#cluster-level-node-auto-provisioning)). |
-| System pool | one small manual COS pool (`n4-standard-4`, Hyperdisk Balanced) for Config Connector and the GKE system workloads, with its own node service account ([Node service account](#node-service-account)). No chart pod runs there. |
-| Private nodes | on (`--enable-private-nodes`); public nodes work too ([Private nodes and egress](#private-nodes-and-egress)) |
+| System pool | one small COS pool (`n4-standard-4`, Hyperdisk Balanced) for Config Connector and the GKE system workloads, with its own node service account ([Node service account](#node-service-account)) and autoscaling ([DNS at scale](#dns-at-scale)). No chart pod runs there. |
+| Private nodes | on (`--enable-private-nodes`) with `--disable-default-snat`, the only supported setup ([Private nodes and egress](#private-nodes-and-egress)) |
 | Control plane access | DNS-based endpoint only (`--enable-dns-access`, `--no-enable-ip-access`) ([Control plane access](#control-plane-access)) |
 | Control plane to nodes | Private Service Connect ([Control plane to node traffic](#control-plane-to-node-traffic)) |
 | Maintenance window | a recurring window in the quiet hours of your CI ([Node upgrades](#node-upgrades)) |
 | Cloud Monitoring | `--monitoring SYSTEM` ([Monitoring packages](#monitoring-packages)) |
 
-Before the cluster is created: the Container File System API ([install step 2](install.md#2-access-and-project-apis)), the system pool's node service account ([install step 5](install.md#5-system-node-service-account)), and with private nodes the network of [Private nodes and egress](#private-nodes-and-egress). [Install step 6](install.md#6-create-the-cluster) creates the cluster and checks it.
+Before the cluster is created: the Container File System API ([install step 2](install.md#2-access-and-project-apis)), the system pool's node service account ([install step 5](install.md#5-system-node-service-account)), and the network of [Private nodes and egress](#private-nodes-and-egress). [Install step 6](install.md#6-create-the-cluster) creates the cluster and checks it.
 
 `--num-nodes 1` in a regional cluster gives one system node per zone. N4 machines take Hyperdisk boot disks only, hence `--disk-type hyperdisk-balanced`.
 
@@ -69,7 +70,26 @@ gcloud container clusters get-credentials $C --dns-endpoint
 gcloud container clusters update $C --no-enable-ip-access
 ```
 
-`gcloud container clusters update --enable-private-nodes` applies to new node pools only. To move the system pool to private nodes, the N4 machine type, its own node account or secure boot, create a new pool (`gcloud container node-pools create` with `--enable-private-nodes`, `--machine-type`, `--disk-type`, `--service-account`, `--workload-metadata` and `--shielded-secure-boot --shielded-integrity-monitoring`), then delete the old one. `node-pools update` cannot change secure boot. If the cluster runs the Config Connector add-on, move to the manual install first ([Moving from the Config Connector add-on](#moving-from-the-config-connector-add-on)).
+A cluster created with public nodes is not supported: create a new cluster. `--disable-default-snat` can be set by `clusters update` only on a cluster created with private nodes. To move the system pool to the N4 machine type, its own node account or secure boot, create a new pool (`gcloud container node-pools create` with `--machine-type`, `--disk-type`, `--service-account`, `--workload-metadata` and `--shielded-secure-boot --shielded-integrity-monitoring`), then delete the old one. `node-pools update` cannot change secure boot. If the cluster runs the Config Connector add-on, move to the manual install first ([Moving from the Config Connector add-on](#moving-from-the-config-connector-add-on)).
+
+### Pod and node ranges
+
+- **Max pods per node**: 32 gives each node a /26. A CI node runs the GKE system DaemonSets, cacheman, the casfs loader and one or two builds.
+- **Pod range** (`--cluster-ipv4-cidr`): a range of prefix p holds 2^(26 - p) nodes, so a /14 holds 4,096 and a /16 1,024. Pick it yourself, outside the node subnet, the proxy-only subnet, `PSC_IP` and every range of peered networks. In a Shared VPC the Pod secondary range plays this role.
+- **Node subnet**: its primary range holds every node, with four addresses reserved: a /20 holds 4,092, a /22 1,020.
+- **Services**: the GKE-managed default range holds 4,096 Services; keep it.
+
+A cluster created with a smaller range or more pods per node keeps that node limit; it needs a new cluster, or an additional Pod range.
+
+### DNS at scale
+
+NodeLocal DNSCache answers DNS on each node; keep it on. kube-dns runs on the system pool (the class nodes are tainted), with `replicas = max(ceil(cores / 256), ceil(nodes / 16))` from its autoscaler. At 2,000 CI nodes of 32 vCPU that is 250 replicas. Set `max` in the ConfigMap `kube-system/kube-dns-autoscaler`: GKE advises at most 500 above 500 nodes, and in most cases much lower. Plan 64 for up to 2,000 CI nodes; the system pool then needs `$SYSTEM_MAX` 6 ([install step 6](install.md#6-create-the-cluster), basis in [System pool and kube-dns](sizing.md#system-pool-and-kube-dns)):
+
+```sh
+kubectl -n kube-system get configmap kube-dns-autoscaler -o jsonpath='{.data.linear}{"\n"}'
+kubectl -n kube-system patch configmap kube-dns-autoscaler --type merge \
+  -p '{"data":{"linear":"{\"coresPerReplica\":256,\"nodesPerReplica\":16,\"preventSinglePointFailure\":true,\"max\":<max>}"}}'
+```
 
 ### Image streaming
 
@@ -78,7 +98,7 @@ The chart turns image streaming on for the four ComputeClasses (`computeClasses.
 - the Container File System API (`containerfilesystem.googleapis.com`), enabled in install step 2 and by the KCC base;
 - images in Artifact Registry;
 - `roles/serviceusage.serviceUsageConsumer` for every node service account, in the project that holds the images ([Node service account](#node-service-account));
-- with private nodes, Private Google Access on the node subnet.
+- Private Google Access on the node subnet.
 
 Set it when the cluster is created. Turning it on or off later recreates the nodes of every pool that follows the cluster setting, and a recreated CI node loses its node cache. A change of `computeClasses.imageStreaming` applies to new node pools only. Check: a node carries the label `cloud.google.com/gke-image-streaming: "true"`, and a streamed container gets the event `ImageStreaming` with `is backed by image streaming`.
 
@@ -217,18 +237,19 @@ kubectl -n abfs annotate <kind>/<name> cnrm.cloud.google.com/deletion-policy-
 
 ## Network
 
-A plain VPC is enough; a Shared VPC is not required. It needs a subnet for the cluster in the region and a proxy-only subnet. With private nodes it also needs a Private Service Connect endpoint for Google APIs with its DNS zones, Private Google Access on the node subnet and Cloud NAT in the region.
+A plain VPC is enough; a Shared VPC is not required. It needs a subnet for the cluster in the region, a proxy-only subnet, a Private Service Connect endpoint for Google APIs with its DNS zones, Private Google Access on the node subnet and Cloud NAT in the region.
 
 ### Private nodes and egress
 
+Nodes are private (`--enable-private-nodes`). This is the only supported setup; public nodes are not supported.
+
 - Google APIs (Artifact Registry, image streaming, Spanner, Bigtable, Cloud Storage, Cloud Monitoring, Cloud Logging, the Workload Identity token services) go to the [Private Service Connect endpoint](#private-service-connect-endpoint-for-google-apis) through Cloud DNS private zones.
 - Cloud NAT carries the rest: `gerrit.googlesource.com` for the patched `repo` tool ([install](install.md#check-the-patched-repo-tool)), a Gerrit outside the VPC, and with `ci.casfs.provider: daemonset` the Ubuntu archive. A Gerrit inside the VPC, or reached through Cloud VPN or Cloud Interconnect, needs no NAT.
+- `--disable-default-snat`: Pod traffic keeps the Pod address, and Cloud NAT translates it once, as GKE's networking best practices advise. Cloud NAT must then serve the Pod range: `--nat-custom-subnet-ip-ranges <subnet>:ALL` covers the primary and secondary ranges. Leave the flag out only when Pod addresses must be hidden behind node addresses towards on-premises networks. On an existing cluster, `clusters update --disable-default-snat` works only if the cluster was created with private nodes; it applies once every node has been replaced.
 
-Keep Private Google Access on for the node subnet; VMs without external addresses use the endpoint only from such a subnet. Set up the subnet flag and Cloud NAT before the cluster is created: [install step 4.1](install.md#41-private-google-access-and-cloud-nat) creates the router `abfs-nat-router` and the gateway `abfs-nat` with `--auto-allocate-nat-external-ips` and `--nat-all-subnet-ip-ranges`.
+Keep Private Google Access on for the node subnet; VMs without external addresses use the endpoint only from such a subnet. Set up the subnet flag and Cloud NAT before the cluster is created: [install step 4.1](install.md#41-private-google-access-and-cloud-nat) creates the router `abfs-nat-router` and the gateway `abfs-nat` for the cluster's subnet only (`--nat-custom-subnet-ip-ranges <subnet>:ALL`), with dynamic port allocation from 64 to 2,048 ports per VM and error logging, the values of GKE's networking best practices. Dynamic allocation does not work with endpoint-independent mapping, which is off by default.
 
-`--nat-all-subnet-ip-ranges` gives every subnet of the network in the region internet egress, and only one gateway can serve a subnet range. Where the region has other subnets or a gateway ([install step 4.0](install.md#40-check-what-the-network-has)), reuse a gateway that serves the cluster's subnet, or use `--nat-custom-subnet-ip-ranges <subnet>:ALL`. Check after step 6: every node shows `<none>` under `EXTERNAL-IP`; the ComputeClass pools follow the cluster setting.
-
-Public nodes work too: leave out `--enable-private-nodes`. They need no Cloud NAT and use the endpoint without Private Google Access. The chart, the KCC tree and the internal Gateway address do not change. Keep the VPC firewall closed to inbound traffic from outside.
+Only one gateway can serve a subnet range. Where the region has a gateway ([install step 4.0](install.md#40-check-what-the-network-has)), reuse one that serves the cluster's subnet with all its ranges. Check after step 6: every node shows `<none>` under `EXTERNAL-IP`; the ComputeClass pools follow the cluster setting.
 
 ### Private Service Connect endpoint for Google APIs
 
@@ -246,9 +267,9 @@ Check ([install step 4](install.md#check-the-network)): the forwarding rule show
 
 ### Proxy-only subnet
 
-One per network and region, purpose `REGIONAL_MANAGED_PROXY`, role `ACTIVE`, a `/23` recommended. [Install step 4.3](install.md#43-proxy-only-subnet) checks for one.
+One per network and region, purpose `REGIONAL_MANAGED_PROXY`, role `ACTIVE`. Every Envoy-based load balancer of the network in the region shares it, one address per proxy. A `/23` serves a small install; at thousands of CI nodes plan a `/22` ([sizing](sizing.md#gateway)). It cannot grow in place: a larger one is created with role `BACKUP` and then made `ACTIVE`. [Install step 4.3](install.md#43-proxy-only-subnet) checks for one.
 
-If there is none, add the component `network/proxy-subnet` to the overlay and set `proxySubnetRange` in `settings.yaml`. In a plain VPC, pick that range outside `10.0.0.0/8`: a cluster create without `--cluster-ipv4-cidr` or `--cluster-secondary-range-name` gets a `/14` Pod range that GKE picks at random from `10.0.0.0/8`, and the component creates the subnet after the cluster, so a range in `10.0.0.0/8` can collide with it. In a Shared VPC, pick it outside the Pod and Service secondary ranges of the host project. A free range also avoids the control-plane ranges of older private clusters on the network, often in `172.16.0.0/12`. If there is one, leave the component out and use its range. Either way, set `networkPolicy.proxyOnlySubnetCidr` to that range.
+If there is none, add the component `network/proxy-subnet` to the overlay and set `proxySubnetRange` in `settings.yaml`. Pick that range outside the node subnet, the cluster's Pod range (`POD_RANGE` of install step 6), `PSC_IP` and peered ranges. In a Shared VPC, pick it outside the Pod and Service secondary ranges of the host project. A free range also avoids the control-plane ranges of older private clusters on the network, often in `172.16.0.0/12`. If there is one, leave the component out and use its range. Either way, set `networkPolicy.proxyOnlySubnetCidr` to that range.
 
 ### Firewall
 
@@ -331,5 +352,5 @@ These are steps of the [install](install.md):
 - the IP of the Gateway address for `gateway.vip`;
 - no cluster operation running ([Wait for cluster operations](#wait-for-cluster-operations));
 - cluster-level node auto-provisioning off, or its limits above the peak of all nodes ([Cluster-level node auto-provisioning](#cluster-level-node-auto-provisioning));
-- with private nodes, the Private Service Connect endpoint for Google APIs and its DNS zones, Private Google Access on the node subnet, and Cloud NAT ([Private nodes and egress](#private-nodes-and-egress));
+- the Private Service Connect endpoint for Google APIs and its DNS zones, Private Google Access on the node subnet, and Cloud NAT ([Private nodes and egress](#private-nodes-and-egress));
 - `kubectl` on the DNS-based endpoint, with an account that may create cluster-scoped objects ([Control plane access](#control-plane-access)).

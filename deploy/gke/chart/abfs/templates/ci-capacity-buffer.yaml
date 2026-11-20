@@ -1,0 +1,61 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.ci.enabled .Values.ci.capacityBuffer.enabled }}
+{{- $ci := .Values.ci }}
+{{- $b := $ci.capacityBuffer }}
+# Standby capacity buffer: GKE keeps replicas suspended CI nodes, each sized by this pod
+# template, and resumes one before it creates a new node. The template is the shape of
+# one build pod (ci.exampleJob.resources plus ci.buildDisk); its pods never run. A buffer
+# node starts with an empty ABFS cache. Limits: docs/sizing.md, "Standby buffer".
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: {{ .Release.Name }}-ci-standby
+  namespace: {{ $ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+template:
+  spec:
+    nodeSelector:
+      cloud.google.com/compute-class: abfs-ci
+    tolerations:
+      - key: cloud.google.com/compute-class
+        operator: Equal
+        value: abfs-ci
+        effect: NoSchedule
+    containers:
+      - name: build
+        image: {{ include "abfs.image" (dict "root" . "image" "client") }}
+        resources:
+          {{- include "abfs.ci.ephemeralRequest" (dict "res" $ci.exampleJob.resources "what" "ci.exampleJob.resources" "value" "ci.buildDisk") }}
+          requests:
+            {{- toYaml (merge (dict "ephemeral-storage" $ci.buildDisk) (deepCopy ($ci.exampleJob.resources.requests | default dict))) | nindent 12 }}
+---
+apiVersion: autoscaling.x-k8s.io/v1beta1
+kind: CapacityBuffer
+metadata:
+  name: {{ .Release.Name }}-ci-standby
+  namespace: {{ $ci.namespace }}
+  labels:
+    {{- include "abfs.labels" . | nindent 4 }}
+  annotations:
+    buffer.gke.io/standby-capacity-init-time: {{ $b.initTime | quote }}
+    buffer.gke.io/standby-capacity-refresh-frequency: {{ $b.refresh | quote }}
+spec:
+  podTemplateRef:
+    name: {{ .Release.Name }}-ci-standby
+  replicas: {{ int $b.replicas }}
+  provisioningStrategy: buffer.gke.io/standby-capacity
+{{- end }}

@@ -1,0 +1,25 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Overlay on seed-values.yaml: a fallback zone list, Spot and a hand-made pool. The CI and
+# server classes put the primary zone (backend.zone) first and the fallback zones, with
+# locationPolicy ANY, after it; make template also checks the rule order.
+# expect:         zones: ["europe-west4-b"]
+# expect:         zones: ["europe-west4-a","europe-west4-c"]
+# expect:         locationPolicy: ANY
+computeClasses:
+  zones:
+    fallback: [europe-west4-a, europe-west4-c]
+  ci:
+    spot: true
+    nodepools: [abfs-ci-iops]

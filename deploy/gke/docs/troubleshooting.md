@@ -207,7 +207,7 @@ gcloud compute backend-services get-health <backend service> --project example-p
 
 ## Proxy-only subnet fails with "conflicts with"
 
-`kubectl -n abfs describe computesubnetwork abfs-proxy-only` shows `UpdateFailed` and `Invalid IPCidrRange: <range> conflicts with ...`. The range overlaps another range of the network, often the Pod range GKE picked for the cluster. List the ranges in use:
+`kubectl -n abfs describe computesubnetwork abfs-proxy-only` shows `UpdateFailed` and `Invalid IPCidrRange: <range> conflicts with ...`. The range overlaps another range of the network, often the cluster's Pod range. List the ranges in use:
 
 ```sh
 gcloud compute networks subnets list --project $NET_P --network $NET \
@@ -215,7 +215,7 @@ gcloud compute networks subnets list --project $NET_P --network $NET \
 gcloud network-connectivity internal-ranges list --project $NET_P
 ```
 
-Pick a free `/23` outside them and set it as `proxySubnetRange` in `settings.yaml`, then run `kubectl apply -k kcc/overlays/<name>` again. Set the same range as `networkPolicy.proxyOnlySubnetCidr` in step 13; if the chart is already installed, run `helm upgrade` with the files of step 14.
+Pick a free `/23` (`/22` for thousands of CI nodes) outside them and set it as `proxySubnetRange` in `settings.yaml`, then run `kubectl apply -k kcc/overlays/<name>` again. Set the same range as `networkPolicy.proxyOnlySubnetCidr` in step 13; if the chart is already installed, run `helm upgrade` with the files of step 14.
 
 ## StatefulSet update forbidden on a volumeClaimTemplate change
 

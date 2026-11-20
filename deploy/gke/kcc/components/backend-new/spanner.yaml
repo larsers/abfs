@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Spanner holds projects and refs only, so 100 processing units are enough.
+# Spanner holds projects and refs only, so 100 processing units are enough;
+# the setting spannerProcessingUnits changes it. No managed autoscaler: it
+# needs at least 1000 processing units and the Enterprise edition.
 # A new instance gets Spanner's default automated daily backups; delete the
 # backups before deleting the instance (docs/runbook.md, Teardown).
 # spec.labels needs Config Connector 1.130.1 or later; older versions refuse

@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # One cluster: the server needs single-cluster routing. Autoscaling between
-# minNodes and maxNodes, the cost cap; patch maxNodes in the overlay.
+# minNodes and maxNodes, the cost cap, on cpuTarget; the overlay's settings
+# bigtableMinNodes, bigtableMaxNodes and bigtableCpuTarget set the three.
 apiVersion: bigtable.cnrm.cloud.google.com/v1beta1
 kind: BigtableInstance
 metadata:
