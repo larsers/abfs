@@ -34,6 +34,7 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -1125,6 +1126,24 @@ func (a *ABFS) createProject(ctx context.Context, man *manifest.Manifest, projec
 	return nil
 }
 
+// setProjectDeepTree sets the deeptree of a project directory. A project nested in another project
+// can sit at the path of a submodule entry of the other project's tree, which casfs gives as an
+// empty directory that does not take a deeptree. That directory is replaced by a plain directory,
+// as repo checks out the nested project over the submodule entry.
+func setProjectDeepTree(ctx context.Context, casfs bindcas.CASFS, root bindcas.Dir, prjPath string, prjDir bindcas.Dir, deepTree entities.Hash) (bindcas.Dir, error) {
+	err := prjDir.DeepUpdate(ctx, deepTree)
+	if !errors.Is(err, syscall.EOPNOTSUPP) {
+		return prjDir, err
+	}
+	if rmErr := casfs.Remove(prjDir.Path()); rmErr != nil {
+		return prjDir, fmt.Errorf("%w (cannot replace %s: %v)", err, prjPath, rmErr)
+	}
+	if prjDir, err = root.MkdirAll(ctx, prjPath); err != nil {
+		return nil, fmt.Errorf("cannot create directory for project %s: %w", prjPath, err)
+	}
+	return prjDir, prjDir.DeepUpdate(ctx, deepTree)
+}
+
 func (a *ABFS) createProjectFromFSOperation(ctx context.Context, man *manifest.Manifest, project *manifest.Project, root bindcas.Dir) error {
 	hash := entities.NewHash(project.Revision)
 
@@ -1230,7 +1249,8 @@ func (a *ABFS) createProjectFromFSOperation(ctx context.Context, man *manifest.M
 		}
 	}
 
-	if err := prjDir.DeepUpdate(ctx, deepTree.Hash); err != nil {
+	prjDir, err = setProjectDeepTree(ctx, a.mnt.CASFS(), root, prjPath, prjDir, deepTree.Hash)
+	if err != nil {
 		return fmt.Errorf("cannot set deep-tree %s (tree=%s): %w", deepTree.Hash, commit.TreeHash, err)
 	}
 
