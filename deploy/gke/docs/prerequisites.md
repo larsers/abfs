@@ -83,12 +83,12 @@ A cluster created with a smaller range or more pods per node keeps that node lim
 
 ### DNS at scale
 
-NodeLocal DNSCache answers DNS on each node; keep it on. kube-dns runs on the system pool (the class nodes are tainted), with `replicas = max(ceil(cores / 256), ceil(nodes / 16))` from its autoscaler. At 2,000 CI nodes of 32 vCPU that is 250 replicas. Set `max` in the ConfigMap `kube-system/kube-dns-autoscaler`: GKE advises at most 500 above 500 nodes, and in most cases much lower. Plan 64 for up to 2,000 CI nodes; the system pool then needs `$SYSTEM_MAX` 6 ([install step 6](install.md#6-create-the-cluster), basis in [System pool and kube-dns](sizing.md#system-pool-and-kube-dns)):
+NodeLocal DNSCache answers DNS on each node; keep it on. kube-dns runs on the system pool (the class nodes are tainted), with `replicas = max(ceil(cores / 256), ceil(nodes / 16))` from its autoscaler. At 2,000 CI nodes of 32 vCPU that is 250 replicas. Set `max` in the ConfigMap `kube-system/kube-dns-autoscaler`; the patch replaces the whole `linear` value, so it repeats the GKE defaults that the first command prints: GKE advises at most 500 above 500 nodes, and in most cases much lower. Plan 64 for up to 2,000 CI nodes; the system pool then needs `$SYSTEM_MAX` 6 ([install step 6](install.md#6-create-the-cluster), basis in [System pool and kube-dns](sizing.md#system-pool-and-kube-dns)):
 
 ```sh
 kubectl -n kube-system get configmap kube-dns-autoscaler -o jsonpath='{.data.linear}{"\n"}'
 kubectl -n kube-system patch configmap kube-dns-autoscaler --type merge \
-  -p '{"data":{"linear":"{\"coresPerReplica\":256,\"nodesPerReplica\":16,\"preventSinglePointFailure\":true,\"max\":<max>}"}}'
+  -p '{"data":{"linear":"{\"coresPerReplica\":256,\"nodesPerReplica\":16,\"preventSinglePointFailure\":true,\"includeUnschedulableNodes\":true,\"max\":<max>}"}}'
 ```
 
 ### Image streaming
