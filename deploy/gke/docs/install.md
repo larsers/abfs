@@ -131,7 +131,7 @@ gcloud compute networks subnets list --project $NET_P --network $NET \
   --filter "purpose=REGIONAL_MANAGED_PROXY AND region:$REGION"
 ```
 
-When all four list nothing, continue with 4.1 (`WARNING: The following filter keys were not present in any resource : visibility` is then expected). Otherwise:
+When all four list nothing, continue with 4.1. On a network without them the commands print `Listed 0 items.` or a `WARNING: The following filter keys were not present in any resource` line each; both mean nothing was found. Otherwise:
 
 - **Zones:** a private zone for `googleapis.com`, `pkg.dev` or `gcr.io` bound to `$NET` stays; do not create it in 4.2. Agree with the network owner that it covers the APIs of [Private nodes and egress](prerequisites.md#private-nodes-and-egress).
 - **Forwarding rules:** an endpoint with target `all-apis` or `vpc-sc` is reused: set `PSC_IP` to its `IPAddress` and skip the address and forwarding rule of 4.2. With `vpc-sc`, the network owner confirms it serves the APIs ABFS uses.
@@ -325,6 +325,8 @@ Expected:
 - `clusterIpv4CidrBlock` is `$POD_RANGE`; `maxPodsPerNode: '32'`; `defaultSnatStatus` `disabled: true`; the system pool's `autoscaling` shows `enabled: true` and `totalMaxNodeCount` `$SYSTEM_MAX`; `dnsCacheConfig` not `enabled: false`.
 - `locations` lists the zones of `computeClasses.zones` ([Zones](sizing.md#zones)); if a fallback zone is missing, check once that a class node starts there before you change the cluster's node locations.
 - Every node shows `<none>` under `EXTERNAL-IP`. The three CRDs exist; `gke-l7-rilb` appears within 10 minutes.
+
+Then set the kube-dns `max` ([DNS at scale](prerequisites.md#dns-at-scale)).
 
 If it fails: [kubectl cannot reach the control plane](troubleshooting.md#kubectl-cannot-reach-the-control-plane), [Gateway waits for its controller](troubleshooting.md#gateway-waits-for-its-controller).
 
@@ -601,7 +603,7 @@ Leave `image.*` to `values-images.yaml`.
         - {branch: release-1, file: default.xml}
   ```
 
-- Upstream AOSP only: keep the example pool; the [AAOS acceptance test](#16-aaos-acceptance-test) sets a release.
+- Upstream AOSP only: set `pusher.pool.manifest.url` to `https://android.googlesource.com/platform/manifest` and `project` to `""`; the [AAOS acceptance test](#16-aaos-acceptance-test) sets a release.
 
 **The smoke pool.** Step 14 passes `docs/examples/values-smoke.yaml` last, so no full seed starts before the tests; your manifest is seeded later ([Seed your manifest](#seed-your-manifest)). The file replaces the manifest, branch files, fetch refspec and overrides with `http://abfs-smoke-manifest.abfs.svc.cluster.local:8080/manifest`, the host of the [quick end-to-end test](#quick-end-to-end-test). Use it unchanged.
 

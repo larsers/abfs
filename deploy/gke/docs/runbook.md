@@ -373,12 +373,11 @@ Never delete the `ConfigConnectorContext` while KCC objects exist in the namespa
 
    The namespace `abfs` then stays `Terminating` for about a minute.
 
-   Every data resource and the Gateway address carry `cnrm.cloud.google.com/deletion-policy: abandon`: the Spanner instance and database, the Bigtable instance, tables, policies and the collector's app profile, the bucket, the proxy-only subnet, the Gateway address and the enabled APIs stay, with their data. The two IAM service accounts and every IAM grant are deleted; workloads that still run with them lose their roles at once.
+   Every data resource and the Gateway address carry `cnrm.cloud.google.com/deletion-policy: abandon`: the Spanner instance and database, the Bigtable instance, tables, policies and the collector's app profile, the bucket, the proxy-only subnet, the Gateway address and the enabled APIs stay, with their data. [Remove the rest of the install](#remove-the-rest-of-the-install) removes the proxy-only subnet. The namespace delete also deletes the pusher PVCs and their disks. The two IAM service accounts and every IAM grant are deleted; workloads that still run with them lose their roles at once.
 
-3. Delete the pusher PVCs and the CI namespace:
+3. Delete the CI namespace:
 
    ```sh
-   kubectl -n abfs delete pvc -l app.kubernetes.io/name=abfs,app.kubernetes.io/component=pusher
    kubectl delete namespace abfs-ci
    ```
 
@@ -387,11 +386,118 @@ Never delete the `ConfigConnectorContext` while KCC objects exist in the namespa
    ```sh
    gcloud spanner backups list --instance abfs --project example-project --format 'value(name.basename())' |
      xargs -r -n 1 gcloud spanner backups delete --instance abfs --project example-project --quiet
-   gcloud spanner instances delete abfs --project example-project
-   gcloud bigtable instances delete abfs-objects --project example-project
+   gcloud spanner instances delete abfs --project example-project --quiet
+   gcloud bigtable instances delete abfs-objects --project example-project --quiet
    gcloud storage rm --recursive gs://example-project-abfs-blobs
-   gcloud compute addresses delete abfs-gateway --region europe-west4 --project example-project
+   gcloud compute addresses delete abfs-gateway --region europe-west4 --project example-project --quiet
    ```
+
+### Remove the rest of the install
+
+To remove everything the install created, continue after steps 1 to 3 above, and step 4 if the data goes too, in this order. Steps 1 to 3 must have ended first: Config Connector removes the service accounts and IAM grants of the overlay only while it runs, and a cluster deleted before `kubectl -n abfs delete gcp --all` ended leaves them in the project. The commands use the example names of [install](install.md#before-you-start); use your own. In a Shared VPC, the proxy-only subnet and the network resources of steps 5 to 7 below are in the host project of the network: run those commands with `--project` set to it. The Gateway address is in the service project.
+
+Delete only what the install created. The private zones, the Private Service Connect endpoint and the Cloud NAT gateway act on the whole network, and other workloads may use them by now. When [install step 4.0](install.md#40-check-what-the-network-has) found a zone, an endpoint, a gateway or a proxy-only subnet and the install reused it, it was there before ABFS: leave it, and ask the network owner before you delete anything in a network that others use.
+
+1. Delete the cluster. It takes about 5 minutes and removes the node pools with their disks, the Config Connector operator and the maintenance exclusions:
+
+   ```sh
+   gcloud container clusters delete abfs --project example-project --region europe-west4 --quiet
+   ```
+
+   To keep the cluster, uninstall the Config Connector operator instead, with the files of the bundle that [install step 9](install.md#9-install-config-connector) applied:
+
+   ```sh
+   kubectl delete ConfigConnector configconnector.core.cnrm.cloud.google.com --wait=true
+   kubectl delete -f kcc-<version>/operator-system/configconnector-operator.yaml --wait=true
+   ```
+
+2. Delete the Artifact Registry repository with its images:
+
+   ```sh
+   gcloud artifacts repositories delete abfs --location europe-west4 --project example-project --quiet
+   ```
+
+3. Delete the proxy-only subnet, only if the overlay listed `network/proxy-subnet`, and the Gateway address, if the data removal above left it. The subnet serves every internal Application Load Balancer of the network in the region; delete it only when no other load balancer uses it:
+
+   ```sh
+   gcloud compute networks subnets delete abfs-proxy-only --region europe-west4 --project example-project --quiet
+   gcloud compute addresses delete abfs-gateway --region europe-west4 --project example-project --quiet
+   ```
+
+4. Remove the project roles of the two service accounts that the install created by hand, then delete the accounts. Remove the roles first: the bindings of a deleted account stay in the project policy, with a `deleted:` prefix, for up to 60 days. The Workload Identity binding of `kcc-abfs` and the admin's `roles/iam.serviceAccountUser` on `abfs-system-nodes` are bindings on the accounts and go with them:
+
+   ```sh
+   for r in roles/serviceusage.serviceUsageAdmin roles/iam.serviceAccountAdmin \
+       roles/resourcemanager.projectIamAdmin roles/compute.networkAdmin \
+       roles/spanner.admin roles/bigtable.admin roles/storage.admin \
+       roles/monitoring.metricWriter; do
+     gcloud projects remove-iam-policy-binding example-project \
+       --member serviceAccount:kcc-abfs@example-project.iam.gserviceaccount.com --role $r
+   done
+   for r in roles/container.defaultNodeServiceAccount roles/serviceusage.serviceUsageConsumer; do
+     gcloud projects remove-iam-policy-binding example-project \
+       --member serviceAccount:abfs-system-nodes@example-project.iam.gserviceaccount.com --role $r
+   done
+   gcloud iam service-accounts delete kcc-abfs@example-project.iam.gserviceaccount.com --project example-project --quiet
+   gcloud iam service-accounts delete abfs-system-nodes@example-project.iam.gserviceaccount.com --project example-project --quiet
+   ```
+
+   In a Shared VPC, first remove the grants of `kcc-abfs` in the host project: `roles/compute.networkUser` on the subnet with `gcloud compute networks subnets remove-iam-policy-binding`, and `roles/compute.networkAdmin` on the host project with `gcloud projects remove-iam-policy-binding`, each with the arguments of the grant in install step 9. A CI test account of [Check CI access to the control plane](install.md#check-ci-access-to-the-control-plane) is yours to remove as well.
+
+5. Delete the private zones of install step 4.2, first their records, since a zone with records other than SOA and NS cannot be deleted; then the endpoint and its address. The endpoint deletes its own `p.googleapis.com` zone. Leave out every zone and the endpoint that 4.0 found and the install reused, and add `gke.goog` to the list if you created that zone:
+
+   ```sh
+   for z in googleapis.com pkg.dev gcr.io; do
+     n=psc-${z//./-}
+     gcloud dns record-sets delete "*.$z." --project example-project --zone $n --type CNAME
+     gcloud dns record-sets delete $z. --project example-project --zone $n --type A
+     gcloud dns managed-zones delete $n --project example-project --quiet
+   done
+   gcloud compute forwarding-rules delete abfsapis --project example-project --global --quiet
+   gcloud compute addresses delete abfs-apis-psc --project example-project --global --quiet
+   ```
+
+   The zones go first: once they are gone, the network resolves the Google API names to their public addresses again, and no VM of the network sends API calls to an endpoint that no longer exists.
+
+6. Delete the Cloud NAT gateway and its router of install step 4.1, unless 4.0 found a gateway and the install reused it:
+
+   ```sh
+   gcloud compute routers nats delete abfs-nat --router abfs-nat-router --region europe-west4 \
+     --project example-project --quiet
+   gcloud compute routers delete abfs-nat-router --region europe-west4 --project example-project --quiet
+   ```
+
+   Install step 4.1 also turned on Private Google Access on the subnet. Leave it on if other VMs of the subnet use it; otherwise turn it off with `gcloud compute networks subnets update example-subnet --region europe-west4 --project example-project --no-enable-private-ip-google-access`.
+
+7. The install does not create the network and the subnet. If they were created for this deployment alone and nothing else uses them, delete the firewall rules of the network, then the subnet, then the network:
+
+   ```sh
+   gcloud compute firewall-rules list --project example-project \
+     --filter 'network~/networks/example-network$' --format 'value(name)'
+   gcloud compute networks subnets delete example-subnet --region europe-west4 --project example-project --quiet
+   gcloud compute networks delete example-network --project example-project --quiet
+   ```
+
+   Delete each rule that the first command lists with `gcloud compute firewall-rules delete <rule> --project example-project`. The Gateway controller removes its own rule with the Gateway when the release is uninstalled.
+
+Check:
+
+```sh
+gcloud container clusters list --project example-project
+gcloud artifacts repositories list --project example-project --location europe-west4
+gcloud iam service-accounts list --project example-project \
+  --filter 'email~^(abfs-server|abfs-nodes|abfs-system-nodes|kcc-abfs)@'
+gcloud projects get-iam-policy example-project --flatten 'bindings[].members' \
+  --filter 'bindings.members~"(abfs-server|abfs-nodes|abfs-system-nodes|kcc-abfs)@"' \
+  --format 'value(bindings.role, bindings.members)'
+gcloud compute addresses list --project example-project --filter 'name=(abfs-gateway abfs-apis-psc)'
+gcloud compute networks subnets list --project example-project --filter 'name=abfs-proxy-only'
+gcloud compute forwarding-rules list --project example-project --global --filter 'name=abfsapis'
+gcloud dns managed-zones list --project example-project --format 'table(name, dnsName)'
+gcloud compute routers list --project example-project --regions europe-west4 --filter 'name=abfs-nat-router'
+```
+
+In a Shared VPC, run the lists of addresses, subnets, forwarding rules, zones and routers with the host project as well. None of the commands lists the cluster, the repository, a service account, IAM binding, address, subnet, endpoint or router of this deployment, and the zone list holds none of the `psc-*` zones and no `p.googleapis.com.` of the network. An empty list can come with a `WARNING: The following filter keys were not present in any resource` line, as in install step 4.0. The project roles of `abfs-server` and `abfs-nodes`, which Config Connector removed with the KCC objects, are gone as well.
 
 ## Bundle and source tree
 
