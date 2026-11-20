@@ -454,6 +454,9 @@ func (c *ABFSBackend) IsClean(step *build.Step) (bool, error) {
 	if SkipNode(step.Node) {
 		return true, nil
 	}
+	if noOpStep(step) {
+		return true, nil
+	}
 
 	ent, found := c.logEntries.Get(step.Node)
 	if !found {
