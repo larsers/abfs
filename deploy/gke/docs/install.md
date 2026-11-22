@@ -979,9 +979,9 @@ Check: `COMPLETIONS 1/1`.
 grep -h 'cache: hits:' cold-build.log warm-build.log
 ```
 
-Each line reads `Evaluation took <time>, fail: <n>, cache: hits: <n>, misses: <n>, ratio: <percent>, check errors: <n>`.
+Each line reads `Evaluation took <time>, fail: <n>, cache: hits: <n>, misses: <n>, ratio: <percent>, check errors: <n>, not looked up: <n>`. Steps that never consult the cache, such as `phony_output` steps, count under `not looked up`, not as misses.
 
-Check: the warm rebuild takes minutes, and each of its ratios is above 99. A few misses (build number, build host) are normal. A low ratio points to another mount path, another lunch target, or a non-deterministic step ([usage](usage.md#steady-state)).
+Check: the warm rebuild takes minutes, and each of its ratios is above 99. A few misses are normal; `build_number.txt` misses whenever `BUILD_NUMBER` changes between builds. A low ratio points to another mount path, another lunch target, or a non-deterministic step ([usage](usage.md#steady-state)).
 
 ### After the test
 
