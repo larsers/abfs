@@ -62,6 +62,15 @@ type HashFetchReq struct {
 	callback func(*HashStat, error)
 }
 
+// abfsClient is the part of binding.Client that the backend uses.
+type abfsClient interface {
+	Store() entities.CASStore
+	ApplyPatch(match, patch entities.Patch, deletes entities.DeletePatch, chroot string) error
+	ExecuteSupport() (bool, error)
+	Execute(evalReq entities.Hash, patches []entities.Hash, storeMapResult, prefetchInputs bool) (entities.Hash, error)
+	WaitFor(timeout time.Duration, priority float64, objects []entities.Hash) error
+}
+
 type ABFSBackend struct {
 	startTime       time.Time
 	params          *ninjaruntime.RunParameters
@@ -71,7 +80,7 @@ type ABFSBackend struct {
 	remotePatches   sync.Map
 	useRemote       bool
 	remotableRules  map[string]struct{}
-	abfs            *binding.Client
+	abfs            abfsClient
 	store           entities.CASStore
 	cacheman        *client.Client
 	graph           *graph.Graph
@@ -599,7 +608,7 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 				if err := c.addToNinjaLog(eval, resp, runType); err != nil {
 					return false, err
 				}
-				c.steps.addStep(runType, "", resp)
+				c.steps.addStep(runType, "", true, resp)
 				return true, nil
 			}
 			if !binding.IsMatchError(err) {
@@ -887,7 +896,8 @@ func (c *ABFSBackend) postExec(eval *Eval, resp *binding.EvalResponse, runType n
 		if err := c.addToNinjaLog(eval, resp, runType); err != nil {
 			return err
 		}
-		c.steps.addStep(runType, missReason(c.config.EvalNoCache, eval), resp)
+		reason, lookedUp := missReason(c.config.EvalNoCache, eval)
+		c.steps.addStep(runType, reason, lookedUp, resp)
 	}
 
 	return err
@@ -1257,18 +1267,15 @@ func (c *ABFSBackend) FinalizeBuild(err error) error {
 	close(c.hashFetchC)
 	c.pendingJobs.Wait()
 
-	states := c.engine.StateCounts()
-
-	failed := states[build.StateFailed]
-	cached := states[build.StateCached]
-	done := states[build.StateDone]
+	failed := c.engine.StateCounts()[build.StateFailed]
+	hits, misses, notLookedUp := c.cacheCounts(c.steps.snapshot())
 	hitRate := 0.0
-	if cached+done != 0 {
-		hitRate = float64(cached) / float64(cached+done) * 100
+	if hits+misses != 0 {
+		hitRate = float64(hits) / float64(hits+misses) * 100
 	}
 	msg := fmt.Sprintf(
-		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f, check errors: %d",
-		time.Since(c.startTime), failed, cached, done, hitRate, c.cacheErrors.Load(),
+		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f, check errors: %d, not looked up: %d",
+		time.Since(c.startTime), failed, hits, misses, hitRate, c.cacheErrors.Load(), notLookedUp,
 	)
 	c.log.Warnf("%s", msg)
 

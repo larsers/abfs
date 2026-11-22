@@ -17,8 +17,11 @@ package binding
 // Reasons why a cached response was rejected, or why a step was executed instead of
 // taken from the cache.
 const (
-	// CacheReasonOff means the cache lookup is turned off.
+	// CacheReasonOff means the cache lookup is turned off, so the step was not looked up.
 	CacheReasonOff = "cache_off"
+	// CacheReasonPhonyOutput means the step declares phony_output, so it runs on every
+	// build and is never looked up.
+	CacheReasonPhonyOutput = "phony_output"
 	// CacheReasonNoResult means the cache held no response for the step's request.
 	CacheReasonNoResult = "no_result"
 	// CacheReasonSkipped means a cached response does not write the step's targets.
@@ -34,8 +37,12 @@ const (
 type StepStats struct {
 	// RunTypes counts the steps that completed, by ninja log run type.
 	RunTypes map[string]uint32 `json:",omitempty"`
-	// MissReasons counts the steps that were executed, by cache reason.
+	// MissReasons counts the steps that were executed because their cache lookup found no
+	// usable response, by cache reason.
 	MissReasons map[string]uint32 `json:",omitempty"`
+	// NotLookedUp counts the steps that were executed without a cache lookup, by cache
+	// reason.
+	NotLookedUp map[string]uint32 `json:",omitempty"`
 	// RejectedResponses counts the cached responses that were not used, by cache reason
 	// (skipped, mismatch or apply_failed).
 	RejectedResponses map[string]uint32 `json:",omitempty"`
@@ -43,6 +50,29 @@ type StepStats struct {
 	// time of the steps taken from the cache, as measured by the builds that produced them.
 	CacheHitRunSecs float64
 	CacheHitCPUSecs float64
-	// ExecutedRunSecs sums the run time of the steps executed in this run.
+	// ExecutedRunSecs sums the run time of the steps executed after a cache miss.
 	ExecutedRunSecs float64
+	// NotLookedUpRunSecs sums the run time of the steps executed without a cache lookup.
+	NotLookedUpRunSecs float64
+}
+
+// CacheCounts returns the steps taken from the cache, the executed steps whose lookup found
+// no usable response, and the executed steps that were not looked up.
+func (s *StepStats) CacheCounts() (hits, misses, notLookedUp uint32) {
+	var completed uint32
+	for _, n := range s.RunTypes {
+		completed += n
+	}
+	for _, n := range s.MissReasons {
+		misses += n
+	}
+	for _, n := range s.NotLookedUp {
+		notLookedUp += n
+	}
+	// Every completed step that is not a cache hit counts once in MissReasons or
+	// NotLookedUp. Failed steps are not counted at all.
+	if completed > misses+notLookedUp {
+		hits = completed - misses - notLookedUp
+	}
+	return hits, misses, notLookedUp
 }
