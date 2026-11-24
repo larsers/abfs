@@ -17,7 +17,7 @@ The values assume the chart defaults (`ci.uid` and `ci.gid` 1000, `ci.hostCacheD
 - [ ] **`ABFS_BASE_DIR=/var/lib/abfs/base`**, and the ABFS instance `ci` (`abfs -i ci ...`).
 - [ ] **A mount point owned by uid 1000 with owner `rwx`.** Otherwise `casfs-mounter` fails with "owned by a different user". `mkdir -p "$WORK/src"` in an `emptyDir` meets it.
 - [ ] **An init container that waits for `/sys/module/casfs`** up to a timeout (15 minutes in the chart), then fails, so the CI system retries the pod on another node.
-- [ ] **A wait for `/var/lib/abfs/bin/abfs`** and the cacheman socket `/var/lib/abfs/base/ci/cache/socket`.
+- [ ] **A wait for `/var/lib/abfs/bin/abfs`** and a responding cacheman (`timeout -k 2 8 /var/lib/abfs/bin/abfs -i ci cacheman ping -t 5s`, not only a socket file).
 - [ ] **`resources.requests.ephemeral-storage: 400Gi`** (`ci.buildDisk`), and **no ephemeral-storage limit and no `sizeLimit`** on the `emptyDir` ([Node disk](#node-disk)).
 - [ ] **A priority below 1000000000**, the value of the chart's PriorityClass `<release>-ci-node` (`abfs-ci-node` for the release `abfs`). A pod without a `priorityClassName` has priority 0 unless the cluster has a global default class. cacheman and the casfs loader run at that class and preempt build pods; a build pod at the same priority can keep cacheman Pending.
 - [ ] **A PID 1 that reaps orphaned processes**, such as a shell that runs the build steps (`/bin/bash -c ...`) or `tini`. With `sleep` as PID 1, `abfs unmount` waits 30 s and prints "process did not die in 30s".
@@ -107,19 +107,25 @@ spec:
             - -c
             - |
               end=$(( $(date +%s) + 900 ))
-              until [ -x /var/lib/abfs/bin/abfs ] && [ -S /var/lib/abfs/base/ci/cache/socket ]; do
+              until [ -x /var/lib/abfs/bin/abfs ] && timeout -k 2 8 /var/lib/abfs/bin/abfs -i ci cacheman ping -t 5s; do
                 if [ "$(date +%s)" -ge "$end" ]; then
-                  echo "no ABFS tools or cacheman socket on this node; see the abfs-cacheman pod" >&2
+                  echo "no ABFS tools or responding cacheman on this node; see the abfs-cacheman pod" >&2
                   exit 1
                 fi
                 sleep 5
               done
+          env:
+            - {name: USER, value: "1000"}
+            - {name: ABFS_BASE_DIR, value: /var/lib/abfs/base}
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
             runAsGroup: 1000
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
           volumeMounts:
             - name: abfs
               mountPath: /var/lib/abfs

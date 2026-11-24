@@ -183,6 +183,14 @@ template:
 	    '              set +u|              source build/envsetup.sh && lunch "$$TARGET" && m|' ]] || \
 	  { echo "FAIL: the example Job does not run its default command after set +u" >&2; exit 1; }; \
 	echo "OK: the example Job runs the ABFS steps under set -euo pipefail and its command after set +u"; \
+	wc=$$(awk '/^        - name: wait-for-cacheman$$/ { c = 1; print; next } c && /^        - name: |^      containers:$$/ { c = 0 } c' <<<"$$j"); \
+	for w in \
+	    '              until [ -x /var/lib/abfs/bin/abfs ] && timeout -k 2 8 /var/lib/abfs/bin/abfs -i ci cacheman ping -t 5s; do' \
+	    '            - name: USER' '            - name: ABFS_BASE_DIR' \
+	    '              cpu: 10m' '              memory: 32Mi' '              memory: 128Mi'; do \
+	  want "$$wc" "$$w" "the wait-for-cacheman init container"; \
+	done; \
+	echo "OK: wait-for-cacheman pings cacheman with a timeout, sets USER and ABFS_BASE_DIR, and sets resource requests and a memory limit"; \
 	helm template abfs $(CHART) -n abfs -f $(CI)/seed-values.yaml -f $(CI)/fail-evict-threshold-overlay.yaml \
 	  --set ci.cacheman.evictThreshold=null >/dev/null || \
 	  { echo "FAIL: --set ci.cacheman.evictThreshold=null does not clear the removed value" >&2; exit 1; }; \
