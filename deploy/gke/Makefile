@@ -117,9 +117,17 @@ template:
 	want "$$pv" '      - containerName: git-pusher' "the pusher VerticalPodAutoscaler"; \
 	[[ $$(grep -A1 -xF '      - containerName: "*"' <<<"$$pv" | tail -n 1) == '        mode: "Off"' ]] || \
 	  { echo "FAIL: the pusher VerticalPodAutoscaler has no '*' container policy in mode Off" >&2; exit 1; }; \
-	show alert-rules.yaml --set alerts.enabled=true --set alerts.clusterName=x | grep -qF 'container_name=~"git-pusher(-seed)?"' || \
+	ar=$$(show alert-rules.yaml --set alerts.enabled=true --set alerts.clusterName=x); \
+	grep -qF 'container_name=~"git-pusher(-seed)?"' <<<"$$ar" || \
 	  { echo "FAIL: AbfsPusherRestarted does not match both pusher container names" >&2; exit 1; }; \
 	echo "OK: the pusher container is git-pusher-seed in seed and git-pusher in steady, the VPA controls only git-pusher, and the restart alert matches both"; \
+	grep -qF 'alert: AbfsCachemanRestarted' <<<"$$ar" && \
+	  grep -qF 'namespace_name="abfs-ci", container_name="cacheman"' <<<"$$ar" || \
+	  { echo "FAIL: AbfsCachemanRestarted does not match the cacheman container in abfs-ci" >&2; exit 1; }; \
+	if show alert-rules.yaml --set alerts.enabled=true --set alerts.clusterName=x --set ci.enabled=false | grep -qF 'AbfsCachemanRestarted'; then \
+	  echo "FAIL: ci.enabled=false still renders AbfsCachemanRestarted" >&2; exit 1; \
+	fi; \
+	echo "OK: AbfsCachemanRestarted matches cacheman in abfs-ci and only renders with ci.enabled"; \
 	v=$$(show cacheman-vpa.yaml); \
 	for w in '    kind: DaemonSet' '    updateMode: "Off"' '        controlledResources: ["memory"]'; do \
 	  want "$$v" "$$w" "the cacheman VerticalPodAutoscaler"; \
@@ -183,6 +191,14 @@ template:
 	    '              set +u|              source build/envsetup.sh && lunch "$$TARGET" && m|' ]] || \
 	  { echo "FAIL: the example Job does not run its default command after set +u" >&2; exit 1; }; \
 	echo "OK: the example Job runs the ABFS steps under set -euo pipefail and its command after set +u"; \
+	wc=$$(awk '/^        - name: wait-for-cacheman$$/ { c = 1; print; next } c && /^        - name: |^      containers:$$/ { c = 0 } c' <<<"$$j"); \
+	for w in \
+	    '              until [ -x /var/lib/abfs/bin/abfs ] && timeout -k 2 8 /var/lib/abfs/bin/abfs -i ci cacheman ping -t 5s; do' \
+	    '            - name: USER' '            - name: ABFS_BASE_DIR' \
+	    '              cpu: 10m' '              memory: 32Mi' '              memory: 128Mi'; do \
+	  want "$$wc" "$$w" "the wait-for-cacheman init container"; \
+	done; \
+	echo "OK: wait-for-cacheman pings cacheman with a timeout, sets USER and ABFS_BASE_DIR, and sets resource requests and a memory limit"; \
 	helm template abfs $(CHART) -n abfs -f $(CI)/seed-values.yaml -f $(CI)/fail-evict-threshold-overlay.yaml \
 	  --set ci.cacheman.evictThreshold=null >/dev/null || \
 	  { echo "FAIL: --set ci.cacheman.evictThreshold=null does not clear the removed value" >&2; exit 1; }; \

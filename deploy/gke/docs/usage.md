@@ -140,6 +140,7 @@ Upgrade the server before the clients. A server refuses a client older than it s
 | Store size | Bigtable storage, the bucket size | growth without garbage collection |
 | Pusher pool | `alerts.enabled` rules, the pusher logs | projects that no running pusher serves, and pusher restarts, usually OOM kills |
 | CI node disk | `alerts.enabled` rule `AbfsNodeDiskHigh`, or the query in [node disk](ci-job.md#node-disk) | a boot disk that fills with build outputs and cache; kubelet evicts pods at 90 % |
+| cacheman restarts | `alerts.enabled` rule `AbfsCachemanRestarted`, the cacheman logs | a restart drops pending uploads in memory and fails uncached reads and writes while cacheman is down, breaking builds if recovery takes more than a few seconds (for example on an OOM kill or crash loop); mounts reconnect once cacheman returns |
 | cacheman memory | the VerticalPodAutoscaler `abfs-cacheman` ([configuration](configuration.md#right-sizing)) | the memory request that cacheman needs under your load |
 
 Every workload sends OpenTelemetry metrics and traces to `otel.endpoint`.

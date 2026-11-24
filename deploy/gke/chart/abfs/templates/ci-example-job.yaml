@@ -74,15 +74,25 @@ spec:
             - -c
             - |
               end=$(( $(date +%s) + {{ include "abfs.seconds" $ci.waitForCasfsTimeout }} ))
-              until [ -x {{ $ci.hostCacheDir }}/bin/abfs ] && [ -S {{ $ci.hostCacheDir }}/base/ci/cache/socket ]; do
+              until [ -x {{ $ci.hostCacheDir }}/bin/abfs ] && timeout -k 2 8 {{ $ci.hostCacheDir }}/bin/abfs -i ci cacheman ping -t 5s; do
                 if [ "$(date +%s)" -ge "$end" ]; then
-                  echo "no ABFS tools or cacheman socket on this node; see the abfs-cacheman pod" >&2
+                  echo "no ABFS tools or responding cacheman on this node; see the abfs-cacheman pod" >&2
                   exit 1
                 fi
                 sleep 5
               done
+          env:
+            {{- include "abfs.userEnv" . | nindent 12 }}
+            - name: ABFS_BASE_DIR
+              value: {{ $ci.hostCacheDir }}/base
           securityContext:
             {{- include "abfs.restrictedSecurityContext" (dict "uid" $ci.uid "gid" $ci.gid) | nindent 12 }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
           volumeMounts:
             - name: abfs
               mountPath: {{ $ci.hostCacheDir }}

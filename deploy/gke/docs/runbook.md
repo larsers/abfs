@@ -258,7 +258,10 @@ A cacheman that finds the cache directory skips `abfs init`, so it must never st
 N=<node>
 CLIENT_IMG=<abfs-client image>
 kubectl cordon $N
-# wait until no build pod runs on the node
+# wait until no build pod runs on the node, then drain pending uploads
+CACHEMAN_POD=$(kubectl -n abfs-ci get pod --field-selector spec.nodeName=$N -l app.kubernetes.io/component=cacheman -o jsonpath='{.items[0].metadata.name}')
+# if wait fails: fix an unreachable server and repeat, or continue if cacheman is not running (drops pending uploads)
+kubectl -n abfs-ci exec "$CACHEMAN_POD" -- abfs -i ci cacheman wait -t 600
 kubectl -n abfs-ci create -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -284,6 +287,8 @@ kubectl -n abfs-ci delete pod --field-selector spec.nodeName=$N -l app.kubernete
 kubectl uncordon $N
 ```
 
+If the wait fails, uploads are still pending or cacheman is not running; the reset drops them. Fix the server and repeat, or continue with the reset if the pod does not run.
+
 The pod runs as root (`privileged` level of `abfs-ci`). If the wait times out or the pod fails, read `kubectl -n abfs-ci logs abfs-cache-reset`, and do not restart cacheman until `/var/lib/abfs/base/ci/cache` is gone. A second run finishes an earlier delete. The new cacheman log shows `Initialization for instance 'ci' complete`. Deleting the node resets its cache too.
 
 ## Upgrades
@@ -303,7 +308,7 @@ The bootstrap Job rewrites the two configs when they changed.
 - casfs loader: a rolling update. A loaded module stays loaded, and `casfs_max_mounts` is read-only after load, so a new casfs version (node image, or loader image with `daemonset`) or `ci.casfs.maxMounts` takes effect on new nodes only.
 - CI node disk: a change of `ci.cacheman.cacheDisk` reaches new CI nodes only. A change of `computeClasses.ci.bootDiskGb` or `computeClasses.imageStreaming` reaches new CI node pools only, not new nodes of existing pools. To move at once, cordon the nodes of the old CI pools, wait until their builds end, and delete the pools.
 - GKE node upgrades: surge upgrades for the server and pusher nodes, version upgrades held on existing CI pools, and node auto-repair at any time ([prerequisites](prerequisites.md#node-upgrades)). The CI system retries a build whose node is replaced.
-- cacheman: `updateStrategy: OnDelete`, because a stopped cacheman makes every mount on its node refuse reads and writes. Recycle the CI nodes: cordon a node, wait until its builds end and delete its cacheman pod as in [Cache reset](#cache-reset) (without the reset pod), or cordon the old nodes and let the autoscaler remove them. Each new cacheman pod copies its tool set to `/var/lib/abfs/bin`.
+- cacheman: `updateStrategy: OnDelete`, because a stopped cacheman makes every mount on its node refuse reads and writes. Recycle the CI nodes: cordon a node, wait until its builds end, drain pending uploads (`abfs -i ci cacheman wait -t 600`; if the wait fails because the server is unreachable, fix the server and repeat before deleting the pod, whereas if cacheman is stopped or crash-looping, delete the pod directly, noting that any un-uploaded outputs on the node are lost) and delete its cacheman pod as in [Cache reset](#cache-reset) (without the reset pod), or cordon the old nodes and let the autoscaler remove them. Each new cacheman pod copies its tool set to `/var/lib/abfs/bin`.
 
 `ci.cacheman.evictThreshold` was removed; the threshold is now 90 % of `ci.cacheman.cacheDisk`, so remove it from your values files. With `alerts.enabled`, `alerts.clusterName` is required.
 

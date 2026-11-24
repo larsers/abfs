@@ -465,6 +465,11 @@ the CI node disk.
 {{- end -}}
 {{- end -}}
 {{- if and .Values.ci.enabled .Values.computeClasses.enabled -}}
+{{- range $mt := .Values.computeClasses.ci.machineTypes -}}
+{{- if contains "lssd" (toString $mt) -}}
+{{- fail (printf "computeClasses.ci.machineTypes entry %q attaches Local SSD, which this chart does not support; GKE backs kubelet ephemeral storage with Local SSD while the node cache stays on the boot disk" $mt) -}}
+{{- end -}}
+{{- end -}}
 {{- $cache := include "abfs.bytes" .Values.ci.cacheman.cacheDisk | int64 -}}
 {{- $build := include "abfs.bytes" .Values.ci.buildDisk | int64 -}}
 {{- $gb := .Values.computeClasses.ci.bootDiskGb -}}

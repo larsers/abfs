@@ -125,6 +125,21 @@ spec:
             severity: warning
           annotations:
             summary: The boot disk of a node is over 85 % full; kubelet evicts pods at 90 %.
+    # A cacheman restart drops pending uploads in memory and fails uncached reads and
+    # writes while cacheman is down, breaking builds if recovery takes more than a few
+    # seconds (for example on an OOM kill or crash loop); mounts reconnect once cacheman
+    # returns.
+    - name: abfs-cacheman-restarts
+      interval: 60s
+      rules:
+        - alert: AbfsCachemanRestarted
+          expr: >-
+            increase(kubernetes_io:container_restart_count{monitored_resource="k8s_container",
+            namespace_name="{{ .Values.ci.namespace }}", container_name="cacheman"{{ $cluster }}}[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A cacheman container restarted; check its last state for OOMKilled and its logs.
     {{- end }}
     {{- if .Values.pusher.enabled }}
     # An OOM kill is the usual reason a pusher container restarts. In the steady phase with
