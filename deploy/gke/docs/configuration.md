@@ -216,7 +216,7 @@ With `pusher.enabled: false` (the pushers run in another release), set `pusher.p
 | `computeClasses.zones.primary` | `""` | Zone tried first by the CI and server classes; empty means `backend.zone`, the Bigtable zone ([Zones](sizing.md#zones)) |
 | `computeClasses.zones.fallback` | `[]` | Other zones of the region, tried with `locationPolicy: ANY` when the primary zone lacks capacity. Empty means the primary zone only: a stockout there leaves build pods pending. Set it for every regional cluster ([install step 13](install.md#13-chart-values-and-the-gerrit-secret)). The render fails when it holds the primary zone or a zone of another region. |
 | `computeClasses.ci.families` | `[n4, n4d, c4d, c4]` | Machine families in fallback order |
-| `computeClasses.ci.machineTypes` | `[]` | Exact machine types in place of `families` (then `minCores` and `minMemoryGb` do not apply). Required with `ci.capacityBuffer`: types of at most 208 GB. |
+| `computeClasses.ci.machineTypes` | `[]` | Exact machine types in place of `families` (then `minCores` and `minMemoryGb` do not apply). Required with `ci.capacityBuffer`: types of at most 208 GB. No Local SSD (`-lssd`) types: the render fails. |
 | `computeClasses.ci.minCores`, `.minMemoryGb` | `32`, `120` | Node floor; 120 GB keeps highcpu shapes out |
 | `computeClasses.ci.bootDiskGb` | `1100` | Hyperdisk Balanced boot disk in GiB; also sets the disk IOPS and throughput. 1,100 fits the cache and one build; two builds need 1,600 ([node disk](ci-job.md#node-disk)). New CI node pools only ([runbook](runbook.md#upgrades)). |
 | `computeClasses.ci.spot` | `false` | Spot rules before the on-demand ones. Only if the CI system retries builds whose node was preempted. |

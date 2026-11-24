@@ -391,7 +391,8 @@ computeClasses:
   ci:
     families: [n4, n4d, c4d, c4]
     # Exact machine types in place of families, in fallback order. Required with
-    # ci.capacityBuffer, which supports no node over 208 GB of memory.
+    # ci.capacityBuffer, which supports no node over 208 GB of memory. No Local SSD
+    # shapes (-lssd types): the render fails.
     machineTypes: []
     minCores: 32
     minMemoryGb: 120
