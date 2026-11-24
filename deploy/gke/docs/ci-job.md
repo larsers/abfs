@@ -42,7 +42,7 @@ Every mount, remount and unmount pings cacheman over its socket, so the build po
 
 ### Build cache hits
 
-The mount path is part of many cache keys. Every build pod must mount at the same path, `$WORK/src` with `WORK=/work` (`/work/src`) as in the example Job. Outputs built at another path do not serve it, so the first builds of a new deployment run cold, even on a store that other clients use. After that, a build of the same commit and lunch target takes nearly all steps from the cache.
+The mount path is part of many cache keys. Every build pod must mount at the same path, `$WORK/src` with `WORK=/work` (`/work/src`) as in the example Job. Outputs built at another path do not serve it, so the first builds of a new deployment run cold, even on a store that other clients use. After that, a build of the same commit and lunch target takes nearly all steps from the cache. Keep `BUILD_NUMBER` and `BUILD_USERNAME` the same across builds that share results; a per-job value misses the version and image steps. A direct `ninjago` call, or `ALLOW_NINJA_ENV=true`, hashes the whole environment, so run it without per-job variables.
 
 ## Example Job
 
@@ -272,7 +272,7 @@ Build outputs land in the node cache, `/var/lib/abfs/base/ci/cache` in the hostP
 | `ci.buildDisk` | 400Gi | each build pod |
 | `computeClasses.ci.bootDiskGb` | 1100 | fits the cache and one build; two builds per node need 1,600 |
 
-cacheman evicts uploaded content, least recently used first, above its threshold of 90 % of `ci.cacheman.cacheDisk` (360 GiB), down to 80 % of it. It runs at the next index write or maintenance pass, so the cache can pass the threshold for a while. Outputs not uploaded are never evicted; an idle sweep removes them after 60 s with no mount, which a busy node may never run.
+cacheman's `--evict-threshold` is 90 % of `ci.cacheman.cacheDisk` (360 GiB); it starts to evict uploaded content, least recently used first, at 90 % of that threshold (324 GiB, 81 % of `cacheDisk`) and stops at 80 % of it (288 GiB, 72 % of `cacheDisk`). It runs at the next index write or maintenance pass, so the cache can pass the threshold for a while. Outputs not uploaded are never evicted; an idle sweep removes local-only blobs older than 1 h once no mount is connected and no new connection arrived for 15 s, with a healthy server and no upload pending, which a busy node may never run.
 
 At 85 % disk use kubelet starts image garbage collection and GKE reports `StoragePressureRootFileSystem`. At 90 % kubelet evicts pods, which does not shrink the hostPath.
 
