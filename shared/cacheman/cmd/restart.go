@@ -59,10 +59,10 @@ func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
 
 	checkName := "remote-ok"
-	checkFunc := func() error { return c.Cacheman.RemoteOK() }
+	checkFunc := func(ctx context.Context) error { return c.Cacheman.RemoteOKContext(ctx) }
 	if c.Config != nil && c.Config.LocalOnly {
 		checkName = "ping"
-		checkFunc = func() error { return c.Cacheman.Ping() }
+		checkFunc = func(ctx context.Context) error { return c.Cacheman.PingContext(ctx) }
 	}
 
 	if c.sysRestart != nil {
@@ -86,13 +86,13 @@ func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		}
 		outPath := cachemanOutPath(c.Instance)
 		answers := checkFunc
-		checkFunc = func() error {
+		checkFunc = func(ctx context.Context) error {
 			// The new cacheman is our child until we exit, so it stays a zombie when it
 			// fails and the check can tell at once.
 			if processExited(started) {
 				return fmt.Errorf("%w before it answered %s; see %s", errCachemanExited, checkName, outPath)
 			}
-			return answers()
+			return answers(ctx)
 		}
 	}
 
@@ -100,7 +100,7 @@ func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return c.waitFor(ctx, checkName, checkFunc)
 }
 
-func (c *restartCmd) waitFor(ctx context.Context, name string, check func() error) error {
+func (c *restartCmd) waitFor(ctx context.Context, name string, check func(context.Context) error) error {
 	if c.CachemanProvider == nil || c.Cacheman == nil {
 		return errors.New("cacheman client not initialized")
 	}
@@ -108,18 +108,26 @@ func (c *restartCmd) waitFor(ctx context.Context, name string, check func() erro
 }
 
 // waitForCacheman polls check until it succeeds or timeout expires.
-func waitForCacheman(ctx context.Context, timeout time.Duration, name string, check func() error) error {
+func waitForCacheman(ctx context.Context, timeout time.Duration, name string, check func(context.Context) error) error {
 	timeoutTime := time.Now().Add(timeout)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		err := check()
+		reqCtx, cancel := context.WithDeadline(ctx, timeoutTime)
+		err := check(reqCtx)
+		cancel()
 		if err == nil {
 			return nil
 		}
 		if errors.Is(err, errCachemanExited) {
 			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !time.Now().Before(timeoutTime) {
+			return fmt.Errorf("timeout waiting for cacheman to respond to %s: %w", name, err)
 		}
 
 		select {
