@@ -99,6 +99,9 @@ type BadgerIndexStore struct {
 	timestampsLock [timestampShards]sync.Mutex
 	timestamps     [timestampShards]map[entities.Hash]int64
 
+	// The last Use of a hash that the LRU does not track, for the Use cooldown only
+	untrackedUses [timestampShards]map[entities.Hash]int64
+
 	// 'totalSize' is an atomic int, but it is not updated
 	// atomically with respect to the state of the index.
 	// Callers of methods that would change the totalSize will see
@@ -156,10 +159,12 @@ func NewBadgerIndexStore(path string, printer Printer, evictBatchSize uint, trac
 	var timestamps [timestampShards]map[entities.Hash]int64
 	var parked [timestampShards]map[entities.Hash]parkedEntry
 	var released [timestampShards]map[entities.Hash]int64
+	var untrackedUses [timestampShards]map[entities.Hash]int64
 	for i := range timestampShards {
 		timestamps[i] = make(map[entities.Hash]int64)
 		parked[i] = make(map[entities.Hash]parkedEntry)
 		released[i] = make(map[entities.Hash]int64)
+		untrackedUses[i] = make(map[entities.Hash]int64)
 	}
 
 	return &BadgerIndexStore{
@@ -168,6 +173,7 @@ func NewBadgerIndexStore(path string, printer Printer, evictBatchSize uint, trac
 		timestamps:      timestamps,
 		parked:          parked,
 		released:        released,
+		untrackedUses:   untrackedUses,
 		evictBatchSize:  evictBatchSize,
 		done:            make(chan struct{}, 1),
 	}
@@ -1181,7 +1187,12 @@ func (b *BadgerIndexStore) restoreIndexStats() error {
 // by iterating over the lru:: keyspace.
 func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 	var lruSz int64
-	err := b.db.Update(func(txn *badger.Txn) error {
+	// A write batch has no size limit, unlike a transaction. It keeps the keys until it
+	// commits, so they must be copies.
+	wb := b.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	err := b.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(keyOnlyIterationOpts())
 		defer it.Close()
 		prefix := []byte(lruPrefix)
@@ -1191,7 +1202,7 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 			parts := bytes.Split(key, []byte("::"))
 			if len(parts) != 3 {
 				b.printer.Printf("WARNING: deleting malformed LRU key: %v\n", string(key))
-				if err := txn.Delete(key); err != nil {
+				if err := wb.Delete(item.KeyCopy(nil)); err != nil {
 					return err
 				}
 				continue
@@ -1199,7 +1210,7 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 			timestamp, err := strconv.ParseInt(string(parts[1]), 10, 64)
 			if err != nil {
 				b.printer.Printf("WARNING: deleting LRU key with invalid timestamp: %v\n", string(key))
-				if err := txn.Delete(key); err != nil {
+				if err := wb.Delete(item.KeyCopy(nil)); err != nil {
 					return err
 				}
 				continue
@@ -1207,9 +1218,9 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 			hash := entities.NewHash(string(parts[2]))
 
 			entry, _ := b.get(txn, hash)
-			// Migration/Cleanup: If entry doesn't exist, is not Remote, or is not an LRU candidate, it shouldn't be in LRU.
-			if entry == nil || !entry.Remote || !b.isLRUCandidate(hash) || b.isParkedLocked(hash) {
-				if err := txn.Delete(key); err != nil {
+			// Migration/Cleanup: If entry doesn't exist, is not Local (evicted), is not Remote, or is not an LRU candidate, it shouldn't be in LRU.
+			if entry == nil || !entry.Local || !entry.Remote || !b.isLRUCandidate(hash) || b.isParkedLocked(hash) {
+				if err := wb.Delete(item.KeyCopy(nil)); err != nil {
 					return err
 				}
 				continue
@@ -1224,7 +1235,10 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 		}
 		return nil
 	})
-	return lruSz, err
+	if err != nil {
+		return 0, err
+	}
+	return lruSz, wb.Flush()
 }
 
 // ensureLRUConsistency ensures that all entries that should be in the LRU are present
@@ -1351,6 +1365,7 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	// sizeDelta will be zero if the entry is already in LRU tracking
 	// otherwise, it will be LocalSize of the entry
 	var sizeDelta int64
+	var tracked bool
 	if !b.isLRUCandidate(hash) {
 		return nil
 	}
@@ -1359,8 +1374,9 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	defer b.unlockTimestamps(hash)
 
 	prevTimestamp := b.readTimestampLocked(hash)
+	untracked := b.untrackedUses[shardForHash(hash)]
 	// Limit spammy Use() calls.
-	if (currTimestamp - prevTimestamp) < useCooldownSec {
+	if (currTimestamp - max(prevTimestamp, untracked[hash])) < useCooldownSec {
 		return nil
 	}
 	// A parked entry stays out of the LRU until it is unparked.
@@ -1384,16 +1400,13 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 		// Use() and Put() are concurrent with each other, so it's possible
 		// the entry may not exist yet. The LRU will be updated on a future Put()
 		// call. 'maintenance' will also re-establish consistency.
+		// Only local entries backed by the remote store belong in the LRU.
 		entry, _ := b.get(txn, hash)
-		if entry == nil {
+		if entry == nil || !entry.Local || !entry.Remote {
 			return nil
 		}
 
-		// Only add to LRU if it is a Remote object.
-		if !entry.Remote {
-			return nil
-		}
-
+		tracked = true
 		sizeDelta += int64(entry.LocalSize())
 
 		var deleteErr error
@@ -1416,12 +1429,14 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	if err != nil {
 		return err
 	}
-	if success {
+	if success && tracked {
 		b.writeTimestampLocked(hash, currTimestamp)
 		b.lruSize.Add(sizeDelta)
 		if releaseDropped {
 			delete(b.released[shardForHash(hash)], hash)
 		}
+	} else if success {
+		untracked[hash] = currTimestamp
 	}
 
 	return nil
@@ -1477,11 +1492,13 @@ func (b *BadgerIndexStore) readTimestampLocked(hash entities.Hash) int64 {
 func (b *BadgerIndexStore) writeTimestampLocked(hash entities.Hash, timestamp int64) {
 	shard := shardForHash(hash)
 	b.timestamps[shard][hash] = timestamp
+	delete(b.untrackedUses[shard], hash)
 }
 
 func (b *BadgerIndexStore) deleteTimestampLocked(hash entities.Hash) {
 	shard := shardForHash(hash)
 	delete(b.timestamps[shard], hash)
+	delete(b.untrackedUses[shard], hash)
 }
 
 // Transaction conflicts can occur when:
