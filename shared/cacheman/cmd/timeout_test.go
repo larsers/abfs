@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 
 	cachemanclient "github.com/google/abfs/shared/cacheman/client"
@@ -157,7 +158,7 @@ func TestCachemanCLICommandsHonorTimeoutAndCancel(t *testing.T) {
 	}
 }
 
-func TestCachemanPingAndRemoteOKRejectNonPositiveTimeout(t *testing.T) {
+func TestCachemanRejectNonPositiveTimeout(t *testing.T) {
 	dir := t.TempDir()
 	client := cachemanclient.NewClient(dir, time.Second)
 	t.Cleanup(func() { _ = client.Close() })
@@ -179,7 +180,24 @@ func TestCachemanPingAndRemoteOKRejectNonPositiveTimeout(t *testing.T) {
 			err := c.remoteOk(context.Background())
 			require.ErrorContains(t, err, "timeout must be positive")
 		})
+		t.Run("restart_"+timeout.String(), func(t *testing.T) {
+			c := &restartCmd{timeout: timeout, sysRestart: &recordingCmd{}}
+			err := c.Exec(context.Background(), pflag.NewFlagSet("restart", pflag.ContinueOnError))
+			require.ErrorContains(t, err, "timeout must be positive")
+			require.False(t, c.sysRestart.(*recordingCmd).ran)
+		})
 	}
+}
+
+// recordingCmd is a system restart command that records that it ran.
+type recordingCmd struct {
+	cmd.ABFSCmd
+	ran bool
+}
+
+func (c *recordingCmd) Exec(context.Context, *pflag.FlagSet) error {
+	c.ran = true
+	return nil
 }
 
 func TestCachemanPingAndRemoteOKTimeoutWrapsLastError(t *testing.T) {

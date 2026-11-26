@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/args"
+	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/instance"
 )
 
@@ -57,6 +58,9 @@ func (c *restartCmd) RegisterFlags(fl *pflag.FlagSet) {
 
 func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
+	if c.timeout <= 0 {
+		return clierr.CLIErr("timeout must be positive")
+	}
 
 	checkName := "remote-ok"
 	checkFunc := func(ctx context.Context) error { return c.Cacheman.RemoteOKContext(ctx) }
